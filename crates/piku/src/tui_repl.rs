@@ -17,7 +17,8 @@
 ///   3. redraw the divider at H-1
 ///   4. call readline again (it redraws at H)
 ///
-/// Shift+Enter / multiline: type `\` at end of line to continue.
+/// Multiline: paste text with newlines, or press Enter mid-input to add
+/// a line. Submit by pressing Enter on an empty continuation line.
 use std::io::{self, Write};
 
 use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -32,6 +33,7 @@ use piku_tools::{all_tool_definitions, Destructiveness};
 use rustyline::error::ReadlineError;
 
 use crate::cli::ResolvedProvider;
+use crate::input_helper;
 use crate::self_update;
 
 // ── Permission prompter ───────────────────────────────────────────────────────
@@ -747,7 +749,8 @@ async fn run_tui_repl_core(
     let _ = rl.load_history(&history_path);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    let mut pending_lines: Vec<String> = Vec::new();
+    // Track whether the last turn had an error, to change the prompt glyph.
+    let mut last_turn_error = false;
 
     loop {
         // Check for a newer binary on every iteration — catches the case where
@@ -778,10 +781,11 @@ async fn run_tui_repl_core(
         print!("\x1b[2K"); // clear current line before readline redraws
         let _ = io::stdout().flush();
 
-        let prompt = if pending_lines.is_empty() {
-            "\x1b[36m›\x1b[0m  "
+        // Prompt glyph reflects state: red after error, cyan normally.
+        let prompt = if last_turn_error {
+            "\x1b[31m!\x1b[0m  "
         } else {
-            "\x1b[36m…\x1b[0m  "
+            "\x1b[1m>\x1b[0m  "
         };
 
         let readline = rl.readline(prompt);
@@ -794,20 +798,11 @@ async fn run_tui_repl_core(
             Ok(line) => {
                 let _ = rl.add_history_entry(&line);
 
-                // Continuation: line ending with backslash
-                if let Some(stripped) = line.strip_suffix('\\') {
-                    pending_lines.push(stripped.to_string());
-                    continue;
-                }
-
-                // Assemble full input
-                let full_input = if pending_lines.is_empty() {
-                    line.trim().to_string()
-                } else {
-                    let mut parts = pending_lines.drain(..).collect::<Vec<_>>();
-                    parts.push(line.trim().to_string());
-                    parts.join("\n")
-                };
+                // Validator handles multiline: the buffer may contain
+                // embedded newlines from pasted text or continuation.
+                // Trim trailing blank lines that the Validator uses as
+                // the submit signal.
+                let full_input = line.trim().to_string();
 
                 if full_input.is_empty() {
                     continue;
@@ -842,13 +837,14 @@ async fn run_tui_repl_core(
                 // stays visible in the scroll history, then clear the input row.
                 let (_, rows) = term_size();
                 let scroll_bot = rows.saturating_sub(2);
-                // Clear input row first so the stale › prompt disappears
+                // Clear input row first so the stale prompt disappears
                 goto(rows, 1);
                 print!("\x1b[2K");
-                // Echo user message into scroll zone with a distinct prefix
+                // Echo user message into scroll zone — visually distinct from
+                // the active prompt: dimmed text with a different glyph so the
+                // user can distinguish "what I typed" from "where I type next".
                 goto(scroll_bot, 1);
                 print!("\r\n"); // fresh line before the user message
-                                // Render up to 3 lines of the user input; truncate very long messages
                 let display_input = {
                     let lines: Vec<&str> = full_input.lines().collect();
                     if lines.len() <= 3 {
@@ -858,13 +854,21 @@ async fn run_tui_repl_core(
                         format!("{head}\r\n\x1b[2m… ({} more lines)\x1b[0m", lines.len() - 3)
                     }
                 };
-                println!("\x1b[36m›\x1b[0m  {display_input}\r");
+                // Dimmed echo with a different glyph (▸) so it reads as
+                // "you said this" rather than looking like a live prompt.
+                println!("\x1b[2m▸  {display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
                 let tool_defs = all_tool_definitions();
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
+
+                // Hide the cursor while the agent is streaming so it doesn't
+                // visibly jump to the scroll zone. We restore it to the input
+                // row once the turn is done.
+                print!("\x1b[?25l");
+                let _ = io::stdout().flush();
 
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,
@@ -883,6 +887,7 @@ async fn run_tui_repl_core(
                 .await;
 
                 total_usage.accumulate(&result.usage);
+                last_turn_error = result.stream_error.is_some();
 
                 if let Some(err) = &result.stream_error {
                     // Print error into scroll zone
@@ -944,8 +949,7 @@ async fn run_tui_repl_core(
             }
 
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-C: clear pending continuation lines
-                pending_lines.clear();
+                // Ctrl-C: cancel current input
                 let (_, rows) = term_size();
                 let scroll_bot = rows.saturating_sub(2);
                 goto(scroll_bot, 1);
@@ -1403,12 +1407,6 @@ fn announce_self_update(new_binary: &std::path::Path) {
 
 // ── rustyline factory ─────────────────────────────────────────────────────────
 
-fn build_editor() -> anyhow::Result<rustyline::DefaultEditor> {
-    let mut builder = rustyline::Config::builder()
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List);
-    if std::env::var("PIKU_VI").is_ok() {
-        builder = builder.edit_mode(rustyline::EditMode::Vi);
-    }
-    Ok(rustyline::DefaultEditor::with_config(builder.build())?)
+fn build_editor() -> anyhow::Result<input_helper::PikuEditor> {
+    input_helper::build_editor()
 }

@@ -88,8 +88,9 @@ fn cursor_restored_on_ctrl_c() {
 // ── User message echo ─────────────────────────────────────────────────────────
 
 /// Before run_turn is called, the user's input must be echoed into the scroll zone.
-/// We verify that the user-input echo (the cyan › prefix) appears in the code
-/// BEFORE the run_turn call site, not after.
+/// We verify that the user-input echo appears in the code BEFORE the run_turn
+/// call site, not after. The echo uses a dimmed style with ▸ glyph to
+/// distinguish it from the active prompt.
 #[test]
 fn user_message_echoed_before_run_turn() {
     let src = tui_repl_source();
@@ -104,14 +105,17 @@ fn user_message_echoed_before_run_turn() {
         .map(|p| agent_turn_pos + p)
         .expect("run_turn call must exist after agent turn comment");
 
-    // The user-message echo uses the cyan › prefix: \x1b[36m›
-    let echo_pos = src[agent_turn_pos..run_turn_pos].find("\\x1b[36m");
+    let block = &src[agent_turn_pos..run_turn_pos];
+
+    // The echo uses a dim style (\x1b[2m) with the ▸ glyph — visually
+    // distinct from the active prompt.
+    let has_echo = block.contains("display_input") && block.contains("\\x1b[2m");
 
     assert!(
-        echo_pos.is_some(),
-        "User message echo (\\x1b[36m › prefix) must appear BEFORE run_turn in the agent turn block.\n\
+        has_echo,
+        "User message echo (dimmed with display_input) must appear BEFORE run_turn in the agent turn block.\n\
          Agent turn block (first 800 chars):\n{}",
-        &src[agent_turn_pos..agent_turn_pos + 800]
+        &src[agent_turn_pos..agent_turn_pos + 800.min(run_turn_pos - agent_turn_pos)]
     );
 }
 
