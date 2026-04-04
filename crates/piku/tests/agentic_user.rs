@@ -672,6 +672,54 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
+/// Check raw ANSI output for cursor-visibility issues.
+/// Returns a list of bugs if cursor is left hidden at the end of the output,
+/// or if there are long stretches of output with cursor hidden.
+fn check_cursor_visibility(raw: &str) -> Vec<Bug> {
+    let mut bugs = Vec::new();
+    let mut cursor_visible = true;
+    let mut hide_byte_pos: Option<usize> = None;
+
+    // Scan for ESC[?25l (hide) and ESC[?25h (show)
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i + 5 < bytes.len() {
+        if bytes[i] == b'\x1b' && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
+            // Look for "25l" or "25h" following
+            let rest = &raw[i + 3..];
+            if rest.starts_with("25l") {
+                if cursor_visible {
+                    hide_byte_pos = Some(i);
+                }
+                cursor_visible = false;
+                i += 6;
+                continue;
+            } else if rest.starts_with("25h") {
+                cursor_visible = true;
+                hide_byte_pos = None;
+                i += 6;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // If cursor is hidden at the end of the captured output, that's a bug
+    if !cursor_visible {
+        bugs.push(Bug {
+            severity: Severity::Major,
+            description: "cursor left hidden at end of turn output".to_string(),
+            expected: "cursor should be visible (ESC[?25h) after every turn".to_string(),
+            actual: format!(
+                "last cursor-hide at byte {} with no matching cursor-show",
+                hide_byte_pos.unwrap_or(0)
+            ),
+        });
+    }
+
+    bugs
+}
+
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
@@ -1097,8 +1145,19 @@ fn run_agentic_session(persona: &Persona) {
             eprintln!("[agentic_user] turn {turn} tail: {tail}");
         }
 
+        // ── Deterministic checks (no LLM needed) ─────────────────────────
+        // Check raw ANSI output for cursor-visibility issues before
+        // stripping. This catches bugs the LLM can't see.
+        let cursor_bugs = check_cursor_visibility(&screen_raw);
+        for bug in &cursor_bugs {
+            eprintln!("[agentic_user] [DETERMINISTIC] [{:}] {}", bug.severity, bug.description);
+        }
+
         // Ask the user-agent to critique
-        let entry = user_agent_turn(&llm, persona, turn, &current_prompt, &screen_text);
+        let mut entry = user_agent_turn(&llm, persona, turn, &current_prompt, &screen_text);
+
+        // Merge deterministic bugs into the LLM's critique
+        entry.bugs.extend(cursor_bugs);
 
         // Print bugs immediately as they're found
         for bug in &entry.bugs {
@@ -1220,4 +1279,34 @@ fn strip_ansi_collapses_cr() {
     let stripped = strip_ansi(raw);
     assert!(stripped.contains("line1"));
     assert!(stripped.contains("line2"));
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for check_cursor_visibility
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_visible_when_balanced() {
+    // hide then show = no bugs
+    let raw = "text\x1b[?25lhidden\x1b[?25hvisible";
+    let bugs = check_cursor_visibility(raw);
+    assert!(bugs.is_empty(), "balanced hide/show should produce no bugs");
+}
+
+#[test]
+fn cursor_hidden_at_end_is_bug() {
+    // hide without matching show
+    let raw = "text\x1b[?25lhidden stuff";
+    let bugs = check_cursor_visibility(raw);
+    assert_eq!(bugs.len(), 1);
+    assert_eq!(bugs[0].severity, Severity::Major);
+    assert!(bugs[0].description.contains("cursor left hidden"));
+}
+
+#[test]
+fn cursor_no_sequences_is_fine() {
+    // no cursor sequences at all = visible (default state)
+    let raw = "just normal text output";
+    let bugs = check_cursor_visibility(raw);
+    assert!(bugs.is_empty());
 }
