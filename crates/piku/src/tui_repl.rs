@@ -99,7 +99,7 @@ impl PermissionPrompter for TuiPrompter {
 
         // ── Show prompt on the input row ──────────────────────────────────────
         goto(input_row, 1);
-        print!("{prompt}");
+        print!("\x1b[?25h{prompt}"); // ensure cursor visible before waiting
         let _ = io::stdout().flush();
 
         // ── Read one keypress in raw mode ─────────────────────────────────────
@@ -159,11 +159,7 @@ impl PermissionPrompter for TuiPrompter {
         // before the tool executes (or the denial message prints).
         goto(input_row, 1);
         print!("\x1b[2K"); // erase prompt
-                           // Brief echo of the decision into scroll zone
-        let (_, scroll_bot_rows) = term_size();
-        let scroll_bot = scroll_bot_rows.saturating_sub(2);
-        goto(scroll_bot, 1);
-        // Echo decision into scroll zone — CC style: dim, no icons
+        // Echo decision into scroll zone
         let (_, scroll_bot_rows) = term_size();
         let scroll_bot = scroll_bot_rows.saturating_sub(2);
         goto(scroll_bot, 1);
@@ -519,6 +515,9 @@ impl OutputSink for TuiSink {
         // Stream text directly — DECSTBM keeps it in the scroll zone.
         // Replace bare \n with \r\n so the terminal doesn't lose the column.
         let fixed = text.replace('\n', "\r\n");
+        // Ensure cursor stays visible during streaming — something may
+        // have hidden it (raw mode toggling, permission prompt, etc).
+        self.print("\x1b[?25h");
         self.print(&fixed);
         let _ = self.stdout.flush();
     }
@@ -526,6 +525,8 @@ impl OutputSink for TuiSink {
     fn on_tool_start(&mut self, tool_name: &str, _tool_id: &str, input: &serde_json::Value) {
         let label = tool_label(tool_name);
         let args = crate::format_tool_input(tool_name, input);
+        // Show cursor — it may have been hidden by raw mode in permission prompt
+        self.print("\x1b[?25h");
         if args.is_empty() {
             self.println(&format!("\r\n{label}"));
         } else {
@@ -880,6 +881,9 @@ async fn run_tui_repl_core(
                 // Echo: dim blue glyph + dim text, visually distinct from
                 // the bright active prompt.
                 println!("\x1b[2;34m>\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
+                // Ensure cursor is visible during the API call -- there's a
+                // dead period before streaming starts where the user sees nothing.
+                print!("\x1b[?25h");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
