@@ -14,6 +14,7 @@ use piku_runtime::{
 use piku_tools::all_tool_definitions;
 
 use crate::cli::ResolvedProvider;
+use crate::input_helper;
 use crate::self_update;
 
 // ---------------------------------------------------------------------------
@@ -78,15 +79,15 @@ pub async fn run_repl(
     // Print welcome banner
     println!("{}", banner(&model, resolved.name(), &session_id));
 
-    // Set up rustyline editor
-    let mut rl = build_editor()?;
+    // Set up rustyline editor with slash-command completion and hints
+    let mut rl = input_helper::build_editor()?;
     let history_path = sessions_dir.join(".repl_history");
     let _ = rl.load_history(&history_path);
 
     loop {
         let system_sections = build_system_prompt(&cwd, &date, &model);
 
-        let readline = rl.readline("\x1b[36m›\x1b[0m  ");
+        let readline = rl.readline("\x1b[1m>\x1b[0m  ");
         match readline {
             Ok(line) => {
                 let trimmed = line.trim().to_string();
@@ -507,13 +508,4 @@ fn banner(model: &str, provider: &str, session_id: &str) -> String {
 // rustyline editor factory
 // ---------------------------------------------------------------------------
 
-fn build_editor() -> anyhow::Result<rustyline::DefaultEditor> {
-    let mut builder = rustyline::Config::builder()
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List);
-    if std::env::var("PIKU_VI").is_ok() {
-        builder = builder.edit_mode(rustyline::EditMode::Vi);
-    }
-    let editor = rustyline::DefaultEditor::with_config(builder.build())?;
-    Ok(editor)
-}
+// Editor factory moved to crate::input_helper::build_editor()

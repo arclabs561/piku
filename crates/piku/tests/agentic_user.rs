@@ -273,6 +273,14 @@ fn personas() -> HashMap<&'static str, Persona> {
             max_turns: 3,
         });
 
+        m.insert("input_explorer", Persona {
+            name: "input_explorer",
+            description: "Developer testing the input/readline layer on the piku repo copy.",
+            first_task: "/help",
+            behaviour: "Exercise the input layer: slash commands, tab completion, hint text, prompt state changes. Turn 1: /help. Turn 2: /status. Turn 3: ask a real question about the repo. Note whether echoed input looks different from the active prompt, whether hints appear, whether tab-complete works.",
+            max_turns: 3,
+        });
+
         return m;
     }
 
@@ -315,6 +323,22 @@ fn personas() -> HashMap<&'static str, Persona> {
             \nTurn 3: send a very long message (repeat 'test ' 50 times)\
             \nTurn 4: send just a single character\
             \nNote any crashes, hangs, garbled output, or missing echoes.",
+            max_turns: 4,
+        },
+    );
+
+    m.insert(
+        "input_explorer",
+        Persona {
+            name: "input_explorer",
+            description: "Developer specifically testing the input/readline experience.",
+            first_task: "/help",
+            behaviour: "You are testing the input layer of piku. Each turn exercises a different aspect:\
+            \nTurn 1: /help — verify slash commands are listed and formatted. Note whether the prompt has hint text visible (dim placeholder like 'Send a message' when empty).\
+            \nTurn 2: /st then TAB — try to trigger tab completion for /status. If the screen shows the status output, tab-complete worked. If it shows 'unknown command /st', tab-complete did not work. Note which happened.\
+            \nTurn 3: /model — check that the current model is displayed. Note whether the prompt glyph (> or !) looks correct.\
+            \nTurn 4: Send a real message like 'what files are here?' — check that your message is echoed differently from the prompt (should be dimmed with a different glyph like ▸, not the same bright > as the input prompt).\
+            \nLook for: hint text when empty, tab completion for /commands, prompt state changes, echoed input looking distinct from active prompt.",
             max_turns: 4,
         },
     );
@@ -714,14 +738,20 @@ Severity:
 - info: neutral observation
 
 What to look for:
-1. USER MESSAGE ECHO: did YOUR sent message appear before the AI response? (look for › prefix)
-   - YES = good (note it)
+1. USER MESSAGE ECHO: did YOUR sent message appear before the AI response? (look for dimmed text with ▸ prefix)
+   - YES, with ▸ prefix and dimmed = good (note it)
+   - YES, but same style as the input prompt = minor bug "echo not visually distinct from prompt"
    - NO = MAJOR bug "user message not echoed in scroll zone"
-2. CURSOR RESTORE: does the prompt reappear after the response?
+2. CURSOR RESTORE: does the prompt (> or !) reappear after the response?
    - YES = good
    - NO = CRITICAL or MAJOR bug "cursor disappeared"
 3. OUTPUT QUALITY: is the response readable? Correct? Helpful?
 4. TOOL USAGE: did piku use the right tools?
+5. INPUT LAYER (if testing input):
+   - HINT TEXT: when input is empty, is there dim placeholder text like "Send a message"?
+   - TAB COMPLETION: for /commands, does tab show completions?
+   - PROMPT STATE: does the prompt change (> normally, ! after error)?
+   - SLASH COMMANDS: do they produce expected output?
 
 Be specific. Cite exact text from the screen capture in your bugs."#;
 
@@ -1129,6 +1159,15 @@ fn agentic_user_adversarial() {
     }
     let ps = personas();
     run_agentic_session(ps.get("adversarial").unwrap());
+}
+
+#[test]
+fn agentic_user_input_explorer() {
+    if !is_enabled() {
+        return;
+    }
+    let ps = personas();
+    run_agentic_session(ps.get("input_explorer").unwrap());
 }
 
 // ---------------------------------------------------------------------------
