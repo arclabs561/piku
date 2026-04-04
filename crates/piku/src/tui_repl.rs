@@ -489,6 +489,8 @@ pub struct TuiSink {
     binary_mtime_baseline: Option<std::time::SystemTime>,
     /// Path to check for a new build.
     build_candidate: std::path::PathBuf,
+    /// Whether the "thinking" indicator on the input row needs clearing.
+    needs_indicator_clear: bool,
 }
 
 impl TuiSink {
@@ -497,6 +499,23 @@ impl TuiSink {
             stdout: io::stdout(),
             binary_mtime_baseline,
             build_candidate: self_update::default_build_output(),
+            needs_indicator_clear: true,
+        }
+    }
+
+    /// Clear the "…" thinking indicator from the input row and move cursor
+    /// back into the scroll zone. Called once on first output.
+    fn clear_thinking_indicator(&mut self) {
+        if self.needs_indicator_clear {
+            self.needs_indicator_clear = false;
+            let (_, rows) = term_size();
+            let scroll_bot = rows.saturating_sub(2);
+            // Clear the input row's thinking indicator
+            goto(rows, 1);
+            let _ = self.stdout.write_all(b"\x1b[2K");
+            // Move cursor back into scroll zone
+            goto(scroll_bot, 1);
+            let _ = self.stdout.flush();
         }
     }
 
@@ -512,20 +531,19 @@ impl TuiSink {
 
 impl OutputSink for TuiSink {
     fn on_text(&mut self, text: &str) {
+        self.clear_thinking_indicator();
         // Stream text directly — DECSTBM keeps it in the scroll zone.
         // Replace bare \n with \r\n so the terminal doesn't lose the column.
         let fixed = text.replace('\n', "\r\n");
-        // Ensure cursor stays visible during streaming — something may
-        // have hidden it (raw mode toggling, permission prompt, etc).
         self.print("\x1b[?25h");
         self.print(&fixed);
         let _ = self.stdout.flush();
     }
 
     fn on_tool_start(&mut self, tool_name: &str, _tool_id: &str, input: &serde_json::Value) {
+        self.clear_thinking_indicator();
         let label = tool_label(tool_name);
         let args = crate::format_tool_input(tool_name, input);
-        // Show cursor — it may have been hidden by raw mode in permission prompt
         self.print("\x1b[?25h");
         if args.is_empty() {
             self.println(&format!("\r\n{label}"));
@@ -881,9 +899,6 @@ async fn run_tui_repl_core(
                 // Echo: dim blue glyph + dim text, visually distinct from
                 // the bright active prompt.
                 println!("\x1b[2;34m>\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
-                // Ensure cursor is visible during the API call -- there's a
-                // dead period before streaming starts where the user sees nothing.
-                print!("\x1b[?25h");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
@@ -891,10 +906,13 @@ async fn run_tui_repl_core(
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
 
-                // Keep cursor visible during streaming -- hiding it causes
-                // the "cursor disappeared" perception if anything goes wrong.
-                // The cursor will visibly sit in the scroll zone while text
-                // streams around it, which is acceptable and reassuring.
+                // Show a thinking indicator on the input row while the API
+                // call is in flight. This keeps the cursor visible in a
+                // predictable location and gives feedback that piku is working.
+                // The indicator is cleared when the first text/tool output arrives.
+                goto(rows, 1);
+                print!("\x1b[2K\x1b[2m  …\x1b[0m\x1b[?25h");
+                let _ = io::stdout().flush();
 
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,
