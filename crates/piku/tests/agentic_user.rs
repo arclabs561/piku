@@ -291,7 +291,7 @@ fn personas() -> HashMap<&'static str, Persona> {
         description: "Senior Rust developer, high expectations, works quickly.",
         first_task: "Read src/stats.rs and tell me what the mean() function does.",
         behaviour: "You are direct and fast. After seeing the response:\
-            \n- If your message was echoed with › before the response, note that as working correctly.\
+            \n- If your message was echoed (dimmed, with > prefix) before the response, note that as working correctly.\
             \n- If your message was NOT visible in the output, report MAJOR bug: user message echo missing.\
             \n- If cursor is visible and prompt reappears, note that as working correctly.\
             \n- Push harder each turn: first explain, then find bugs, then fix them.\
@@ -305,7 +305,7 @@ fn personas() -> HashMap<&'static str, Persona> {
         first_task: "What files are in this project?",
         behaviour: "You read output very carefully. Look for:\
             \n- Did your message appear echoed back before the AI response? If not: MAJOR bug.\
-            \n- Is the prompt (›) visible after the response? If cursor is gone: CRITICAL bug.\
+            \n- Is the prompt (>) visible after the response? If cursor is gone: CRITICAL bug.\
             \n- Is the output readable or garbled with escape sequences? If garbled: MAJOR bug.\
             \nAsk simple follow-up questions. After 3 turns try: 'write a test for the sum function'.",
         max_turns: 4,
@@ -1041,7 +1041,7 @@ fn run_agentic_session(persona: &Persona) {
 
     // Wait for the TUI to draw its welcome screen
     // Expect the session line to appear (piku is ready)
-    let _ = pty.exp_regex(r"Type a message");
+    let _ = pty.exp_regex(r"/help for commands");
     eprintln!("[agentic_user] startup banner seen");
 
     let llm = LlmClient::new(ua_spec);
@@ -1063,7 +1063,7 @@ fn run_agentic_session(persona: &Persona) {
         // Send the message
         pty.send_line(&current_prompt).expect("send_line failed");
 
-        // Collect output: wait for › prompt to reappear (means turn is done)
+        // Collect output: wait for > prompt to reappear (means turn is done)
         // or timeout after 90 seconds
         let mut screen_raw = match pty.exp_regex(r"\[\d+ iter") {
             Ok((before, matched)) => format!("{before}{matched}"),
@@ -1073,7 +1073,7 @@ fn run_agentic_session(persona: &Persona) {
             }
         };
 
-        match pty.exp_regex(r"›") {
+        match pty.exp_regex(r"> ") {
             Ok((before, matched)) => {
                 screen_raw.push_str(&before);
                 screen_raw.push_str(&matched);

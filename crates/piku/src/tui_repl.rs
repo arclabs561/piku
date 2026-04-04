@@ -366,8 +366,20 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
         line.push_str(reset);
     }
 
-    // Right-align the hint: pad with spaces to fill the row
+    // Right-align the hint: pad with spaces to fill the row.
+    // visible_len must account for ALL shown segments.
     let visible_len = model_seg.len()
+        + if show_agents {
+            sep.len() + agents_seg.len()
+        } else {
+            0
+        }
+        + if show_ctx {
+            // ctx_seg contains ANSI codes — use base length estimate
+            sep.len() + 6 // " NN% " + sep
+        } else {
+            0
+        }
         + if show_tok {
             sep.len() + tok_seg.len()
         } else {
@@ -712,6 +724,17 @@ async fn run_tui_repl_core(
         }
     }
 
+    // ── Terminal safety ────────────────────────────────────────────────────────
+    // Install a panic hook that resets the terminal before printing the panic.
+    // Without this, a panic leaves DECSTBM set and cursor hidden.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort terminal reset
+        let _ = io::stdout().write_all(b"\x1b[r\x1b[?25h\n");
+        let _ = io::stdout().flush();
+        default_hook(info);
+    }));
+
     // ── Terminal setup ────────────────────────────────────────────────────────
     let (cols, rows) = term_size();
     setup_layout(rows, cols, &model, resolved.name(), &session_id);
@@ -727,7 +750,7 @@ async fn run_tui_repl_core(
             );
         } else {
             println!(
-                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}\x1b[0m\r\n\x1b[2msession: {session_id}\x1b[0m\r\n\x1b[2mType a message. \\ at end of line for newline. /help · Ctrl-D exit.\x1b[0m\r",
+                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}\x1b[0m\r\n\x1b[2m/help for commands · Ctrl-D to exit\x1b[0m\r",
                 resolved.name(), model,
             );
         }
@@ -781,11 +804,11 @@ async fn run_tui_repl_core(
         print!("\x1b[2K"); // clear current line before readline redraws
         let _ = io::stdout().flush();
 
-        // Prompt glyph reflects state: red after error, cyan normally.
+        // Prompt glyph reflects state: red after error, blue normally.
         let prompt = if last_turn_error {
-            "\x1b[31m!\x1b[0m  "
+            "\x1b[31m>\x1b[0m "
         } else {
-            "\x1b[1m>\x1b[0m  "
+            "\x1b[34m>\x1b[0m "
         };
 
         let readline = rl.readline(prompt);
@@ -854,9 +877,9 @@ async fn run_tui_repl_core(
                         format!("{head}\r\n\x1b[2m… ({} more lines)\x1b[0m", lines.len() - 3)
                     }
                 };
-                // Dimmed echo with a different glyph (▸) so it reads as
-                // "you said this" rather than looking like a live prompt.
-                println!("\x1b[2m▸  {display_input}\x1b[0m\r");
+                // Echo: dim blue glyph + dim text, visually distinct from
+                // the bright active prompt.
+                println!("\x1b[2;34m>\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
@@ -864,11 +887,10 @@ async fn run_tui_repl_core(
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
 
-                // Hide the cursor while the agent is streaming so it doesn't
-                // visibly jump to the scroll zone. We restore it to the input
-                // row once the turn is done.
-                print!("\x1b[?25l");
-                let _ = io::stdout().flush();
+                // Keep cursor visible during streaming -- hiding it causes
+                // the "cursor disappeared" perception if anything goes wrong.
+                // The cursor will visibly sit in the scroll zone while text
+                // streams around it, which is acceptable and reassuring.
 
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,

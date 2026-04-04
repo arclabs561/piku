@@ -116,25 +116,11 @@ impl Highlighter for PikuHelper {
 // ── Validator ───────────────────────────────────────────────────────────────
 
 impl Validator for PikuHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        let input = ctx.input();
-
-        // Single-line input: always accept immediately
-        if !input.contains('\n') {
-            return Ok(ValidationResult::Valid(None));
-        }
-
-        // Multiline: if the last line is empty (user pressed Enter on a blank
-        // continuation line), accept the whole buffer. This means:
-        //   - Pasted text with newlines accumulates in the buffer
-        //   - To submit multiline, press Enter on an empty line
-        //   - Single Enter on non-empty text adds a newline
-        let last_line = input.rsplit('\n').next().unwrap_or("");
-        if last_line.trim().is_empty() {
-            Ok(ValidationResult::Valid(None))
-        } else {
-            Ok(ValidationResult::Incomplete)
-        }
+    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        // Always accept on Enter. This is a chat REPL, not a code editor --
+        // users expect Enter to submit. Pasted multiline text arrives as a
+        // single buffer anyway (rustyline accumulates rapid keystrokes).
+        Ok(ValidationResult::Valid(None))
     }
 }
 
