@@ -87,7 +87,7 @@ pub async fn run_repl(
     loop {
         let system_sections = build_system_prompt(&cwd, &date, &model);
 
-        let readline = rl.readline("\x1b[1m>\x1b[0m  ");
+        let readline = rl.readline("\x1b[34m>\x1b[0m ");
         match readline {
             Ok(line) => {
                 let trimmed = line.trim().to_string();
