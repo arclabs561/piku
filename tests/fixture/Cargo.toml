@@ -1,0 +1,15 @@
+[package]
+name = "piku-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# This is the piku dogfood fixture project.
+# It is intentionally imperfect: it has bugs, missing doc comments,
+# incomplete tests, and a function that needs to be renamed.
+# Do NOT fix the bugs here — they are the test targets.
+#
+# Known issues (for scenario reference):
+#   - stats.rs: `mean()` divides by `n` but `n` is the wrong type (potential panic on empty)
+#   - parser.rs: `split_csv` mishandles consecutive commas
+#   - lib.rs: `process_batch` is missing — referenced in README but not implemented
+#   - utils.rs: `format_output` is undocumented

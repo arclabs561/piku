@@ -1,0 +1,38 @@
+# Build output
+target/
+*.d
+
+# Rust
+Cargo.lock.bak
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+
+# OS
+.DS_Store
+Thumbs.db
+
+# piku runtime — never track session data or agent state
+.claude/
+.piku/
+
+# Test fixtures
+tests/fixture/tmp/
+
+# Legacy dirs — explicitly excluded so they can never creep back in
+src/
+assets/
+rust/
+.github/
+tests/test_porting_workspace.py
+
+# Legacy / not for this repo
+__pycache__/
+*.py[cod]
+archive/
+.omx/
+.clawd-agents/
