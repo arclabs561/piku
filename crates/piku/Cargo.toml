@@ -26,7 +26,6 @@ piku-tools = { path = "../piku-tools" }
 piku-runtime = { path = "../piku-runtime" }
 crossterm = { workspace = true }
 syntect = { workspace = true }
-rustyline = "14"
 
 [dev-dependencies]
 async-stream = "0.3"

@@ -1,141 +1,1016 @@
-#![allow(warnings)]
-
-//! Shared rustyline Helper for piku REPLs.
+//! Custom line editor for piku TUI.
 //!
-//! Provides:
-//! - Tab-completion for slash commands
-//! - Dim hint text when the input line is empty
-//! - Cyan syntax highlighting for `/commands`
-//! - Multiline via Validator (pasted newlines accumulate; Enter on a
-//!   complete line submits)
+//! Built on crossterm raw mode. Supports:
+//! - Shift+Enter / Ctrl+J for newline insertion (multiline input)
+//! - Emacs readline keybindings (Ctrl+A/E/K/U/W/D, Alt+B/F)
+//! - History navigation (Up/Down, with draft preservation)
+//! - Tab completion for slash commands
+//! - Continuation prompt for multiline display
+//! - Dim placeholder hint when input is empty
 
-use std::borrow::Cow;
+use std::io::{self, IsTerminal, Write};
 
-use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Context, Helper};
+use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{self, Clear, ClearType};
+use crossterm::{execute, queue};
 
-/// All known slash commands (used for completion and validation).
+/// All known slash commands (used for completion).
 pub const SLASH_CMDS: &[&str] = &[
     "/help", "/status", "/cost", "/model", "/tasks", "/agents", "/sessions", "/clear", "/exit",
     "/quit",
 ];
 
-// ── Helper ──────────────────────────────────────────────────────────────────
+// ── Input buffer ────────────────────────────────────────────────────────────
 
-pub struct PikuHelper {
-    /// Hint shown when the input line is empty.
-    pub placeholder: &'static str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputBuffer {
+    buffer: String,
+    cursor: usize,
 }
 
-impl PikuHelper {
+impl InputBuffer {
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            placeholder: "Send a message or /help",
+            buffer: String::new(),
+            cursor: 0,
         }
     }
-}
 
-impl Helper for PikuHelper {}
+    pub fn insert(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
 
-// ── Completer ───────────────────────────────────────────────────────────────
+    pub fn insert_newline(&mut self) {
+        self.insert('\n');
+    }
 
-impl Completer for PikuHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let word = &line[..pos];
-        // Only complete if we're in the first token and it starts with /
-        if !word.starts_with('/') || word.contains(' ') {
-            return Ok((0, vec![]));
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
         }
-        let candidates: Vec<Pair> = SLASH_CMDS
+        let prev = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map_or(0, |(i, _)| i);
+        self.buffer.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    /// Delete character under cursor (Ctrl+D behavior when buffer non-empty).
+    pub fn delete_char(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
+            self.buffer.drain(self.cursor..self.cursor + ch.len_utf8());
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map_or(0, |(i, _)| i);
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
+
+    /// Move cursor back one word (Alt+B / Ctrl+Left).
+    pub fn move_word_back(&mut self) {
+        // Skip whitespace, then skip word chars
+        let before = &self.buffer[..self.cursor];
+        let trimmed = before.trim_end();
+        if trimmed.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        // Find last whitespace boundary in trimmed portion
+        let word_start = trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        self.cursor = word_start;
+    }
+
+    /// Move cursor forward one word (Alt+F / Ctrl+Right).
+    pub fn move_word_forward(&mut self) {
+        let after = &self.buffer[self.cursor..];
+        // Skip current word chars, then skip whitespace
+        let skip_word = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
+        let rest = &after[skip_word..];
+        let skip_space = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        self.cursor += skip_word + skip_space;
+    }
+
+    /// Kill from cursor to end of line (Ctrl+K).
+    pub fn kill_to_end(&mut self) {
+        self.buffer.truncate(self.cursor);
+    }
+
+    /// Kill from start to cursor (Ctrl+U).
+    pub fn kill_to_start(&mut self) {
+        self.buffer.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    /// Kill previous word (Ctrl+W).
+    pub fn kill_word_back(&mut self) {
+        let old_cursor = self.cursor;
+        self.move_word_back();
+        self.buffer.drain(self.cursor..old_cursor);
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.buffer
+    }
+
+    #[must_use] 
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+    }
+
+    pub fn replace(&mut self, value: impl Into<String>) {
+        self.buffer = value.into();
+        self.cursor = self.buffer.len();
+    }
+
+    /// Try to complete a slash command prefix. Returns true if anything changed.
+    pub fn complete_slash_command(&mut self, candidates: &[&str]) -> bool {
+        // Only complete if cursor is at end and input starts with /
+        if self.cursor != self.buffer.len() {
+            return false;
+        }
+        let prefix = &self.buffer[..self.cursor];
+        if prefix.contains(char::is_whitespace) || !prefix.starts_with('/') {
+            return false;
+        }
+        let matches: Vec<&str> = candidates
             .iter()
-            .filter(|cmd| cmd.starts_with(word))
-            .map(|cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
+            .filter(|c| c.starts_with(prefix))
+            .copied()
             .collect();
-        Ok((0, candidates))
+        if matches.is_empty() {
+            return false;
+        }
+        let replacement = longest_common_prefix(&matches);
+        if replacement == prefix {
+            return false;
+        }
+        self.replace(replacement);
+        true
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 }
 
-// ── Hinter ──────────────────────────────────────────────────────────────────
+// ── Read outcome ────────────────────────────────────────────────────────────
 
-impl Hinter for PikuHelper {
-    type Hint = String;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Submit(String),
+    Cancel,
+    Exit,
+}
 
-    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        if line.is_empty() {
-            return Some(self.placeholder.to_string());
+// ── Line editor ─────────────────────────────────────────────────────────────
+
+pub struct LineEditor {
+    prompt: String,
+    continuation_prompt: String,
+    placeholder: String,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    draft: Option<String>,
+}
+
+impl LineEditor {
+    #[must_use]
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            continuation_prompt: String::from("  "),
+            placeholder: String::from("Send a message or /help"),
+            history: Vec::new(),
+            history_index: None,
+            draft: None,
         }
-        // Slash command prefix hint: show the first matching command
-        if line.starts_with('/') && !line.contains(' ') {
-            for cmd in SLASH_CMDS {
-                if cmd.starts_with(line) && *cmd != line {
-                    // Show the remaining suffix
-                    return Some(cmd[line.len()..].to_string());
+    }
+
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+    }
+
+    pub fn push_history(&mut self, entry: impl Into<String>) {
+        let entry = entry.into();
+        if entry.trim().is_empty() {
+            return;
+        }
+        // Deduplicate consecutive entries
+        if self.history.last().map(String::as_str) != Some(entry.as_str()) {
+            self.history.push(entry);
+        }
+        self.history_index = None;
+        self.draft = None;
+    }
+
+    pub fn load_history_file(&mut self, path: &std::path::Path) {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    self.history.push(trimmed.to_string());
                 }
             }
         }
-        None
     }
-}
 
-// ── Highlighter ─────────────────────────────────────────────────────────────
+    pub fn save_history_file(&self, path: &std::path::Path) {
+        // Keep last 500 entries
+        let start = self.history.len().saturating_sub(500);
+        let contents: String = self.history[start..]
+            .iter()
+            .map(|s| format!("{s}\n"))
+            .collect();
+        let _ = std::fs::write(path, contents);
+    }
 
-impl Highlighter for PikuHelper {
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        if line.starts_with('/') {
-            // Cyan for slash commands
-            Cow::Owned(format!("\x1b[36m{line}\x1b[0m"))
-        } else {
-            Cow::Borrowed(line)
+    /// Read a line of input. Manages raw mode internally.
+    /// The caller should position the cursor before calling this.
+    pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return self.read_line_fallback();
+        }
+
+        let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
+        if !was_raw {
+            terminal::enable_raw_mode()?;
+        }
+
+        let mut stdout = io::stdout();
+        let mut input = InputBuffer::new();
+        let mut rendered_lines = 1usize;
+        self.redraw(&mut stdout, &input, rendered_lines)?;
+
+        let outcome = loop {
+            match event::read() {
+                Ok(Event::Key(key)) => match self.handle_key(key, &mut input) {
+                    Action::Continue => {
+                        rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                    }
+                    Action::Submit => {
+                        break ReadOutcome::Submit(input.as_str().to_owned());
+                    }
+                    Action::Cancel => {
+                        break ReadOutcome::Cancel;
+                    }
+                    Action::Exit => {
+                        break ReadOutcome::Exit;
+                    }
+                },
+                Ok(Event::Resize(..)) => {
+                    // Terminal resized — just redraw
+                    rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if !was_raw {
+                        let _ = terminal::disable_raw_mode();
+                    }
+                    return Err(e);
+                }
+            }
+        };
+
+        if !was_raw {
+            terminal::disable_raw_mode()?;
+        }
+
+        // Move past the rendered input
+        let final_render = self.render(&input);
+        let below = final_render.line_count.saturating_sub(1);
+        if below > 0 {
+            execute!(stdout, MoveDown(sat_u16(below)))?;
+        }
+        execute!(stdout, MoveToColumn(0))?;
+        write!(stdout, "\r\n")?;
+        stdout.flush()?;
+
+        self.history_index = None;
+        self.draft = None;
+
+        Ok(outcome)
+    }
+
+    fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
+        let mut stdout = io::stdout();
+        write!(stdout, "{}", self.prompt)?;
+        stdout.flush()?;
+        let mut buf = String::new();
+        let n = io::stdin().read_line(&mut buf)?;
+        if n == 0 {
+            return Ok(ReadOutcome::Exit);
+        }
+        while matches!(buf.chars().last(), Some('\n' | '\r')) {
+            buf.pop();
+        }
+        Ok(ReadOutcome::Submit(buf))
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
+        match key {
+            // ── Ctrl combos ─────────────────────────────────────────────
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if input.is_empty() {
+                    Action::Exit
+                } else {
+                    input.clear();
+                    self.history_index = None;
+                    self.draft = None;
+                    Action::Cancel
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if input.is_empty() {
+                    Action::Exit
+                } else {
+                    input.delete_char();
+                    Action::Continue
+                }
+            }
+            // Ctrl+J / Shift+Enter → insert newline
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.insert_newline();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::SHIFT) => {
+                input.insert_newline();
+                Action::Continue
+            }
+            // Readline: Ctrl+A = home, Ctrl+E = end
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_home();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_end();
+                Action::Continue
+            }
+            // Readline: Ctrl+K = kill to end, Ctrl+U = kill to start
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.kill_to_end();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.kill_to_start();
+                Action::Continue
+            }
+            // Readline: Ctrl+W = kill word back
+            KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.kill_word_back();
+                Action::Continue
+            }
+            // Readline: Ctrl+B = left, Ctrl+F = right
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_left();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_right();
+                Action::Continue
+            }
+            // Alt+B = word back, Alt+F = word forward
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                input.move_word_back();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                input.move_word_forward();
+                Action::Continue
+            }
+            // ── Basic keys ──────────────────────────────────────────────
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => Action::Submit,
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                input.backspace();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } => {
+                input.delete_char();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                input.move_word_back();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                input.move_word_forward();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                input.move_left();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                input.move_right();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.history_up(input);
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.history_down(input);
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => {
+                input.move_home();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => {
+                input.move_end();
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                input.complete_slash_command(SLASH_CMDS);
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                if !input.is_empty() {
+                    input.clear();
+                    self.history_index = None;
+                    self.draft = None;
+                }
+                Action::Continue
+            }
+            // Regular character input
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                input.insert(ch);
+                self.history_index = None;
+                self.draft = None;
+                Action::Continue
+            }
+            _ => Action::Continue,
         }
     }
 
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        // Dim hint text
-        Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+    fn history_up(&mut self, input: &mut InputBuffer) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_index {
+            Some(0) => {}
+            Some(i) => {
+                let next = i - 1;
+                input.replace(self.history[next].clone());
+                self.history_index = Some(next);
+            }
+            None => {
+                self.draft = Some(input.as_str().to_owned());
+                let next = self.history.len() - 1;
+                input.replace(self.history[next].clone());
+                self.history_index = Some(next);
+            }
+        }
     }
 
-    fn highlight_char(&self, line: &str, _pos: usize, _forced: bool) -> bool {
-        // Re-highlight when typing a slash command
-        line.starts_with('/')
+    fn history_down(&mut self, input: &mut InputBuffer) {
+        let Some(i) = self.history_index else {
+            return;
+        };
+        if i + 1 < self.history.len() {
+            let next = i + 1;
+            input.replace(self.history[next].clone());
+            self.history_index = Some(next);
+        } else {
+            input.replace(self.draft.take().unwrap_or_default());
+            self.history_index = None;
+        }
+    }
+
+    // ── Rendering ───────────────────────────────────────────────────────
+
+    fn render(&self, input: &InputBuffer) -> Rendered {
+        let text = input.as_str();
+
+        // Cursor position within the text
+        let before_cursor = &text[..input.cursor];
+        let cursor_row = before_cursor.chars().filter(|&c| c == '\n').count();
+        let cursor_line = before_cursor.rsplit('\n').next().unwrap_or_default();
+        let cursor_prompt = if cursor_row == 0 {
+            &self.prompt
+        } else {
+            &self.continuation_prompt
+        };
+        // Account for visible prompt width (strip ANSI)
+        let prompt_width = visible_width(cursor_prompt);
+        let cursor_col = prompt_width + cursor_line.chars().count();
+
+        // Build display lines
+        let mut lines = Vec::new();
+        if text.is_empty() {
+            // Show placeholder hint
+            lines.push(format!(
+                "{}\x1b[2m{}\x1b[0m",
+                self.prompt, self.placeholder
+            ));
+        } else {
+            for (i, line) in text.split('\n').enumerate() {
+                let prefix = if i == 0 {
+                    &self.prompt
+                } else {
+                    &self.continuation_prompt
+                };
+                lines.push(format!("{prefix}{line}"));
+            }
+        }
+
+        Rendered {
+            lines,
+            cursor_row: sat_u16(cursor_row),
+            cursor_col: sat_u16(cursor_col),
+            line_count: text.split('\n').count().max(1),
+        }
+    }
+
+    fn redraw(
+        &self,
+        out: &mut impl Write,
+        input: &InputBuffer,
+        prev_lines: usize,
+    ) -> io::Result<usize> {
+        let rendered = self.render(input);
+
+        // Move up to the first line of previous render
+        if prev_lines > 1 {
+            queue!(out, MoveUp(sat_u16(prev_lines - 1)))?;
+        }
+        queue!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+
+        // Write lines
+        for (i, line) in rendered.lines.iter().enumerate() {
+            if i > 0 {
+                write!(out, "\r\n")?;
+            }
+            write!(out, "{line}")?;
+        }
+
+        // Position cursor
+        let lines_below = rendered.line_count.saturating_sub(1);
+        if lines_below > 0 {
+            // We're at the last line; move up to cursor row
+            let up = lines_below.saturating_sub(rendered.cursor_row as usize);
+            if up > 0 {
+                queue!(out, MoveUp(sat_u16(up)))?;
+            }
+        }
+        queue!(out, MoveToColumn(rendered.cursor_col))?;
+        // Ensure cursor is visible
+        write!(out, "\x1b[?25h")?;
+        out.flush()?;
+
+        Ok(rendered.line_count)
     }
 }
 
-// ── Validator ───────────────────────────────────────────────────────────────
-
-impl Validator for PikuHelper {
-    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        // Always accept on Enter. This is a chat REPL, not a code editor --
-        // users expect Enter to submit. Pasted multiline text arrives as a
-        // single buffer anyway (rustyline accumulates rapid keystrokes).
-        Ok(ValidationResult::Valid(None))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Continue,
+    Submit,
+    Cancel,
+    Exit,
 }
 
-// ── Editor factory ──────────────────────────────────────────────────────────
+struct Rendered {
+    lines: Vec<String>,
+    cursor_row: u16,
+    cursor_col: u16,
+    line_count: usize,
+}
 
-pub type PikuEditor = rustyline::Editor<PikuHelper, rustyline::history::DefaultHistory>;
+// ── Utilities ───────────────────────────────────────────────────────────────
 
-pub fn build_editor() -> anyhow::Result<PikuEditor> {
-    let mut builder = rustyline::Config::builder()
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List);
-    if std::env::var("PIKU_VI").is_ok() {
-        builder = builder.edit_mode(rustyline::EditMode::Vi);
+fn longest_common_prefix(values: &[&str]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = (*first).to_string();
+    for value in values.iter().skip(1) {
+        while !value.starts_with(&prefix) {
+            prefix.pop();
+            if prefix.is_empty() {
+                break;
+            }
+        }
     }
-    let mut rl = PikuEditor::with_config(builder.build())?;
-    rl.set_helper(Some(PikuHelper::new()));
-    Ok(rl)
+    prefix
+}
+
+/// Count visible characters (strip ANSI escape sequences).
+fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+fn sat_u16(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn _alt(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn basic_insert_and_backspace() {
+        let mut buf = InputBuffer::new();
+        buf.insert('h');
+        buf.insert('i');
+        assert_eq!(buf.as_str(), "hi");
+        buf.backspace();
+        assert_eq!(buf.as_str(), "h");
+    }
+
+    #[test]
+    fn newline_insertion() {
+        let mut buf = InputBuffer::new();
+        buf.insert('a');
+        buf.insert_newline();
+        buf.insert('b');
+        assert_eq!(buf.as_str(), "a\nb");
+    }
+
+    #[test]
+    fn delete_char() {
+        let mut buf = InputBuffer::new();
+        for ch in "abc".chars() {
+            buf.insert(ch);
+        }
+        buf.move_home();
+        buf.delete_char();
+        assert_eq!(buf.as_str(), "bc");
+    }
+
+    #[test]
+    fn kill_to_end() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world".chars() {
+            buf.insert(ch);
+        }
+        buf.move_home();
+        // Move to after "hello"
+        for _ in 0..5 {
+            buf.move_right();
+        }
+        buf.kill_to_end();
+        assert_eq!(buf.as_str(), "hello");
+    }
+
+    #[test]
+    fn kill_to_start() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world".chars() {
+            buf.insert(ch);
+        }
+        // Cursor at end, move back to after space
+        for _ in 0..5 {
+            buf.move_left();
+        }
+        buf.kill_to_start();
+        assert_eq!(buf.as_str(), "world");
+    }
+
+    #[test]
+    fn kill_word_back() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world foo".chars() {
+            buf.insert(ch);
+        }
+        buf.kill_word_back();
+        assert_eq!(buf.as_str(), "hello world ");
+    }
+
+    #[test]
+    fn word_movement() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world foo".chars() {
+            buf.insert(ch);
+        }
+        buf.move_word_back();
+        assert_eq!(buf.cursor(), 12); // before "foo"
+        buf.move_word_back();
+        assert_eq!(buf.cursor(), 6); // before "world"
+        buf.move_word_forward();
+        assert_eq!(buf.cursor(), 12); // before "foo"
+    }
+
+    #[test]
+    fn slash_command_completion() {
+        let mut buf = InputBuffer::new();
+        for ch in "/he".chars() {
+            buf.insert(ch);
+        }
+        assert!(buf.complete_slash_command(SLASH_CMDS));
+        assert_eq!(buf.as_str(), "/help");
+    }
+
+    #[test]
+    fn history_navigation() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("first");
+        editor.push_history("second");
+
+        let mut input = InputBuffer::new();
+        for ch in "draft".chars() {
+            input.insert(ch);
+        }
+
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        assert_eq!(input.as_str(), "second");
+
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        assert_eq!(input.as_str(), "first");
+
+        let _ = editor.handle_key(key(KeyCode::Down), &mut input);
+        assert_eq!(input.as_str(), "second");
+
+        let _ = editor.handle_key(key(KeyCode::Down), &mut input);
+        assert_eq!(input.as_str(), "draft");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        input.insert('a');
+        let action = editor.handle_key(ctrl('j'), &mut input);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(input.as_str(), "a\n");
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        input.insert('a');
+        let action = editor.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut input,
+        );
+        assert_eq!(action, Action::Continue);
+        assert_eq!(input.as_str(), "a\n");
+    }
+
+    #[test]
+    fn ctrl_a_e_home_end() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        for ch in "hello".chars() {
+            input.insert(ch);
+        }
+        assert_eq!(input.cursor(), 5);
+
+        let _ = editor.handle_key(ctrl('a'), &mut input);
+        assert_eq!(input.cursor(), 0);
+
+        let _ = editor.handle_key(ctrl('e'), &mut input);
+        assert_eq!(input.cursor(), 5);
+    }
+
+    #[test]
+    fn ctrl_k_u_w() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        for ch in "hello world".chars() {
+            input.insert(ch);
+        }
+
+        // Ctrl+W kills last word
+        let _ = editor.handle_key(ctrl('w'), &mut input);
+        assert_eq!(input.as_str(), "hello ");
+
+        // Ctrl+U kills to start
+        let _ = editor.handle_key(ctrl('u'), &mut input);
+        assert_eq!(input.as_str(), "");
+    }
+
+    #[test]
+    fn ctrl_d_exits_on_empty_deletes_on_non_empty() {
+        let mut editor = LineEditor::new("> ");
+
+        let mut empty = InputBuffer::new();
+        let action = editor.handle_key(ctrl('d'), &mut empty);
+        assert_eq!(action, Action::Exit);
+
+        let mut filled = InputBuffer::new();
+        filled.insert('x');
+        filled.move_home();
+        let action = editor.handle_key(ctrl('d'), &mut filled);
+        assert_eq!(action, Action::Continue);
+        assert_eq!(filled.as_str(), "");
+    }
+
+    #[test]
+    fn esc_clears_input() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        for ch in "some text".chars() {
+            input.insert(ch);
+        }
+        let _ = editor.handle_key(key(KeyCode::Esc), &mut input);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn visible_width_strips_ansi() {
+        assert_eq!(visible_width("\x1b[34m>\x1b[0m "), 2); // "> "
+        assert_eq!(visible_width("hello"), 5);
+        assert_eq!(visible_width("\x1b[1m\x1b[36m##\x1b[0m"), 2);
+    }
+
+    #[test]
+    fn render_shows_placeholder_when_empty() {
+        let editor = LineEditor::new("> ");
+        let input = InputBuffer::new();
+        let rendered = editor.render(&input);
+        assert_eq!(rendered.lines.len(), 1);
+        assert!(rendered.lines[0].contains("Send a message"));
+    }
+
+    #[test]
+    fn render_multiline_with_continuation() {
+        let editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        for ch in "hello".chars() {
+            input.insert(ch);
+        }
+        input.insert_newline();
+        for ch in "world".chars() {
+            input.insert(ch);
+        }
+        let rendered = editor.render(&input);
+        assert_eq!(rendered.lines.len(), 2);
+        assert!(rendered.lines[0].starts_with("> "));
+        assert!(rendered.lines[1].starts_with("  "));
+    }
+
+    #[test]
+    fn dedup_consecutive_history() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("same");
+        editor.push_history("same");
+        editor.push_history("different");
+        editor.push_history("different");
+        assert_eq!(editor.history.len(), 2);
+    }
 }
