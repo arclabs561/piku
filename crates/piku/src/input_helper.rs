@@ -656,14 +656,25 @@ impl LineEditor {
             KeyEvent {
                 code: KeyCode::Up, ..
             } => {
-                self.history_up(input);
+                // Only navigate history when cursor is on the first line
+                // (multiline awareness — matches Claude Code / Codex behavior)
+                let on_first_line = !input.as_str()[..input.cursor].contains('\n');
+                if on_first_line {
+                    self.history_up(input);
+                }
+                // TODO: cursor-up within multiline text
                 Action::Continue
             }
             KeyEvent {
                 code: KeyCode::Down,
                 ..
             } => {
-                self.history_down(input);
+                // Only navigate history when cursor is on the last line
+                let on_last_line = !input.as_str()[input.cursor..].contains('\n');
+                if on_last_line {
+                    self.history_down(input);
+                }
+                // TODO: cursor-down within multiline text
                 Action::Continue
             }
             KeyEvent {
