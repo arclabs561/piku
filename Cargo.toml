@@ -40,6 +40,10 @@ syntect = { version = "5", default-features = false, features = [
   "regex-fancy",
 ] }
 
+# Unicode
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

@@ -26,6 +26,8 @@ piku-tools = { path = "../piku-tools" }
 piku-runtime = { path = "../piku-runtime" }
 crossterm = { workspace = true }
 syntect = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 async-stream = "0.3"

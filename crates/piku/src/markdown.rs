@@ -132,9 +132,35 @@ impl StreamingMarkdown {
         out
     }
 
+    /// Fast check: does this line contain any markdown syntax characters?
+    /// If not, we can skip all block-level parsing and just do inline rendering.
+    fn has_markdown_syntax(line: &str) -> bool {
+        // Must check code fences even in fast path
+        if line.starts_with("```") {
+            return true;
+        }
+        let sample = if line.len() > 200 { &line[..200] } else { line };
+        sample
+            .bytes()
+            .any(|b| matches!(b, b'#' | b'*' | b'`' | b'>' | b'_' | b'~' | b'[' | b'-'))
+            || sample
+                .bytes()
+                .take(4)
+                .all(|b| b.is_ascii_digit() || b == b'.')
+                && sample.contains(". ")
+    }
+
     fn process_line(&mut self, line: &str, out: &mut String) {
         let trimmed = line.trim_end();
         let eol = self.eol;
+
+        // Fast path: no markdown syntax → skip all block-level parsing.
+        // Still need to check code fence state.
+        if !self.in_code_block && !Self::has_markdown_syntax(trimmed) {
+            out.push_str(trimmed);
+            out.push_str(eol);
+            return;
+        }
 
         // ── Code fence detection ────────────────────────────────────────
         if let Some(rest) = trimmed.strip_prefix("```") {
