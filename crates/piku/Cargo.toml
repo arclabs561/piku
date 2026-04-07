@@ -31,6 +31,7 @@ unicode-width = { workspace = true }
 
 [dev-dependencies]
 async-stream = "0.3"
+libc = "0.2"
 nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
 vt100 = "0.16"
