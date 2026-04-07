@@ -569,6 +569,40 @@ impl TerminalObserver {
         }
     }
 
+    /// Get all content including scrollback (what a human could see by scrolling up).
+    /// Returns scrollback lines + visible screen lines combined.
+    fn contents_with_scrollback(&mut self) -> String {
+        let screen = self.parser.screen_mut();
+        let (_, cols) = screen.size();
+
+        // First, capture visible screen (scrollback=0)
+        let old_offset = screen.scrollback();
+        screen.set_scrollback(0);
+        let visible: Vec<String> = screen
+            .rows(0, cols)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+
+        // Then, capture scrollback content
+        screen.set_scrollback(500);
+        let scrollback: Vec<String> = screen
+            .rows(0, cols)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+
+        // Restore
+        screen.set_scrollback(old_offset);
+
+        // Combine: scrollback first (older), then visible (current)
+        let mut all = scrollback;
+        all.extend(visible);
+
+        all.into_iter()
+            .filter(|r| !r.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn extract_styled_row(&self, screen: &vt100::Screen, row: u16, cols: u16) -> StyledRow {
         let mut cells = Vec::new();
         let mut text = String::new();
@@ -740,50 +774,30 @@ impl PtyHandle {
     }
 
     /// Wait until the screen shows piku is ready (prompt visible, cursor on input row).
-    /// Returns the final snapshot plus a transcript of all content seen during the wait
-    /// (accumulated from periodic snapshots to capture scrolling content).
+    /// Returns the final snapshot.
     fn wait_for_ready(
         &mut self,
         observer: &mut TerminalObserver,
         timeout: Duration,
-    ) -> (ScreenSnapshot, String) {
+    ) -> ScreenSnapshot {
         let deadline = Instant::now() + timeout;
-        let mut transcript = String::new();
-        let mut last_contents = String::new();
-
         loop {
             self.drain(observer);
             let snap = observer.snapshot();
-
-            // Accumulate any new content since last snapshot
-            let current_contents = snap.contents.clone();
-            if current_contents != last_contents {
-                // Find non-empty rows in the current snapshot
-                for row in &snap.rows {
-                    let trimmed = row.trim();
-                    if !trimmed.is_empty() && !transcript.contains(trimmed) {
-                        transcript.push_str(trimmed);
-                        transcript.push('\n');
-                    }
-                }
-                last_contents = current_contents;
-            }
-
             if snap.is_ready() {
-                return (snap, transcript);
+                return snap;
             }
             if Instant::now() >= deadline {
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
                      (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
-                     non_empty_rows={}, transcript_lines={})",
+                     non_empty_rows={})",
                     snap.cursor_visible,
                     snap.cursor,
                     snap.input_row(),
                     snap.rows.iter().filter(|r| !r.trim().is_empty()).count(),
-                    transcript.lines().count(),
                 );
-                return (snap, transcript);
+                return snap;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -2093,7 +2107,7 @@ fn run_agentic_session(persona: &Persona) {
 
     // Wait for piku to be ready
     eprintln!("[agentic_user] waiting for piku startup...");
-    let (startup_snap, _) = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+    let startup_snap = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
     if !startup_snap.is_ready() {
         eprintln!("[agentic_user] piku did not become ready within 30s, proceeding anyway");
         eprintln!(
@@ -2120,7 +2134,6 @@ fn run_agentic_session(persona: &Persona) {
 
         // Execute scripted actions
         let snap_before = observer.snapshot();
-        let mut turn_transcript = String::new();
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
             pty.execute_action(action, &mut observer);
@@ -2144,10 +2157,8 @@ fn run_agentic_session(persona: &Persona) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
 
-                // Phase 2: wait for ready (response complete), capturing transcript
-                let (_snap, transcript) =
-                    pty.wait_for_ready(&mut observer, Duration::from_secs(90));
-                turn_transcript.push_str(&transcript);
+                // Phase 2: wait for ready (response complete)
+                let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
             }
         }
 
@@ -2202,18 +2213,28 @@ fn run_agentic_session(persona: &Persona) {
                 .join(" -> ")
         );
 
-        // LLM critique: use transcript (accumulated during response) + final screen
-        let screen_for_llm = if turn_transcript.is_empty() {
-            snap_after.summary(30)
-        } else {
-            // Transcript captures what scrolled through; final snapshot shows current state
+        // Get full response content from scrollback (captures DECSTBM-scrolled text)
+        let scrollback_content = observer.contents_with_scrollback();
+        let screen_for_llm = if scrollback_content.lines().count()
+            > snap_after
+                .rows
+                .iter()
+                .filter(|r| !r.trim().is_empty())
+                .count()
+        {
             format!(
-                "RESPONSE TRANSCRIPT (content seen during response):\n{}\n\
-                 FINAL SCREEN STATE:\n{}",
-                safe_truncate(&turn_transcript, 3000),
+                "FULL OUTPUT (including scrollback):\n{}\n\nVISIBLE SCREEN:\n{}",
+                safe_truncate(&scrollback_content, 3500),
                 snap_after.summary(10)
             )
+        } else {
+            snap_after.summary(30)
         };
+        eprintln!(
+            "[agentic_user] screen_for_llm: {} chars, {} lines",
+            screen_for_llm.len(),
+            screen_for_llm.lines().count()
+        );
         let (observations, bugs, _next) = user_agent_critique(
             &ua_llm,
             persona,
@@ -2240,16 +2261,10 @@ fn run_agentic_session(persona: &Persona) {
             workspace_changes: ws_diff.summary(),
         });
 
-        // Use transcript for the report if available (captures scrolled content)
-        let entry_screen = if turn_transcript.is_empty() {
-            snap_after.contents.clone()
-        } else {
-            turn_transcript.clone()
-        };
         entries.push(CritiqueEntry {
             phase: phase.name.to_string(),
             action_desc,
-            screen_text: entry_screen,
+            screen_text: scrollback_content,
             observations,
             bugs,
             deterministic_findings: findings,
@@ -2290,7 +2305,19 @@ fn run_agentic_session(persona: &Persona) {
                 NextAction::Send(msg) => {
                     eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
-                    let (snap_after_free, free_transcript) =
+                    // Two-phase wait for freeform too
+                    let pre_free = observer.snapshot().contents.clone();
+                    let free_deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        pty.drain(&mut observer);
+                        if observer.snapshot().contents != pre_free
+                            || Instant::now() >= free_deadline
+                        {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let snap_after_free =
                         pty.wait_for_ready(&mut observer, Duration::from_secs(90));
                     let findings_free = deterministic_checks(
                         &snap_before_free,
@@ -2305,14 +2332,15 @@ fn run_agentic_session(persona: &Persona) {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let free_screen = if free_transcript.is_empty() {
-                        snap_after_free.summary(30)
-                    } else {
+                    let free_scrollback = observer.contents_with_scrollback();
+                    let free_screen = if free_scrollback.lines().count() > 2 {
                         format!(
-                            "RESPONSE TRANSCRIPT:\n{}\n\nFINAL SCREEN:\n{}",
-                            safe_truncate(&free_transcript, 3000),
+                            "FULL OUTPUT (including scrollback):\n{}\n\nVISIBLE SCREEN:\n{}",
+                            safe_truncate(&free_scrollback, 3500),
                             snap_after_free.summary(10)
                         )
+                    } else {
+                        snap_after_free.summary(30)
                     };
                     let (obs2, bugs2, _) = user_agent_critique(
                         &ua_llm,
@@ -2342,7 +2370,7 @@ fn run_agentic_session(persona: &Persona) {
                     entries.push(CritiqueEntry {
                         phase: phase.name.to_string(),
                         action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
-                        screen_text: snap_after_free.contents.clone(),
+                        screen_text: free_scrollback,
                         observations: obs2,
                         bugs: bugs2,
                         deterministic_findings: findings_free,
@@ -2445,6 +2473,39 @@ fn terminal_observer_basic() {
         snap.contents
     );
     assert!(snap.cursor_visible, "cursor should be visible by default");
+}
+
+#[test]
+fn terminal_observer_scrollback_captures_scrolled_content() {
+    // Simulate a 5-row terminal where content scrolls off the top
+    let mut obs = TerminalObserver::new(5, 40);
+    // Write 10 lines — first 5 scroll into scrollback, last 5 are on screen
+    for i in 0..10 {
+        obs.process(format!("line {i}\r\n").as_bytes());
+    }
+    // Visible screen should only show the last few lines
+    let snap = obs.snapshot();
+    assert!(
+        !snap.contents.contains("line 0"),
+        "line 0 should have scrolled off visible screen"
+    );
+
+    // Scrollback should contain the scrolled-off lines
+    let all_content = obs.contents_with_scrollback();
+    assert!(
+        all_content.contains("line 0"),
+        "scrollback should contain 'line 0': {all_content:?}"
+    );
+    assert!(
+        all_content.contains("line 4"),
+        "scrollback should contain 'line 4': {all_content:?}"
+    );
+    // Total content should span scrollback + visible
+    let line_count = all_content.lines().count();
+    assert!(
+        line_count >= 8,
+        "scrollback + visible should have >= 8 lines, got {line_count}: {all_content:?}"
+    );
 }
 
 #[test]
