@@ -732,30 +732,50 @@ impl PtyHandle {
     }
 
     /// Wait until the screen shows piku is ready (prompt visible, cursor on input row).
-    /// Returns the final snapshot.
+    /// Returns the final snapshot plus a transcript of all content seen during the wait
+    /// (accumulated from periodic snapshots to capture scrolling content).
     fn wait_for_ready(
         &mut self,
         observer: &mut TerminalObserver,
         timeout: Duration,
-    ) -> ScreenSnapshot {
+    ) -> (ScreenSnapshot, String) {
         let deadline = Instant::now() + timeout;
+        let mut transcript = String::new();
+        let mut last_contents = String::new();
+
         loop {
             self.drain(observer);
             let snap = observer.snapshot();
+
+            // Accumulate any new content since last snapshot
+            let current_contents = snap.contents.clone();
+            if current_contents != last_contents {
+                // Find non-empty rows in the current snapshot
+                for row in &snap.rows {
+                    let trimmed = row.trim();
+                    if !trimmed.is_empty() && !transcript.contains(trimmed) {
+                        transcript.push_str(trimmed);
+                        transcript.push('\n');
+                    }
+                }
+                last_contents = current_contents;
+            }
+
             if snap.is_ready() {
-                return snap;
+                return (snap, transcript);
             }
             if Instant::now() >= deadline {
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
                      (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
-                     non_empty_rows={})",
+                     non_empty_rows={}, transcript_lines={})",
                     snap.cursor_visible,
                     snap.cursor,
                     snap.input_row(),
                     snap.rows.iter().filter(|r| !r.trim().is_empty()).count(),
+                    transcript.lines().count(),
                 );
-                return snap;
+                return (snap, transcript);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -2065,7 +2085,7 @@ fn run_agentic_session(persona: &Persona) {
 
     // Wait for piku to be ready
     eprintln!("[agentic_user] waiting for piku startup...");
-    let startup_snap = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+    let (startup_snap, _) = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
     if !startup_snap.is_ready() {
         eprintln!("[agentic_user] piku did not become ready within 30s, proceeding anyway");
         eprintln!(
@@ -2092,13 +2112,16 @@ fn run_agentic_session(persona: &Persona) {
 
         // Execute scripted actions
         let snap_before = observer.snapshot();
+        let mut turn_transcript = String::new();
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
             pty.execute_action(action, &mut observer);
 
-            // After Submit, wait for piku to respond
+            // After Submit, wait for piku to respond and capture scrolling content
             if matches!(action, Action::Submit(_)) {
-                let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
+                let (_snap, transcript) =
+                    pty.wait_for_ready(&mut observer, Duration::from_secs(90));
+                turn_transcript.push_str(&transcript);
             }
         }
 
@@ -2153,13 +2176,24 @@ fn run_agentic_session(persona: &Persona) {
                 .join(" -> ")
         );
 
-        // LLM critique of the scripted phase
+        // LLM critique: use transcript (accumulated during response) + final screen
+        let screen_for_llm = if turn_transcript.is_empty() {
+            snap_after.summary(30)
+        } else {
+            // Transcript captures what scrolled through; final snapshot shows current state
+            format!(
+                "RESPONSE TRANSCRIPT (content seen during response):\n{}\n\
+                 FINAL SCREEN STATE:\n{}",
+                safe_truncate(&turn_transcript, 3000),
+                snap_after.summary(10)
+            )
+        };
         let (observations, bugs, _next) = user_agent_critique(
             &ua_llm,
             persona,
             phase,
             &action_desc,
-            &snap_after.summary(30),
+            &screen_for_llm,
             &det_report,
             &ws_diff.summary(),
             &memory,
@@ -2180,10 +2214,16 @@ fn run_agentic_session(persona: &Persona) {
             workspace_changes: ws_diff.summary(),
         });
 
+        // Use transcript for the report if available (captures scrolled content)
+        let entry_screen = if turn_transcript.is_empty() {
+            snap_after.contents.clone()
+        } else {
+            turn_transcript.clone()
+        };
         entries.push(CritiqueEntry {
             phase: phase.name.to_string(),
             action_desc,
-            screen_text: snap_after.contents.clone(),
+            screen_text: entry_screen,
             observations,
             bugs,
             deterministic_findings: findings,
@@ -2224,7 +2264,7 @@ fn run_agentic_session(persona: &Persona) {
                 NextAction::Send(msg) => {
                     eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
-                    let snap_after_free =
+                    let (snap_after_free, free_transcript) =
                         pty.wait_for_ready(&mut observer, Duration::from_secs(90));
                     let findings_free = deterministic_checks(
                         &snap_before_free,
@@ -2239,12 +2279,21 @@ fn run_agentic_session(persona: &Persona) {
                         .collect::<Vec<_>>()
                         .join("\n");
 
+                    let free_screen = if free_transcript.is_empty() {
+                        snap_after_free.summary(30)
+                    } else {
+                        format!(
+                            "RESPONSE TRANSCRIPT:\n{}\n\nFINAL SCREEN:\n{}",
+                            safe_truncate(&free_transcript, 3000),
+                            snap_after_free.summary(10)
+                        )
+                    };
                     let (obs2, bugs2, _) = user_agent_critique(
                         &ua_llm,
                         persona,
                         phase,
                         &format!("freeform: {:?}", &msg[..msg.len().min(40)]),
-                        &snap_after_free.summary(30),
+                        &free_screen,
                         &det_report_free,
                         &ws_diff_free.summary(),
                         &memory,
