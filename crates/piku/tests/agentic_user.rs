@@ -672,6 +672,9 @@ struct PtyHandle {
     _process: rexpect::process::PtyProcess,
     writer: std::fs::File,
     reader: std::fs::File,
+    /// Raw bytes captured since last clear — used to extract response text
+    /// by running through a plain VT100 parser (no DECSTBM interference).
+    raw_capture: Vec<u8>,
 }
 
 impl PtyHandle {
@@ -725,6 +728,7 @@ impl PtyHandle {
             _process: process,
             writer,
             reader,
+            raw_capture: Vec::new(),
         }
     }
 
@@ -797,6 +801,7 @@ impl PtyHandle {
                 Ok(0) => break,
                 Ok(n) => {
                     observer.process(&buf[..n]);
+                    self.raw_capture.extend_from_slice(&buf[..n]);
                     total += n;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -804,6 +809,36 @@ impl PtyHandle {
             }
         }
         total
+    }
+
+    /// Clear the raw capture buffer (call before a new phase/turn).
+    fn clear_capture(&mut self) {
+        self.raw_capture.clear();
+    }
+
+    /// Extract text content from captured bytes by running through a tall
+    /// single-zone VT100 parser (no DECSTBM scroll region clipping).
+    /// This gives us the full response text regardless of scroll regions.
+    fn captured_text(&self) -> String {
+        // Use a very tall terminal so nothing scrolls off
+        let mut parser = vt100::Parser::new(500, 120, 0);
+        parser.process(&self.raw_capture);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines = Vec::new();
+        for r in 0..rows {
+            let mut line = String::new();
+            for c in 0..cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    line.push_str(cell.contents());
+                }
+            }
+            let trimmed = line.trim_end().to_string();
+            if !trimmed.is_empty() {
+                lines.push(trimmed);
+            }
+        }
+        lines.join("\n")
     }
 
     /// Drain then sleep, repeat until no new bytes arrive.
@@ -2178,6 +2213,7 @@ fn run_agentic_session(persona: &Persona) {
         eprintln!("[agentic_user] --- phase: {} ---", phase.name);
 
         // Execute scripted actions
+        pty.clear_capture();
         let snap_before = observer.snapshot();
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
@@ -2258,18 +2294,12 @@ fn run_agentic_session(persona: &Persona) {
                 .join(" -> ")
         );
 
-        // Get full response content from scrollback (captures DECSTBM-scrolled text)
-        let scrollback_content = observer.contents_with_scrollback();
-        let screen_for_llm = if scrollback_content.lines().count()
-            > snap_after
-                .rows
-                .iter()
-                .filter(|r| !r.trim().is_empty())
-                .count()
-        {
+        // Get full response content from raw byte capture (bypasses DECSTBM clipping)
+        let captured = pty.captured_text();
+        let screen_for_llm = if captured.lines().count() > 2 {
             format!(
-                "FULL OUTPUT (including scrollback):\n{}\n\nVISIBLE SCREEN:\n{}",
-                safe_truncate(&scrollback_content, 3500),
+                "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
+                safe_truncate(&captured, 3500),
                 snap_after.summary(10)
             )
         } else {
@@ -2309,7 +2339,7 @@ fn run_agentic_session(persona: &Persona) {
         entries.push(CritiqueEntry {
             phase: phase.name.to_string(),
             action_desc,
-            screen_text: scrollback_content,
+            screen_text: captured,
             observations,
             bugs,
             deterministic_findings: findings,
@@ -2349,6 +2379,7 @@ fn run_agentic_session(persona: &Persona) {
             match next {
                 NextAction::Send(msg) => {
                     eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
+                    pty.clear_capture();
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
                     // Two-phase wait for freeform too
                     let pre_free = observer.snapshot().contents.clone();
@@ -2377,11 +2408,11 @@ fn run_agentic_session(persona: &Persona) {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let free_scrollback = observer.contents_with_scrollback();
-                    let free_screen = if free_scrollback.lines().count() > 2 {
+                    let free_captured = pty.captured_text();
+                    let free_screen = if free_captured.lines().count() > 2 {
                         format!(
-                            "FULL OUTPUT (including scrollback):\n{}\n\nVISIBLE SCREEN:\n{}",
-                            safe_truncate(&free_scrollback, 3500),
+                            "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
+                            safe_truncate(&free_captured, 3500),
                             snap_after_free.summary(10)
                         )
                     } else {
@@ -2415,7 +2446,7 @@ fn run_agentic_session(persona: &Persona) {
                     entries.push(CritiqueEntry {
                         phase: phase.name.to_string(),
                         action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
-                        screen_text: free_scrollback,
+                        screen_text: free_captured,
                         observations: obs2,
                         bugs: bugs2,
                         deterministic_findings: findings_free,
