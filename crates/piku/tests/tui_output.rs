@@ -1,5 +1,3 @@
-#![allow(warnings)]
-
 /// TUI output regression tests.
 ///
 /// These tests verify that the TUI code emits the correct ANSI sequences

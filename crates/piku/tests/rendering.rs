@@ -3,29 +3,10 @@
 /// These test the actual output of the markdown renderer and tool input
 /// formatter with realistic inputs, not source-code pattern matching.
 
-// ── Markdown rendering ──────────────────────────────────────────────────────
+mod test_helpers;
+use test_helpers::strip_ansi;
 
 use piku::markdown::StreamingMarkdown;
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
 
 /// Realistic assistant response with multiple markdown features.
 #[test]
