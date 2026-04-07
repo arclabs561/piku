@@ -444,42 +444,59 @@ struct ScreenSnapshot {
 }
 
 impl ScreenSnapshot {
-    /// The input/prompt row (last row)
+    /// The row the cursor is on (where the user is typing).
+    /// Follows the cursor rather than assuming a fixed row position,
+    /// since piku uses DECSTBM scroll regions that can place the prompt
+    /// at different absolute rows.
     fn input_row(&self) -> &str {
-        self.rows.last().map(|s| s.as_str()).unwrap_or("")
+        let r = self.cursor.0 as usize;
+        if r < self.rows.len() {
+            &self.rows[r]
+        } else {
+            self.rows.last().map(|s| s.as_str()).unwrap_or("")
+        }
     }
 
-    /// The footer row (second-to-last)
+    /// The row above the cursor (typically the footer/status bar).
     fn footer_row(&self) -> &str {
-        if self.rows.len() >= 2 {
-            &self.rows[self.rows.len() - 2]
+        let r = self.cursor.0.saturating_sub(1) as usize;
+        if r < self.rows.len() {
+            &self.rows[r]
         } else {
             ""
         }
     }
 
-    /// Check if piku is ready for input (cursor visible, on input row, prompt glyph present)
+    /// Check if piku is ready for input.
+    /// Looks for a prompt glyph on the cursor's row. piku uses `❯` as
+    /// the primary prompt, `>` as fallback, `!` after errors.
     fn is_ready(&self) -> bool {
+        if !self.cursor_visible {
+            return false;
+        }
         let input = self.input_row().trim_start();
-        let has_prompt = input.starts_with('>') || input.starts_with('!');
-        let cursor_on_input = self.cursor.0 == self.size.0.saturating_sub(1);
-        self.cursor_visible && cursor_on_input && has_prompt
+        // piku's prompt glyphs: ❯ (U+276F), > (ASCII), ! (error state)
+        input.starts_with('\u{276F}')
+            || input.starts_with('>')
+            || input.starts_with('!')
+            // Also match hint text (prompt present but showing placeholder)
+            || input.contains("Send a message")
     }
 
-    /// Compact text summary for LLM context (no full screen dump)
-    fn summary(&self, max_content_lines: usize) -> String {
-        let content_lines: Vec<&str> = self
+    /// All non-empty visible rows, for the LLM to critique.
+    /// This is what a human would see on screen right now.
+    fn summary(&self, max_lines: usize) -> String {
+        let visible: Vec<&str> = self
             .rows
             .iter()
-            .take(self.rows.len().saturating_sub(2)) // exclude footer + input
             .map(|s| s.as_str())
             .filter(|l| !l.trim().is_empty())
             .collect();
 
         let mut out = String::new();
-        for (i, line) in content_lines.iter().enumerate() {
-            if i >= max_content_lines {
-                out.push_str(&format!("  ... ({} more lines)\n", content_lines.len() - i));
+        for (i, line) in visible.iter().enumerate() {
+            if i >= max_lines {
+                out.push_str(&format!("  ... ({} more lines)\n", visible.len() - i));
                 break;
             }
             let truncated = if line.len() > 120 { &line[..120] } else { line };
@@ -728,10 +745,12 @@ impl PtyHandle {
             if Instant::now() >= deadline {
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
-                     (cursor_visible={}, cursor={:?}, input_row={:?})",
+                     (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
+                     non_empty_rows={})",
                     snap.cursor_visible,
                     snap.cursor,
-                    snap.input_row()
+                    snap.input_row(),
+                    snap.rows.iter().filter(|r| !r.trim().is_empty()).count(),
                 );
                 return snap;
             }
@@ -1634,11 +1653,19 @@ fn user_agent_critique(
     deterministic_report: &str,
     workspace_diff: &str,
     memory: &ConversationMemory,
+    prior_findings: &str,
 ) -> (Vec<String>, Vec<Bug>, NextAction) {
+    let prior_section = if prior_findings.is_empty() {
+        String::new()
+    } else {
+        format!("{prior_findings}\n")
+    };
+
     let user_prompt = format!(
         "PERSONA: {} -- {}\n\
          PHASE: {} (focus: {})\n\
          ACTION: {}\n\n\
+         {}\
          {}\
          DETERMINISTIC CHECKS:\n{}\n\n\
          WORKSPACE CHANGES: {}\n\n\
@@ -1650,6 +1677,7 @@ fn user_agent_critique(
         phase.focus,
         action_desc,
         memory.format_for_llm(),
+        prior_section,
         deterministic_report,
         workspace_diff,
         safe_truncate(screen_text, 4000),
@@ -1816,6 +1844,145 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
     println!();
 }
 
+// ===========================================================================
+// Findings persistence — accumulate across runs, feed back to LLM
+// ===========================================================================
+
+fn findings_log_path() -> PathBuf {
+    let dir = std::env::var("PIKU_AGENTIC_FINDINGS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("target")
+                .join("agentic-findings")
+        });
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("findings.jsonl")
+}
+
+/// Append a session's findings to the persistent JSONL log.
+fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
+    let path = findings_log_path();
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        eprintln!("[findings] could not open {}", path.display());
+        return;
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for entry in entries {
+        // Persist bugs (non-info) and deterministic findings (non-info)
+        for bug in &entry.bugs {
+            if bug.severity == Severity::Info {
+                continue;
+            }
+            let record = serde_json::json!({
+                "ts": timestamp,
+                "persona": persona,
+                "phase": entry.phase,
+                "severity": format!("{}", bug.severity),
+                "description": bug.description,
+                "expected": bug.expected,
+                "actual": bug.actual,
+                "source": "llm",
+            });
+            let _ = writeln!(file, "{}", record);
+        }
+        for finding in &entry.deterministic_findings {
+            if finding.severity == Severity::Info {
+                continue;
+            }
+            let record = serde_json::json!({
+                "ts": timestamp,
+                "persona": persona,
+                "phase": entry.phase,
+                "severity": format!("{}", finding.severity),
+                "description": finding.description,
+                "expected": finding.expected,
+                "actual": finding.actual,
+                "source": "deterministic",
+            });
+            let _ = writeln!(file, "{}", record);
+        }
+    }
+    eprintln!(
+        "[findings] appended to {} ({} bytes)",
+        path.display(),
+        path.metadata().map(|m| m.len()).unwrap_or(0)
+    );
+}
+
+/// Load prior findings to give the LLM context on known-weak areas.
+/// Returns a summary string suitable for inclusion in the LLM prompt.
+fn load_prior_findings(persona: &str) -> String {
+    let path = findings_log_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return String::new();
+    };
+
+    let mut bug_counts: HashMap<String, usize> = HashMap::new();
+    let mut recent_bugs: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        // Count recurring bugs across all personas
+        if let Some(desc) = record["description"].as_str() {
+            *bug_counts.entry(desc.to_string()).or_insert(0) += 1;
+        }
+        // Collect recent bugs for this persona (last 20)
+        if record["persona"].as_str() == Some(persona) {
+            if let (Some(sev), Some(desc)) =
+                (record["severity"].as_str(), record["description"].as_str())
+            {
+                recent_bugs.push(format!("[{sev}] {desc}"));
+            }
+        }
+    }
+
+    if bug_counts.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("PRIOR FINDINGS (from previous runs):\n");
+
+    // Recurring bugs (found 2+ times)
+    let mut recurring: Vec<(&String, &usize)> =
+        bug_counts.iter().filter(|(_, &c)| c >= 2).collect();
+    recurring.sort_by(|a, b| b.1.cmp(a.1));
+    if !recurring.is_empty() {
+        out.push_str("  Recurring bugs (probe these harder):\n");
+        for (desc, count) in recurring.iter().take(5) {
+            out.push_str(&format!("    ({count}x) {desc}\n"));
+        }
+    }
+
+    // Recent persona-specific bugs
+    if !recent_bugs.is_empty() {
+        out.push_str(&format!(
+            "  Recent bugs for {persona} ({} total):\n",
+            recent_bugs.len()
+        ));
+        for bug in recent_bugs.iter().rev().take(5) {
+            out.push_str(&format!("    {bug}\n"));
+        }
+    }
+
+    out
+}
+
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
@@ -1873,6 +2040,15 @@ fn run_agentic_session(persona: &Persona) {
         piku_spec.label, piku_spec.model
     );
     eprintln!("[agentic_user] workspace: {}", workspace.display());
+
+    // Load prior findings to inform this session
+    let prior_findings = load_prior_findings(persona.name);
+    if !prior_findings.is_empty() {
+        eprintln!(
+            "[agentic_user] loaded prior findings ({} chars)",
+            prior_findings.len()
+        );
+    }
 
     let mut observer = TerminalObserver::new(40, 120);
     let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
@@ -1959,6 +2135,7 @@ fn run_agentic_session(persona: &Persona) {
             &det_report,
             &ws_diff.summary(),
             &memory,
+            &prior_findings,
         );
 
         // Update memory
@@ -2012,6 +2189,7 @@ fn run_agentic_session(persona: &Persona) {
                 "",
                 "no changes",
                 &memory,
+                &prior_findings,
             );
 
             match next {
@@ -2042,6 +2220,7 @@ fn run_agentic_session(persona: &Persona) {
                         &det_report_free,
                         &ws_diff_free.summary(),
                         &memory,
+                        &prior_findings,
                     );
 
                     memory.push(TurnSummary {
@@ -2085,6 +2264,7 @@ fn run_agentic_session(persona: &Persona) {
     std::thread::sleep(Duration::from_millis(500));
 
     print_report(persona, &entries);
+    persist_findings(persona.name, &entries);
 }
 
 // ===========================================================================
@@ -2189,12 +2369,42 @@ fn terminal_observer_styled_rows() {
 }
 
 #[test]
-fn screen_snapshot_is_ready() {
+fn screen_snapshot_is_ready_ascii_prompt() {
     let mut obs = TerminalObserver::new(5, 40);
-    // Simulate prompt on last row with cursor visible
+    // Cursor at row 5 (1-indexed) with > prompt
     obs.process(b"\x1b[5;1H> ");
     let snap = obs.snapshot();
-    assert!(snap.is_ready(), "should be ready with prompt visible");
+    assert!(
+        snap.is_ready(),
+        "should be ready: {:?} cursor={:?}",
+        snap.input_row(),
+        snap.cursor
+    );
+}
+
+#[test]
+fn screen_snapshot_is_ready_unicode_prompt() {
+    let mut obs = TerminalObserver::new(5, 40);
+    // piku uses ❯ (U+276F) as prompt glyph
+    obs.process("\x1b[5;1H\u{276F} ".as_bytes());
+    let snap = obs.snapshot();
+    assert!(
+        snap.is_ready(),
+        "should be ready with ❯ prompt: {:?}",
+        snap.input_row()
+    );
+}
+
+#[test]
+fn screen_snapshot_is_ready_with_hint() {
+    let mut obs = TerminalObserver::new(5, 40);
+    obs.process("\x1b[5;1H\u{276F} Send a message or /help".as_bytes());
+    let snap = obs.snapshot();
+    assert!(
+        snap.is_ready(),
+        "should be ready with hint text: {:?}",
+        snap.input_row()
+    );
 }
 
 #[test]
@@ -2203,6 +2413,20 @@ fn screen_snapshot_not_ready_when_hidden() {
     obs.process(b"\x1b[?25l\x1b[5;1H> ");
     let snap = obs.snapshot();
     assert!(!snap.is_ready(), "should not be ready with cursor hidden");
+}
+
+#[test]
+fn screen_snapshot_input_row_follows_cursor() {
+    let mut obs = TerminalObserver::new(10, 40);
+    // Write prompt at row 3 (1-indexed = row 2 zero-indexed)
+    obs.process(b"\x1b[3;1H> hello");
+    let snap = obs.snapshot();
+    assert_eq!(snap.cursor.0, 2, "cursor should be at row 2 (0-indexed)");
+    assert!(
+        snap.input_row().contains("hello"),
+        "input_row follows cursor: {:?}",
+        snap.input_row()
+    );
 }
 
 #[test]

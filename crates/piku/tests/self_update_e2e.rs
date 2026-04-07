@@ -1,5 +1,3 @@
-
-
 /// Integration tests for the self-update mechanism.
 ///
 /// These tests cover the full self-update chain including:

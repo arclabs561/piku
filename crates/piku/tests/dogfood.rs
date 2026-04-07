@@ -1,5 +1,3 @@
-
-
 /// Dogfooding harness — piku tests itself using a real LLM.
 ///
 /// Each scenario describes an idea, seeds a workspace, runs piku against it,
