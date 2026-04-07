@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 /// Integration tests for the self-update mechanism.
 ///

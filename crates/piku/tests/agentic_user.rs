@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 /// Agentic user harness — an LLM plays the role of a developer using piku.
 ///

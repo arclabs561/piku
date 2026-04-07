@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 use std::path::PathBuf;
 /// Subprocess tests against the compiled piku binary.

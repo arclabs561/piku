@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 /// Real end-to-end tests: spawns the compiled piku binary against a real LLM API.
 ///

@@ -443,7 +443,7 @@ const PASTE_PILL_CHARS: usize = 800;
 const PASTE_PILL_LINES: usize = 3;
 
 /// Stashed input state (Ctrl+S toggle).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Stash {
     text: String,
     cursor: usize,
@@ -1294,9 +1294,6 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
-    fn _alt(ch: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT)
-    }
 
     #[test]
     fn basic_insert_and_backspace() {
