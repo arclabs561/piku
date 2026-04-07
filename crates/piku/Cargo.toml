@@ -32,6 +32,7 @@ unicode-width = { workspace = true }
 [dev-dependencies]
 async-stream = "0.3"
 rexpect = "0.7"
+vt100 = "0.16"
 
 [lints]
 workspace = true

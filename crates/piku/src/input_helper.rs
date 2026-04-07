@@ -438,6 +438,10 @@ pub enum ReadOutcome {
 
 // ── Line editor ─────────────────────────────────────────────────────────────
 
+/// Threshold for collapsing pasted text into a pill.
+const PASTE_PILL_CHARS: usize = 800;
+const PASTE_PILL_LINES: usize = 3;
+
 /// Stashed input state (Ctrl+S toggle).
 #[derive(Debug, Clone)]
 struct Stash {
@@ -455,6 +459,9 @@ pub struct LineEditor {
     draft: Option<String>,
     preferred_col: Option<usize>,
     stash: Option<Stash>,
+    /// Storage for large pastes collapsed to pills.
+    /// Key: pill ID, Value: full pasted text.
+    pasted_contents: Vec<String>,
 }
 
 impl LineEditor {
@@ -469,7 +476,30 @@ impl LineEditor {
             draft: None,
             preferred_col: None,
             stash: None,
+            pasted_contents: Vec::new(),
         }
+    }
+
+    /// Expand any paste pills in the text, replacing `[Pasted text #N ...]`
+    /// with the actual pasted content. Call on submit.
+    pub fn expand_paste_pills(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for (i, content) in self.pasted_contents.iter().enumerate() {
+            let id = i + 1;
+            // Find and replace the pill marker
+            let prefix = format!("[Pasted text #{id}");
+            if let Some(start) = result.find(&prefix) {
+                if let Some(end) = result[start..].find(']') {
+                    result.replace_range(start..start + end + 1, content);
+                }
+            }
+        }
+        result
+    }
+
+    /// Clear paste pill storage (call after submit).
+    pub fn clear_paste_pills(&mut self) {
+        self.pasted_contents.clear();
     }
 
     pub fn set_prompt(&mut self, prompt: impl Into<String>) {
@@ -578,8 +608,22 @@ impl LineEditor {
                     }
                 },
                 Ok(Event::Paste(text)) => {
-                    // Bracketed paste: normalize and insert
-                    input.insert_str(&text);
+                    // Bracketed paste: normalize, then either insert inline
+                    // or collapse to a pill for large pastes.
+                    let cleaned = strip_ansi_from_paste(&text);
+                    let normalized = cleaned.replace("\r\n", "\n").replace('\r', "\n");
+                    let lines = normalized.lines().count();
+                    if normalized.len() > PASTE_PILL_CHARS || lines > PASTE_PILL_LINES {
+                        // Collapse to pill
+                        let id = self.pasted_contents.len() + 1;
+                        self.pasted_contents.push(normalized);
+                        let pill = format!("[Pasted text #{id} +{lines} lines]");
+                        for ch in pill.chars() {
+                            input.insert(ch);
+                        }
+                    } else {
+                        input.insert_str(&text);
+                    }
                     self.history_index = None;
                     self.draft = None;
                     rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
@@ -1032,12 +1076,9 @@ impl LineEditor {
                 } else {
                     &self.continuation_prompt
                 };
-                // Highlight slash commands in cyan (like Claude Code)
-                if i == 0 && line.starts_with('/') && !line.contains(' ') {
-                    lines.push(format!("{prefix}\x1b[36m{line}\x1b[0m"));
-                } else {
-                    lines.push(format!("{prefix}{line}"));
-                }
+                // Syntax highlighting for input text
+                let highlighted = highlight_input_line(line, i == 0);
+                lines.push(format!("{prefix}{highlighted}"));
             }
             // Ghost text: show dim hint from matching history entry (single-line only).
             // Only when cursor is at end and input has no newlines.
@@ -1126,6 +1167,42 @@ fn col_to_byte_offset(line: &str, target_col: usize) -> usize {
         col += w;
     }
     line.len() // target_col beyond line end → park at end
+}
+
+/// Highlight input text: slash commands cyan, backtick code green.
+fn highlight_input_line(line: &str, is_first_line: bool) -> String {
+    // Slash commands: full line cyan when on first line, no spaces
+    if is_first_line && line.starts_with('/') && !line.contains(' ') {
+        return format!("\x1b[36m{line}\x1b[0m");
+    }
+
+    // Inline backtick highlighting: `code` → green
+    if !line.contains('`') {
+        return line.to_string();
+    }
+
+    let mut out = String::new();
+    let mut in_backtick = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '`' {
+            if in_backtick {
+                out.push('`');
+                out.push_str("\x1b[0m");
+                in_backtick = false;
+            } else {
+                out.push_str("\x1b[32m");
+                out.push('`');
+                in_backtick = true;
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    if in_backtick {
+        out.push_str("\x1b[0m"); // unclosed backtick
+    }
+    out
 }
 
 /// Strip ANSI escape sequences from pasted text.
