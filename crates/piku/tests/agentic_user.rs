@@ -1,38 +1,35 @@
-
-
 /// Agentic user harness — an LLM plays the role of a developer using piku.
 ///
-/// This is the "real experience" dogfood: instead of scripted assertions on
-/// individual tool calls, a second LLM instance acts as a skeptical user who:
-///
-///   1. Opens piku in a real PTY via `rexpect` (real terminal, real ANSI output)
-///   2. Sends messages as a developer would over multiple turns
-///   3. Reads the raw screen output after each turn
-///   4. Notes observations and bugs in a running critique log
-///   5. Decides what to type next (follow-up, harder task, or quit)
-///   6. Prints a structured UX report at the end
+/// Architecture (v2):
+///   - **Keystroke-level action space**: Type(char), Key(Tab/Enter/Arrow/Ctrl-*),
+///     Observe, Wait — not just send_line.
+///   - **VT100 screen observation**: a persistent `vt100::Parser` processes raw PTY
+///     bytes. Snapshots return the rendered screen grid, cursor position, cell styles.
+///   - **Deterministic + LLM split**: cursor visibility, prompt glyph, echo styling,
+///     footer presence are checked by code. The LLM focuses on content quality and
+///     interaction flow.
+///   - **Workspace observation**: filesystem diffs verify tool side-effects.
+///   - **Conversation memory**: rolling turn summaries let the LLM detect regressions.
+///   - **Phase-based personas**: scripted keystroke sequences for reproducible coverage
+///     + LLM freeform exploration for discovery.
 ///
 /// GATING: Requires PIKU_AGENTIC_USER=1 AND an API key.
 ///
-/// QUICK RUN (confident_dev persona, ~2 min):
+/// QUICK RUN (confident_dev persona):
 ///   cargo build --release -p piku
 ///   PIKU_AGENTIC_USER=1 OPENROUTER_API_KEY=sk-or-... \
 ///     cargo test --test agentic_user -- agentic_user_confident_dev --nocapture
 ///
 /// ALL PERSONAS:
 ///   PIKU_AGENTIC_USER=1 cargo test --test agentic_user -- --nocapture
-///
-/// The test only fails on CRITICAL bugs (crash, cursor permanently gone, no output).
-/// The full critique report is always printed to stdout.
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{Read, Write as IoWrite};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
-
-use rexpect::session::PtySession;
+use std::time::{Duration, Instant, SystemTime};
 
 // ---------------------------------------------------------------------------
-// Gate
+// Gate + binary discovery
 // ---------------------------------------------------------------------------
 
 fn is_enabled() -> bool {
@@ -81,6 +78,52 @@ fn ollama_is_available(host: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn tempdir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join(format!("piku_agentic_{label}_{nanos}"));
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn agentic_seed_source() -> PathBuf {
+    if let Ok(dir) = std::env::var("PIKU_AGENTIC_PLAYDIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fixture")
+}
+
+// ---------------------------------------------------------------------------
+// Provider detection
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 enum Backend {
@@ -135,21 +178,15 @@ impl ProviderSpec {
 
     fn env_pairs(&self) -> Vec<(String, String)> {
         let mut pairs = vec![
-            (
-                "PATH".to_string(),
-                std::env::var("PATH").unwrap_or_default(),
-            ),
-            (
-                "HOME".to_string(),
-                std::env::var("HOME").unwrap_or_default(),
-            ),
-            ("TERM".to_string(), "xterm-256color".to_string()),
-            ("COLUMNS".to_string(), "120".to_string()),
-            ("LINES".to_string(), "40".to_string()),
-            ("PIKU_NO_TRACE".to_string(), "1".to_string()),
+            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            ("HOME".into(), std::env::var("HOME").unwrap_or_default()),
+            ("TERM".into(), "xterm-256color".into()),
+            ("COLUMNS".into(), "120".into()),
+            ("LINES".into(), "40".into()),
+            ("PIKU_NO_TRACE".into(), "1".into()),
         ];
         if let Some(host) = &self.ollama_host {
-            pairs.push(("OLLAMA_HOST".to_string(), host.clone()));
+            pairs.push(("OLLAMA_HOST".into(), host.clone()));
         }
         if let (Some(key_var), Some(key)) = (self.api_key_env, self.api_key.as_ref()) {
             pairs.push((key_var.to_string(), key.clone()));
@@ -158,8 +195,8 @@ impl ProviderSpec {
     }
 }
 
-/// Provider for the user-agent LLM (cheap/fast — reads and critiques output).
-fn user_agent_provider() -> Option<ProviderSpec> {
+/// User-agent LLM: cheap model for scripted critique, better for freeform.
+fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
     let ollama = ProviderSpec::ollama(
         std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "llama3.2:latest".to_string()),
     );
@@ -167,21 +204,29 @@ fn user_agent_provider() -> Option<ProviderSpec> {
         return Some(ollama);
     }
     if has_key("OPENROUTER_API_KEY") {
+        let model = if freeform {
+            "anthropic/claude-sonnet-4-6"
+        } else {
+            "anthropic/claude-haiku-4-5"
+        };
         return Some(ProviderSpec::openrouter(
-            std::env::var("PIKU_AGENTIC_USER_MODEL")
-                .unwrap_or_else(|_| "anthropic/claude-haiku-4-5".to_string()),
+            std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| model.to_string()),
         ));
     }
     if has_key("ANTHROPIC_API_KEY") {
+        let model = if freeform {
+            "claude-sonnet-4-6"
+        } else {
+            "claude-haiku-4-5"
+        };
         return Some(ProviderSpec::anthropic(
-            std::env::var("PIKU_AGENTIC_USER_MODEL")
-                .unwrap_or_else(|_| "claude-haiku-4-5".to_string()),
+            std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| model.to_string()),
         ));
     }
     None
 }
 
-/// Provider for piku itself (quality matters here).
+/// Provider for piku itself.
 fn piku_provider() -> Option<ProviderSpec> {
     let ollama = ProviderSpec::ollama(
         std::env::var("PIKU_AGENTIC_PIKU_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
@@ -192,54 +237,841 @@ fn piku_provider() -> Option<ProviderSpec> {
     if has_key("OPENROUTER_API_KEY") {
         return Some(ProviderSpec::openrouter(
             std::env::var("PIKU_AGENTIC_PIKU_MODEL")
-                .unwrap_or_else(|_| "anthropic/claude-sonnet-4-5".to_string()),
+                .unwrap_or_else(|_| "anthropic/claude-sonnet-4-6".to_string()),
         ));
     }
     if has_key("ANTHROPIC_API_KEY") {
         return Some(ProviderSpec::anthropic(
             std::env::var("PIKU_AGENTIC_PIKU_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-5".to_string()),
+                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
         ));
     }
     None
 }
 
-fn tempdir(label: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let base = std::env::temp_dir().join(format!("piku_agentic_{label}_{nanos}"));
-    std::fs::create_dir_all(&base).unwrap();
-    base
+// ===========================================================================
+// Action space — keystroke-level interaction
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+enum SpecialKey {
+    Enter,
+    Tab,
+    Escape,
+    Backspace,
+    Delete,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    CtrlC,
+    CtrlD,
+    CtrlL,
+    CtrlA,
+    CtrlE,
+    CtrlW,
+    CtrlU,
 }
 
-fn agentic_turn_limit(persona: &Persona) -> usize {
-    if std::env::var("PIKU_AGENTIC_FULL")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-    {
-        return persona.max_turns;
+impl SpecialKey {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            SpecialKey::Enter => b"\r",
+            SpecialKey::Tab => b"\t",
+            SpecialKey::Escape => b"\x1b",
+            SpecialKey::Backspace => b"\x7f",
+            SpecialKey::Delete => b"\x1b[3~",
+            SpecialKey::ArrowUp => b"\x1b[A",
+            SpecialKey::ArrowDown => b"\x1b[B",
+            SpecialKey::ArrowLeft => b"\x1b[D",
+            SpecialKey::ArrowRight => b"\x1b[C",
+            SpecialKey::Home => b"\x1b[H",
+            SpecialKey::End => b"\x1b[F",
+            SpecialKey::CtrlC => b"\x03",
+            SpecialKey::CtrlD => b"\x04",
+            SpecialKey::CtrlL => b"\x0c",
+            SpecialKey::CtrlA => b"\x01",
+            SpecialKey::CtrlE => b"\x05",
+            SpecialKey::CtrlW => b"\x17",
+            SpecialKey::CtrlU => b"\x15",
+        }
     }
 
-    std::env::var("PIKU_AGENTIC_MAX_TURNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2)
-        .min(persona.max_turns)
+    fn name(&self) -> &'static str {
+        match self {
+            SpecialKey::Enter => "Enter",
+            SpecialKey::Tab => "Tab",
+            SpecialKey::Escape => "Escape",
+            SpecialKey::Backspace => "Backspace",
+            SpecialKey::Delete => "Delete",
+            SpecialKey::ArrowUp => "ArrowUp",
+            SpecialKey::ArrowDown => "ArrowDown",
+            SpecialKey::ArrowLeft => "ArrowLeft",
+            SpecialKey::ArrowRight => "ArrowRight",
+            SpecialKey::Home => "Home",
+            SpecialKey::End => "End",
+            SpecialKey::CtrlC => "Ctrl-C",
+            SpecialKey::CtrlD => "Ctrl-D",
+            SpecialKey::CtrlL => "Ctrl-L",
+            SpecialKey::CtrlA => "Ctrl-A",
+            SpecialKey::CtrlE => "Ctrl-E",
+            SpecialKey::CtrlW => "Ctrl-W",
+            SpecialKey::CtrlU => "Ctrl-U",
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Persona definitions
-// ---------------------------------------------------------------------------
+impl std::fmt::Display for SpecialKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Action {
+    /// Single printable character
+    Type(char),
+    /// Special key (tab, enter, arrows, ctrl-*)
+    Key(SpecialKey),
+    /// Observe current screen without sending anything
+    Observe,
+    /// Wait N ms then observe
+    Wait(Duration),
+    /// Type a string char-by-char with inter-key delay
+    TypeString { text: String, delay_ms: u64 },
+    /// Type string + Enter (convenience, like old send_line)
+    Submit(String),
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Action::Type(c) => write!(f, "Type('{c}')"),
+            Action::Key(k) => write!(f, "Key({k})"),
+            Action::Observe => write!(f, "Observe"),
+            Action::Wait(d) => write!(f, "Wait({d:?})"),
+            Action::TypeString { text, .. } => {
+                let preview = if text.len() > 30 {
+                    format!("{}...", &text[..30])
+                } else {
+                    text.clone()
+                };
+                write!(f, "TypeString({preview:?})")
+            }
+            Action::Submit(s) => {
+                let preview = if s.len() > 40 {
+                    format!("{}...", &s[..40])
+                } else {
+                    s.clone()
+                };
+                write!(f, "Submit({preview:?})")
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Screen snapshot — structured VT100 observation
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Color {
+    Default,
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl From<vt100::Color> for Color {
+    fn from(c: vt100::Color) -> Self {
+        match c {
+            vt100::Color::Default => Color::Default,
+            vt100::Color::Idx(0) => Color::Black,
+            vt100::Color::Idx(1) => Color::Red,
+            vt100::Color::Idx(2) => Color::Green,
+            vt100::Color::Idx(3) => Color::Yellow,
+            vt100::Color::Idx(4) => Color::Blue,
+            vt100::Color::Idx(5) => Color::Magenta,
+            vt100::Color::Idx(6) => Color::Cyan,
+            vt100::Color::Idx(7) => Color::White,
+            vt100::Color::Idx(n) => Color::Idx(n),
+            vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StyledCell {
+    ch: String,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    inverse: bool,
+    fg: Color,
+    bg: Color,
+}
+
+#[derive(Debug, Clone)]
+struct StyledRow {
+    row_index: u16,
+    cells: Vec<StyledCell>,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenSnapshot {
+    /// Full rendered screen (what a human would see)
+    contents: String,
+    /// Individual rows, whitespace-trimmed
+    rows: Vec<String>,
+    /// Cursor position (row, col)
+    cursor: (u16, u16),
+    /// Whether cursor is visible
+    cursor_visible: bool,
+    /// Styled rows for interesting lines (input row, footer row)
+    styled_rows: Vec<StyledRow>,
+    /// Terminal dimensions (rows, cols)
+    size: (u16, u16),
+}
+
+impl ScreenSnapshot {
+    /// The input/prompt row (last row)
+    fn input_row(&self) -> &str {
+        self.rows.last().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// The footer row (second-to-last)
+    fn footer_row(&self) -> &str {
+        if self.rows.len() >= 2 {
+            &self.rows[self.rows.len() - 2]
+        } else {
+            ""
+        }
+    }
+
+    /// Check if piku is ready for input (cursor visible, on input row, prompt glyph present)
+    fn is_ready(&self) -> bool {
+        let input = self.input_row().trim_start();
+        let has_prompt = input.starts_with('>') || input.starts_with('!');
+        let cursor_on_input = self.cursor.0 == self.size.0.saturating_sub(1);
+        self.cursor_visible && cursor_on_input && has_prompt
+    }
+
+    /// Compact text summary for LLM context (no full screen dump)
+    fn summary(&self, max_content_lines: usize) -> String {
+        let content_lines: Vec<&str> = self
+            .rows
+            .iter()
+            .take(self.rows.len().saturating_sub(2)) // exclude footer + input
+            .map(|s| s.as_str())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+
+        let mut out = String::new();
+        for (i, line) in content_lines.iter().enumerate() {
+            if i >= max_content_lines {
+                out.push_str(&format!("  ... ({} more lines)\n", content_lines.len() - i));
+                break;
+            }
+            let truncated = if line.len() > 120 { &line[..120] } else { line };
+            out.push_str(truncated);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+// ===========================================================================
+// Terminal observer — persistent VT100 parser
+// ===========================================================================
+
+struct TerminalObserver {
+    parser: vt100::Parser,
+}
+
+impl TerminalObserver {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, 500),
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    fn snapshot(&self) -> ScreenSnapshot {
+        let screen = self.parser.screen();
+        let (term_rows, term_cols) = screen.size();
+
+        let mut rows = Vec::with_capacity(term_rows as usize);
+        for r in 0..term_rows {
+            let mut row = String::new();
+            for c in 0..term_cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    row.push_str(&cell.contents());
+                }
+            }
+            rows.push(row.trim_end().to_string());
+        }
+
+        // Extract styled rows for input (last) and footer (second-to-last)
+        let interesting_rows = [term_rows.saturating_sub(1), term_rows.saturating_sub(2)];
+        let styled_rows = interesting_rows
+            .iter()
+            .map(|&r| self.extract_styled_row(&screen, r, term_cols))
+            .collect();
+
+        ScreenSnapshot {
+            contents: screen.contents(),
+            rows,
+            cursor: screen.cursor_position(),
+            cursor_visible: !screen.hide_cursor(),
+            styled_rows,
+            size: (term_rows, term_cols),
+        }
+    }
+
+    fn extract_styled_row(&self, screen: &vt100::Screen, row: u16, cols: u16) -> StyledRow {
+        let mut cells = Vec::new();
+        let mut text = String::new();
+        for c in 0..cols {
+            if let Some(cell) = screen.cell(row, c) {
+                let ch = cell.contents().to_string();
+                text.push_str(&ch);
+                cells.push(StyledCell {
+                    ch,
+                    bold: cell.bold(),
+                    dim: cell.dim(),
+                    italic: cell.italic(),
+                    inverse: cell.inverse(),
+                    fg: cell.fgcolor().into(),
+                    bg: cell.bgcolor().into(),
+                });
+            }
+        }
+        StyledRow {
+            row_index: row,
+            cells,
+            text: text.trim_end().to_string(),
+        }
+    }
+}
+
+// ===========================================================================
+// PTY handle — raw byte-level I/O, bypassing rexpect's reader
+// ===========================================================================
+
+struct PtyHandle {
+    _process: rexpect::process::PtyProcess,
+    writer: std::fs::File,
+    reader: std::fs::File,
+}
+
+impl PtyHandle {
+    fn spawn(workspace: &Path, spec: &ProviderSpec) -> Self {
+        let piku_bin = piku_binary();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c");
+
+        let inner_cmd = format!(
+            "cd {} && {} --provider {} --model {}",
+            shell_escape(&workspace.to_string_lossy()),
+            piku_bin.display(),
+            spec.label,
+            spec.model
+        );
+        cmd.arg(&inner_cmd);
+
+        // Clean env, set only what we need
+        cmd.env_clear();
+        for (k, v) in spec.env_pairs() {
+            cmd.env(&k, &v);
+        }
+
+        let mut process = rexpect::process::PtyProcess::new(cmd).expect("failed to spawn piku");
+        process.set_kill_timeout(Some(5_000));
+
+        let writer = process.get_file_handle().expect("writer handle");
+        let reader = process.get_file_handle().expect("reader handle");
+
+        // Set reader to non-blocking
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        let flags = fcntl(&reader, FcntlArg::F_GETFL).expect("F_GETFL");
+        fcntl(
+            &reader,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+        )
+        .expect("F_SETFL O_NONBLOCK");
+
+        Self {
+            _process: process,
+            writer,
+            reader,
+        }
+    }
+
+    /// Send raw bytes to the PTY
+    fn send_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
+    /// Send a string (each byte)
+    fn send_str(&mut self, s: &str) {
+        self.send_bytes(s.as_bytes());
+    }
+
+    /// Send a string followed by newline
+    fn send_line(&mut self, s: &str) {
+        self.send_str(s);
+        self.send_bytes(b"\r");
+    }
+
+    /// Execute an action, feeding output to the terminal observer.
+    /// Returns after a short settle time.
+    fn execute_action(&mut self, action: &Action, observer: &mut TerminalObserver) {
+        match action {
+            Action::Type(c) => {
+                let mut buf = [0u8; 4];
+                let bytes = c.encode_utf8(&mut buf);
+                self.send_bytes(bytes.as_bytes());
+                self.settle(observer, Duration::from_millis(30));
+            }
+            Action::Key(key) => {
+                self.send_bytes(key.as_bytes());
+                // Tab/Enter need more settle time for completion/response
+                let settle = match key {
+                    SpecialKey::Tab => Duration::from_millis(100),
+                    SpecialKey::Enter => Duration::from_millis(50),
+                    _ => Duration::from_millis(30),
+                };
+                self.settle(observer, settle);
+            }
+            Action::Observe => {
+                self.drain(observer);
+            }
+            Action::Wait(d) => {
+                std::thread::sleep(*d);
+                self.drain(observer);
+            }
+            Action::TypeString { text, delay_ms } => {
+                for c in text.chars() {
+                    let mut buf = [0u8; 4];
+                    let bytes = c.encode_utf8(&mut buf);
+                    self.send_bytes(bytes.as_bytes());
+                    std::thread::sleep(Duration::from_millis(*delay_ms));
+                    self.drain(observer);
+                }
+            }
+            Action::Submit(s) => {
+                self.send_line(s);
+                self.settle(observer, Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Drain all available bytes from the PTY into the observer (non-blocking).
+    fn drain(&mut self, observer: &mut TerminalObserver) -> usize {
+        let mut buf = [0u8; 4096];
+        let mut total = 0;
+        loop {
+            match self.reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    observer.process(&buf[..n]);
+                    total += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        total
+    }
+
+    /// Drain then sleep, repeat until no new bytes arrive.
+    fn settle(&mut self, observer: &mut TerminalObserver, max_wait: Duration) {
+        let start = Instant::now();
+        loop {
+            let n = self.drain(observer);
+            if n == 0 || start.elapsed() >= max_wait {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until the screen shows piku is ready (prompt visible, cursor on input row).
+    /// Returns the final snapshot.
+    fn wait_for_ready(
+        &mut self,
+        observer: &mut TerminalObserver,
+        timeout: Duration,
+    ) -> ScreenSnapshot {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(observer);
+            let snap = observer.snapshot();
+            if snap.is_ready() {
+                return snap;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "[pty] ready-wait timed out after {timeout:?} \
+                     (cursor_visible={}, cursor={:?}, input_row={:?})",
+                    snap.cursor_visible,
+                    snap.cursor,
+                    snap.input_row()
+                );
+                return snap;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+// ===========================================================================
+// Workspace observer — filesystem side-effect detection
+// ===========================================================================
+
+struct WorkspaceObserver {
+    root: PathBuf,
+    baseline: HashMap<PathBuf, (SystemTime, u64)>,
+}
+
+impl WorkspaceObserver {
+    fn new(root: PathBuf) -> Self {
+        let mut ws = Self {
+            root,
+            baseline: HashMap::new(),
+        };
+        ws.checkpoint();
+        ws
+    }
+
+    fn checkpoint(&mut self) {
+        self.baseline = self.scan_files();
+    }
+
+    fn diff_since_checkpoint(&self) -> WorkspaceDiff {
+        let current = self.scan_files();
+        WorkspaceDiff {
+            created: current
+                .keys()
+                .filter(|k| !self.baseline.contains_key(*k))
+                .cloned()
+                .collect(),
+            modified: current
+                .iter()
+                .filter(|(k, (mtime, size))| {
+                    self.baseline
+                        .get(*k)
+                        .map_or(false, |(bt, bs)| mtime != bt || size != bs)
+                })
+                .map(|(k, _)| k.clone())
+                .collect(),
+            deleted: self
+                .baseline
+                .keys()
+                .filter(|k| !current.contains_key(*k))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn read_file(&self, relative: &Path) -> Option<String> {
+        std::fs::read_to_string(self.root.join(relative)).ok()
+    }
+
+    fn scan_files(&self) -> HashMap<PathBuf, (SystemTime, u64)> {
+        let mut map = HashMap::new();
+        self.scan_dir(&self.root, &mut map);
+        map
+    }
+
+    fn scan_dir(&self, dir: &Path, map: &mut HashMap<PathBuf, (SystemTime, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Skip hidden dirs (like .git)
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with('.'))
+            {
+                continue;
+            }
+            if path.is_dir() {
+                self.scan_dir(&path, map);
+            } else if let Ok(meta) = path.metadata() {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
+                map.insert(relative, (mtime, meta.len()));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceDiff {
+    created: Vec<PathBuf>,
+    modified: Vec<PathBuf>,
+    deleted: Vec<PathBuf>,
+}
+
+impl WorkspaceDiff {
+    fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        if self.is_empty() {
+            return "no changes".to_string();
+        }
+        let mut parts = Vec::new();
+        if !self.created.is_empty() {
+            let files: Vec<String> = self
+                .created
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            parts.push(format!("created: {}", files.join(", ")));
+        }
+        if !self.modified.is_empty() {
+            let files: Vec<String> = self
+                .modified
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            parts.push(format!("modified: {}", files.join(", ")));
+        }
+        if !self.deleted.is_empty() {
+            let files: Vec<String> = self
+                .deleted
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            parts.push(format!("deleted: {}", files.join(", ")));
+        }
+        parts.join("; ")
+    }
+}
+
+// ===========================================================================
+// Conversation memory — rolling context across turns
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct TurnSummary {
+    turn: usize,
+    action_desc: String,
+    observations: Vec<String>,
+    bugs: Vec<String>,
+    prompt_visible: bool,
+    cursor_visible: bool,
+    workspace_changes: String,
+}
+
+struct ConversationMemory {
+    entries: Vec<TurnSummary>,
+}
+
+impl ConversationMemory {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, summary: TurnSummary) {
+        self.entries.push(summary);
+    }
+
+    /// Format prior turns for LLM context
+    fn format_for_llm(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("PRIOR TURNS:\n");
+        for e in &self.entries {
+            out.push_str(&format!(
+                "  Turn {}: {} | prompt={} cursor={} | {} obs, {} bugs",
+                e.turn,
+                e.action_desc,
+                if e.prompt_visible { "ok" } else { "MISSING" },
+                if e.cursor_visible { "ok" } else { "HIDDEN" },
+                e.observations.len(),
+                e.bugs.len(),
+            ));
+            if !e.workspace_changes.is_empty() && e.workspace_changes != "no changes" {
+                out.push_str(&format!(" | fs: {}", e.workspace_changes));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+// ===========================================================================
+// Deterministic checks — code-verifiable screen properties
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct Finding {
+    severity: Severity,
+    description: String,
+    expected: String,
+    actual: String,
+}
+
+fn deterministic_checks(
+    before: &ScreenSnapshot,
+    after: &ScreenSnapshot,
+    action: &Action,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    // 1. Cursor visibility
+    if !after.cursor_visible {
+        findings.push(Finding {
+            severity: Severity::Major,
+            description: "cursor hidden after action".to_string(),
+            expected: "cursor should be visible after every action".to_string(),
+            actual: format!(
+                "cursor at ({}, {}), hidden=true",
+                after.cursor.0, after.cursor.1
+            ),
+        });
+    }
+
+    // 2. Prompt glyph presence (only check after submit + response)
+    if matches!(action, Action::Submit(_)) && after.is_ready() {
+        let input = after.input_row().trim_start();
+        if !input.starts_with('>') && !input.starts_with('!') {
+            findings.push(Finding {
+                severity: Severity::Major,
+                description: "prompt glyph missing from input row".to_string(),
+                expected: "input row should start with > or !".to_string(),
+                actual: format!("input row: {:?}", &input[..input.len().min(40)]),
+            });
+        }
+    }
+
+    // 3. Footer presence (check reverse-video on footer row)
+    if after.styled_rows.len() >= 2 {
+        let footer = &after.styled_rows[1]; // index 1 = second-to-last row
+        let has_inverse = footer
+            .cells
+            .iter()
+            .any(|c| c.inverse && !c.ch.trim().is_empty());
+        if !footer.text.trim().is_empty() && !has_inverse {
+            findings.push(Finding {
+                severity: Severity::Minor,
+                description: "footer row not rendered in reverse video".to_string(),
+                expected: "footer should use reverse video for status bar".to_string(),
+                actual: format!(
+                    "footer text: {:?}",
+                    &footer.text[..footer.text.len().min(60)]
+                ),
+            });
+        }
+    }
+
+    // 4. Echo styling after submit (user message should appear dim in scroll zone)
+    if let Action::Submit(text) = action {
+        if !text.is_empty() && after.is_ready() {
+            // Look for the submitted text in the scroll zone rows
+            let scroll_rows = &after.rows[..after.rows.len().saturating_sub(2)];
+            let echo_found = scroll_rows.iter().any(|r| r.contains(text.as_str()));
+            if echo_found {
+                findings.push(Finding {
+                    severity: Severity::Info,
+                    description: "user message echoed in scroll zone".to_string(),
+                    expected: String::new(),
+                    actual: format!("found echo of: {:?}", &text[..text.len().min(40)]),
+                });
+            }
+        }
+    }
+
+    // 5. Screen corruption: control chars in rendered content
+    for (i, row) in after.rows.iter().enumerate() {
+        if row
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            findings.push(Finding {
+                severity: Severity::Major,
+                description: format!("control characters in rendered row {i}"),
+                expected: "rendered rows should contain only printable text".to_string(),
+                actual: format!("row {i}: {:?}", &row[..row.len().min(60)]),
+            });
+        }
+    }
+
+    // 6. Tab completion response (after Tab, did the input row change?)
+    if matches!(action, Action::Key(SpecialKey::Tab)) {
+        let before_input = before.input_row();
+        let after_input = after.input_row();
+        if before_input != after_input {
+            findings.push(Finding {
+                severity: Severity::Info,
+                description: "tab completion changed input".to_string(),
+                expected: String::new(),
+                actual: format!(
+                    "{:?} -> {:?}",
+                    &before_input[..before_input.len().min(40)],
+                    &after_input[..after_input.len().min(40)]
+                ),
+            });
+        } else {
+            findings.push(Finding {
+                severity: Severity::Info,
+                description: "tab had no effect on input".to_string(),
+                expected: String::new(),
+                actual: format!(
+                    "input unchanged: {:?}",
+                    &after_input[..after_input.len().min(40)]
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
+// ===========================================================================
+// Phase-based persona definitions
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct Phase {
+    name: &'static str,
+    /// Scripted actions to execute (deterministic, reproducible)
+    scripted: Vec<Action>,
+    /// What the LLM should focus on when critiquing this phase
+    focus: &'static str,
+    /// After scripted actions, let the LLM choose N freeform submissions
+    freeform_turns: usize,
+}
 
 #[derive(Debug, Clone)]
 struct Persona {
     name: &'static str,
     description: &'static str,
-    first_task: &'static str,
-    behaviour: &'static str,
-    max_turns: usize,
+    phases: Vec<Phase>,
 }
 
 fn personas() -> HashMap<&'static str, Persona> {
@@ -247,83 +1079,107 @@ fn personas() -> HashMap<&'static str, Persona> {
         .map(|v| v == "repo")
         .unwrap_or(false)
     {
-        let mut m = HashMap::new();
-
-        m.insert("confident_dev", Persona {
-            name: "confident_dev",
-            description: "Senior Rust developer working on the piku repo copy.",
-            first_task: "Read crates/piku/src/tui_repl.rs and tell me how the sticky-bottom REPL works.",
-            behaviour: "You are direct and practical. Look for UX regressions like cursor disappearance, missing user echoes, and bad prompt restoration. After the first turn, ask for one concrete improvement to the TUI. After the second turn, ask it to point out one specific code path in the REPL.",
-            max_turns: 3,
-        });
-
-        m.insert("cautious_beginner", Persona {
-            name: "cautious_beginner",
-            description: "Junior dev learning the piku repo copy.",
-            first_task: "What is this repo? Show me how to run the main binary and what it does.",
-            behaviour: "You read output carefully and note whether piku explains the repository clearly. If the user message is missing from the screen, treat that as a usability bug. Ask for a plain-English explanation first, then a concrete run command.",
-            max_turns: 2,
-        });
-
-        m.insert("adversarial", Persona {
-            name: "adversarial",
-            description: "Developer stress-testing the piku repo copy.",
-            first_task: "Run the workspace tests and tell me which area is most fragile.",
-            behaviour: "You are trying to find broken UX and brittle behavior. Push the agent to inspect the TUI, the dogfood harness, and the tests. Call out missing echoes, cursor issues, and any confusing repo assumptions.",
-            max_turns: 3,
-        });
-
-        m.insert("input_explorer", Persona {
-            name: "input_explorer",
-            description: "Developer testing the input/readline layer on the piku repo copy.",
-            first_task: "/help",
-            behaviour: "Exercise the input layer: slash commands, tab completion, hint text, prompt state changes. Turn 1: /help. Turn 2: /status. Turn 3: ask a real question about the repo. Note whether echoed input looks different from the active prompt, whether hints appear, whether tab-complete works.",
-            max_turns: 3,
-        });
-
-        return m;
+        return repo_personas();
     }
+    fixture_personas()
+}
 
+fn fixture_personas() -> HashMap<&'static str, Persona> {
     let mut m = HashMap::new();
 
-    m.insert("confident_dev", Persona {
-        name: "confident_dev",
-        description: "Senior Rust developer, high expectations, works quickly.",
-        first_task: "Read src/stats.rs and tell me what the mean() function does.",
-        behaviour: "You are direct and fast. After seeing the response:\
-            \n- If your message was echoed (dimmed, with > prefix) before the response, note that as working correctly.\
-            \n- If your message was NOT visible in the output, report MAJOR bug: user message echo missing.\
-            \n- If cursor is visible and prompt reappears, note that as working correctly.\
-            \n- Push harder each turn: first explain, then find bugs, then fix them.\
-            \nAfter turn 3, ask piku to fix the mean() panic bug.",
-        max_turns: 5,
-    });
+    m.insert(
+        "confident_dev",
+        Persona {
+            name: "confident_dev",
+            description: "Senior Rust developer, high expectations, works quickly.",
+            phases: vec![
+                Phase {
+                    name: "explore",
+                    scripted: vec![Action::Submit(
+                        "Read src/stats.rs and tell me what the mean() function does.".into(),
+                    )],
+                    focus: "Did piku read the file? Is the explanation accurate? \
+                            Was the empty-slice panic bug mentioned?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "challenge",
+                    scripted: vec![Action::Submit(
+                        "Find bugs in this codebase and explain them.".into(),
+                    )],
+                    focus: "Did piku identify the mean() panic, split_csv comma bug, \
+                            and unimplemented process_batch?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "fix",
+                    scripted: vec![Action::Submit(
+                        "Fix the mean() function to handle empty slices by returning 0.0".into(),
+                    )],
+                    focus: "Did piku modify stats.rs? Check workspace diff for the change. \
+                            Was the fix correct?",
+                    freeform_turns: 1,
+                },
+            ],
+        },
+    );
 
-    m.insert("cautious_beginner", Persona {
-        name: "cautious_beginner",
-        description: "Junior dev, new to AI tools, reads every line carefully.",
-        first_task: "What files are in this project?",
-        behaviour: "You read output very carefully. Look for:\
-            \n- Did your message appear echoed back before the AI response? If not: MAJOR bug.\
-            \n- Is the prompt (>) visible after the response? If cursor is gone: CRITICAL bug.\
-            \n- Is the output readable or garbled with escape sequences? If garbled: MAJOR bug.\
-            \nAsk simple follow-up questions. After 3 turns try: 'write a test for the sum function'.",
-        max_turns: 4,
-    });
+    m.insert(
+        "cautious_beginner",
+        Persona {
+            name: "cautious_beginner",
+            description: "Junior dev, new to AI tools, reads every line carefully.",
+            phases: vec![
+                Phase {
+                    name: "orient",
+                    scripted: vec![Action::Submit("What files are in this project?".into())],
+                    focus: "Is the output readable? Does it list the project structure clearly?",
+                    freeform_turns: 1,
+                },
+                Phase {
+                    name: "understand",
+                    scripted: vec![Action::Submit(
+                        "Explain what process_batch in lib.rs should do".into(),
+                    )],
+                    focus:
+                        "Is the explanation clear for a junior dev? Does it reference the README?",
+                    freeform_turns: 1,
+                },
+            ],
+        },
+    );
 
     m.insert(
         "adversarial",
         Persona {
             name: "adversarial",
-            description: "Developer trying to find edge cases.",
-            first_task: "ls",
-            behaviour: "Stress-test piku each turn with a different edge case:\
-            \nTurn 1: bare shell command (ls)\
-            \nTurn 2: ask for a file that doesn't exist\
-            \nTurn 3: send a very long message (repeat 'test ' 50 times)\
-            \nTurn 4: send just a single character\
-            \nNote any crashes, hangs, garbled output, or missing echoes.",
-            max_turns: 4,
+            description: "Developer trying to find edge cases and break things.",
+            phases: vec![
+                Phase {
+                    name: "bare_command",
+                    scripted: vec![Action::Submit("ls".into())],
+                    focus: "How does piku handle a bare shell command? Does it use bash tool?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "missing_file",
+                    scripted: vec![Action::Submit("Read the file src/nonexistent.rs".into())],
+                    focus: "Does piku handle the missing file gracefully?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "long_input",
+                    scripted: vec![Action::Submit("test ".repeat(50).trim().to_string())],
+                    focus: "Does the long message render without crashing or garbling?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "single_char",
+                    scripted: vec![Action::Submit("x".into())],
+                    focus: "Does piku handle a single character input?",
+                    freeform_turns: 0,
+                },
+            ],
         },
     );
 
@@ -331,34 +1187,192 @@ fn personas() -> HashMap<&'static str, Persona> {
         "input_explorer",
         Persona {
             name: "input_explorer",
-            description: "Developer specifically testing the input/readline experience.",
-            first_task: "/help",
-            behaviour: "You are testing the input layer of piku. Each turn exercises a different aspect:\
-            \nTurn 1: /help — verify slash commands are listed and formatted. Note whether the prompt has hint text visible (dim placeholder like 'Send a message' when empty).\
-            \nTurn 2: /st then TAB — try to trigger tab completion for /status. If the screen shows the status output, tab-complete worked. If it shows 'unknown command /st', tab-complete did not work. Note which happened.\
-            \nTurn 3: /model — check that the current model is displayed. Note whether the prompt glyph (> or !) looks correct.\
-            \nTurn 4: Send a real message like 'what files are here?' — check that your message is echoed differently from the prompt (should be dimmed with a different glyph like ▸, not the same bright > as the input prompt).\
-            \nLook for: hint text when empty, tab completion for /commands, prompt state changes, echoed input looking distinct from active prompt.",
-            max_turns: 4,
+            description: "Developer testing the input/readline layer.",
+            phases: vec![
+                Phase {
+                    name: "slash_help",
+                    scripted: vec![
+                        // Type '/' char-by-char and observe completion menu
+                        Action::Type('/'),
+                        Action::Wait(Duration::from_millis(200)),
+                        Action::Observe,
+                        // Type 'h', 'e', 'l' to narrow completions
+                        Action::TypeString {
+                            text: "hel".into(),
+                            delay_ms: 80,
+                        },
+                        Action::Wait(Duration::from_millis(150)),
+                        Action::Observe,
+                        // Tab to complete
+                        Action::Key(SpecialKey::Tab),
+                        Action::Wait(Duration::from_millis(150)),
+                        Action::Observe,
+                        // Enter to execute
+                        Action::Key(SpecialKey::Enter),
+                    ],
+                    focus: "Did typing '/' show anything (completion hint, menu)? \
+                            Did typing 'hel' narrow it? Did Tab fill in '/help'? \
+                            Did Enter show the help output?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "tab_completion",
+                    scripted: vec![
+                        Action::Type('/'),
+                        Action::Type('s'),
+                        Action::Type('t'),
+                        Action::Wait(Duration::from_millis(100)),
+                        Action::Key(SpecialKey::Tab),
+                        Action::Wait(Duration::from_millis(200)),
+                        Action::Observe,
+                        // Clear with Ctrl-U if we want to try something else
+                        Action::Key(SpecialKey::CtrlU),
+                    ],
+                    focus: "Did '/st' + Tab complete to '/status'? Check the input row \
+                            contents after Tab.",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "model_command",
+                    scripted: vec![Action::Submit("/model".into())],
+                    focus: "Does /model show the current model? Is the prompt glyph correct?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "echo_styling",
+                    scripted: vec![Action::Submit("what files are here?".into())],
+                    focus: "Is the echoed user message visually distinct from the prompt? \
+                            Check that the echo row has dim styling. Is the response helpful?",
+                    freeform_turns: 1,
+                },
+            ],
         },
     );
 
     m
 }
 
-// ---------------------------------------------------------------------------
-// Structured critique types
-// ---------------------------------------------------------------------------
+fn repo_personas() -> HashMap<&'static str, Persona> {
+    let mut m = HashMap::new();
 
-#[derive(Debug, Clone)]
-struct CritiqueEntry {
-    turn: usize,
-    prompt_sent: String,
-    screen_text: String, // ANSI-stripped screen capture
-    observations: Vec<String>,
-    bugs: Vec<Bug>,
-    next_action: NextAction,
+    m.insert(
+        "confident_dev",
+        Persona {
+            name: "confident_dev",
+            description: "Senior Rust developer working on the piku repo copy.",
+            phases: vec![
+                Phase {
+                    name: "architecture",
+                    scripted: vec![Action::Submit(
+                        "Read crates/piku/src/tui_repl.rs and tell me how the sticky-bottom REPL works."
+                            .into(),
+                    )],
+                    focus: "Does piku explain DECSTBM scroll regions, the fixed input row, \
+                            and the footer? Is the explanation architecturally accurate?",
+                    freeform_turns: 1,
+                },
+                Phase {
+                    name: "improvement",
+                    scripted: vec![Action::Submit(
+                        "Suggest one concrete improvement to the TUI code.".into(),
+                    )],
+                    focus: "Is the suggestion actionable and well-reasoned?",
+                    freeform_turns: 0,
+                },
+            ],
+        },
+    );
+
+    m.insert(
+        "cautious_beginner",
+        Persona {
+            name: "cautious_beginner",
+            description: "Junior dev learning the piku repo copy.",
+            phases: vec![Phase {
+                name: "orient",
+                scripted: vec![Action::Submit(
+                    "What is this repo? Show me how to run the main binary.".into(),
+                )],
+                focus: "Is the explanation clear? Does it mention cargo build/run?",
+                freeform_turns: 1,
+            }],
+        },
+    );
+
+    m.insert(
+        "adversarial",
+        Persona {
+            name: "adversarial",
+            description: "Developer stress-testing the piku repo copy.",
+            phases: vec![Phase {
+                name: "stress",
+                scripted: vec![Action::Submit(
+                    "Run the workspace tests and tell me which area is most fragile.".into(),
+                )],
+                focus: "Does piku run cargo test? Does it identify flaky or slow tests?",
+                freeform_turns: 1,
+            }],
+        },
+    );
+
+    m.insert(
+        "input_explorer",
+        Persona {
+            name: "input_explorer",
+            description: "Developer testing the input/readline layer on the piku repo copy.",
+            phases: vec![
+                Phase {
+                    name: "slash_help",
+                    scripted: vec![
+                        Action::Type('/'),
+                        Action::Wait(Duration::from_millis(200)),
+                        Action::Observe,
+                        Action::TypeString {
+                            text: "help".into(),
+                            delay_ms: 50,
+                        },
+                        Action::Key(SpecialKey::Enter),
+                    ],
+                    focus: "Did /help execute and show command list?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "status",
+                    scripted: vec![Action::Submit("/status".into())],
+                    focus: "Does /status show model and provider?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "freeform_question",
+                    scripted: vec![Action::Submit(
+                        "How does the input helper handle tab completion?".into(),
+                    )],
+                    focus: "Does piku read the input_helper code?",
+                    freeform_turns: 0,
+                },
+            ],
+        },
+    );
+
+    m
 }
+
+fn phase_turn_limit() -> usize {
+    if std::env::var("PIKU_AGENTIC_FULL")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+    {
+        return usize::MAX;
+    }
+    std::env::var("PIKU_AGENTIC_MAX_TURNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
+// ===========================================================================
+// Bug / Severity types
+// ===========================================================================
 
 #[derive(Debug, Clone)]
 struct Bug {
@@ -388,14 +1402,26 @@ impl std::fmt::Display for Severity {
 }
 
 #[derive(Debug, Clone)]
+struct CritiqueEntry {
+    phase: String,
+    action_desc: String,
+    screen_text: String,
+    observations: Vec<String>,
+    bugs: Vec<Bug>,
+    deterministic_findings: Vec<Finding>,
+    workspace_diff: String,
+    next_action: NextAction,
+}
+
+#[derive(Debug, Clone)]
 enum NextAction {
     Send(String),
     Quit,
 }
 
-// ---------------------------------------------------------------------------
-// LLM client — blocking curl subprocess, JSON mode enforced
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// LLM client
+// ===========================================================================
 
 struct LlmClient {
     spec: ProviderSpec,
@@ -406,14 +1432,12 @@ impl LlmClient {
         Self { spec }
     }
 
-    /// Call LLM and return raw response text.
     fn call_raw(&self, system: &str, messages: &[(&str, &str)]) -> String {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
             .collect();
 
-        // Build body — Anthropic and OpenAI-compat have slightly different shapes
         let body = match self.spec.backend {
             Backend::Anthropic => serde_json::json!({
                 "model": self.spec.model,
@@ -422,21 +1446,21 @@ impl LlmClient {
                 "messages": msgs,
             }),
             Backend::OpenRouter => {
-                let mut all_msgs = vec![serde_json::json!({"role": "system", "content": system})];
-                all_msgs.extend(msgs.iter().cloned());
+                let mut all = vec![serde_json::json!({"role": "system", "content": system})];
+                all.extend(msgs.iter().cloned());
                 serde_json::json!({
                     "model": self.spec.model,
                     "max_tokens": 1024,
-                    "messages": all_msgs,
+                    "messages": all,
                     "response_format": {"type": "json_object"},
                 })
             }
             Backend::Ollama => {
-                let mut all_msgs = vec![serde_json::json!({"role": "system", "content": system})];
-                all_msgs.extend(msgs.iter().cloned());
+                let mut all = vec![serde_json::json!({"role": "system", "content": system})];
+                all.extend(msgs.iter().cloned());
                 serde_json::json!({
                     "model": self.spec.model,
-                    "messages": all_msgs,
+                    "messages": all,
                     "stream": false,
                     "format": "json",
                 })
@@ -472,7 +1496,7 @@ impl LlmClient {
         };
 
         let body_str = serde_json::to_string(&body).unwrap();
-        let mut cmd_args: Vec<String> = vec![
+        let mut args: Vec<String> = vec![
             "-s".into(),
             "-X".into(),
             "POST".into(),
@@ -480,17 +1504,17 @@ impl LlmClient {
             "-H".into(),
             "Content-Type: application/json".into(),
         ];
-        if let Some(auth_header) = auth_header {
-            cmd_args.push("-H".into());
-            cmd_args.push(auth_header);
+        if let Some(h) = auth_header {
+            args.push("-H".into());
+            args.push(h);
         }
         if matches!(self.spec.backend, Backend::Anthropic) {
-            cmd_args.extend(["-H".into(), "anthropic-version: 2023-06-01".into()]);
+            args.extend(["-H".into(), "anthropic-version: 2023-06-01".into()]);
         }
-        cmd_args.extend(["-d".into(), body_str]);
+        args.extend(["-d".into(), body_str]);
 
         let output = Command::new("curl")
-            .args(&cmd_args)
+            .args(&args)
             .output()
             .expect("curl must be available");
 
@@ -504,11 +1528,8 @@ impl LlmClient {
             .to_string()
     }
 
-    /// Call LLM and parse JSON response, with one retry if parsing fails.
     fn call_json(&self, system: &str, user: &str) -> serde_json::Value {
-        // Use owned Strings so we can accumulate the retry conversation.
         let mut messages: Vec<(String, String)> = vec![("user".into(), user.into())];
-
         for attempt in 0..2 {
             let refs: Vec<(&str, &str)> = messages
                 .iter()
@@ -516,24 +1537,23 @@ impl LlmClient {
                 .collect();
             let raw = self.call_raw(system, &refs);
             let json_str = extract_json(&raw);
-
             match serde_json::from_str::<serde_json::Value>(&json_str) {
                 Ok(v) if v.is_object() => return v,
                 _ => {
                     if attempt == 0 {
                         eprintln!("[user_agent] JSON parse failed, retrying");
                         eprintln!("[user_agent] raw: {}", &raw[..raw.len().min(300)]);
-                        let correction = "Your previous response was not valid JSON. \
-                            Respond with ONLY a JSON object. \
-                            Start with { and end with }. No markdown, no prose."
-                            .to_string();
                         messages.push(("assistant".into(), raw));
-                        messages.push(("user".into(), correction));
+                        messages.push((
+                            "user".into(),
+                            "Your previous response was not valid JSON. \
+                             Respond with ONLY a JSON object. Start with {{ and end with }}."
+                                .into(),
+                        ));
                     }
                 }
             }
         }
-
         eprintln!("[user_agent] JSON parse failed after 2 attempts");
         serde_json::json!({
             "observations": ["[user-agent parse error]"],
@@ -544,25 +1564,20 @@ impl LlmClient {
     }
 }
 
-/// Extract a JSON object from a string that may contain prose or markdown.
 fn extract_json(s: &str) -> String {
     let s = s.trim();
-    // Direct: already valid JSON
     if s.starts_with('{') {
         return s.to_string();
     }
-    // Markdown fence: ```json ... ``` or ``` ... ```
     for fence in &["```json", "```"] {
         if let Some(start) = s.find(fence) {
             let after = &s[start + fence.len()..];
-            // skip optional newline
             let after = after.trim_start_matches('\n');
             if let Some(end) = after.find("```") {
                 return after[..end].trim().to_string();
             }
         }
     }
-    // Last resort: find first { .. last }
     if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
         if start < end {
             return s[start..=end].to_string();
@@ -571,262 +1586,73 @@ fn extract_json(s: &str) -> String {
     s.to_string()
 }
 
-// ---------------------------------------------------------------------------
-// PTY session via rexpect
-// ---------------------------------------------------------------------------
-
-/// Spawn piku in a real PTY using rexpect, which properly handles terminal
-/// echo, control codes, and idle detection.
-fn spawn_piku_pty(
-    workspace: &std::path::Path,
-    spec: &ProviderSpec,
-    config_dir: &std::path::Path,
-) -> PtySession {
-    let piku_bin = piku_binary();
-
-    // Build the command string for rexpect::spawn
-    let cmd = format!(
-        "{} --provider {} --model {}",
-        piku_bin.display(),
-        spec.label,
-        spec.model
-    );
-
-    let env_prefix: String = spec
-        .env_pairs()
-        .into_iter()
-        .map(|(k, v)| format!("{}={}", k, shell_escape(&v)))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let full_cmd = format!(
-        "cd {} && {} {}",
-        shell_escape(&workspace.to_string_lossy()),
-        env_prefix,
-        cmd,
-    );
-
-    rexpect::spawn(
-        &format!("sh -c '{}'", full_cmd.replace('\'', "'\\''")),
-        Some(120_000),
-    )
-    .expect("failed to spawn piku via rexpect")
-}
-
-fn shell_escape(s: &str) -> String {
-    // Simple escaping: wrap in single quotes, escape embedded single quotes
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-// ---------------------------------------------------------------------------
-// ANSI stripping + screen normalisation
-// ---------------------------------------------------------------------------
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some(&'[') => {
-                    chars.next();
-                    // CSI sequence: consume until final byte (letter or ~)
-                    for ch in chars.by_ref() {
-                        if ch.is_ascii_alphabetic() || ch == '~' {
-                            break;
-                        }
-                    }
-                }
-                Some(&']') => {
-                    // OSC sequence: consume until ST (ESC \) or BEL
-                    chars.next();
-                    for ch in chars.by_ref() {
-                        if ch == '\x07' || ch == '\x1b' {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else if c == '\r' {
-            out.push('\n');
-        } else {
-            out.push(c);
-        }
-    }
-    // Collapse 3+ consecutive newlines to 2
-    let mut result = String::new();
-    let mut nl_count = 0;
-    for line in out.lines() {
-        if line.trim().is_empty() {
-            nl_count += 1;
-            if nl_count <= 2 {
-                result.push('\n');
-            }
-        } else {
-            nl_count = 0;
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-    result
-}
-
-/// Check raw ANSI output for cursor-visibility issues.
-/// Returns a list of bugs if cursor is left hidden at the end of the output,
-/// or if there are long stretches of output with cursor hidden.
-fn check_cursor_visibility(raw: &str) -> Vec<Bug> {
-    let mut bugs = Vec::new();
-    let mut cursor_visible = true;
-    let mut hide_byte_pos: Option<usize> = None;
-
-    // Scan for ESC[?25l (hide) and ESC[?25h (show)
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i + 5 < bytes.len() {
-        if bytes[i] == b'\x1b' && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
-            // Look for "25l" or "25h" following
-            let rest = &raw[i + 3..];
-            if rest.starts_with("25l") {
-                if cursor_visible {
-                    hide_byte_pos = Some(i);
-                }
-                cursor_visible = false;
-                i += 6;
-                continue;
-            } else if rest.starts_with("25h") {
-                cursor_visible = true;
-                hide_byte_pos = None;
-                i += 6;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    // If cursor is hidden at the end of the captured output, that's a bug
-    if !cursor_visible {
-        bugs.push(Bug {
-            severity: Severity::Major,
-            description: "cursor left hidden at end of turn output".to_string(),
-            expected: "cursor should be visible (ESC[?25h) after every turn".to_string(),
-            actual: format!(
-                "last cursor-hide at byte {} with no matching cursor-show",
-                hide_byte_pos.unwrap_or(0)
-            ),
-        });
-    }
-
-    bugs
-}
-
-fn safe_truncate(s: &str, max_chars: usize) -> &str {
-    if s.chars().count() <= max_chars {
-        return s;
-    }
-    // Walk to max_chars char boundary
-    let mut idx = 0;
-    for (i, _) in s.char_indices().take(max_chars) {
-        idx = i;
-    }
-    &s[..idx]
-}
-
-fn head_tail_preview(s: &str, chars: usize) -> (String, String) {
-    let head = safe_truncate(s, chars).to_string();
-    let total = s.chars().count();
-    if total <= chars {
-        return (head, String::new());
-    }
-
-    let tail_start = total.saturating_sub(chars);
-    let mut byte_idx = 0;
-    for (i, _) in s.char_indices().skip(tail_start) {
-        byte_idx = i;
-        break;
-    }
-    (head, s[byte_idx..].to_string())
-}
-
-// ---------------------------------------------------------------------------
-// User-agent decision
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// User-agent LLM interaction (updated prompt)
+// ===========================================================================
 
 const USER_AGENT_SYSTEM: &str = r#"You are a developer testing a terminal AI coding agent called piku.
-After each turn you will receive a screen capture and you MUST critique it.
+You will receive a rendered terminal screen (from a VT100 emulator) and critique it.
 
-CRITICAL: You MUST respond with ONLY a JSON object. No prose. No markdown. No explanation outside the JSON.
-Start your response with { and end with }.
+CRITICAL: Respond with ONLY a JSON object. No prose. No markdown.
 
-JSON schema (required):
+JSON schema:
 {
-  "observations": ["string", "string"],
+  "observations": ["string"],
   "bugs": [
     {
       "severity": "CRITICAL or MAJOR or minor or info",
       "description": "what is wrong",
       "expected": "what you expected",
-      "actual": "what you actually saw"
+      "actual": "what you saw"
     }
   ],
-  "next_action": {
-    "type": "send",
-    "message": "the exact message to send to piku"
-  },
+  "next_action": {"type": "send", "message": "text"} or {"type": "quit"},
   "reasoning": "one sentence"
 }
 
-Or to quit:
-  "next_action": { "type": "quit" }
-
 Severity:
-- CRITICAL: tool unusable (crashed, cursor permanently invisible, zero output)
-- MAJOR: significantly degrades experience (user message not echoed, output garbled)
-- minor: cosmetic issue
+- CRITICAL: tool unusable (crashed, zero output, no response)
+- MAJOR: significantly degraded (output garbled, wrong tool used, incorrect answer)
+- minor: cosmetic or formatting issue
 - info: neutral observation
 
-What to look for:
-1. USER MESSAGE ECHO: did YOUR sent message appear before the AI response? (look for dimmed text with ▸ prefix)
-   - YES, with ▸ prefix and dimmed = good (note it)
-   - YES, but same style as the input prompt = minor bug "echo not visually distinct from prompt"
-   - NO = MAJOR bug "user message not echoed in scroll zone"
-2. CURSOR RESTORE: does the prompt (> or !) reappear after the response?
-   - YES = good
-   - NO = CRITICAL or MAJOR bug "cursor disappeared"
-3. OUTPUT QUALITY: is the response readable? Correct? Helpful?
-4. TOOL USAGE: did piku use the right tools?
-5. INPUT LAYER (if testing input):
-   - HINT TEXT: when input is empty, is there dim placeholder text like "Send a message"?
-   - TAB COMPLETION: for /commands, does tab show completions?
-   - PROMPT STATE: does the prompt change (> normally, ! after error)?
-   - SLASH COMMANDS: do they produce expected output?
+NOTE: cursor visibility, prompt glyph, echo styling, and footer presence are
+checked automatically by deterministic code. You do NOT need to check these.
+Focus on:
+1. CONTENT QUALITY: is the response correct, helpful, well-structured?
+2. TOOL USAGE: did piku use the right tools? Read the right files?
+3. FORMATTING: is the output readable in the terminal?
+4. INTERACTION FLOW: does the conversation make sense?
+5. WORKSPACE CHANGES: do the filesystem changes match what piku claimed?"#;
 
-Be specific. Cite exact text from the screen capture in your bugs."#;
-
-fn user_agent_turn(
+fn user_agent_critique(
     llm: &LlmClient,
     persona: &Persona,
-    turn: usize,
-    prompt_sent: &str,
+    phase: &Phase,
+    action_desc: &str,
     screen_text: &str,
-) -> CritiqueEntry {
-    let truncated_screen = safe_truncate(screen_text, 3000);
-
+    deterministic_report: &str,
+    workspace_diff: &str,
+    memory: &ConversationMemory,
+) -> (Vec<String>, Vec<Bug>, NextAction) {
     let user_prompt = format!(
-        "PERSONA: {name} — {desc}\n\
-         TURN: {turn} of {max}\n\
-         MESSAGE YOU SENT TO PIKU: {prompt}\n\n\
-         SCREEN OUTPUT (ANSI stripped):\n\
-         ---\n{screen}\n---\n\n\
-         BEHAVIOUR GUIDE: {behaviour}\n\n\
+        "PERSONA: {} -- {}\n\
+         PHASE: {} (focus: {})\n\
+         ACTION: {}\n\n\
+         {}\
+         DETERMINISTIC CHECKS:\n{}\n\n\
+         WORKSPACE CHANGES: {}\n\n\
+         RENDERED SCREEN:\n---\n{}\n---\n\n\
          Analyse and respond with JSON only.",
-        name = persona.name,
-        desc = persona.description,
-        turn = turn,
-        max = persona.max_turns,
-        prompt = prompt_sent,
-        screen = truncated_screen,
-        behaviour = persona.behaviour,
+        persona.name,
+        persona.description,
+        phase.name,
+        phase.focus,
+        action_desc,
+        memory.format_for_llm(),
+        deterministic_report,
+        workspace_diff,
+        safe_truncate(screen_text, 4000),
     );
 
     let parsed = llm.call_json(USER_AGENT_SYSTEM, &user_prompt);
@@ -844,18 +1670,17 @@ fn user_agent_turn(
         .as_array()
         .map(|a| {
             a.iter()
-                .filter_map(|entry| {
-                    let sev = match entry["severity"].as_str().unwrap_or("info") {
-                        "CRITICAL" => Severity::Critical,
-                        "MAJOR" => Severity::Major,
-                        "minor" => Severity::Minor,
-                        _ => Severity::Info,
-                    };
+                .filter_map(|e| {
                     Some(Bug {
-                        severity: sev,
-                        description: entry["description"].as_str().unwrap_or("").to_string(),
-                        expected: entry["expected"].as_str().unwrap_or("").to_string(),
-                        actual: entry["actual"].as_str().unwrap_or("").to_string(),
+                        severity: match e["severity"].as_str().unwrap_or("info") {
+                            "CRITICAL" => Severity::Critical,
+                            "MAJOR" => Severity::Major,
+                            "minor" => Severity::Minor,
+                            _ => Severity::Info,
+                        },
+                        description: e["description"].as_str().unwrap_or("").to_string(),
+                        expected: e["expected"].as_str().unwrap_or("").to_string(),
+                        actual: e["actual"].as_str().unwrap_or("").to_string(),
                     })
                 })
                 .collect()
@@ -873,24 +1698,17 @@ fn user_agent_turn(
         _ => NextAction::Quit,
     };
 
-    let reasoning = parsed["reasoning"].as_str().unwrap_or("").to_string();
+    let reasoning = parsed["reasoning"].as_str().unwrap_or("");
     if !reasoning.is_empty() {
-        eprintln!("[user_agent] turn {turn} reasoning: {reasoning}");
+        eprintln!("[user_agent] reasoning: {reasoning}");
     }
 
-    CritiqueEntry {
-        turn,
-        prompt_sent: prompt_sent.to_string(),
-        screen_text: screen_text.to_string(),
-        observations,
-        bugs,
-        next_action,
-    }
+    (observations, bugs, next_action)
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Report printer
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
     let all_bugs: Vec<&Bug> = entries.iter().flat_map(|e| &e.bugs).collect();
@@ -906,166 +1724,138 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
         .iter()
         .filter(|b| b.severity == Severity::Minor)
         .count();
+    let n_det: usize = entries.iter().map(|e| e.deterministic_findings.len()).sum();
 
     println!();
-    println!("╔══════════════════════════════════════════════════════════════════");
     println!(
-        "║  AGENTIC USER REPORT  ·  persona: {}  ·  {} turns",
+        "=== AGENTIC USER REPORT === persona: {} === {} entries ===",
         persona.name,
         entries.len()
     );
     println!(
-        "║  {} CRITICAL  ·  {} MAJOR  ·  {} minor",
-        n_critical, n_major, n_minor
+        "    {} CRITICAL  {} MAJOR  {} minor  {} deterministic findings",
+        n_critical, n_major, n_minor, n_det
     );
-    println!("╠══════════════════════════════════════════════════════════════════");
+    println!("---");
 
     for entry in entries {
-        println!("║");
-        println!(
-            "║  TURN {}  ──  sent: {:?}",
-            entry.turn,
-            if entry.prompt_sent.len() > 70 {
-                format!("{}…", &entry.prompt_sent[..70])
-            } else {
-                entry.prompt_sent.clone()
-            }
-        );
+        println!();
+        println!("  PHASE: {}  ACTION: {}", entry.phase, entry.action_desc);
 
-        // Show condensed screen (first 10 non-empty lines)
-        let screen_lines: Vec<&str> = entry
+        // Show condensed screen
+        let non_empty: Vec<&str> = entry
             .screen_text
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .take(10)
             .collect();
         println!(
-            "║  screen ({} chars, {} non-empty lines):",
+            "  screen: {} chars, {} non-empty lines",
             entry.screen_text.len(),
-            entry
-                .screen_text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count()
+            non_empty.len()
         );
-        for line in &screen_lines {
-            let truncated = if line.len() > 100 { &line[..100] } else { line };
-            println!("║    {truncated}");
+        for line in non_empty.iter().take(8) {
+            let t = if line.len() > 100 { &line[..100] } else { line };
+            println!("    {t}");
         }
-        let total = entry
-            .screen_text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
-        if total > 10 {
-            println!("║    … ({} more lines)", total - 10);
+        if non_empty.len() > 8 {
+            println!("    ... ({} more)", non_empty.len() - 8);
         }
 
-        println!("║  observations:");
-        for obs in &entry.observations {
-            println!("║    · {obs}");
+        if !entry.workspace_diff.is_empty() && entry.workspace_diff != "no changes" {
+            println!("  workspace: {}", entry.workspace_diff);
+        }
+
+        if !entry.deterministic_findings.is_empty() {
+            println!("  deterministic:");
+            for f in &entry.deterministic_findings {
+                println!("    [{}] {}", f.severity, f.description);
+            }
+        }
+
+        if !entry.observations.is_empty() {
+            println!("  observations:");
+            for obs in &entry.observations {
+                println!("    - {obs}");
+            }
         }
 
         if !entry.bugs.is_empty() {
-            println!("║  bugs:");
+            println!("  bugs:");
             for bug in &entry.bugs {
-                println!("║    [{}]  {}", bug.severity, bug.description);
+                println!("    [{}] {}", bug.severity, bug.description);
                 if !bug.expected.is_empty() {
-                    println!("║          expected: {}", bug.expected);
+                    println!("      expected: {}", bug.expected);
                 }
                 if !bug.actual.is_empty() {
-                    println!("║          actual:   {}", bug.actual);
+                    println!("      actual:   {}", bug.actual);
                 }
             }
         }
 
         match &entry.next_action {
-            NextAction::Send(m) => println!("║  → next: {:?}", m),
-            NextAction::Quit => println!("║  → QUIT"),
+            NextAction::Send(m) => println!("  next: {:?}", m),
+            NextAction::Quit => println!("  next: QUIT"),
         }
     }
 
-    println!("║");
-    println!("╠══════════════════════════════════════════════════════════════════");
-    println!("║  VERDICT");
+    println!();
+    println!("=== VERDICT ===");
     if n_critical == 0 && n_major == 0 {
-        println!("║  ✓ No critical or major bugs found");
+        println!("  No critical or major bugs found");
     }
     for bug in all_bugs.iter().filter(|b| b.severity == Severity::Critical) {
-        println!("║  ✗ CRITICAL: {}", bug.description);
+        println!("  CRITICAL: {}", bug.description);
     }
     for bug in all_bugs.iter().filter(|b| b.severity == Severity::Major) {
-        println!("║  ! MAJOR:    {}", bug.description);
+        println!("  MAJOR:    {}", bug.description);
     }
     for bug in all_bugs.iter().filter(|b| b.severity == Severity::Minor) {
-        println!("║  ~ minor:    {}", bug.description);
+        println!("  minor:    {}", bug.description);
     }
-    println!("╚══════════════════════════════════════════════════════════════════");
+    println!("===");
     println!();
 }
 
-// ---------------------------------------------------------------------------
-// Copy directory tree
-// ---------------------------------------------------------------------------
-
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dest_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), dest_path)?;
-        }
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
     }
-    Ok(())
+    let mut idx = 0;
+    for (i, _) in s.char_indices().take(max_chars) {
+        idx = i;
+    }
+    &s[..idx]
 }
 
-fn agentic_seed_source() -> PathBuf {
-    if let Ok(dir) = std::env::var("PIKU_AGENTIC_PLAYDIR") {
-        return PathBuf::from(dir);
-    }
-
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tests")
-        .join("fixture")
-}
-
-// ---------------------------------------------------------------------------
-// Core session runner
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Session runner — the main loop
+// ===========================================================================
 
 fn run_agentic_session(persona: &Persona) {
-    let Some(ua_spec) = user_agent_provider() else {
-        eprintln!("skipping: no supported provider for user-agent LLM");
+    let Some(ua_spec) = user_agent_provider(false) else {
+        eprintln!("skipping: no user-agent provider");
         return;
     };
     let Some(piku_spec) = piku_provider() else {
-        eprintln!("skipping: no supported provider for piku");
+        eprintln!("skipping: no piku provider");
         return;
     };
 
     // Seed workspace
     let workspace = tempdir(persona.name);
-    let config_dir = workspace.join(".config");
-    std::fs::create_dir_all(&config_dir).unwrap();
-
     let seed_source = agentic_seed_source();
     if seed_source.exists() {
         copy_dir_all(&seed_source, &workspace)
             .unwrap_or_else(|e| eprintln!("[agentic_user] warn: copy fixture: {e}"));
     } else {
-        // Minimal fallback
         std::fs::create_dir_all(workspace.join("src")).unwrap();
-        std::fs::write(workspace.join("src/stats.rs"),
-            "pub fn mean(values: &[i32]) -> f64 {\n    let n = values.len();\n    values.iter().sum::<i32>() as f64 / n as f64\n}\n"
-        ).unwrap();
+        std::fs::write(
+            workspace.join("src/stats.rs"),
+            "pub fn mean(values: &[i32]) -> f64 {\n    \
+             let n = values.len();\n    \
+             values.iter().sum::<i32>() as f64 / n as f64\n}\n",
+        )
+        .unwrap();
         std::fs::write(
             workspace.join("Cargo.toml"),
             "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
@@ -1079,122 +1869,227 @@ fn run_agentic_session(persona: &Persona) {
         ua_spec.label, ua_spec.model
     );
     eprintln!(
-        "[agentic_user] piku:       {}/{}",
+        "[agentic_user] piku: {}/{}",
         piku_spec.label, piku_spec.model
     );
-    eprintln!("[agentic_user] workspace:  {}", workspace.display());
+    eprintln!("[agentic_user] workspace: {}", workspace.display());
 
-    // Spawn piku in PTY
-    let mut pty = spawn_piku_pty(&workspace, &piku_spec, &config_dir);
+    let mut observer = TerminalObserver::new(40, 120);
+    let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
+    let mut ws_observer = WorkspaceObserver::new(workspace.clone());
+    let mut memory = ConversationMemory::new();
+    let ua_llm = LlmClient::new(ua_spec);
 
-    // Wait for the TUI to draw its welcome screen
-    // Expect the session line to appear (piku is ready)
-    let _ = pty.exp_regex(r"/help for commands");
-    eprintln!("[agentic_user] startup banner seen");
+    // Wait for piku to be ready
+    eprintln!("[agentic_user] waiting for piku startup...");
+    let startup_snap = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+    if !startup_snap.is_ready() {
+        eprintln!("[agentic_user] piku did not become ready within 30s, proceeding anyway");
+        eprintln!(
+            "[agentic_user] screen contents: {:?}",
+            &startup_snap.contents[..startup_snap.contents.len().min(200)]
+        );
+    } else {
+        eprintln!(
+            "[agentic_user] piku ready (footer: {:?})",
+            startup_snap.footer_row()
+        );
+    }
 
-    let llm = LlmClient::new(ua_spec);
+    let turn_limit = phase_turn_limit();
     let mut entries: Vec<CritiqueEntry> = Vec::new();
-    let turn_limit = agentic_turn_limit(persona);
-    let mut current_prompt = persona.first_task.to_string();
+    let mut total_turns = 0;
 
-    for turn in 1..=turn_limit {
-        eprintln!(
-            "[agentic_user] turn {turn}/{} → {:?}",
-            turn_limit,
-            if current_prompt.len() > 60 {
-                &current_prompt[..60]
-            } else {
-                &current_prompt
+    for phase in &persona.phases {
+        if total_turns >= turn_limit {
+            break;
+        }
+
+        eprintln!("[agentic_user] --- phase: {} ---", phase.name);
+
+        // Execute scripted actions
+        let snap_before = observer.snapshot();
+        for action in &phase.scripted {
+            eprintln!("[agentic_user] scripted: {action}");
+            pty.execute_action(action, &mut observer);
+
+            // After Submit, wait for piku to respond
+            if matches!(action, Action::Submit(_)) {
+                let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
             }
+        }
+
+        // Get final snapshot and run checks
+        let snap_after = observer.snapshot();
+        let last_action = phase.scripted.last().cloned().unwrap_or(Action::Observe);
+        let findings = deterministic_checks(&snap_before, &snap_after, &last_action);
+        let ws_diff = ws_observer.diff_since_checkpoint();
+
+        // Log deterministic findings
+        for f in &findings {
+            if f.severity != Severity::Info {
+                eprintln!("[agentic_user] [DET] [{}] {}", f.severity, f.description);
+            }
+        }
+
+        // Format deterministic findings for LLM context
+        let det_report: String = findings
+            .iter()
+            .map(|f| format!("[{}] {}", f.severity, f.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let action_desc = format!(
+            "scripted: {}",
+            phase
+                .scripted
+                .iter()
+                .map(|a| format!("{a}"))
+                .collect::<Vec<_>>()
+                .join(" -> ")
         );
 
-        // Send the message
-        pty.send_line(&current_prompt).expect("send_line failed");
-
-        // Collect output: wait for > prompt to reappear (means turn is done)
-        // or timeout after 90 seconds
-        let mut screen_raw = match pty.exp_regex(r"\[\d+ iter") {
-            Ok((before, matched)) => format!("{before}{matched}"),
-            Err(e) => {
-                eprintln!("[agentic_user] turn {turn}: timeout waiting for turn footer: {e}");
-                e.to_string()
-            }
-        };
-
-        match pty.exp_regex(r"> ") {
-            Ok((before, matched)) => {
-                screen_raw.push_str(&before);
-                screen_raw.push_str(&matched);
-            }
-            Err(e) => {
-                eprintln!("[agentic_user] turn {turn}: prompt did not reappear: {e}");
-                screen_raw.push_str(&e.to_string());
-            }
-        }
-
-        let screen_text = strip_ansi(&screen_raw);
-        eprintln!(
-            "[agentic_user] turn {turn}: captured {} chars ({} stripped)",
-            screen_raw.len(),
-            screen_text.len()
+        // LLM critique of the scripted phase
+        let (observations, bugs, _next) = user_agent_critique(
+            &ua_llm,
+            persona,
+            phase,
+            &action_desc,
+            &snap_after.summary(30),
+            &det_report,
+            &ws_diff.summary(),
+            &memory,
         );
 
-        let (head, tail) = head_tail_preview(&screen_text, 180);
-        eprintln!("[agentic_user] turn {turn} head: {head}");
-        if !tail.is_empty() {
-            eprintln!("[agentic_user] turn {turn} tail: {tail}");
-        }
+        // Update memory
+        memory.push(TurnSummary {
+            turn: total_turns + 1,
+            action_desc: action_desc.clone(),
+            observations: observations.clone(),
+            bugs: bugs
+                .iter()
+                .map(|b| format!("[{}] {}", b.severity, b.description))
+                .collect(),
+            prompt_visible: snap_after.is_ready(),
+            cursor_visible: snap_after.cursor_visible,
+            workspace_changes: ws_diff.summary(),
+        });
 
-        // ── Deterministic checks (no LLM needed) ─────────────────────────
-        // Check raw ANSI output for cursor-visibility issues before
-        // stripping. This catches bugs the LLM can't see.
-        let cursor_bugs = check_cursor_visibility(&screen_raw);
-        for bug in &cursor_bugs {
-            eprintln!(
-                "[agentic_user] [DETERMINISTIC] [{:}] {}",
-                bug.severity, bug.description
-            );
-        }
+        entries.push(CritiqueEntry {
+            phase: phase.name.to_string(),
+            action_desc,
+            screen_text: snap_after.contents.clone(),
+            observations,
+            bugs,
+            deterministic_findings: findings,
+            workspace_diff: ws_diff.summary(),
+            next_action: NextAction::Quit, // scripted phase, no next
+        });
 
-        // Ask the user-agent to critique
-        let mut entry = user_agent_turn(&llm, persona, turn, &current_prompt, &screen_text);
+        ws_observer.checkpoint();
+        total_turns += 1;
 
-        // Merge deterministic bugs into the LLM's critique
-        entry.bugs.extend(cursor_bugs);
-
-        // Print bugs immediately as they're found
-        for bug in &entry.bugs {
-            eprintln!("[agentic_user] [{:}] {}", bug.severity, bug.description);
-        }
-
-        let next = entry.next_action.clone();
-        entries.push(entry);
-
-        match next {
-            NextAction::Quit => {
-                eprintln!("[agentic_user] user agent chose to quit after turn {turn}");
+        // Freeform exploration turns
+        for freeform_turn in 0..phase.freeform_turns {
+            if total_turns >= turn_limit {
                 break;
             }
-            NextAction::Send(msg) => {
-                current_prompt = msg;
+
+            // Get a freeform LLM provider (better model for exploration)
+            let Some(freeform_spec) = user_agent_provider(true) else {
+                break;
+            };
+            let freeform_llm = LlmClient::new(freeform_spec);
+
+            let snap_before_free = observer.snapshot();
+
+            let (_, _, next) = user_agent_critique(
+                &freeform_llm,
+                persona,
+                phase,
+                &format!("freeform turn {}", freeform_turn + 1),
+                &snap_before_free.summary(20),
+                "",
+                "no changes",
+                &memory,
+            );
+
+            match next {
+                NextAction::Send(msg) => {
+                    eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
+                    pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
+                    let snap_after_free =
+                        pty.wait_for_ready(&mut observer, Duration::from_secs(90));
+                    let findings_free = deterministic_checks(
+                        &snap_before_free,
+                        &snap_after_free,
+                        &Action::Submit(msg.clone()),
+                    );
+                    let ws_diff_free = ws_observer.diff_since_checkpoint();
+
+                    let det_report_free: String = findings_free
+                        .iter()
+                        .map(|f| format!("[{}] {}", f.severity, f.description))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let (obs2, bugs2, _) = user_agent_critique(
+                        &ua_llm,
+                        persona,
+                        phase,
+                        &format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        &snap_after_free.summary(30),
+                        &det_report_free,
+                        &ws_diff_free.summary(),
+                        &memory,
+                    );
+
+                    memory.push(TurnSummary {
+                        turn: total_turns + 1,
+                        action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        observations: obs2.clone(),
+                        bugs: bugs2
+                            .iter()
+                            .map(|b| format!("[{}] {}", b.severity, b.description))
+                            .collect(),
+                        prompt_visible: snap_after_free.is_ready(),
+                        cursor_visible: snap_after_free.cursor_visible,
+                        workspace_changes: ws_diff_free.summary(),
+                    });
+
+                    entries.push(CritiqueEntry {
+                        phase: phase.name.to_string(),
+                        action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        screen_text: snap_after_free.contents.clone(),
+                        observations: obs2,
+                        bugs: bugs2,
+                        deterministic_findings: findings_free,
+                        workspace_diff: ws_diff_free.summary(),
+                        next_action: NextAction::Quit,
+                    });
+
+                    ws_observer.checkpoint();
+                }
+                NextAction::Quit => {
+                    eprintln!("[agentic_user] freeform: LLM chose to quit");
+                    break;
+                }
             }
+
+            total_turns += 1;
         }
     }
 
-    // Exit cleanly
-    let _ = pty.send_control('d');
-    std::thread::sleep(Duration::from_millis(300));
+    // Exit piku cleanly
+    pty.send_bytes(b"\x04"); // Ctrl-D
+    std::thread::sleep(Duration::from_millis(500));
 
     print_report(persona, &entries);
-
-    // Dogfood is a report-first harness: never fail the test just because the
-    // model made a bad judgment or the task itself wasn't solved. The point is
-    // to observe the experience and keep the suite executable.
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Test entry points
+// ===========================================================================
 
 #[test]
 fn agentic_user_confident_dev() {
@@ -1232,9 +2127,9 @@ fn agentic_user_input_explorer() {
     run_agentic_session(ps.get("input_explorer").unwrap());
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests for extract_json
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Unit tests
+// ===========================================================================
 
 #[test]
 fn extract_json_bare_object() {
@@ -1245,8 +2140,7 @@ fn extract_json_bare_object() {
 #[test]
 fn extract_json_from_markdown_fence() {
     let s = "Here is the JSON:\n```json\n{\"a\": 1}\n```\nDone.";
-    let j = extract_json(s);
-    assert_eq!(j, r#"{"a": 1}"#);
+    assert_eq!(extract_json(s), r#"{"a": 1}"#);
 }
 
 #[test]
@@ -1258,58 +2152,160 @@ fn extract_json_from_prose() {
 }
 
 #[test]
-fn strip_ansi_removes_escape_codes() {
-    let raw = "\x1b[2mfaint text\x1b[0m normal";
-    let stripped = strip_ansi(raw);
+fn terminal_observer_basic() {
+    let mut obs = TerminalObserver::new(24, 80);
+    obs.process(b"Hello, world!\r\n");
+    let snap = obs.snapshot();
     assert!(
-        stripped.contains("faint text"),
-        "should contain text: {stripped:?}"
+        snap.contents.contains("Hello, world!"),
+        "screen: {:?}",
+        snap.contents
     );
+    assert!(snap.cursor_visible, "cursor should be visible by default");
+}
+
+#[test]
+fn terminal_observer_cursor_hide() {
+    let mut obs = TerminalObserver::new(24, 80);
+    obs.process(b"\x1b[?25l");
+    let snap = obs.snapshot();
+    assert!(!snap.cursor_visible, "cursor should be hidden");
+    obs.process(b"\x1b[?25h");
+    let snap2 = obs.snapshot();
+    assert!(snap2.cursor_visible, "cursor should be visible again");
+}
+
+#[test]
+fn terminal_observer_styled_rows() {
+    let mut obs = TerminalObserver::new(5, 40);
+    // Move to last row and write prompt
+    obs.process(b"\x1b[5;1H> ");
+    let snap = obs.snapshot();
     assert!(
-        stripped.contains("normal"),
-        "should contain normal: {stripped:?}"
+        snap.input_row().contains('>'),
+        "input row: {:?}",
+        snap.input_row()
     );
-    // ANSI codes are removed, remaining text is preserved
+}
+
+#[test]
+fn screen_snapshot_is_ready() {
+    let mut obs = TerminalObserver::new(5, 40);
+    // Simulate prompt on last row with cursor visible
+    obs.process(b"\x1b[5;1H> ");
+    let snap = obs.snapshot();
+    assert!(snap.is_ready(), "should be ready with prompt visible");
+}
+
+#[test]
+fn screen_snapshot_not_ready_when_hidden() {
+    let mut obs = TerminalObserver::new(5, 40);
+    obs.process(b"\x1b[?25l\x1b[5;1H> ");
+    let snap = obs.snapshot();
+    assert!(!snap.is_ready(), "should not be ready with cursor hidden");
+}
+
+#[test]
+fn workspace_observer_detects_new_file() {
+    let dir = tempdir("ws_test");
+    std::fs::write(dir.join("existing.txt"), "hello").unwrap();
+    let ws = WorkspaceObserver::new(dir.clone());
+    std::fs::write(dir.join("new_file.txt"), "world").unwrap();
+    let diff = ws.diff_since_checkpoint();
     assert!(
-        !stripped.contains("\x1b"),
-        "no escape sequences should remain: {stripped:?}"
+        diff.created
+            .iter()
+            .any(|p| p.to_str().unwrap().contains("new_file")),
+        "should detect new file: {:?}",
+        diff.created
     );
 }
 
 #[test]
-fn strip_ansi_collapses_cr() {
-    let raw = "line1\r\nline2\r\n";
-    let stripped = strip_ansi(raw);
-    assert!(stripped.contains("line1"));
-    assert!(stripped.contains("line2"));
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests for check_cursor_visibility
-// ---------------------------------------------------------------------------
-
-#[test]
-fn cursor_visible_when_balanced() {
-    // hide then show = no bugs
-    let raw = "text\x1b[?25lhidden\x1b[?25hvisible";
-    let bugs = check_cursor_visibility(raw);
-    assert!(bugs.is_empty(), "balanced hide/show should produce no bugs");
-}
-
-#[test]
-fn cursor_hidden_at_end_is_bug() {
-    // hide without matching show
-    let raw = "text\x1b[?25lhidden stuff";
-    let bugs = check_cursor_visibility(raw);
-    assert_eq!(bugs.len(), 1);
-    assert_eq!(bugs[0].severity, Severity::Major);
-    assert!(bugs[0].description.contains("cursor left hidden"));
+fn workspace_observer_detects_modification() {
+    let dir = tempdir("ws_mod_test");
+    std::fs::write(dir.join("file.txt"), "before").unwrap();
+    // Small delay so mtime differs
+    std::thread::sleep(Duration::from_millis(50));
+    let ws = WorkspaceObserver::new(dir.clone());
+    std::thread::sleep(Duration::from_millis(50));
+    std::fs::write(dir.join("file.txt"), "after - longer content").unwrap();
+    let diff = ws.diff_since_checkpoint();
+    assert!(
+        diff.modified
+            .iter()
+            .any(|p| p.to_str().unwrap().contains("file.txt")),
+        "should detect modification: {:?}",
+        diff.modified
+    );
 }
 
 #[test]
-fn cursor_no_sequences_is_fine() {
-    // no cursor sequences at all = visible (default state)
-    let raw = "just normal text output";
-    let bugs = check_cursor_visibility(raw);
-    assert!(bugs.is_empty());
+fn deterministic_checks_cursor_hidden() {
+    let mut obs = TerminalObserver::new(5, 40);
+    obs.process(b"\x1b[5;1H> ");
+    let before = obs.snapshot();
+    obs.process(b"\x1b[?25l");
+    let after = obs.snapshot();
+    let findings = deterministic_checks(&before, &after, &Action::Observe);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.severity == Severity::Major && f.description.contains("cursor hidden")),
+        "should find cursor hidden: {:?}",
+        findings.iter().map(|f| &f.description).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn deterministic_checks_tab_change() {
+    let mut obs = TerminalObserver::new(5, 40);
+    obs.process(b"\x1b[5;1H> /st");
+    let before = obs.snapshot();
+    // Simulate tab completion filling in '/status'
+    obs.process(b"\x1b[5;1H> /status");
+    let after = obs.snapshot();
+    let findings = deterministic_checks(&before, &after, &Action::Key(SpecialKey::Tab));
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.description.contains("tab completion changed")),
+        "should detect tab change: {:?}",
+        findings.iter().map(|f| &f.description).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn action_display() {
+    assert_eq!(format!("{}", Action::Type('a')), "Type('a')");
+    assert_eq!(format!("{}", Action::Key(SpecialKey::Tab)), "Key(Tab)");
+    assert_eq!(
+        format!("{}", Action::Submit("hello".into())),
+        r#"Submit("hello")"#
+    );
+}
+
+#[test]
+fn conversation_memory_format() {
+    let mut mem = ConversationMemory::new();
+    mem.push(TurnSummary {
+        turn: 1,
+        action_desc: "Submit(\"hello\")".into(),
+        observations: vec!["response was helpful".into()],
+        bugs: vec![],
+        prompt_visible: true,
+        cursor_visible: true,
+        workspace_changes: "no changes".into(),
+    });
+    let formatted = mem.format_for_llm();
+    assert!(formatted.contains("Turn 1"), "formatted: {formatted}");
+    assert!(formatted.contains("prompt=ok"), "formatted: {formatted}");
+}
+
+#[test]
+fn special_key_bytes() {
+    assert_eq!(SpecialKey::Tab.as_bytes(), b"\t");
+    assert_eq!(SpecialKey::Enter.as_bytes(), b"\r");
+    assert_eq!(SpecialKey::ArrowUp.as_bytes(), b"\x1b[A");
+    assert_eq!(SpecialKey::CtrlC.as_bytes(), b"\x03");
 }
