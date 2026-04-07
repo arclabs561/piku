@@ -186,12 +186,14 @@ async fn run_turn_inner(
         // Tries LLM summarisation first (richer summaries); falls back to
         // structural (no-LLM) if the provider call fails or times out.
         if crate::compact::should_compact(session, compact_cfg) {
-            let result = try_llm_compact(session, provider, model, compact_cfg).await
-                .unwrap_or_else(|| crate::compact::compact_session(session, compact_cfg));
+            let (result, method) = match try_llm_compact(session, provider, model, compact_cfg).await {
+                Some(r) => (r, "llm"),
+                None => (crate::compact::compact_session(session, compact_cfg), "structural"),
+            };
             if result.removed_message_count > 0 {
                 *session = result.compacted_session;
                 sink.on_text(&format!(
-                    "\x1b[2m[context compacted: {} messages summarised]\x1b[0m\n",
+                    "\x1b[2m[context compacted: {} messages summarised ({method})]\x1b[0m\n",
                     result.removed_message_count
                 ));
             }
@@ -690,9 +692,7 @@ fn execute_spawn_agent(
         let mut prompt = def.system_prompt().to_string();
         // Inject per-agent-type persistent memory
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(mem_prompt) =
-            crate::memory::build_agent_memory_prompt(&cwd, def.agent_type())
-        {
+        if let Some(mem_prompt) = crate::memory::build_agent_memory_prompt(&cwd, def.agent_type()) {
             prompt.push_str(&mem_prompt);
         }
         vec![prompt]
@@ -821,6 +821,24 @@ fn execute_spawn_agent(
     let wt_branch = worktree_branch;
     let wt_path_clone = cwd_override;
 
+    // Build transparent spawn hint showing what the agent got.
+    let tool_count = sub_tool_defs.len();
+    let type_info = if let Some(ref def) = agent_def {
+        format!(" [type={}, tools={tool_count}, max_turns={effective_max_turns}]",
+                def.agent_type())
+    } else {
+        format!(" [tools={tool_count}, max_turns={effective_max_turns}]")
+    };
+
+    let hint = if p.background {
+        format!("spawned agent {} ({}){type_info}", p.name, task_id)
+    } else {
+        format!(
+            "spawned agent {} ({}){type_info} — use agent_join({}) to wait for result",
+            p.name, task_id, task_id
+        )
+    };
+
     let custom_agents_owned = custom_agents.to_vec();
     let _handle = tokio::task::spawn_local(run_subagent_task(
         task_id_clone,
@@ -836,16 +854,6 @@ fn execute_spawn_agent(
         wt_branch,
         custom_agents_owned,
     ));
-
-    // foreground: hint to caller that they should follow up with agent_join
-    let hint = if p.background {
-        format!("spawned agent {} ({})", p.name, task_id)
-    } else {
-        format!(
-            "spawned agent {} ({}) — use agent_join({}) to wait for result",
-            p.name, task_id, task_id
-        )
-    };
 
     (hint, false)
 }
