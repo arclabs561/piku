@@ -815,7 +815,7 @@ fn longest_common_prefix(values: &[&str]) -> String {
 }
 
 /// Count visible characters (strip ANSI escape sequences).
-fn visible_width(s: &str) -> usize {
+pub fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut in_escape = false;
     for ch in s.chars() {

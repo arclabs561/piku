@@ -383,6 +383,7 @@ impl OutputSink for StdoutSink {
             "\n\x1b[2m[{iterations} iter · {}↑ {}↓ tokens]\x1b[0m",
             usage.input_tokens, usage.output_tokens
         );
+        let _ = self.stdout.flush();
         self.trace
             .turn_end(iterations, usage.input_tokens, usage.output_tokens);
     }
