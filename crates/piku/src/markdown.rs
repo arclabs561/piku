@@ -117,6 +117,7 @@ impl StreamingMarkdown {
                 self.code_buf.push('\n');
             } else {
                 out.push_str(&render_inline(&line));
+                out.push_str(self.eol);
             }
         }
 
@@ -358,8 +359,7 @@ fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
 /// Try to parse a heading. Returns (prefix, remaining text).
 fn try_strip_heading(line: &str) -> Option<(&str, &str)> {
     for (prefix, skip) in [("#### ", 5), ("### ", 4), ("## ", 3), ("# ", 2)] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let _ = rest;
+        if line.starts_with(prefix) {
             return Some((prefix, &line[skip..]));
         }
     }

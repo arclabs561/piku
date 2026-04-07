@@ -345,7 +345,7 @@ impl OutputSink for ReplSink {
 
         let _ = writeln!(
             self.stdout,
-            "\x1b[2m{} → {status_color}{tag}\x1b[0m\x1b[2m]\x1b[0m",
+            "\x1b[2m[{} → {status_color}{tag}\x1b[0m\x1b[2m]\x1b[0m",
             tool_name,
         );
         if !preview.is_empty() {
@@ -384,6 +384,7 @@ impl OutputSink for ReplSink {
             "\n\x1b[2m[{iterations} iter · {}↑ {}↓]\x1b[0m",
             usage.input_tokens, usage.output_tokens
         );
+        let _ = self.stdout.flush();
     }
 }
 

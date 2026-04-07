@@ -301,25 +301,30 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     let mut show_agents = false;
     let mut show_sess = false;
 
+    // Helper: visible width of a segment (strips ANSI escape codes).
+    let vis = |s: &str| -> usize {
+        crate::input_helper::visible_width(s)
+    };
+
     // agents always shown if there are any (highest priority optional)
-    if !agents_seg.is_empty() && budget >= agents_seg.len() + sep.len() {
-        budget -= agents_seg.len() + sep.len();
+    if !agents_seg.is_empty() && budget >= vis(&agents_seg) + sep.len() {
+        budget -= vis(&agents_seg) + sep.len();
         show_agents = true;
     }
     // context % — shown when ≥50%, high priority (user needs to know)
-    if !ctx_seg.is_empty() && budget >= ctx_seg.len() + sep.len() {
-        budget -= ctx_seg.len() + sep.len();
+    if !ctx_seg.is_empty() && budget >= vis(&ctx_seg) + sep.len() {
+        budget -= vis(&ctx_seg) + sep.len();
         show_ctx = true;
     }
-    if !tok_seg.is_empty() && budget >= tok_seg.len() + sep.len() {
-        budget -= tok_seg.len() + sep.len();
+    if !tok_seg.is_empty() && budget >= vis(&tok_seg) + sep.len() {
+        budget -= vis(&tok_seg) + sep.len();
         show_tok = true;
     }
-    if !turns_seg.is_empty() && budget >= turns_seg.len() + sep.len() {
-        budget -= turns_seg.len() + sep.len();
+    if !turns_seg.is_empty() && budget >= vis(&turns_seg) + sep.len() {
+        budget -= vis(&turns_seg) + sep.len();
         show_turns = true;
     }
-    if budget >= sess_seg.len() + sep.len() {
+    if budget >= vis(&sess_seg) + sep.len() {
         show_sess = true;
     }
 
@@ -362,36 +367,35 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     }
 
     // Right-align the hint: pad with spaces to fill the row.
-    // visible_len must account for ALL shown segments.
-    let visible_len = model_seg.len()
+    // visible_len uses vis() for ANSI-containing segments.
+    let visible_len = vis(&model_seg)
         + if show_agents {
-            sep.len() + agents_seg.len()
+            sep.len() + vis(&agents_seg)
         } else {
             0
         }
         + if show_ctx {
-            // ctx_seg contains ANSI codes — use base length estimate
-            sep.len() + 6 // " NN% " + sep
+            sep.len() + vis(&ctx_seg)
         } else {
             0
         }
         + if show_tok {
-            sep.len() + tok_seg.len()
+            sep.len() + vis(&tok_seg)
         } else {
             0
         }
         + if show_turns {
-            sep.len() + turns_seg.len()
+            sep.len() + vis(&turns_seg)
         } else {
             0
         }
         + if show_sess {
-            sep.len() + sess_seg.len()
+            sep.len() + vis(&sess_seg)
         } else {
             0
         }
         + sep.len()
-        + hint_seg.len();
+        + vis(hint_seg);
 
     let padding = cols.saturating_sub(visible_len);
     line.push_str(&" ".repeat(padding));
@@ -1455,18 +1459,6 @@ fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
         "grep" => format_result_lines(result, 6, true),
         // Unknown tools — dim, short
         _ => format_result_lines(result, 4, true),
-    }
-}
-
-fn truncate_scroll(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.replace('\n', "\r\n")
-    } else {
-        format!(
-            "{}\x1b[2m … [{} chars]\x1b[0m",
-            &s[..max].replace('\n', "\r\n"),
-            s.len() - max
-        )
     }
 }
 
