@@ -839,13 +839,18 @@ async fn run_tui_repl_core(
             editor.set_prompt("\x1b[34m›\x1b[0m ");
         }
 
-        // Temporarily reset scroll region so the editor can use the
-        // full input row without DECSTBM interference.
+        // Use read_line_raw so the editor doesn't emit post-submit
+        // cursor movement that conflicts with the DECSTBM layout.
+        // We temporarily reset the scroll region so MoveUp/MoveDown
+        // in the editor's redraw work without scroll-region clipping.
         reset_scroll_region();
-        let readline = editor.read_line();
-        // Restore scroll region after input
-        let (_, rows) = term_size();
+        let readline = editor.read_line_raw();
+        // Restore scroll region and re-position cursor.
+        let (cols, rows) = term_size();
         set_scroll_region(1, rows.saturating_sub(2));
+        // Park cursor in scroll zone bottom so output lands there.
+        let scroll_bot = rows.saturating_sub(2);
+        goto(scroll_bot, 1);
         print!("\x1b[?25h");
         let _ = io::stdout().flush();
 
