@@ -1176,6 +1176,12 @@ fn highlight_input_line(line: &str, is_first_line: bool) -> String {
         return format!("\x1b[36m{line}\x1b[0m");
     }
 
+    // ! bash escape: highlight the ! in magenta, command dim
+    if is_first_line && line.starts_with('!') {
+        let cmd = &line[1..];
+        return format!("\x1b[35m!\x1b[0m\x1b[2m{cmd}\x1b[0m");
+    }
+
     // Inline backtick highlighting: `code` → green
     if !line.contains('`') {
         return line.to_string();
