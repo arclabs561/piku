@@ -884,8 +884,12 @@ async fn run_tui_repl_core(
                     break;
                 }
 
-                // Slash commands
+                // Slash commands — clear the input row first
                 if full_input.starts_with('/') {
+                    let (_, rows) = term_size();
+                    goto(rows, 1);
+                    print!("\x1b[2K");
+                    let _ = io::stdout().flush();
                     let current_model_name = model.clone();
                     let should_exit = handle_slash_cmd(
                         &full_input,
@@ -1400,7 +1404,14 @@ fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
     let total = lines.len();
     let mut out = Vec::new();
 
-    for (i, line) in lines.iter().take(max_lines).enumerate() {
+    // +1 exception: if only 1 extra line, just show it (Claude Code pattern)
+    let show_lines = if total == max_lines + 1 {
+        max_lines + 1
+    } else {
+        max_lines
+    };
+
+    for (i, line) in lines.iter().take(show_lines).enumerate() {
         // Truncate very long lines (minified JSON, binary-ish content)
         let display = if line.len() > MAX_LINE_WIDTH {
             format!("{}…", &line[..MAX_LINE_WIDTH])
@@ -1416,10 +1427,10 @@ fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
         }
     }
 
-    if total > max_lines {
+    if total > show_lines {
         out.push(format!(
             "  \x1b[2m… +{} lines\x1b[0m",
-            total - max_lines
+            total - show_lines
         ));
     }
 

@@ -180,13 +180,13 @@ impl StreamingMarkdown {
             return;
         }
 
-        // Block quote
+        // Block quote — ▎ (U+258E, left quarter block) is thinner than │
         if let Some(rest) = trimmed.strip_prefix("> ") {
-            let _ = write!(out, "{DIM}│ {}{RESET}{eol}", render_inline(rest));
+            let _ = write!(out, "{DIM}\u{258e} {}{RESET}{eol}", render_inline(rest));
             return;
         }
         if trimmed == ">" {
-            let _ = write!(out, "{DIM}│{RESET}{eol}");
+            let _ = write!(out, "{DIM}\u{258e}{RESET}{eol}");
             return;
         }
 
