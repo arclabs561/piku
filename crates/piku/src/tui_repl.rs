@@ -867,8 +867,11 @@ async fn run_tui_repl_core(
 
         match readline {
             Ok(ReadOutcome::Submit(line)) => {
-                editor.push_history(&line);
-                let full_input = line.trim().to_string();
+                // Expand paste pills before processing
+                let expanded = editor.expand_paste_pills(&line);
+                editor.clear_paste_pills();
+                editor.push_history(&expanded);
+                let full_input = expanded.trim().to_string();
 
                 if full_input.is_empty() {
                     continue;
