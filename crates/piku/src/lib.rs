@@ -137,7 +137,7 @@ pub fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
         _ => {
             // Generic: show first string-valued key
             if let Some(obj) = input.as_object() {
-                for (_, v) in obj.iter().take(1) {
+                for (_, v) in obj {
                     if let Some(s) = v.as_str() {
                         return truncate_arg(s, 60);
                     }

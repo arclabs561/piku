@@ -70,18 +70,18 @@ fn cursor_restored_in_teardown() {
     );
 }
 
-/// Ctrl-C (ReadlineError::Interrupted) path must also restore cursor.
+/// Ctrl-C / Cancel path must also restore cursor.
 #[test]
 fn cursor_restored_on_ctrl_c() {
     let src = tui_repl_source();
-    let interrupted_pos = src
-        .find("ReadlineError::Interrupted")
-        .expect("Interrupted arm must exist");
-    // Capture enough chars to cover the full arm body (char-boundary safe)
-    let arm: String = src[interrupted_pos..].chars().take(1500).collect();
+    // We replaced ReadlineError::Interrupted with ReadOutcome::Cancel
+    let cancel_pos = src
+        .find("ReadOutcome::Cancel")
+        .expect("Cancel arm must exist in tui_repl.rs");
+    let arm: String = src[cancel_pos..].chars().take(1500).collect();
     assert!(
         arm.contains("?25h"),
-        "Interrupted (Ctrl-C) arm must restore cursor with ESC[?25h.\narm:\n{arm}"
+        "Cancel (Ctrl-C) arm must restore cursor with ESC[?25h.\narm:\n{arm}"
     );
 }
 
