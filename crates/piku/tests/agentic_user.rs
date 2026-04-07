@@ -470,20 +470,28 @@ impl ScreenSnapshot {
         }
     }
 
-    /// Check if piku is ready for input.
-    /// Looks for a prompt glyph on the cursor's row. piku uses `❯` as
-    /// the primary prompt, `>` as fallback, `!` after errors.
+    /// Check if piku is ready for input (not thinking, not streaming).
+    /// Distinguishes the ready prompt from the thinking indicator:
+    ///   Ready:    `❯ Send a message or /help` or `❯ ` (empty prompt)
+    ///   Thinking: `❯ · thinking…` or `❯ ✻ thinking…`
     fn is_ready(&self) -> bool {
         if !self.cursor_visible {
             return false;
         }
         let input = self.input_row().trim_start();
-        // piku's prompt glyphs: ❯ (U+276F), > (ASCII), ! (error state)
-        input.starts_with('\u{276F}')
+        // Must have a prompt glyph
+        let has_prompt = input.starts_with('\u{276F}')
             || input.starts_with('>')
             || input.starts_with('!')
-            // Also match hint text (prompt present but showing placeholder)
-            || input.contains("Send a message")
+            || input.contains("Send a message");
+        if !has_prompt {
+            return false;
+        }
+        // Reject thinking/streaming indicators
+        if input.contains("thinking") || input.contains("\u{00B7}") || input.contains("\u{273B}") {
+            return false;
+        }
+        true
     }
 
     /// All non-empty visible rows, for the LLM to critique.
