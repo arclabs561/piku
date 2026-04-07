@@ -895,6 +895,7 @@ dependencies = [
  "async-stream",
  "crossterm",
  "futures-util",
+ "nix",
  "piku-api",
  "piku-runtime",
  "piku-tools",
