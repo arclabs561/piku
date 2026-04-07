@@ -79,7 +79,7 @@ pub async fn run_repl(
     // Print welcome banner
     println!("{}", banner(&model, resolved.name(), &session_id));
 
-    let mut editor = input_helper::LineEditor::new("\x1b[34m>\x1b[0m ");
+    let mut editor = input_helper::LineEditor::new("\x1b[34m›\x1b[0m ");
     let history_path = sessions_dir.join(".repl_history");
     editor.load_history_file(&history_path);
 

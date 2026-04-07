@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn visible_width_strips_ansi() {
-        assert_eq!(visible_width("\x1b[34m>\x1b[0m "), 2); // "> "
+        assert_eq!(visible_width("\x1b[34m›\x1b[0m "), 2); // "› "
         assert_eq!(visible_width("hello"), 5);
         assert_eq!(visible_width("\x1b[1m\x1b[36m##\x1b[0m"), 2);
     }

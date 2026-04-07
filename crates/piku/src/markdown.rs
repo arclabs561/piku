@@ -194,7 +194,7 @@ impl StreamingMarkdown {
             let pad = indent * 2;
             let _ = write!(
                 out,
-                "{:pad$}  {DIM}{CYAN}{RESET} {}{eol}",
+                "{:pad$}  {DIM}\u{2022}{RESET} {}{eol}",
                 "",
                 render_inline(text)
             );
