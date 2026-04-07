@@ -757,22 +757,31 @@ fn strip_ansi_bytes(bytes: &[u8]) -> String {
         }
     }
 
-    // Collapse 3+ consecutive newlines
+    // Post-process: remove thinking indicator frames and prompt redraws,
+    // collapse blank lines
     let mut result = String::new();
     let mut nl_count = 0;
     for line in out.lines() {
-        if line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             nl_count += 1;
             if nl_count <= 1 {
                 result.push('\n');
             }
-        } else {
-            if nl_count > 0 {
-                nl_count = 0;
-            }
-            result.push_str(line.trim_end());
-            result.push('\n');
+            continue;
         }
+        nl_count = 0;
+        // Skip thinking indicator lines (❯ · thinking… / ❯ ✶ thinking… etc)
+        if trimmed.contains("thinking\u{2026}") || trimmed.contains("thinking...") {
+            continue;
+        }
+        // Skip progressive prompt redraws (❯ W❯ Wh❯ Wha... pattern)
+        // These have multiple ❯ on a single line from rapid redraws
+        if trimmed.matches('\u{276F}').count() > 1 {
+            continue;
+        }
+        result.push_str(trimmed);
+        result.push('\n');
     }
     result
 }
