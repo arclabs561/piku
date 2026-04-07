@@ -642,15 +642,27 @@ fn execute_spawn_agent(
         system_prompt.to_vec()
     };
 
-    // Filter tool defs if built-in has restrictions
+    // Filter tool defs if built-in has restrictions.
+    // Allowlist takes precedence: if non-empty, only listed tools pass.
+    // Otherwise, blocklist filters out disallowed tools.
     let sub_tool_defs: Vec<ToolDefinition> = if let Some(def) = built_in {
-        let denied: std::collections::HashSet<&str> =
-            def.disallowed_tools.iter().copied().collect();
-        tool_defs
-            .iter()
-            .filter(|t| !denied.contains(t.name.as_str()))
-            .cloned()
-            .collect()
+        if !def.allowed_tools.is_empty() {
+            let allowed: std::collections::HashSet<&str> =
+                def.allowed_tools.iter().copied().collect();
+            tool_defs
+                .iter()
+                .filter(|t| allowed.contains(t.name.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            let denied: std::collections::HashSet<&str> =
+                def.disallowed_tools.iter().copied().collect();
+            tool_defs
+                .iter()
+                .filter(|t| !denied.contains(t.name.as_str()))
+                .cloned()
+                .collect()
+        }
     } else {
         tool_defs.to_vec()
     };
@@ -658,30 +670,55 @@ fn execute_spawn_agent(
     // Build the task prompt — prepend context file contents if requested
     let mut prompt = p.task.clone();
 
-    // Fork: prepend parent session history as <fork_context>
+    // Fork: prepend parent session history as <fork_context>.
+    // Includes user text, assistant text, and tool call names+results
+    // (results masked to 200 chars to keep context lean).
     if p.fork && !parent_session_messages.is_empty() {
         let mut fork_ctx = String::from("\n\n<fork_context>\n");
         fork_ctx.push_str(
             "The following is the conversation history from the parent agent. \
-                           Use it for context — you do not need to repeat work already done.\n\n",
+             Use it for context — you do not need to repeat work already done.\n\n",
         );
         for msg in parent_session_messages {
             let role = match msg.role {
                 crate::session::MessageRole::User => "user",
                 crate::session::MessageRole::Assistant => "assistant",
-                _ => continue,
+                crate::session::MessageRole::Tool => "tool",
+                crate::session::MessageRole::System => continue,
             };
-            if let Some(text) = msg.blocks.iter().find_map(|b| match b {
-                crate::session::ContentBlock::Text { text } if !text.trim().is_empty() => {
-                    Some(text.as_str())
+            for block in &msg.blocks {
+                match block {
+                    crate::session::ContentBlock::Text { text } if !text.trim().is_empty() => {
+                        fork_ctx.push('[');
+                        fork_ctx.push_str(role);
+                        fork_ctx.push_str("]: ");
+                        let trunc = if text.len() > 500 {
+                            format!("{}...", &text[..text.len().min(500)])
+                        } else {
+                            text.clone()
+                        };
+                        fork_ctx.push_str(&trunc);
+                        fork_ctx.push('\n');
+                    }
+                    crate::session::ContentBlock::ToolUse { name, .. } => {
+                        fork_ctx.push_str("[tool_use]: ");
+                        fork_ctx.push_str(name);
+                        fork_ctx.push('\n');
+                    }
+                    crate::session::ContentBlock::ToolResult { output, .. }
+                        if !output.trim().is_empty() =>
+                    {
+                        fork_ctx.push_str("[tool_result]: ");
+                        if output.len() > 200 {
+                            let preview: String = output.chars().take(100).collect();
+                            fork_ctx.push_str(&format!("{preview}... ({} chars)", output.len()));
+                        } else {
+                            fork_ctx.push_str(output);
+                        }
+                        fork_ctx.push('\n');
+                    }
+                    _ => {}
                 }
-                _ => None,
-            }) {
-                fork_ctx.push('[');
-                fork_ctx.push_str(role);
-                fork_ctx.push_str("]: ");
-                fork_ctx.push_str(&text[..text.len().min(500)]);
-                fork_ctx.push_str("\n\n");
             }
         }
         fork_ctx.push_str("</fork_context>");
@@ -718,6 +755,14 @@ fn execute_spawn_agent(
         prompt.push_str(". You can freely edit files here without affecting the main checkout.");
     }
 
+    // Per-agent turn limit: built-in def's max_turns overrides the default
+    // when the model didn't explicitly set one in the spawn params.
+    let effective_max_turns = if let Some(def) = built_in {
+        def.max_turns.unwrap_or(p.max_turns)
+    } else {
+        p.max_turns
+    };
+
     let task_id = registry.register(
         p.name.clone(),
         p.task.clone(),
@@ -739,7 +784,7 @@ fn execute_spawn_agent(
         model_owned,
         sub_system_prompt,
         sub_tool_defs,
-        p.max_turns,
+        effective_max_turns,
         registry_clone,
         depth + 1,
         wt_path_clone,

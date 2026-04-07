@@ -166,6 +166,13 @@ pub struct CompactionResult {
 /// Compact a session without calling an LLM — builds a structural summary
 /// from the message metadata (useful as a fast fallback or for testing).
 ///
+/// Two-phase compaction (mirrors Claude Code's approach):
+///   1. **Observation masking**: large tool results (>200 chars) in older
+///      messages are replaced with a short preview. This preserves the
+///      reasoning chain (text blocks, tool call names) while shedding bulk.
+///   2. **Hard compaction**: if still over threshold after masking, the old
+///      messages are replaced with a structural summary.
+///
 /// For a richer summary, call the LLM with `compact_system_prompt()` instead,
 /// then pass its response to `apply_compact_summary`.
 #[must_use]
@@ -179,14 +186,36 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         };
     }
 
+    // Phase 1: observation masking on older messages (keep last N untouched).
     let keep_from = session
         .messages
         .len()
         .saturating_sub(config.preserve_recent_messages);
-    let removed = &session.messages[..keep_from];
+    let masked = mask_observations(&session.messages[..keep_from]);
     let preserved = session.messages[keep_from..].to_vec();
 
-    let summary = build_structural_summary(removed);
+    // Check if masking alone brought us under threshold.
+    let masked_tokens: usize = masked.iter().map(estimate_message_tokens).sum::<usize>()
+        + preserved.iter().map(estimate_message_tokens).sum::<usize>();
+
+    if masked_tokens < config.max_estimated_tokens {
+        // Masking was enough — reassemble without hard compaction.
+        let mut all = masked;
+        all.extend(preserved);
+        return CompactionResult {
+            summary: String::new(),
+            formatted_summary: String::new(),
+            compacted_session: Session {
+                version: session.version,
+                id: session.id.clone(),
+                messages: all,
+            },
+            removed_message_count: 0,
+        };
+    }
+
+    // Phase 2: hard compaction — summarise the masked old messages.
+    let summary = build_structural_summary(&masked);
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -201,7 +230,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             id: session.id.clone(),
             messages: compacted_messages,
         },
-        removed_message_count: removed.len(),
+        removed_message_count: masked.len(),
     }
 }
 
@@ -235,6 +264,48 @@ pub fn apply_compact_summary(
         },
         removed_message_count: removed_count,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Observation masking (phase 1 of compaction)
+// ---------------------------------------------------------------------------
+
+/// Threshold in chars above which a tool result is masked.
+const MASK_THRESHOLD: usize = 200;
+
+/// Replace large tool results with a short preview.
+/// Preserves text blocks and tool-use blocks (reasoning chain) intact.
+/// Only ToolResult outputs above `MASK_THRESHOLD` chars are masked.
+fn mask_observations(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    messages
+        .iter()
+        .map(|msg| {
+            let blocks: Vec<ContentBlock> = msg
+                .blocks
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        output,
+                        is_error,
+                    } if output.len() > MASK_THRESHOLD => {
+                        let preview: String = output.chars().take(100).collect();
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            output: format!("[masked: {preview}... ({} chars)]", output.len()),
+                            is_error: *is_error,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            ConversationMessage {
+                role: msg.role.clone(),
+                blocks,
+                usage: msg.usage.clone(),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +604,94 @@ mod tests {
         let msg = get_compact_continuation_message("<summary>Did stuff</summary>", true, false);
         assert!(msg.contains("Did stuff"));
         assert!(msg.contains("Continue the conversation"));
+    }
+
+    #[test]
+    fn masking_replaces_large_tool_results() {
+        let msgs = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                output: "x".repeat(500),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+        let masked = super::mask_observations(&msgs);
+        let output = match &masked[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output,
+            _ => panic!("expected ToolResult"),
+        };
+        assert!(output.starts_with("[masked:"));
+        assert!(output.contains("500 chars"));
+    }
+
+    #[test]
+    fn masking_preserves_small_tool_results() {
+        let msgs = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                output: "small".to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+        let masked = super::mask_observations(&msgs);
+        let output = match &masked[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output,
+            _ => panic!("expected ToolResult"),
+        };
+        assert_eq!(output, "small");
+    }
+
+    #[test]
+    fn masking_preserves_text_blocks() {
+        let msgs = vec![ConversationMessage::assistant(
+            vec![ContentBlock::Text {
+                text: "x".repeat(1000),
+            }],
+            None,
+        )];
+        let masked = super::mask_observations(&msgs);
+        match &masked[0].blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text.len(), 1000),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn compact_uses_masking_before_hard_compaction() {
+        // Build a session with large tool results -- masking should reduce size
+        let mut s = Session::new("test".to_string());
+        for _ in 0..8 {
+            s.push(ConversationMessage::user("do something"));
+            s.push(ConversationMessage::assistant(
+                vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "foo.rs"}),
+                }],
+                None,
+            ));
+            s.push(ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    output: "x".repeat(500),
+                    is_error: false,
+                }],
+                usage: None,
+            });
+        }
+        let cfg = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 100,
+        };
+        let result = compact_session(&s, cfg);
+        // Should have been compacted (hard phase, since masking alone won't
+        // bring 22 messages with tool-use blocks under 100 tokens)
+        assert!(result.removed_message_count > 0 || result.compacted_session.messages.len() < s.messages.len());
     }
 
     #[test]
