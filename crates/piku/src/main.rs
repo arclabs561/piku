@@ -300,7 +300,7 @@ impl StdoutSink {
             stdout: io::stdout(),
             trace,
             pending_tool_id: std::collections::HashMap::new(),
-            md: piku::markdown::StreamingMarkdown::new(),
+            md: piku::markdown::StreamingMarkdown::new_stdout(),
         }
     }
 }

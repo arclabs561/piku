@@ -300,23 +300,33 @@ fn handle_slash_cmd(
 
 pub struct ReplSink {
     stdout: io::Stdout,
+    md: crate::markdown::StreamingMarkdown,
 }
 
 impl ReplSink {
     pub fn new() -> Self {
         Self {
             stdout: io::stdout(),
+            md: crate::markdown::StreamingMarkdown::new_stdout(),
         }
     }
 }
 
 impl OutputSink for ReplSink {
     fn on_text(&mut self, text: &str) {
-        let _ = self.stdout.write_all(text.as_bytes());
-        let _ = self.stdout.flush();
+        let rendered = self.md.push(text);
+        if !rendered.is_empty() {
+            let _ = self.stdout.write_all(rendered.as_bytes());
+            let _ = self.stdout.flush();
+        }
     }
 
     fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value) {
+        // Flush pending markdown before tool label
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            let _ = self.stdout.write_all(flushed.as_bytes());
+        }
         let icon = tool_icon(tool_name);
         let args = crate::format_tool_input(tool_name, input);
         let line = if args.is_empty() {
@@ -370,6 +380,10 @@ impl OutputSink for ReplSink {
     }
 
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            let _ = self.stdout.write_all(flushed.as_bytes());
+        }
         let _ = writeln!(
             self.stdout,
             "\n\x1b[2m[{iterations} iter · {}↑ {}↓]\x1b[0m",
