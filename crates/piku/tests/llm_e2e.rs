@@ -1,5 +1,3 @@
-
-
 /// Real end-to-end tests: spawns the compiled piku binary against a real LLM API.
 ///
 /// GATING: All tests require `PIKU_LLM_E2E=1` to run. Without it they skip.

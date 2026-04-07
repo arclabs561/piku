@@ -1,5 +1,3 @@
-
-
 /// End-to-end integration tests for the piku agentic runtime.
 ///
 /// These tests use:

@@ -5,7 +5,6 @@
 /// as a real terminal would see it -- no strip_ansi heuristics needed.
 ///
 /// Pattern from Codex: CrosstermBackend<vt100::Parser> → screen().contents()
-
 use piku::markdown::StreamingMarkdown;
 
 /// Create a VT100 parser, write text to it, return screen contents.
@@ -75,10 +74,7 @@ fn list_bullets_render() {
     let screen = render_to_vt100(&out);
     assert!(screen.contains("first"), "list item 1: {screen:?}");
     assert!(screen.contains("second"), "list item 2: {screen:?}");
-    assert!(
-        screen.contains('\u{2022}'),
-        "bullet char: {screen:?}"
-    );
+    assert!(screen.contains('\u{2022}'), "bullet char: {screen:?}");
 }
 
 #[test]
@@ -87,10 +83,7 @@ fn blockquote_renders_with_bar() {
     let out = md.push("> quoted text\n");
     let screen = render_to_vt100(&out);
     assert!(screen.contains("quoted text"), "quote content: {screen:?}");
-    assert!(
-        screen.contains('\u{258e}'),
-        "quarter block bar: {screen:?}"
-    );
+    assert!(screen.contains('\u{258e}'), "quarter block bar: {screen:?}");
 }
 
 #[test]

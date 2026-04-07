@@ -1294,7 +1294,6 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
-
     #[test]
     fn basic_insert_and_backspace() {
         let mut buf = InputBuffer::new();

@@ -898,10 +898,7 @@ async fn run_tui_repl_core(
                         // Run it
                         let _ = io::stdout().flush();
                         reset_scroll_region();
-                        let output = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(cmd)
-                            .output();
+                        let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
                         let (_, rows) = term_size();
                         set_scroll_region(1, rows.saturating_sub(2));
                         let scroll_bot = rows.saturating_sub(2);
@@ -914,8 +911,10 @@ async fn run_tui_repl_core(
                                     println!("  {line}\r");
                                 }
                                 if stdout_str.lines().count() > 20 {
-                                    println!("  \x1b[2m… +{} lines\x1b[0m\r",
-                                        stdout_str.lines().count() - 20);
+                                    println!(
+                                        "  \x1b[2m… +{} lines\x1b[0m\r",
+                                        stdout_str.lines().count() - 20
+                                    );
                                 }
                                 if !stderr_str.is_empty() {
                                     for line in stderr_str.lines().take(5) {
