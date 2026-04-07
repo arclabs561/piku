@@ -19,6 +19,12 @@ pub struct AgentDef {
     pub system_prompt: &'static str,
     /// Tools the agent is NOT allowed to use.  Empty = all tools allowed.
     pub disallowed_tools: &'static [&'static str],
+    /// Tools the agent IS allowed to use (allowlist).  Empty = all tools
+    /// allowed (subject to `disallowed_tools`).  When non-empty, only these
+    /// tools are available — `disallowed_tools` is ignored.
+    pub allowed_tools: &'static [&'static str],
+    /// Per-agent turn limit.  `None` uses the caller's default (20).
+    pub max_turns: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +132,8 @@ pub const VERIFICATION_AGENT: AgentDef = AgentDef {
                   Returns PASS / FAIL / PARTIAL verdict with evidence.",
     system_prompt: VERIFICATION_SYSTEM_PROMPT,
     disallowed_tools: &["spawn_agent", "write_file", "edit_file"],
+    allowed_tools: &[],
+    max_turns: Some(30),
 };
 
 // ---------------------------------------------------------------------------
@@ -151,4 +159,6 @@ pub const EXPLORER_AGENT: AgentDef = AgentDef {
                   'find all usages of Z'. Returns a structured research report.",
     system_prompt: EXPLORER_SYSTEM_PROMPT,
     disallowed_tools: &["spawn_agent", "write_file", "edit_file", "bash"],
+    allowed_tools: &[],
+    max_turns: Some(15),
 };
