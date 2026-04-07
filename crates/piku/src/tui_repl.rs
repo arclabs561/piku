@@ -783,7 +783,7 @@ async fn run_tui_repl_core(
             );
         } else {
             println!(
-                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}\x1b[0m\r\n\x1b[2m/help for commands · Ctrl-D to exit\x1b[0m\r",
+                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}\x1b[0m\r\n\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r",
                 resolved.name(), model,
             );
         }
@@ -797,7 +797,7 @@ async fn run_tui_repl_core(
 
     // ── Line editor ──────────────────────────────────────────────────────────
     let history_path = sessions_dir.join(".repl_history");
-    let mut editor = LineEditor::new("\x1b[34m>\x1b[0m ");
+    let mut editor = LineEditor::new("\x1b[34m›\x1b[0m ");
     editor.load_history_file(&history_path);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -834,9 +834,9 @@ async fn run_tui_repl_core(
 
         // Prompt glyph reflects state: red after error, blue normally.
         if last_turn_error {
-            editor.set_prompt("\x1b[31m>\x1b[0m ");
+            editor.set_prompt("\x1b[31m›\x1b[0m ");
         } else {
-            editor.set_prompt("\x1b[34m>\x1b[0m ");
+            editor.set_prompt("\x1b[34m›\x1b[0m ");
         }
 
         // Temporarily reset scroll region so the editor can use the
@@ -906,7 +906,7 @@ async fn run_tui_repl_core(
                 };
                 // Echo: dim blue glyph + dim text, visually distinct from
                 // the bright active prompt.
-                println!("\x1b[2;34m>\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
+                println!("\x1b[2;34m›\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
@@ -1177,7 +1177,7 @@ fn handle_slash_cmd(
     match cmd.as_str() {
         "help" | "h" => {
             println!(
-                "\x1b[1mSlash commands:\x1b[0m\r
+                "\x1b[1mCommands:\x1b[0m\r
   /help          This message\r
   /status        Session info\r
   /cost          Token usage\r
@@ -1185,7 +1185,15 @@ fn handle_slash_cmd(
   /tasks         List background agents\r
   /sessions      List saved sessions\r
   /clear         Clear session context\r
-  /exit, /quit   Exit piku\r"
+  /exit, /quit   Exit piku\r
+\r
+\x1b[1mKeys:\x1b[0m\r
+  Shift+Enter    Insert newline (multiline input)\r
+  Ctrl+J         Insert newline (alternative)\r
+  Ctrl+A / E     Move to start / end of line\r
+  Ctrl+K / U     Kill to end / start of line\r
+  Ctrl+W         Kill previous word\r
+  Esc            Clear input\r"
             );
         }
         "status" => {
