@@ -646,8 +646,11 @@ impl PtyHandle {
         let mut cmd = Command::new("sh");
         cmd.arg("-c");
 
+        // Set terminal size via stty before launching piku, so crossterm's
+        // terminal::size() returns the correct dimensions. Without this,
+        // DECSTBM scroll regions don't align with our VT100 parser grid.
         let inner_cmd = format!(
-            "cd {} && {} --provider {} --model {}",
+            "stty rows 40 cols 120 2>/dev/null; cd {} && {} --provider {} --model {}",
             shell_escape(&workspace.to_string_lossy()),
             piku_bin.display(),
             spec.label,
@@ -664,6 +667,10 @@ impl PtyHandle {
         let mut process = rexpect::process::PtyProcess::new(cmd).expect("failed to spawn piku");
         process.set_kill_timeout(Some(5_000));
 
+        // Set PTY window size so piku's crossterm::terminal::size() returns
+        // the correct dimensions (not the default 24x80). Without this,
+        // DECSTBM scroll regions are misconfigured and response content
+        // doesn't align with our VT100 parser's grid.
         let writer = process.get_file_handle().expect("writer handle");
         let reader = process.get_file_handle().expect("reader handle");
 
