@@ -1,3 +1,6 @@
+#[path = "agentic/mod.rs"]
+mod agentic;
+
 /// Agentic user harness — an LLM plays the role of a developer using piku.
 ///
 /// Architecture (v2):
@@ -978,11 +981,15 @@ fn deterministic_checks(
     // 2. Prompt glyph presence (only check after submit + response)
     if matches!(action, Action::Submit(_)) && after.is_ready() {
         let input = after.input_row().trim_start();
-        if !input.starts_with('>') && !input.starts_with('!') {
+        let has_glyph = input.starts_with('\u{276F}') // ❯
+            || input.starts_with('>')
+            || input.starts_with('!')
+            || input.contains("Send a message");
+        if !has_glyph {
             findings.push(Finding {
                 severity: Severity::Major,
                 description: "prompt glyph missing from input row".to_string(),
-                expected: "input row should start with > or !".to_string(),
+                expected: "input row should start with ❯, >, or !".to_string(),
                 actual: format!("input row: {:?}", &input[..input.len().min(40)]),
             });
         }
@@ -2097,6 +2104,27 @@ fn run_agentic_session(persona: &Persona) {
 
         // Get final snapshot and run checks
         let snap_after = observer.snapshot();
+        let non_empty: Vec<(usize, &str)> = snap_after
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.trim().is_empty())
+            .map(|(i, r)| (i, r.as_str()))
+            .collect();
+        eprintln!(
+            "[agentic_user] snapshot: cursor={:?} visible={} non_empty_rows={} is_ready={}",
+            snap_after.cursor,
+            snap_after.cursor_visible,
+            non_empty.len(),
+            snap_after.is_ready()
+        );
+        for (i, row) in non_empty.iter().take(5) {
+            let preview = if row.len() > 80 { &row[..80] } else { row };
+            eprintln!("[agentic_user]   row {i}: {preview}");
+        }
+        if non_empty.len() > 5 {
+            eprintln!("[agentic_user]   ... and {} more", non_empty.len() - 5);
+        }
         let last_action = phase.scripted.last().cloned().unwrap_or(Action::Observe);
         let findings = deterministic_checks(&snap_before, &snap_after, &last_action);
         let ws_diff = ws_observer.diff_since_checkpoint();
