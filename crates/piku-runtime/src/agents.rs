@@ -1,34 +1,116 @@
-/// Built-in agent definitions.
+/// Agent definitions — built-in and custom (loaded from `.piku/agents/*.md`).
 ///
-/// Each built-in agent has a type name, a system prompt, and optional
-/// tool restrictions.  The agent loop resolves these when the model calls
+/// Each agent has a type name, a system prompt, and optional tool
+/// restrictions.  The agent loop resolves these when the model calls
 /// `spawn_agent` with a matching `subagent_type`.
 ///
-/// Adapted from Claude Code's `src/tools/AgentTool/built-in/`.
+/// Custom agents are defined as markdown files with YAML-ish frontmatter:
+///
+/// ```markdown
+/// ---
+/// name: reviewer
+/// description: Review code changes for correctness and style.
+/// disallowed_tools: [write_file, edit_file]
+/// max_turns: 25
+/// ---
+///
+/// You are a code reviewer. Read the diff and report issues...
+/// ```
+
+use std::path::Path;
+
 // ---------------------------------------------------------------------------
-// Definition type
+// Definition types
 // ---------------------------------------------------------------------------
 
+/// A built-in agent definition with `&'static` string references.
 #[derive(Debug, Clone)]
 pub struct AgentDef {
-    /// Unique type name (e.g. "verification", "explorer").
     pub agent_type: &'static str,
-    /// One-line description of when to use this agent.
     pub when_to_use: &'static str,
-    /// System prompt injected at the start of the subagent's session.
     pub system_prompt: &'static str,
-    /// Tools the agent is NOT allowed to use.  Empty = all tools allowed.
     pub disallowed_tools: &'static [&'static str],
-    /// Tools the agent IS allowed to use (allowlist).  Empty = all tools
-    /// allowed (subject to `disallowed_tools`).  When non-empty, only these
-    /// tools are available — `disallowed_tools` is ignored.
+    /// When non-empty, only these tools are available (`disallowed_tools` ignored).
     pub allowed_tools: &'static [&'static str],
-    /// Per-agent turn limit.  `None` uses the caller's default (20).
     pub max_turns: Option<u32>,
 }
 
+/// A custom agent definition loaded from a `.md` file (owns its strings).
+#[derive(Debug, Clone)]
+pub struct CustomAgentDef {
+    pub agent_type: String,
+    pub when_to_use: String,
+    pub system_prompt: String,
+    pub disallowed_tools: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub max_turns: Option<u32>,
+    /// Source file path (for debugging).
+    pub source_path: String,
+}
+
+/// Unified view over both built-in and custom agents.
+#[derive(Debug, Clone)]
+pub enum AnyAgentDef {
+    BuiltIn(&'static AgentDef),
+    Custom(CustomAgentDef),
+}
+
+impl AnyAgentDef {
+    #[must_use]
+    pub fn agent_type(&self) -> &str {
+        match self {
+            Self::BuiltIn(d) => d.agent_type,
+            Self::Custom(d) => &d.agent_type,
+        }
+    }
+
+    #[must_use]
+    pub fn when_to_use(&self) -> &str {
+        match self {
+            Self::BuiltIn(d) => d.when_to_use,
+            Self::Custom(d) => &d.when_to_use,
+        }
+    }
+
+    #[must_use]
+    pub fn system_prompt(&self) -> &str {
+        match self {
+            Self::BuiltIn(d) => d.system_prompt,
+            Self::Custom(d) => &d.system_prompt,
+        }
+    }
+
+    #[must_use]
+    pub fn max_turns(&self) -> Option<u32> {
+        match self {
+            Self::BuiltIn(d) => d.max_turns,
+            Self::Custom(d) => d.max_turns,
+        }
+    }
+
+    /// Check if a tool is allowed for this agent.
+    /// Returns true if the tool should be included in the subagent's tool set.
+    #[must_use]
+    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
+        match self {
+            Self::BuiltIn(d) => {
+                if !d.allowed_tools.is_empty() {
+                    return d.allowed_tools.contains(&tool_name);
+                }
+                !d.disallowed_tools.contains(&tool_name)
+            }
+            Self::Custom(d) => {
+                if !d.allowed_tools.is_empty() {
+                    return d.allowed_tools.iter().any(|t| t == tool_name);
+                }
+                !d.disallowed_tools.iter().any(|t| t == tool_name)
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Registry
+// Built-in registry
 // ---------------------------------------------------------------------------
 
 static BUILT_INS: &[AgentDef] = &[VERIFICATION_AGENT, EXPLORER_AGENT];
@@ -45,14 +127,55 @@ pub fn find_built_in(agent_type: &str) -> Option<&'static AgentDef> {
     BUILT_INS.iter().find(|a| a.agent_type == agent_type)
 }
 
-/// Build the agent listing section injected into the system prompt.
-/// Lists all built-in agents with their `when_to_use` description.
+// ---------------------------------------------------------------------------
+// Custom agent loading
+// ---------------------------------------------------------------------------
+
+/// Load custom agent definitions from `.piku/agents/` in the given directory.
+/// Returns an empty vec if the directory doesn't exist.
+pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
+    let agents_dir = project_root.join(".piku").join("agents");
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut agents = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        match parse_agent_markdown(&path) {
+            Ok(def) => agents.push(def),
+            Err(e) => {
+                eprintln!("[piku] warning: failed to parse agent {}: {e}", path.display());
+            }
+        }
+    }
+    agents
+}
+
+/// Find an agent by type name across built-ins and custom agents.
 #[must_use]
-pub fn agent_listing_prompt() -> String {
+pub fn find_agent<'a>(
+    agent_type: &str,
+    custom_agents: &'a [CustomAgentDef],
+) -> Option<AnyAgentDef> {
+    // Custom agents override built-ins with the same name.
+    if let Some(custom) = custom_agents.iter().find(|a| a.agent_type == agent_type) {
+        return Some(AnyAgentDef::Custom(custom.clone()));
+    }
+    find_built_in(agent_type).map(AnyAgentDef::BuiltIn)
+}
+
+/// Build the agent listing prompt including both built-in and custom agents.
+#[must_use]
+pub fn agent_listing_prompt_with_custom(custom_agents: &[CustomAgentDef]) -> String {
     let mut out = String::from(
         "# Available agents\n\n\
          You can delegate tasks to specialized agents using the `spawn_agent` tool.\n\
-         Pass `subagent_type` to use a named built-in agent.\n\n",
+         Pass `subagent_type` to use a named agent.\n\n",
     );
     for a in BUILT_INS {
         out.push_str("- **");
@@ -61,11 +184,109 @@ pub fn agent_listing_prompt() -> String {
         out.push_str(a.when_to_use);
         out.push('\n');
     }
+    for a in custom_agents {
+        out.push_str("- **");
+        out.push_str(&a.agent_type);
+        out.push_str("**: ");
+        out.push_str(&a.when_to_use);
+        out.push('\n');
+    }
     out.push_str(
         "\nOmit `subagent_type` to spawn a general-purpose agent \
          with no specialized system prompt.",
     );
     out
+}
+
+/// Build the agent listing (built-ins only, for backward compat).
+#[must_use]
+pub fn agent_listing_prompt() -> String {
+    agent_listing_prompt_with_custom(&[])
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter parser (simple, no YAML dep)
+// ---------------------------------------------------------------------------
+
+fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read error: {e}"))?;
+
+    let (frontmatter, body) = split_frontmatter(&content)
+        .ok_or_else(|| "missing --- frontmatter delimiters".to_string())?;
+
+    let name = extract_field(&frontmatter, "name")
+        .ok_or_else(|| "missing required 'name' field".to_string())?;
+    let description = extract_field(&frontmatter, "description")
+        .ok_or_else(|| "missing required 'description' field".to_string())?;
+
+    let disallowed_tools = extract_list_field(&frontmatter, "disallowed_tools");
+    let allowed_tools = extract_list_field(&frontmatter, "allowed_tools");
+    let max_turns = extract_field(&frontmatter, "max_turns")
+        .and_then(|v| v.parse::<u32>().ok());
+
+    Ok(CustomAgentDef {
+        agent_type: name,
+        when_to_use: description,
+        system_prompt: body.trim().to_string(),
+        disallowed_tools,
+        allowed_tools,
+        max_turns,
+        source_path: path.display().to_string(),
+    })
+}
+
+/// Split `---\nfrontmatter\n---\nbody` into (frontmatter, body).
+fn split_frontmatter(content: &str) -> Option<(String, String)> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after_first = &trimmed[3..].trim_start_matches(['\r', '\n']);
+    let end = after_first.find("\n---")?;
+    let frontmatter = after_first[..end].to_string();
+    let body_start = end + 4; // skip "\n---"
+    let body = if body_start < after_first.len() {
+        after_first[body_start..].to_string()
+    } else {
+        String::new()
+    };
+    Some((frontmatter, body))
+}
+
+/// Extract a simple `key: value` field from frontmatter text.
+fn extract_field(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract a `key: [a, b, c]` list field from frontmatter text.
+fn extract_list_field(frontmatter: &str, key: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let rest = rest.trim();
+            // Parse [item1, item2, ...] format
+            if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                return inner
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -162,3 +383,143 @@ pub const EXPLORER_AGENT: AgentDef = AgentDef {
     allowed_tools: &[],
     max_turns: Some(15),
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn find_built_in_works() {
+        assert!(find_built_in("verification").is_some());
+        assert!(find_built_in("explorer").is_some());
+        assert!(find_built_in("nonexistent").is_none());
+    }
+
+    #[test]
+    fn split_frontmatter_basic() {
+        let content = "---\nname: test\n---\nbody text";
+        let (fm, body) = split_frontmatter(content).unwrap();
+        assert_eq!(fm, "name: test");
+        assert!(body.contains("body text"));
+    }
+
+    #[test]
+    fn extract_field_basic() {
+        let fm = "name: reviewer\ndescription: Review code";
+        assert_eq!(extract_field(fm, "name"), Some("reviewer".to_string()));
+        assert_eq!(extract_field(fm, "description"), Some("Review code".to_string()));
+        assert_eq!(extract_field(fm, "missing"), None);
+    }
+
+    #[test]
+    fn extract_list_field_basic() {
+        let fm = "disallowed_tools: [write_file, edit_file, bash]";
+        let list = extract_list_field(fm, "disallowed_tools");
+        assert_eq!(list, vec!["write_file", "edit_file", "bash"]);
+    }
+
+    #[test]
+    fn extract_list_field_quoted() {
+        let fm = r#"allowed_tools: ["read_file", "grep", "glob"]"#;
+        let list = extract_list_field(fm, "allowed_tools");
+        assert_eq!(list, vec!["read_file", "grep", "glob"]);
+    }
+
+    #[test]
+    fn parse_agent_markdown_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".piku").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        let agent_md = agent_dir.join("reviewer.md");
+        fs::write(&agent_md, "\
+---
+name: reviewer
+description: Review code for correctness
+disallowed_tools: [write_file, edit_file]
+max_turns: 25
+---
+
+You are a code reviewer. Check the diff carefully.
+").unwrap();
+
+        let agents = load_custom_agents(dir.path());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_type, "reviewer");
+        assert_eq!(agents[0].when_to_use, "Review code for correctness");
+        assert_eq!(agents[0].disallowed_tools, vec!["write_file", "edit_file"]);
+        assert_eq!(agents[0].max_turns, Some(25));
+        assert!(agents[0].system_prompt.contains("code reviewer"));
+    }
+
+    #[test]
+    fn load_custom_agents_no_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = load_custom_agents(dir.path());
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn find_agent_custom_overrides_builtin() {
+        let custom = vec![CustomAgentDef {
+            agent_type: "verification".to_string(),
+            when_to_use: "custom verifier".to_string(),
+            system_prompt: "custom prompt".to_string(),
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            max_turns: Some(10),
+            source_path: "test.md".to_string(),
+        }];
+        let found = find_agent("verification", &custom).unwrap();
+        assert_eq!(found.when_to_use(), "custom verifier");
+        assert_eq!(found.max_turns(), Some(10));
+    }
+
+    #[test]
+    fn any_agent_def_tool_filtering() {
+        let def = AnyAgentDef::BuiltIn(&EXPLORER_AGENT);
+        assert!(def.is_tool_allowed("read_file"));
+        assert!(!def.is_tool_allowed("bash"));
+        assert!(!def.is_tool_allowed("write_file"));
+    }
+
+    #[test]
+    fn any_agent_def_allowlist_precedence() {
+        let custom = CustomAgentDef {
+            agent_type: "narrow".to_string(),
+            when_to_use: "test".to_string(),
+            system_prompt: "test".to_string(),
+            disallowed_tools: vec!["bash".to_string()], // should be ignored
+            allowed_tools: vec!["read_file".to_string(), "grep".to_string()],
+            max_turns: None,
+            source_path: "test.md".to_string(),
+        };
+        let def = AnyAgentDef::Custom(custom);
+        assert!(def.is_tool_allowed("read_file"));
+        assert!(def.is_tool_allowed("grep"));
+        assert!(!def.is_tool_allowed("bash"));
+        assert!(!def.is_tool_allowed("write_file"));
+    }
+
+    #[test]
+    fn agent_listing_includes_custom() {
+        let custom = vec![CustomAgentDef {
+            agent_type: "reviewer".to_string(),
+            when_to_use: "Review code".to_string(),
+            system_prompt: String::new(),
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            max_turns: None,
+            source_path: String::new(),
+        }];
+        let listing = agent_listing_prompt_with_custom(&custom);
+        assert!(listing.contains("reviewer"));
+        assert!(listing.contains("Review code"));
+        assert!(listing.contains("verification"));
+    }
+}
