@@ -933,6 +933,7 @@ dependencies = [
  "futures-util",
  "piku-api",
  "piku-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
