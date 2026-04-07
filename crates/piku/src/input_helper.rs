@@ -26,10 +26,19 @@ pub const SLASH_CMDS: &[&str] = &[
 
 // ── Input buffer ────────────────────────────────────────────────────────────
 
+/// Characters that define word boundaries (matches Codex's WORD_SEPARATORS).
+const WORD_SEPS: &str = " \t\n`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+fn is_word_sep(c: char) -> bool {
+    WORD_SEPS.contains(c)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputBuffer {
     buffer: String,
     cursor: usize,
+    /// Kill ring (single entry, like Codex). Ctrl+K/U/W store here, Ctrl+Y yanks.
+    kill_buffer: String,
 }
 
 impl InputBuffer {
@@ -38,6 +47,7 @@ impl InputBuffer {
         Self {
             buffer: String::new(),
             cursor: 0,
+            kill_buffer: String::new(),
         }
     }
 
@@ -100,33 +110,39 @@ impl InputBuffer {
     }
 
     /// Move cursor back one word (Alt+B / Ctrl+Left).
+    /// Uses separator characters for boundaries (like Codex).
     pub fn move_word_back(&mut self) {
-        // Skip whitespace, then skip word chars
-        let before = &self.buffer[..self.cursor];
-        let trimmed = before.trim_end();
-        if trimmed.is_empty() {
-            self.cursor = 0;
+        if self.cursor == 0 {
             return;
         }
-        // Find last whitespace boundary in trimmed portion
-        let word_start = trimmed
-            .rfind(|c: char| c.is_whitespace())
-            .map_or(0, |i| i + 1);
-        self.cursor = word_start;
+        let before = &self.buffer[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut i = chars.len();
+        // Skip separators
+        while i > 0 && is_word_sep(chars[i - 1]) {
+            i -= 1;
+        }
+        // Skip word chars
+        while i > 0 && !is_word_sep(chars[i - 1]) {
+            i -= 1;
+        }
+        self.cursor = chars[..i].iter().map(|c| c.len_utf8()).sum();
     }
 
     /// Move cursor forward one word (Alt+F / Ctrl+Right).
     pub fn move_word_forward(&mut self) {
         let after = &self.buffer[self.cursor..];
-        // Skip current word chars, then skip whitespace
-        let skip_word = after
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(after.len());
-        let rest = &after[skip_word..];
-        let skip_space = rest
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(rest.len());
-        self.cursor += skip_word + skip_space;
+        let chars: Vec<char> = after.chars().collect();
+        let mut i = 0;
+        // Skip current word chars
+        while i < chars.len() && !is_word_sep(chars[i]) {
+            i += 1;
+        }
+        // Skip separators
+        while i < chars.len() && is_word_sep(chars[i]) {
+            i += 1;
+        }
+        self.cursor += chars[..i].iter().map(|c| c.len_utf8()).sum::<usize>();
     }
 
     /// Transpose the two characters before the cursor (Ctrl+T).
@@ -156,22 +172,36 @@ impl InputBuffer {
         }
     }
 
-    /// Kill from cursor to end of line (Ctrl+K).
+    /// Kill from cursor to end of line (Ctrl+K). Stores killed text.
     pub fn kill_to_end(&mut self) {
+        self.kill_buffer = self.buffer[self.cursor..].to_string();
         self.buffer.truncate(self.cursor);
     }
 
-    /// Kill from start to cursor (Ctrl+U).
+    /// Kill from start to cursor (Ctrl+U). Stores killed text.
     pub fn kill_to_start(&mut self) {
+        self.kill_buffer = self.buffer[..self.cursor].to_string();
         self.buffer.drain(..self.cursor);
         self.cursor = 0;
     }
 
-    /// Kill previous word (Ctrl+W).
+    /// Kill previous word (Ctrl+W). Stores killed text.
     pub fn kill_word_back(&mut self) {
         let old_cursor = self.cursor;
         self.move_word_back();
+        self.kill_buffer = self.buffer[self.cursor..old_cursor].to_string();
         self.buffer.drain(self.cursor..old_cursor);
+    }
+
+    /// Yank (paste) the kill buffer at cursor (Ctrl+Y).
+    pub fn yank(&mut self) {
+        if self.kill_buffer.is_empty() {
+            return;
+        }
+        let text = self.kill_buffer.clone();
+        for ch in text.chars() {
+            self.insert(ch);
+        }
     }
 
     #[must_use]
@@ -496,6 +526,15 @@ impl LineEditor {
                 input.kill_word_back();
                 Action::Continue
             }
+            // Readline: Ctrl+Y = yank (paste kill buffer)
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.yank();
+                Action::Continue
+            }
             // Readline: Ctrl+B = left, Ctrl+F = right
             KeyEvent {
                 code: KeyCode::Char('b'),
@@ -602,7 +641,16 @@ impl LineEditor {
                 code: KeyCode::Right,
                 ..
             } => {
-                input.move_right();
+                // At end of input: accept ghost text hint if available
+                if input.cursor >= input.as_str().len() {
+                    if let Some(ghost) = self.history_ghost(input.as_str()) {
+                        input.replace(format!("{}{ghost}", input.as_str()));
+                        self.history_index = None;
+                        self.draft = None;
+                    }
+                } else {
+                    input.move_right();
+                }
                 Action::Continue
             }
             KeyEvent {
@@ -696,6 +744,22 @@ impl LineEditor {
         }
     }
 
+    /// Find the most recent history entry that starts with `prefix` and
+    /// return the suffix (the part after the prefix). Returns None if no match.
+    fn history_ghost(&self, prefix: &str) -> Option<String> {
+        // Don't ghost slash commands (tab completion handles those)
+        if prefix.starts_with('/') {
+            return None;
+        }
+        // Search from most recent backward
+        for entry in self.history.iter().rev() {
+            if entry.starts_with(prefix) && entry.len() > prefix.len() {
+                return Some(entry[prefix.len()..].to_string());
+            }
+        }
+        None
+    }
+
     // ── Rendering ───────────────────────────────────────────────────────
 
     fn render(&self, input: &InputBuffer) -> Rendered {
@@ -730,6 +794,15 @@ impl LineEditor {
                     &self.continuation_prompt
                 };
                 lines.push(format!("{prefix}{line}"));
+            }
+            // Ghost text: show dim hint from matching history entry (single-line only).
+            // Only when cursor is at end and input has no newlines.
+            if !text.contains('\n') && input.cursor == text.len() && text.len() >= 2 {
+                if let Some(hint) = self.history_ghost(text) {
+                    if let Some(first) = lines.first_mut() {
+                        first.push_str(&format!("\x1b[2m{hint}\x1b[0m"));
+                    }
+                }
             }
         }
 
