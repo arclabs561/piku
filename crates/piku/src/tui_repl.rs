@@ -882,6 +882,69 @@ async fn run_tui_repl_core(
                     break;
                 }
 
+                // ! prefix: direct bash command (bypass AI)
+                if full_input.starts_with('!') {
+                    let cmd = full_input[1..].trim();
+                    if !cmd.is_empty() {
+                        let (_, rows) = term_size();
+                        let scroll_bot = rows.saturating_sub(2);
+                        goto(rows, 1);
+                        print!("\x1b[2K");
+                        goto(scroll_bot, 1);
+                        // Echo command
+                        println!("\r\n\x1b[2;35m!\x1b[0m \x1b[2m{cmd}\x1b[0m\r");
+                        // Run it
+                        let _ = io::stdout().flush();
+                        reset_scroll_region();
+                        let output = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .output();
+                        let (_, rows) = term_size();
+                        set_scroll_region(1, rows.saturating_sub(2));
+                        let scroll_bot = rows.saturating_sub(2);
+                        goto(scroll_bot, 1);
+                        match output {
+                            Ok(out) => {
+                                let stdout_str = String::from_utf8_lossy(&out.stdout);
+                                let stderr_str = String::from_utf8_lossy(&out.stderr);
+                                for line in stdout_str.lines().take(20) {
+                                    println!("  {line}\r");
+                                }
+                                if stdout_str.lines().count() > 20 {
+                                    println!("  \x1b[2m… +{} lines\x1b[0m\r",
+                                        stdout_str.lines().count() - 20);
+                                }
+                                if !stderr_str.is_empty() {
+                                    for line in stderr_str.lines().take(5) {
+                                        println!("  \x1b[31m{line}\x1b[0m\r");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("  \x1b[31m{e}\x1b[0m\r");
+                            }
+                        }
+                        let (cols, rows) = term_size();
+                        draw_footer(
+                            rows.saturating_sub(1),
+                            cols,
+                            &FooterState {
+                                provider: resolved.name(),
+                                model: &model,
+                                session_id: &session_id,
+                                input_tokens: total_usage.input_tokens,
+                                output_tokens: total_usage.output_tokens,
+                                turns: 0,
+                                running_agents: 0,
+                                context_pct: context_pct(total_usage.input_tokens),
+                            },
+                        );
+                        let _ = io::stdout().flush();
+                    }
+                    continue;
+                }
+
                 // Slash commands — clear the input row first
                 if full_input.starts_with('/') {
                     let (_, rows) = term_size();
@@ -1250,6 +1313,7 @@ fn handle_slash_cmd(
             println!(
                 "\x1b[1mCommands:\x1b[0m\r
   /help          This message\r
+  !command       Run shell command directly\r
   /status        Session info\r
   /cost          Token usage\r
   /model [name]  Show or switch model\r
