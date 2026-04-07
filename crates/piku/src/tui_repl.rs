@@ -954,7 +954,7 @@ async fn run_tui_repl_core(
                     let current_model_name = model.clone();
                     let should_exit = handle_slash_cmd(
                         &full_input,
-                        &session,
+                        &mut session,
                         &total_usage,
                         &current_model_name,
                         resolved.name(),
@@ -1290,7 +1290,7 @@ fn first_n_lines(s: &str, n: usize) -> String {
 /// Returns true if the REPL should exit.
 fn handle_slash_cmd(
     input: &str,
-    session: &Session,
+    session: &mut Session,
     total_usage: &TokenUsage,
     current_model: &str,
     provider_name: &str,
@@ -1416,6 +1416,10 @@ fn handle_slash_cmd(
                     }
                 }
             }
+        }
+        "clear" => {
+            session.messages.clear();
+            println!("\x1b[2m[session cleared]\x1b[0m\r");
         }
         "exit" | "quit" | "q" => {
             return true;
