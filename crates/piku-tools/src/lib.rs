@@ -8,6 +8,7 @@ pub mod read_file;
 pub mod spawn_agent;
 #[cfg(test)]
 mod tests;
+pub mod tool_search;
 pub mod write_file;
 
 use piku_api::ToolDefinition;
@@ -129,6 +130,10 @@ pub async fn execute_tool(name: &str, params: serde_json::Value) -> Option<ToolR
         "agent_join" => Some(spawn_agent::execute_agent_join_stub(params)),
         "read_memory" => Some(memory_tool::execute_read_memory(params)),
         "write_memory" => Some(memory_tool::execute_write_memory(params)),
+        // tool_search is routed by the runtime (needs catalog), but provide a stub here
+        "tool_search" => Some(ToolResult::ok(
+            "tool_search requires a tool catalog. Use it in an interactive session.".to_string(),
+        )),
         _ => None,
     }
 }
@@ -205,5 +210,11 @@ static TOOLS: &[ToolEntry] = &[
         description: "Write to your persistent memory (MEMORY.md). Use '## Heading' sections for structured notes that can be updated. Memory persists across sessions. Save: user preferences, feedback corrections, project context, key decisions.",
         schema_fn: memory_tool::write_memory_schema,
         destructiveness_fn: memory_tool::write_memory_destructiveness,
+    },
+    ToolEntry {
+        name: "tool_search",
+        description: "Search for available tools by keyword. Use when you need a capability not in your current tool set. Returns matching tool names and descriptions.",
+        schema_fn: tool_search::tool_search_schema,
+        destructiveness_fn: tool_search::tool_search_destructiveness,
     },
 ];

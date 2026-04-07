@@ -182,11 +182,12 @@ async fn run_turn_inner(
         }
         iterations += 1;
 
-        // Auto-compact: if the session is getting long, summarise old messages
-        // before building the next request. Uses the structural (no-LLM) path
-        // so it always works regardless of provider.
+        // Auto-compact: if the session is getting long, summarise old messages.
+        // Tries LLM summarisation first (richer summaries); falls back to
+        // structural (no-LLM) if the provider call fails or times out.
         if crate::compact::should_compact(session, compact_cfg) {
-            let result = crate::compact::compact_session(session, compact_cfg);
+            let result = try_llm_compact(session, provider, model, compact_cfg).await
+                .unwrap_or_else(|| crate::compact::compact_session(session, compact_cfg));
             if result.removed_message_count > 0 {
                 *session = result.compacted_session;
                 sink.on_text(&format!(
@@ -281,8 +282,19 @@ async fn run_turn_inner(
 
             sink.on_tool_start(&tool_name, &tool_use_id, &params);
 
-            // Route background-agent tools through the task registry when available.
-            let (output, is_error) = if let Some(registry) = task_registry {
+            // Route special tools through the runtime; everything else through execute_tool.
+            let (output, is_error) = if tool_name == "tool_search" {
+                // Build catalog from current tool_defs for on-demand search
+                let catalog: Vec<piku_tools::tool_search::SearchableToolEntry> = tool_defs
+                    .iter()
+                    .map(|t| piku_tools::tool_search::SearchableToolEntry {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                    })
+                    .collect();
+                let r = piku_tools::tool_search::execute_tool_search(params, &catalog);
+                (r.output, r.is_error)
+            } else if let Some(registry) = task_registry {
                 match tool_name.as_str() {
                     "spawn_agent" => execute_spawn_agent(
                         &params,
@@ -1001,6 +1013,100 @@ async fn execute_agent_join(params: &serde_json::Value, registry: &TaskRegistry)
             format!("task {id_str}: timed out after {timeout_secs}s"),
             true,
         ),
+    }
+}
+
+/// Attempt LLM-based compaction: send old messages to the model with the compact
+/// prompt, collect the summary, and apply it. Returns `None` if the LLM call
+/// fails (caller should fall back to structural compaction).
+///
+/// Uses a 15-second timeout to avoid blocking the loop on slow models.
+async fn try_llm_compact(
+    session: &Session,
+    provider: &dyn Provider,
+    model: &str,
+    config: crate::compact::CompactionConfig,
+) -> Option<crate::compact::CompactionResult> {
+    let keep_from = session
+        .messages
+        .len()
+        .saturating_sub(config.preserve_recent_messages);
+    if keep_from == 0 {
+        return None;
+    }
+
+    let removed = &session.messages[..keep_from];
+
+    // Build the conversation to summarise (as a single user message).
+    let mut conversation_text = String::new();
+    for msg in removed {
+        let role = match msg.role {
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Assistant",
+            MessageRole::Tool => "Tool",
+            MessageRole::System => "System",
+        };
+        for block in &msg.blocks {
+            let text = match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[tool_use: {name}({input})]")
+                }
+                ContentBlock::ToolResult { output, .. } => {
+                    if output.len() > 300 {
+                        let preview: String = output.chars().take(150).collect();
+                        format!("[tool_result: {preview}... ({} chars)]", output.len())
+                    } else {
+                        format!("[tool_result: {output}]")
+                    }
+                }
+            };
+            if !text.trim().is_empty() {
+                conversation_text.push_str(role);
+                conversation_text.push_str(": ");
+                conversation_text.push_str(&text);
+                conversation_text.push('\n');
+            }
+        }
+    }
+
+    let compact_prompt = crate::compact::compact_system_prompt(None);
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: 4096,
+        messages: vec![RequestMessage {
+            role: "user".to_string(),
+            content: vec![RequestContent::Text {
+                text: conversation_text,
+            }],
+        }],
+        system: Some(vec![piku_api::SystemBlock::text(compact_prompt)]),
+        tools: None,
+        stream: true,
+    };
+
+    // Stream with timeout
+    let timeout = std::time::Duration::from_secs(15);
+    let mut stream = provider.stream_message(request);
+    let mut summary = String::new();
+
+    let collect_result = tokio::time::timeout(timeout, async {
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::TextDelta { text }) => summary.push_str(&text),
+                Err(_) => return Err(()),
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match collect_result {
+        Ok(Ok(())) if !summary.trim().is_empty() => {
+            Some(crate::compact::apply_compact_summary(session, &summary, config))
+        }
+        _ => None, // Timeout or error — caller falls back to structural
     }
 }
 
