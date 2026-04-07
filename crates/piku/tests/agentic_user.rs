@@ -664,6 +664,41 @@ fn set_pty_winsize(file: &std::fs::File, rows: u16, cols: u16) {
     }
 }
 
+/// Strip DECSTBM scroll region sequences from raw terminal bytes.
+/// Matches `ESC [ <digits> ; <digits> r` and `ESC [ r` (reset).
+/// Also strips cursor save/restore sequences that interact with DECSTBM.
+fn strip_decstbm(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Check for CSI sequence ending in 'r' (DECSTBM)
+            let start = i;
+            i += 2; // skip ESC [
+                    // Scan for the final byte
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b.is_ascii_alphabetic() || b == b'~' {
+                    if b == b'r' {
+                        // This is a DECSTBM sequence — skip it entirely
+                        i += 1;
+                        break;
+                    }
+                    // Not DECSTBM — emit the whole sequence
+                    out.extend_from_slice(&bytes[start..=i]);
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 // ===========================================================================
 // PTY handle — raw byte-level I/O, bypassing rexpect's reader
 // ===========================================================================
@@ -811,18 +846,21 @@ impl PtyHandle {
         total
     }
 
-    /// Clear the raw capture buffer (call before a new phase/turn).
+    /// Clear the raw capture buffer.
     fn clear_capture(&mut self) {
         self.raw_capture.clear();
     }
 
     /// Extract text content from captured bytes by running through a tall
-    /// single-zone VT100 parser (no DECSTBM scroll region clipping).
-    /// This gives us the full response text regardless of scroll regions.
+    /// VT100 parser with DECSTBM sequences stripped. This prevents the
+    /// replay parser from creating its own scroll region, so all content
+    /// stays visible in the 500-row grid.
     fn captured_text(&self) -> String {
-        // Use a very tall terminal so nothing scrolls off
+        // Strip DECSTBM sequences (CSI <n>;<n> r and CSI r) from the raw bytes
+        // so the replay parser doesn't confine content to a scroll region.
+        let cleaned = strip_decstbm(&self.raw_capture);
         let mut parser = vt100::Parser::new(500, 120, 0);
-        parser.process(&self.raw_capture);
+        parser.process(&cleaned);
         let screen = parser.screen();
         let (rows, cols) = screen.size();
         let mut lines = Vec::new();
@@ -2296,6 +2334,12 @@ fn run_agentic_session(persona: &Persona) {
 
         // Get full response content from raw byte capture (bypasses DECSTBM clipping)
         let captured = pty.captured_text();
+        eprintln!(
+            "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
+            pty.raw_capture.len(),
+            captured.len(),
+            captured.lines().count()
+        );
         let screen_for_llm = if captured.lines().count() > 2 {
             format!(
                 "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
