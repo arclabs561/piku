@@ -525,10 +525,10 @@ impl TuiSink {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let (_, rows) = term_size();
             let scroll_bot = rows.saturating_sub(2);
-            // Clear the input row's thinking indicator
+            // Clear the thinking text from the input row
             goto(rows, 1);
             let _ = self.stdout.write_all(b"\x1b[2K");
-            // Move cursor back into scroll zone
+            // Move cursor into scroll zone for output
             goto(scroll_bot, 1);
             let _ = self.stdout.flush();
         }
@@ -940,12 +940,17 @@ async fn run_tui_repl_core(
                 // Cleared by clear_thinking_indicator() on first output.
                 let stop_flag = sink.thinking_stop.clone();
                 stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Show dimmed prompt with animated thinking indicator on the
+                // input row. Cursor stays at the prompt position (like Claude Code
+                // dims the ❯ while loading). The spinner ticks on the input row
+                // using save/restore so streaming output in the scroll zone isn't
+                // disrupted.
                 goto(rows, 1);
-                print!("\x1b[2K\x1b[2m· thinking…\x1b[0m\x1b[?25h");
+                print!("\x1b[2K\x1b[2m❯ · thinking…\x1b[0m\x1b[?25h");
+                goto(rows, 3); // cursor after "❯ "
                 let _ = io::stdout().flush();
-                let indicator_rows = rows;
+                let indicator_row = rows;
                 tokio::task::spawn_local(async move {
-                    // Spinner frames inspired by Claude Code: bounce animation
                     const FRAMES: &[&str] = &["·", "✦", "✶", "✻", "✽", "✻", "✶", "✦"];
                     let start = std::time::Instant::now();
                     let mut tick: usize = 0;
@@ -964,10 +969,10 @@ async fn run_tui_repl_core(
                         };
                         let mut out = io::stdout();
                         let _ = out.write_all(b"\x1b[s"); // save cursor
-                        goto(indicator_rows, 1);
+                        goto(indicator_row, 1);
                         let _ = out.write_all(
                             format!(
-                                "\x1b[2K\x1b[2m{frame} thinking… ({time_str})\x1b[0m\x1b[?25h"
+                                "\x1b[2K\x1b[2m❯ {frame} thinking… ({time_str})\x1b[0m"
                             )
                             .as_bytes(),
                         );
