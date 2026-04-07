@@ -560,34 +560,32 @@ impl OutputSink for TuiSink {
         if !flushed.is_empty() {
             self.print(&flushed);
         }
-        // Claude Code style: ● ToolName(args)
         let name = tool_display_name(tool_name);
         let args = crate::format_tool_input(tool_name, input);
         self.print("\x1b[?25h");
         if args.is_empty() {
-            self.println(&format!(
-                "\r\n\x1b[33m●\x1b[0m \x1b[1m{name}\x1b[0m"
-            ));
+            self.println(&format!("\r\n\x1b[33m⏺\x1b[0m \x1b[1m{name}\x1b[0m"));
         } else {
             self.println(&format!(
-                "\r\n\x1b[33m●\x1b[0m \x1b[1m{name}\x1b[0m\x1b[2m({args})\x1b[0m"
+                "\r\n\x1b[33m⏺\x1b[0m \x1b[1m{name}\x1b[0m\x1b[2m({args})\x1b[0m"
             ));
         }
         let _ = self.stdout.flush();
     }
 
     fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
-        // Show result with tree connector, then status dot
         let preview = format_tool_result(tool_name, result, is_error);
         if !preview.is_empty() {
             self.println(&preview);
         }
 
-        if is_error {
-            self.println("\x1b[31m●\x1b[0m");
+        // Status dot: green success, red error
+        let dot = if is_error {
+            "\x1b[31m⏺\x1b[0m"
         } else {
-            self.println("\x1b[32m●\x1b[0m");
-        }
+            "\x1b[32m⏺\x1b[0m"
+        };
+        self.println(dot);
         let _ = self.stdout.flush();
 
         if tool_name == "bash" {
@@ -811,7 +809,7 @@ async fn run_tui_repl_core(
 
     // ── Line editor ──────────────────────────────────────────────────────────
     let history_path = sessions_dir.join(".repl_history");
-    let mut editor = LineEditor::new("\x1b[34m›\x1b[0m ");
+    let mut editor = LineEditor::new("\x1b[34m❯\x1b[0m ");
     editor.load_history_file(&history_path);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -848,9 +846,9 @@ async fn run_tui_repl_core(
 
         // Prompt glyph reflects state: red after error, blue normally.
         if last_turn_error {
-            editor.set_prompt("\x1b[31m›\x1b[0m ");
+            editor.set_prompt("\x1b[31m❯\x1b[0m ");
         } else {
-            editor.set_prompt("\x1b[34m›\x1b[0m ");
+            editor.set_prompt("\x1b[34m❯\x1b[0m ");
         }
 
         // Use read_line_raw so the editor doesn't emit post-submit
@@ -925,7 +923,7 @@ async fn run_tui_repl_core(
                 };
                 // Echo: dim blue glyph + dim text, visually distinct from
                 // the bright active prompt.
-                println!("\x1b[2;34m›\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
+                println!("\x1b[2;34m❯\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
                 let system_sections = build_system_prompt(&cwd, &date, &model);
@@ -943,22 +941,33 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
                 let indicator_rows = rows;
                 tokio::task::spawn_local(async move {
+                    // Spinner frames inspired by Claude Code: bounce animation
+                    const FRAMES: &[&str] = &["·", "✦", "✶", "✻", "✽", "✻", "✶", "✦"];
                     let start = std::time::Instant::now();
+                    let mut tick: usize = 0;
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
                         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
                         let elapsed = start.elapsed().as_secs();
+                        let frame = FRAMES[tick % FRAMES.len()];
+                        tick += 1;
+                        let time_str = if elapsed < 60 {
+                            format!("{elapsed}s")
+                        } else {
+                            format!("{}m {}s", elapsed / 60, elapsed % 60)
+                        };
                         let mut out = io::stdout();
-                        // Save cursor, draw indicator, restore cursor
-                        let _ = out.write_all(b"\x1b[s");
+                        let _ = out.write_all(b"\x1b[s"); // save cursor
                         goto(indicator_rows, 1);
                         let _ = out.write_all(
-                            format!("\x1b[2K\x1b[2m· thinking… ({elapsed}s)\x1b[0m\x1b[?25h")
-                                .as_bytes(),
+                            format!(
+                                "\x1b[2K\x1b[2m{frame} thinking… ({time_str})\x1b[0m\x1b[?25h"
+                            )
+                            .as_bytes(),
                         );
-                        let _ = out.write_all(b"\x1b[u");
+                        let _ = out.write_all(b"\x1b[u"); // restore cursor
                         let _ = out.flush();
                     }
                 });
@@ -1127,7 +1136,7 @@ fn print_session_tail(session: &Session, _scroll_bot: u16) {
                             continue;
                         }
                         println!(
-                            "\x1b[36m› \x1b[0m\x1b[2m{}\x1b[0m\r",
+                            "\x1b[36m❯ \x1b[0m\x1b[2m{}\x1b[0m\r",
                             first_n_lines(trimmed, MAX_TEXT_LINES)
                         );
                     }
@@ -1375,7 +1384,7 @@ fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
         return String::new();
     }
 
-    let connector = "\x1b[2m└\x1b[0m ";
+    let connector = "\x1b[2m⎿\x1b[0m ";
     let lines: Vec<&str> = result.lines().collect();
     let total = lines.len();
     let mut out = Vec::new();
@@ -1413,7 +1422,7 @@ fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
 
     if is_error {
         // Errors in red, show generously
-        let connector = "\x1b[2m└\x1b[0m ";
+        let connector = "\x1b[2m⎿\x1b[0m ";
         let lines: Vec<&str> = result.lines().collect();
         let mut out = Vec::new();
         for (i, line) in lines.iter().take(8).enumerate() {
