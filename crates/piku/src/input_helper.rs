@@ -11,7 +11,10 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 
@@ -124,6 +127,33 @@ impl InputBuffer {
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(rest.len());
         self.cursor += skip_word + skip_space;
+    }
+
+    /// Transpose the two characters before the cursor (Ctrl+T).
+    pub fn transpose_chars(&mut self) {
+        if self.cursor == 0 || self.buffer.len() < 2 {
+            return;
+        }
+        // If cursor is at end, transpose the last two chars
+        let at_end = self.cursor >= self.buffer.len();
+        if at_end {
+            self.move_left();
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let prev_start = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map_or(0, |(i, _)| i);
+        let curr_char = self.buffer[self.cursor..].chars().next();
+        let prev_char = self.buffer[prev_start..self.cursor].chars().next();
+        if let (Some(p), Some(c)) = (prev_char, curr_char) {
+            let after = self.cursor + c.len_utf8();
+            let replacement = format!("{c}{p}");
+            self.buffer.replace_range(prev_start..after, &replacement);
+            self.cursor = prev_start + replacement.len();
+        }
     }
 
     /// Kill from cursor to end of line (Ctrl+K).
@@ -268,11 +298,38 @@ impl LineEditor {
         let _ = std::fs::write(path, contents);
     }
 
-    /// Read a line of input. Manages raw mode internally.
-    /// The caller should position the cursor before calling this.
+    /// Read a line of input. After submit, moves the cursor past the
+    /// rendered input and emits a newline. Use `read_line_raw` when the
+    /// caller manages cursor positioning (e.g. TUI scroll regions).
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
+        let (outcome, rendered_lines) = self.read_line_inner()?;
+
+        // Move cursor past the rendered input so subsequent output
+        // doesn't overwrite it.
+        if let ReadOutcome::Submit(_) = &outcome {
+            let mut stdout = io::stdout();
+            if rendered_lines > 1 {
+                let _ = execute!(stdout, MoveDown(sat_u16(rendered_lines - 1)));
+            }
+            let _ = execute!(stdout, MoveToColumn(0));
+            let _ = write!(stdout, "\r\n");
+            let _ = stdout.flush();
+        }
+
+        Ok(outcome)
+    }
+
+    /// Read a line without post-submit cursor movement.
+    /// The caller is responsible for positioning after this returns.
+    /// Use this in TUI modes with scroll regions.
+    pub fn read_line_raw(&mut self) -> io::Result<ReadOutcome> {
+        let (outcome, _) = self.read_line_inner()?;
+        Ok(outcome)
+    }
+
+    fn read_line_inner(&mut self) -> io::Result<(ReadOutcome, usize)> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return self.read_line_fallback();
+            return self.read_line_fallback().map(|o| (o, 1));
         }
 
         let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
@@ -280,7 +337,16 @@ impl LineEditor {
             terminal::enable_raw_mode()?;
         }
 
+        // Enable kitty keyboard protocol so Shift+Enter is distinguishable
+        // from plain Enter. Terminals that don't support it silently ignore this.
         let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+
         let mut input = InputBuffer::new();
         let mut rendered_lines = 1usize;
         self.redraw(&mut stdout, &input, rendered_lines)?;
@@ -302,11 +368,11 @@ impl LineEditor {
                     }
                 },
                 Ok(Event::Resize(..)) => {
-                    // Terminal resized — just redraw
                     rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
                     if !was_raw {
                         let _ = terminal::disable_raw_mode();
                     }
@@ -315,24 +381,15 @@ impl LineEditor {
             }
         };
 
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         if !was_raw {
             terminal::disable_raw_mode()?;
         }
 
-        // Move past the rendered input
-        let final_render = self.render(&input);
-        let below = final_render.line_count.saturating_sub(1);
-        if below > 0 {
-            execute!(stdout, MoveDown(sat_u16(below)))?;
-        }
-        execute!(stdout, MoveToColumn(0))?;
-        write!(stdout, "\r\n")?;
-        stdout.flush()?;
-
         self.history_index = None;
         self.draft = None;
 
-        Ok(outcome)
+        Ok((outcome, rendered_lines))
     }
 
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
@@ -454,6 +511,32 @@ impl LineEditor {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 input.move_right();
+                Action::Continue
+            }
+            // Readline: Ctrl+T = transpose chars
+            KeyEvent {
+                code: KeyCode::Char('t'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.transpose_chars();
+                Action::Continue
+            }
+            // Readline: Ctrl+P = history up, Ctrl+N = history down
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_up(input);
+                Action::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_down(input);
                 Action::Continue
             }
             // Alt+B = word back, Alt+F = word forward
@@ -1002,6 +1085,29 @@ mod tests {
         assert_eq!(rendered.lines.len(), 2);
         assert!(rendered.lines[0].starts_with("> "));
         assert!(rendered.lines[1].starts_with("  "));
+    }
+
+    #[test]
+    fn transpose_chars() {
+        let mut buf = InputBuffer::new();
+        for ch in "ab".chars() {
+            buf.insert(ch);
+        }
+        buf.transpose_chars();
+        assert_eq!(buf.as_str(), "ba");
+    }
+
+    #[test]
+    fn ctrl_p_n_history() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("old");
+        let mut input = InputBuffer::new();
+        // Ctrl+P = history up
+        let _ = editor.handle_key(ctrl('p'), &mut input);
+        assert_eq!(input.as_str(), "old");
+        // Ctrl+N = history down (back to draft)
+        let _ = editor.handle_key(ctrl('n'), &mut input);
+        assert_eq!(input.as_str(), "");
     }
 
     #[test]
