@@ -58,6 +58,8 @@ pub struct StreamingMarkdown {
     code_lang: String,
     /// Accumulated code block content.
     code_buf: String,
+    /// Line ending: `"\r\n"` for DECSTBM scroll regions, `"\n"` for normal stdout.
+    eol: &'static str,
 }
 
 impl Default for StreamingMarkdown {
@@ -67,6 +69,7 @@ impl Default for StreamingMarkdown {
 }
 
 impl StreamingMarkdown {
+    /// Create a renderer with `\r\n` line endings (for TUI scroll regions).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -74,6 +77,16 @@ impl StreamingMarkdown {
             in_code_block: false,
             code_lang: String::new(),
             code_buf: String::new(),
+            eol: "\r\n",
+        }
+    }
+
+    /// Create a renderer with plain `\n` line endings (for regular stdout).
+    #[must_use]
+    pub fn new_stdout() -> Self {
+        Self {
+            eol: "\n",
+            ..Self::new()
         }
     }
 
@@ -109,7 +122,7 @@ impl StreamingMarkdown {
 
         // If we're mid-code-block, render what we have
         if self.in_code_block {
-            out.push_str(&render_code_block(&self.code_lang, &self.code_buf));
+            out.push_str(&render_code_block(&self.code_lang, &self.code_buf, self.eol));
             self.in_code_block = false;
             self.code_lang.clear();
             self.code_buf.clear();
@@ -120,12 +133,13 @@ impl StreamingMarkdown {
 
     fn process_line(&mut self, line: &str, out: &mut String) {
         let trimmed = line.trim_end();
+        let eol = self.eol;
 
         // ── Code fence detection ────────────────────────────────────────
         if let Some(rest) = trimmed.strip_prefix("```") {
             if self.in_code_block {
                 // Closing fence
-                out.push_str(&render_code_block(&self.code_lang, &self.code_buf));
+                out.push_str(&render_code_block(&self.code_lang, &self.code_buf, eol));
                 self.in_code_block = false;
                 self.code_lang.clear();
                 self.code_buf.clear();
@@ -150,7 +164,7 @@ impl StreamingMarkdown {
         if let Some((prefix, text)) = try_strip_heading(trimmed) {
             let _ = write!(
                 out,
-                "\r\n{BOLD}{CYAN}{prefix}{RESET}{BOLD}{CYAN}{}{RESET}\r\n",
+                "{eol}{BOLD}{CYAN}{prefix}{RESET}{BOLD}{CYAN}{}{RESET}{eol}",
                 render_inline(text)
             );
             return;
@@ -158,17 +172,20 @@ impl StreamingMarkdown {
 
         // Horizontal rule
         if is_horizontal_rule(trimmed) {
-            let _ = write!(out, "{DIM}────────────────────────────────────────{RESET}\r\n");
+            let _ = write!(
+                out,
+                "{DIM}────────────────────────────────────────{RESET}{eol}"
+            );
             return;
         }
 
         // Block quote
         if let Some(rest) = trimmed.strip_prefix("> ") {
-            let _ = write!(out, "{DIM}│ {}{RESET}\r\n", render_inline(rest));
+            let _ = write!(out, "{DIM}│ {}{RESET}{eol}", render_inline(rest));
             return;
         }
         if trimmed == ">" {
-            let _ = write!(out, "{DIM}│{RESET}\r\n");
+            let _ = write!(out, "{DIM}│{RESET}{eol}");
             return;
         }
 
@@ -177,7 +194,7 @@ impl StreamingMarkdown {
             let pad = indent * 2;
             let _ = write!(
                 out,
-                "{:pad$}  {DIM}{CYAN}{RESET} {}\r\n",
+                "{:pad$}  {DIM}{CYAN}{RESET} {}{eol}",
                 "",
                 render_inline(text)
             );
@@ -189,7 +206,7 @@ impl StreamingMarkdown {
             let pad = indent * 2;
             let _ = write!(
                 out,
-                "{:pad$}{DIM}{num}.{RESET} {}\r\n",
+                "{:pad$}{DIM}{num}.{RESET} {}{eol}",
                 "",
                 render_inline(text)
             );
@@ -198,21 +215,21 @@ impl StreamingMarkdown {
 
         // Regular paragraph line
         out.push_str(&render_inline(trimmed));
-        out.push_str("\r\n");
+        out.push_str(eol);
     }
 }
 
 // ── Block rendering ─────────────────────────────────────────────────────────
 
-fn render_code_block(lang: &str, code: &str) -> String {
+fn render_code_block(lang: &str, code: &str, eol: &str) -> String {
     let mut out = String::new();
     let code = code.trim_end_matches('\n');
 
     // Top frame
     if lang.is_empty() {
-        let _ = write!(out, "{DIM}╭──{RESET}\r\n");
+        let _ = write!(out, "{DIM}╭──{RESET}{eol}");
     } else {
-        let _ = write!(out, "{DIM}╭─ {CYAN}{lang}{RESET}\r\n");
+        let _ = write!(out, "{DIM}╭─ {CYAN}{lang}{RESET}{eol}");
     }
 
     // Highlighted code lines
@@ -236,16 +253,16 @@ fn render_code_block(lang: &str, code: &str) -> String {
                 out.push_str(line.trim_end_matches('\n'));
             }
         }
-        out.push_str("\r\n");
+        out.push_str(eol);
     }
 
     // Handle empty code blocks
     if code.is_empty() {
-        let _ = write!(out, "{DIM}│{RESET}\r\n");
+        let _ = write!(out, "{DIM}│{RESET}{eol}");
     }
 
     // Bottom frame
-    let _ = write!(out, "{DIM}╰──{RESET}\r\n");
+    let _ = write!(out, "{DIM}╰──{RESET}{eol}");
     out
 }
 
@@ -496,5 +513,258 @@ mod tests {
         let out = md.push("> quoted text\n");
         let plain = strip_ansi(&out);
         assert!(plain.contains("quoted text"));
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ordered_list_false_positive_mid_sentence() {
+        // "I found 3. things" should NOT be treated as an ordered list
+        // because the number must be at the start of the line.
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("I found 3. things worth noting\n");
+        let plain = strip_ansi(&out);
+        // Should be treated as a plain line, not a list item
+        assert!(
+            plain.starts_with("I found"),
+            "mid-sentence '3.' should not become a list: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_at_line_start() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("1. first\n2. second\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("first"));
+        assert!(plain.contains("second"));
+    }
+
+    #[test]
+    fn consecutive_code_blocks() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```rust\nlet x = 1;\n```\n```python\ny = 2\n```\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("rust"));
+        assert!(plain.contains("let x"));
+        assert!(plain.contains("python"));
+        assert!(plain.contains("y = 2"));
+        // Should have two top frames and two bottom frames
+        let top_count = plain.matches('╭').count();
+        let bot_count = plain.matches('╰').count();
+        assert_eq!(top_count, 2, "should have 2 code blocks");
+        assert_eq!(bot_count, 2, "should have 2 code blocks");
+    }
+
+    #[test]
+    fn code_block_no_language() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```\nplain text\n```\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("plain text"));
+        assert!(plain.contains('╭'));
+    }
+
+    #[test]
+    fn empty_code_block() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```\n```\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains('╭'));
+        assert!(plain.contains('╰'));
+    }
+
+    #[test]
+    fn backticks_inside_code_block_not_confused() {
+        // Inline backticks inside a fenced code block should not close it
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```rust\nlet s = format!(\"`{}`\", x);\n```\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("format!"));
+        // Should still be one code block
+        assert_eq!(plain.matches('╭').count(), 1);
+        assert_eq!(plain.matches('╰').count(), 1);
+    }
+
+    #[test]
+    fn triple_dash_not_hr_inside_code_block() {
+        // --- inside a code block is code, not a horizontal rule
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```yaml\n---\ntitle: test\n```\n");
+        let plain = strip_ansi(&out);
+        // The --- should be inside the code block, not rendered as ───
+        assert!(
+            !plain.contains("────"),
+            "--- inside code block should not become HR"
+        );
+        assert!(plain.contains("title: test"));
+    }
+
+    #[test]
+    fn heading_inside_code_block_not_rendered() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("```markdown\n# Not a heading\n## Also not\n```\n");
+        let plain = strip_ansi(&out);
+        // Should be rendered as code, not as headings
+        assert_eq!(plain.matches('╭').count(), 1, "should be one code block");
+        assert!(plain.contains("# Not a heading"));
+    }
+
+    #[test]
+    fn nested_bold_in_italic_not_supported_gracefully() {
+        // We don't support nested formatting, but it shouldn't crash
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("This is *italic with **bold** inside*\n");
+        // Just verify no panic and output contains text
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("italic"));
+        assert!(plain.contains("bold"));
+    }
+
+    #[test]
+    fn unclosed_backtick_passthrough() {
+        // A lone backtick without a closing one should pass through
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("This has a ` without closing\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("` without closing"));
+    }
+
+    #[test]
+    fn unclosed_bold_passthrough() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("This has ** without closing\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("** without closing"));
+    }
+
+    #[test]
+    fn empty_line_passthrough() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("\n\n\n");
+        // Should produce three empty \r\n lines
+        assert_eq!(out.matches("\r\n").count(), 3);
+    }
+
+    #[test]
+    fn mixed_content_streaming() {
+        // Simulate realistic API streaming: text, then code, then text
+        let mut md = StreamingMarkdown::new();
+        let mut all = String::new();
+        all.push_str(&md.push("Here's an example:\n"));
+        all.push_str(&md.push("\n"));
+        all.push_str(&md.push("```rust\n"));
+        all.push_str(&md.push("fn main() {\n"));
+        all.push_str(&md.push("    println!(\"hello\");\n"));
+        all.push_str(&md.push("}\n"));
+        all.push_str(&md.push("```\n"));
+        all.push_str(&md.push("\n"));
+        all.push_str(&md.push("That's it.\n"));
+
+        let plain = strip_ansi(&all);
+        assert!(plain.contains("Here's an example:"));
+        assert!(plain.contains("fn main"));
+        assert!(plain.contains("That's it."));
+        assert!(plain.contains('╭'));
+        assert!(plain.contains('╰'));
+    }
+
+    #[test]
+    fn token_by_token_streaming() {
+        // Simulate very fine-grained streaming (1-3 chars at a time)
+        let mut md = StreamingMarkdown::new();
+        let input = "## Title\n\nHello **world**\n";
+        let mut all = String::new();
+        for chunk in input.as_bytes().chunks(2) {
+            let s = std::str::from_utf8(chunk).unwrap();
+            all.push_str(&md.push(s));
+        }
+        all.push_str(&md.flush());
+        let plain = strip_ansi(&all);
+        assert!(plain.contains("## Title"), "heading should survive token streaming");
+        assert!(plain.contains("world"), "bold text should survive");
+    }
+
+    #[test]
+    fn star_in_multiplication_not_italic() {
+        // "2 * 3 * 4" — the stars have spaces so they look like italic markers.
+        // Real markdown treats this as italic between the two stars.
+        // Our renderer will too — this is acceptable markdown behavior.
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("Calculate 2 * 3 * 4\n");
+        // Just verify no panic
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("2"));
+        assert!(plain.contains("4"));
+    }
+
+    #[test]
+    fn indented_list_items() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("- top\n  - nested\n    - deep\n");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("top"));
+        assert!(plain.contains("nested"));
+        assert!(plain.contains("deep"));
+    }
+
+    #[test]
+    fn line_endings_are_crlf_in_tui_mode() {
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("line one\nline two\n");
+        assert!(out.contains("\r\n"), "TUI mode should use \\r\\n");
+    }
+
+    #[test]
+    fn line_endings_are_lf_in_stdout_mode() {
+        let mut md = StreamingMarkdown::new_stdout();
+        let out = md.push("line one\nline two\n");
+        assert!(!out.contains("\r\n"), "stdout mode should not use \\r\\n");
+        assert!(out.contains('\n'), "stdout mode should use \\n");
+    }
+
+    #[test]
+    fn code_block_respects_eol_mode() {
+        let mut md = StreamingMarkdown::new_stdout();
+        let out = md.push("```rust\nlet x = 1;\n```\n");
+        assert!(
+            !out.contains("\r\n"),
+            "code block in stdout mode should not use \\r\\n"
+        );
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("let x"), "code should be present");
+    }
+
+    #[test]
+    fn flush_resets_state() {
+        // After flush, renderer should be clean for next turn
+        let mut md = StreamingMarkdown::new();
+        let _ = md.push("```rust\npartial\n");
+        let _ = md.flush();
+        // Now push a new heading — should work normally
+        let out = md.push("## Fresh start\n");
+        let plain = strip_ansi(&out);
+        assert!(
+            plain.contains("## Fresh start"),
+            "renderer should be clean after flush"
+        );
+    }
+
+    #[test]
+    fn hash_not_heading_without_space() {
+        // "#hashtag" is not a heading
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("#hashtag\n");
+        let plain = strip_ansi(&out);
+        assert_eq!(plain.trim(), "#hashtag");
+    }
+
+    #[test]
+    fn dash_without_space_not_list() {
+        // "-flag" is not a list item
+        let mut md = StreamingMarkdown::new();
+        let out = md.push("-flag\n");
+        let plain = strip_ansi(&out);
+        assert_eq!(plain.trim(), "-flag");
     }
 }

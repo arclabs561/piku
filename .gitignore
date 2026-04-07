@@ -24,7 +24,7 @@ Thumbs.db
 tests/fixture/tmp/
 
 # Legacy dirs — explicitly excluded so they can never creep back in
-src/
+/src/
 assets/
 rust/
 .github/
