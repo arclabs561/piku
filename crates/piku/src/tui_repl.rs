@@ -963,11 +963,7 @@ async fn run_tui_repl_core(
                         let elapsed = start.elapsed().as_secs();
                         let frame = FRAMES[tick % FRAMES.len()];
                         tick += 1;
-                        let time_str = if elapsed < 60 {
-                            format!("{elapsed}s")
-                        } else {
-                            format!("{}m {}s", elapsed / 60, elapsed % 60)
-                        };
+                        let time_str = crate::fmt_duration(elapsed);
                         // Stalled state: after 30s, interpolate color toward red
                         let color = if elapsed > STALL_THRESHOLD_SECS {
                             let intensity = ((elapsed - STALL_THRESHOLD_SECS) as f32
@@ -1463,8 +1459,12 @@ pub(crate) fn format_tool_result(tool_name: &str, result: &str, is_error: bool) 
     }
 
     match tool_name {
-        // Bash output is primary content — not dimmed, generous preview
-        "bash" => format_result_lines(result, 8, false),
+        // Bash output is primary content — not dimmed, generous preview.
+        // Try to pretty-print JSON output for readability.
+        "bash" => {
+            let formatted = crate::try_pretty_json(result);
+            format_result_lines(&formatted, 8, false)
+        }
         // File reads are context — dim, shorter
         "read_file" => format_result_lines(result, 4, true),
         // Edit/write just show the success summary

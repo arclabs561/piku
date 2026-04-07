@@ -7,6 +7,59 @@ use test_helpers::strip_ansi;
 
 use piku::markdown::StreamingMarkdown;
 
+// ── Codex-inspired edge cases ───────────────────────────────────────────────
+
+/// Four-backtick fences: our line-based parser doesn't support these
+/// (it treats any ``` as a fence toggle). This test documents the limitation.
+/// Full pulldown-cmark support would fix this.
+#[test]
+fn four_backtick_fence_known_limitation() {
+    let mut md = StreamingMarkdown::new_stdout();
+    let out = md.push("````\n```rust\nfn x() {}\n```\n````\n");
+    let plain = strip_ansi(&out);
+    // The content should at least be present, even if framing is wrong
+    assert!(plain.contains("fn x"), "code content present: {plain}");
+}
+
+/// Nested blockquote levels.
+#[test]
+fn nested_blockquote() {
+    let mut md = StreamingMarkdown::new_stdout();
+    let out = md.push("> outer\n> > inner\n");
+    let plain = strip_ansi(&out);
+    assert!(plain.contains("outer"), "outer quote: {plain}");
+    assert!(plain.contains("inner"), "inner quote: {plain}");
+}
+
+/// Code block with intentional trailing blank line.
+#[test]
+fn code_block_trailing_blank() {
+    let mut md = StreamingMarkdown::new_stdout();
+    let out = md.push("```\ncode\n\n```\n");
+    let plain = strip_ansi(&out);
+    assert!(plain.contains("code"), "code present: {plain}");
+    assert!(plain.contains('╭'), "frame present");
+}
+
+/// Ordered list starting at non-1 number.
+#[test]
+fn ordered_list_custom_start() {
+    let mut md = StreamingMarkdown::new_stdout();
+    let out = md.push("3. third\n4. fourth\n");
+    let plain = strip_ansi(&out);
+    assert!(plain.contains("3."), "preserves start number: {plain}");
+    assert!(plain.contains("fourth"));
+}
+
+/// Combined bold + italic.
+#[test]
+fn bold_italic_combined() {
+    let mut md = StreamingMarkdown::new_stdout();
+    let out = md.push("This is ***bold italic*** text\n");
+    let plain = strip_ansi(&out);
+    assert!(plain.contains("bold italic"), "content present: {plain}");
+}
+
 /// Realistic assistant response with multiple markdown features.
 #[test]
 fn full_assistant_response() {

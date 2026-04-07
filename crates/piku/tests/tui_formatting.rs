@@ -1,5 +1,43 @@
 /// Tests for TUI formatting: tool input, path shortening, visible_width, markdown edge cases.
 /// Footer/tool-result tests are unit tests in tui_repl.rs (need pub(crate) access).
+
+// ── fmt_duration ────────────────────────────────────────────────────────────
+
+#[test]
+fn duration_seconds() {
+    assert_eq!(piku::fmt_duration(0), "0s");
+    assert_eq!(piku::fmt_duration(45), "45s");
+}
+
+#[test]
+fn duration_minutes() {
+    assert_eq!(piku::fmt_duration(120), "2m");
+    assert_eq!(piku::fmt_duration(150), "2m 30s");
+}
+
+#[test]
+fn duration_hours() {
+    assert_eq!(piku::fmt_duration(3661), "1h 01m 01s");
+}
+
+// ── try_pretty_json ─────────────────────────────────────────────────────────
+
+#[test]
+fn pretty_json_object() {
+    let result = piku::try_pretty_json(r#"{"a":1,"b":"hello"}"#);
+    assert!(result.contains("  \"a\""), "should be indented: {result}");
+}
+
+#[test]
+fn pretty_json_not_json() {
+    assert_eq!(piku::try_pretty_json("not json"), "not json");
+}
+
+#[test]
+fn pretty_json_too_large() {
+    let big = format!("{{\"x\":\"{}\"}}", "a".repeat(11000));
+    assert_eq!(piku::try_pretty_json(&big), big);
+}
 mod test_helpers;
 use test_helpers::strip_ansi;
 
