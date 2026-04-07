@@ -290,6 +290,8 @@ struct StdoutSink {
     /// Track tool_id so on_tool_end can log it (the trait doesn't pass it there).
     /// Maps tool_name → most recent tool_id (good enough for sequential execution).
     pending_tool_id: std::collections::HashMap<String, String>,
+    /// Streaming markdown renderer.
+    md: piku::markdown::StreamingMarkdown,
 }
 
 impl StdoutSink {
@@ -298,18 +300,26 @@ impl StdoutSink {
             stdout: io::stdout(),
             trace,
             pending_tool_id: std::collections::HashMap::new(),
+            md: piku::markdown::StreamingMarkdown::new(),
         }
     }
 }
 
 impl OutputSink for StdoutSink {
     fn on_text(&mut self, text: &str) {
-        let _ = self.stdout.write_all(text.as_bytes());
-        let _ = self.stdout.flush();
+        let rendered = self.md.push(text);
+        if !rendered.is_empty() {
+            let _ = self.stdout.write_all(rendered.as_bytes());
+            let _ = self.stdout.flush();
+        }
         self.trace.text_chunk(text);
     }
 
     fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value) {
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            let _ = self.stdout.write_all(flushed.as_bytes());
+        }
         let args = piku::format_tool_input(tool_name, input);
         let line = if args.is_empty() {
             format!("\n\x1b[2m[{tool_name} …]\x1b[0m")
@@ -364,6 +374,10 @@ impl OutputSink for StdoutSink {
     }
 
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            let _ = self.stdout.write_all(flushed.as_bytes());
+        }
         let _ = writeln!(
             self.stdout,
             "\n\x1b[2m[{iterations} iter · {}↑ {}↓ tokens]\x1b[0m",
