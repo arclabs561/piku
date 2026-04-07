@@ -630,6 +630,41 @@ impl TerminalObserver {
 }
 
 // ===========================================================================
+// PTY window size helper
+// ===========================================================================
+
+/// Set PTY window size via ioctl(TIOCSWINSZ).
+/// Required because crossterm reads terminal size from the PTY's ioctl, not
+/// LINES/COLUMNS env vars. Without this, DECSTBM scroll regions are misconfigured.
+#[allow(unsafe_code)]
+fn set_pty_winsize(file: &std::fs::File, rows: u16, cols: u16) {
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "macos")]
+    const TIOCSWINSZ: libc::c_ulong = 0x80087467;
+    #[cfg(target_os = "linux")]
+    const TIOCSWINSZ: libc::c_ulong = 0x5414;
+
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ writes a fixed-layout struct to a valid PTY fd.
+    unsafe {
+        libc::ioctl(file.as_raw_fd(), TIOCSWINSZ, &ws);
+    }
+}
+
+// ===========================================================================
 // PTY handle — raw byte-level I/O, bypassing rexpect's reader
 // ===========================================================================
 
@@ -646,11 +681,8 @@ impl PtyHandle {
         let mut cmd = Command::new("sh");
         cmd.arg("-c");
 
-        // Set terminal size via stty before launching piku, so crossterm's
-        // terminal::size() returns the correct dimensions. Without this,
-        // DECSTBM scroll regions don't align with our VT100 parser grid.
         let inner_cmd = format!(
-            "stty rows 40 cols 120 2>/dev/null; cd {} && {} --provider {} --model {}",
+            "cd {} && {} --provider {} --model {}",
             shell_escape(&workspace.to_string_lossy()),
             piku_bin.display(),
             spec.label,
@@ -671,6 +703,12 @@ impl PtyHandle {
         // the correct dimensions (not the default 24x80). Without this,
         // DECSTBM scroll regions are misconfigured and response content
         // doesn't align with our VT100 parser's grid.
+        // Set PTY window size so crossterm::terminal::size() returns correct dims.
+        {
+            let pty_fd = process.get_file_handle().expect("pty fd for winsize");
+            set_pty_winsize(&pty_fd, 40, 120);
+        }
+
         let writer = process.get_file_handle().expect("writer handle");
         let reader = process.get_file_handle().expect("reader handle");
 

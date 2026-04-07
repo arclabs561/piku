@@ -47,7 +47,7 @@ unicode-width = "0.2"
 clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
