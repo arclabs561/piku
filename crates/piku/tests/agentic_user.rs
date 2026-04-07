@@ -2345,7 +2345,6 @@ fn run_agentic_session(persona: &Persona) {
         eprintln!("[agentic_user] --- phase: {} ---", phase.name);
 
         // Execute scripted actions
-        pty.clear_capture();
         let snap_before = observer.snapshot();
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
@@ -2369,6 +2368,10 @@ fn run_agentic_session(persona: &Persona) {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
+
+                // Clear capture now — everything before this was typing/echo.
+                // Only the response content (thinking, tool calls, text) follows.
+                pty.clear_capture();
 
                 // Phase 2: wait for ready (response complete)
                 let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
@@ -2517,7 +2520,6 @@ fn run_agentic_session(persona: &Persona) {
             match next {
                 NextAction::Send(msg) => {
                     eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
-                    pty.clear_capture();
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
                     // Two-phase wait for freeform too
                     let pre_free = observer.snapshot().contents.clone();
@@ -2531,6 +2533,8 @@ fn run_agentic_session(persona: &Persona) {
                         }
                         std::thread::sleep(Duration::from_millis(50));
                     }
+                    // Clear capture after typing echo, before response
+                    pty.clear_capture();
                     let snap_after_free =
                         pty.wait_for_ready(&mut observer, Duration::from_secs(90));
                     let findings_free = deterministic_checks(
