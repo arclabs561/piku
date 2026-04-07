@@ -13,7 +13,10 @@ pub use agent_loop::{
     run_turn, run_turn_with_registry, InterjectionRx, InterjectionTx, OutputSink, PostToolAction,
     TurnResult,
 };
-pub use agents::{agent_listing_prompt, all_built_ins, find_built_in, AgentDef};
+pub use agents::{
+    agent_listing_prompt, agent_listing_prompt_with_custom, all_built_ins, find_agent,
+    find_built_in, AgentDef, AnyAgentDef, CustomAgentDef, load_custom_agents,
+};
 pub use compact::{
     apply_compact_summary, compact_session, compact_system_prompt, estimate_session_tokens,
     format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,

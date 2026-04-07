@@ -716,6 +716,7 @@ async fn run_tui_repl_core(
 
     let cwd = std::env::current_dir()?;
     let date = crate::current_date();
+    let custom_agents = piku_runtime::load_custom_agents(&cwd);
     let task_registry = TaskRegistry::new();
     // Wire a notification channel so background agent completions inject
     // a user-role message into the parent's interjection stream.
@@ -1069,6 +1070,7 @@ async fn run_tui_repl_core(
                     Some(&mut notif_rx),
                     &task_registry,
                     0,
+                    &custom_agents,
                 )
                 .await;
 

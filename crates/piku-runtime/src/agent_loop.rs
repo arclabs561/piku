@@ -101,6 +101,7 @@ pub async fn run_turn(
         interjections,
         None,
         0,
+        &[],
     )
     .await
 }
@@ -120,6 +121,7 @@ pub async fn run_turn_with_registry(
     interjections: Option<&mut InterjectionRx>,
     registry: &TaskRegistry,
     depth: u32,
+    custom_agents: &[crate::agents::CustomAgentDef],
 ) -> TurnResult {
     run_turn_inner(
         input,
@@ -134,6 +136,7 @@ pub async fn run_turn_with_registry(
         interjections,
         Some(registry),
         depth,
+        custom_agents,
     )
     .await
 }
@@ -151,6 +154,7 @@ async fn run_turn_inner(
     interjections: Option<&mut InterjectionRx>,
     task_registry: Option<&TaskRegistry>,
     depth: u32,
+    custom_agents: &[crate::agents::CustomAgentDef],
 ) -> TurnResult {
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let mut interjections = interjections;
@@ -163,6 +167,9 @@ async fn run_turn_inner(
     let mut final_stop_reason = StopReason::EndTurn;
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
+
+    // Dedup detection: hash (tool_name, args) to catch repeated identical calls.
+    let mut seen_tool_calls: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // Auto-compaction config — compact when session tokens exceed this threshold.
     // 10k tokens is ~40k chars, roughly 200 exchanges of average length.
@@ -243,6 +250,35 @@ async fn run_turn_inner(
                 }
             }
 
+            // Dedup detection: skip if we've seen this exact (tool, args) before.
+            // Read-only tools (read_file, glob, grep, list_dir) are checked;
+            // write tools and agent tools are exempt (side effects may differ).
+            let is_dedup_eligible = matches!(
+                tool_name.as_str(),
+                "read_file" | "glob" | "grep" | "list_dir"
+            );
+            if is_dedup_eligible {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tool_name.hash(&mut hasher);
+                params.to_string().hash(&mut hasher);
+                let call_hash = hasher.finish();
+                if !seen_tool_calls.insert(call_hash) {
+                    let dedup_msg = format!(
+                        "You already called {tool_name} with the same arguments. \
+                         The result hasn't changed — try a different approach."
+                    );
+                    sink.on_tool_start(&tool_name, &tool_use_id, &params);
+                    sink.on_tool_end(&tool_name, &dedup_msg, true);
+                    session.push(ConversationMessage::tool_result(
+                        tool_use_id,
+                        dedup_msg,
+                        true,
+                    ));
+                    continue;
+                }
+            }
+
             sink.on_tool_start(&tool_name, &tool_use_id, &params);
 
             // Route background-agent tools through the task registry when available.
@@ -257,6 +293,7 @@ async fn run_turn_inner(
                         &tool_defs,
                         depth,
                         &session.messages,
+                        custom_agents,
                     ),
                     "agent_status" => execute_agent_status(&params, registry),
                     "agent_join" => execute_agent_join(&params, registry).await,
@@ -596,6 +633,7 @@ fn execute_spawn_agent(
     tool_defs: &[ToolDefinition],
     depth: u32,
     parent_session_messages: &[crate::session::ConversationMessage],
+    custom_agents: &[crate::agents::CustomAgentDef],
 ) -> (String, bool) {
     if depth >= MAX_SPAWN_DEPTH {
         return (
@@ -626,43 +664,28 @@ fn execute_spawn_agent(
             (None, None, None)
         };
 
-    // Resolve built-in agent definition (system prompt override + tool restrictions)
-    let built_in = p
+    // Resolve agent definition: check custom agents first, then built-ins.
+    let agent_def = p
         .subagent_type
         .as_deref()
-        .and_then(crate::agents::find_built_in);
+        .and_then(|t| crate::agents::find_agent(t, custom_agents));
 
     // Build system prompt for subagent:
-    // - built-in type overrides the main prompt
-    // - fork uses parent's system prompt (shares cache)
+    // - named agent type overrides the main prompt
     // - otherwise use the parent's system prompt unchanged
-    let sub_system_prompt: Vec<String> = if let Some(def) = built_in {
-        vec![def.system_prompt.to_string()]
+    let sub_system_prompt: Vec<String> = if let Some(ref def) = agent_def {
+        vec![def.system_prompt().to_string()]
     } else {
         system_prompt.to_vec()
     };
 
-    // Filter tool defs if built-in has restrictions.
-    // Allowlist takes precedence: if non-empty, only listed tools pass.
-    // Otherwise, blocklist filters out disallowed tools.
-    let sub_tool_defs: Vec<ToolDefinition> = if let Some(def) = built_in {
-        if !def.allowed_tools.is_empty() {
-            let allowed: std::collections::HashSet<&str> =
-                def.allowed_tools.iter().copied().collect();
-            tool_defs
-                .iter()
-                .filter(|t| allowed.contains(t.name.as_str()))
-                .cloned()
-                .collect()
-        } else {
-            let denied: std::collections::HashSet<&str> =
-                def.disallowed_tools.iter().copied().collect();
-            tool_defs
-                .iter()
-                .filter(|t| !denied.contains(t.name.as_str()))
-                .cloned()
-                .collect()
-        }
+    // Filter tool defs via the agent's allowlist/blocklist.
+    let sub_tool_defs: Vec<ToolDefinition> = if let Some(ref def) = agent_def {
+        tool_defs
+            .iter()
+            .filter(|t| def.is_tool_allowed(&t.name))
+            .cloned()
+            .collect()
     } else {
         tool_defs.to_vec()
     };
@@ -755,10 +778,10 @@ fn execute_spawn_agent(
         prompt.push_str(". You can freely edit files here without affecting the main checkout.");
     }
 
-    // Per-agent turn limit: built-in def's max_turns overrides the default
+    // Per-agent turn limit: agent def's max_turns overrides the default
     // when the model didn't explicitly set one in the spawn params.
-    let effective_max_turns = if let Some(def) = built_in {
-        def.max_turns.unwrap_or(p.max_turns)
+    let effective_max_turns = if let Some(ref def) = agent_def {
+        def.max_turns().unwrap_or(p.max_turns)
     } else {
         p.max_turns
     };
@@ -777,6 +800,7 @@ fn execute_spawn_agent(
     let wt_branch = worktree_branch;
     let wt_path_clone = cwd_override;
 
+    let custom_agents_owned = custom_agents.to_vec();
     let _handle = tokio::task::spawn_local(run_subagent_task(
         task_id_clone,
         prompt,
@@ -789,6 +813,7 @@ fn execute_spawn_agent(
         depth + 1,
         wt_path_clone,
         wt_branch,
+        custom_agents_owned,
     ));
 
     // foreground: hint to caller that they should follow up with agent_join
@@ -816,6 +841,7 @@ async fn run_subagent_task(
     depth: u32,
     worktree_cwd: Option<std::path::PathBuf>,
     worktree_branch: Option<String>,
+    custom_agents: Vec<crate::agents::CustomAgentDef>,
 ) {
     let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
     let mut sink = crate::task::DevNullSink;
@@ -850,6 +876,7 @@ async fn run_subagent_task(
         None,
         Some(&registry),
         depth,
+        &custom_agents,
     )
     .await;
 
