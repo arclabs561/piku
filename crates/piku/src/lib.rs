@@ -158,6 +158,45 @@ fn shorten_path(path: &str) -> String {
     format!("…/{}", parts[parts.len() - 2..].join("/"))
 }
 
+/// Format a duration compactly: 45s, 2m 30s, 1h 5m 0s.
+/// Matches Claude Code's formatDuration pattern.
+pub fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s:02}s")
+        }
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{h}h {m:02}m {s:02}s")
+    }
+}
+
+/// Try to pretty-print a JSON string. Returns the original if not valid JSON
+/// or too large. Cap at 10k chars to avoid pathological inputs (Claude Code pattern).
+pub fn try_pretty_json(s: &str) -> String {
+    const MAX_JSON_LEN: usize = 10_000;
+    if s.len() > MAX_JSON_LEN {
+        return s.to_string();
+    }
+    // Only attempt if it looks like JSON
+    let trimmed = s.trim();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return s.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| s.to_string()),
+        Err(_) => s.to_string(),
+    }
+}
+
 fn truncate_arg(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
     if first_line.len() <= max {

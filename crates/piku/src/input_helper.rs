@@ -408,6 +408,14 @@ pub enum ReadOutcome {
 
 // ── Line editor ─────────────────────────────────────────────────────────────
 
+/// Stashed input state (Ctrl+S toggle).
+#[derive(Debug, Clone)]
+struct Stash {
+    text: String,
+    cursor: usize,
+    kill_buffer: String,
+}
+
 pub struct LineEditor {
     prompt: String,
     continuation_prompt: String,
@@ -415,9 +423,8 @@ pub struct LineEditor {
     history: Vec<String>,
     history_index: Option<usize>,
     draft: Option<String>,
-    /// Sticky column for vertical cursor movement in multiline text.
-    /// Cleared on any horizontal movement.
     preferred_col: Option<usize>,
+    stash: Option<Stash>,
 }
 
 impl LineEditor {
@@ -431,6 +438,7 @@ impl LineEditor {
             history_index: None,
             draft: None,
             preferred_col: None,
+            stash: None,
         }
     }
 
@@ -677,6 +685,30 @@ impl LineEditor {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 input.kill_word_back();
+                Action::Continue
+            }
+            // Stash: Ctrl+S — toggle save/restore draft
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if input.is_empty() {
+                    // Pop from stash
+                    if let Some(stash) = self.stash.take() {
+                        input.buffer = stash.text;
+                        input.cursor = stash.cursor.min(input.buffer.len());
+                        input.kill_buffer = stash.kill_buffer;
+                    }
+                } else {
+                    // Push to stash
+                    self.stash = Some(Stash {
+                        text: input.buffer.clone(),
+                        cursor: input.cursor,
+                        kill_buffer: input.kill_buffer.clone(),
+                    });
+                    input.clear();
+                }
                 Action::Continue
             }
             // Undo: Ctrl+Z
