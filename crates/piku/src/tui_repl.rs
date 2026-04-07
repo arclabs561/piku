@@ -551,28 +551,33 @@ impl OutputSink for TuiSink {
         if !flushed.is_empty() {
             self.print(&flushed);
         }
-        let label = tool_label(tool_name);
+        // Claude Code style: ● ToolName(args)
+        let name = tool_display_name(tool_name);
         let args = crate::format_tool_input(tool_name, input);
         self.print("\x1b[?25h");
         if args.is_empty() {
-            self.println(&format!("\r\n{label}"));
+            self.println(&format!(
+                "\r\n\x1b[33m●\x1b[0m \x1b[1m{name}\x1b[0m"
+            ));
         } else {
-            self.println(&format!("\r\n{label}  \x1b[2m{args}\x1b[0m"));
+            self.println(&format!(
+                "\r\n\x1b[33m●\x1b[0m \x1b[1m{name}\x1b[0m\x1b[2m({args})\x1b[0m"
+            ));
         }
         let _ = self.stdout.flush();
     }
 
     fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
-        let (color, tag) = if is_error {
-            ("\x1b[31m", "✗ err")
-        } else {
-            ("\x1b[32m", "✓ ok")
-        };
-        self.println(&format!("  {color}{tag}\x1b[0m"));
-
+        // Show result with tree connector, then status dot
         let preview = format_tool_result(tool_name, result, is_error);
         if !preview.is_empty() {
             self.println(&preview);
+        }
+
+        if is_error {
+            self.println("\x1b[31m●\x1b[0m");
+        } else {
+            self.println("\x1b[32m●\x1b[0m");
         }
         let _ = self.stdout.flush();
 
@@ -1108,7 +1113,8 @@ fn print_session_tail(session: &Session, _scroll_bot: u16) {
                             println!("\x1b[2m{}\x1b[0m\r", first_n_lines(trimmed, MAX_TEXT_LINES));
                         }
                         ContentBlock::ToolUse { name, .. } => {
-                            println!("\x1b[2m  ⚙ {name}\x1b[0m\r");
+                            let dname = tool_display_name(name);
+                            println!("\x1b[2m  ● {dname}\x1b[0m\r");
                         }
                         _ => {}
                     }
@@ -1314,110 +1320,131 @@ fn handle_slash_cmd(
 
 // ── Tool formatting ────────────────────────────────────────────────────────────
 
-fn tool_label(tool_name: &str) -> String {
-    // Each tool gets a distinct color; the name is shown in brackets.
-    let color = match tool_name {
-        "read_file" => "\x1b[34m",  // blue
-        "write_file" => "\x1b[33m", // yellow
-        "edit_file" => "\x1b[33m",  // yellow
-        "bash" => "\x1b[35m",       // magenta
-        "glob" => "\x1b[36m",       // cyan
-        "grep" => "\x1b[36m",       // cyan
-        "list_dir" => "\x1b[34m",   // blue
-        _ => "\x1b[2m",             // dim
-    };
-    format!("{color}[{tool_name}]\x1b[0m")
+/// Friendly display name for a tool (Title case, no underscores).
+fn tool_display_name(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" => "Read",
+        "write_file" => "Write",
+        "edit_file" => "Update",
+        "bash" => "Bash",
+        "glob" => "Glob",
+        "grep" => "Grep",
+        "list_dir" => "List",
+        _ => tool_name,
+    }
 }
 
 fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
     const MAX_LINES: usize = 12;
     const MAX_CHARS: usize = 600;
 
+    // Tree connector prefix for result lines
+    let connector = "\x1b[2m└\x1b[0m ";
+
     if is_error {
-        // Errors: bright red, always shown
         let body = truncate_scroll(result, MAX_CHARS);
-        return body
+        let mut lines: Vec<String> = body
             .lines()
+            .take(MAX_LINES)
             .map(|l| format!("  \x1b[31m{l}\x1b[0m"))
-            .collect::<Vec<_>>()
-            .join("\r\n");
+            .collect();
+        if let Some(first) = lines.first_mut() {
+            *first = format!("{connector}\x1b[31m{}\x1b[0m", body.lines().next().unwrap_or(""));
+        }
+        return lines.join("\r\n");
     }
 
     match tool_name {
         "bash" => {
-            // Bash output is primary content — normal brightness, not dimmed
             let lines: Vec<&str> = result.lines().collect();
             if lines.is_empty() {
                 return String::new();
             }
-            let mut out = lines
-                .iter()
-                .copied()
-                .take(MAX_LINES)
-                .map(|l| format!("  {l}"))
-                .collect::<Vec<_>>()
-                .join("\r\n");
+            let shown: usize = MAX_LINES.min(lines.len());
+            let mut out = Vec::with_capacity(shown + 1);
+            for (i, line) in lines.iter().take(shown).enumerate() {
+                if i == 0 {
+                    out.push(format!("{connector}{line}"));
+                } else {
+                    out.push(format!("  {line}"));
+                }
+            }
             if lines.len() > MAX_LINES {
-                out.push_str(&format!(
-                    "\r\n  \x1b[2m… {} more lines\x1b[0m",
+                out.push(format!(
+                    "  \x1b[2m… +{} lines\x1b[0m",
                     lines.len() - MAX_LINES
                 ));
             }
-            out
+            out.join("\r\n")
         }
         "read_file" => {
-            // File content: dim — it's context, not primary output
             let lines: Vec<&str> = result.lines().collect();
-            let mut out = lines
-                .iter()
-                .copied()
-                .take(6)
-                .map(|l| format!("  \x1b[2m{l}\x1b[0m"))
-                .collect::<Vec<_>>()
-                .join("\r\n");
-            if lines.len() > 6 {
-                out.push_str(&format!(
-                    "\r\n  \x1b[2m({} lines total)\x1b[0m",
-                    lines.len()
-                ));
+            let total = lines.len();
+            let mut out = Vec::new();
+            for (i, line) in lines.iter().take(6).enumerate() {
+                if i == 0 {
+                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
+                } else {
+                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
+                }
             }
-            out
+            if total > 6 {
+                out.push(format!("  \x1b[2m… {total} lines\x1b[0m"));
+            }
+            out.join("\r\n")
         }
         "edit_file" | "write_file" => {
-            // Success message — normal, not dim
-            format!("  {}", result.trim())
+            format!("{connector}{}", result.trim())
         }
         "glob" | "list_dir" => {
             let lines: Vec<&str> = result.lines().collect();
             let count = lines.len();
-            let mut out = lines
-                .iter()
-                .copied()
-                .take(8)
-                .map(|l| format!("  \x1b[2m{l}\x1b[0m"))
-                .collect::<Vec<_>>()
-                .join("\r\n");
-            if count > 8 {
-                out.push_str(&format!("\r\n  \x1b[2m({count} total)\x1b[0m"));
+            let mut out = Vec::new();
+            for (i, line) in lines.iter().take(8).enumerate() {
+                if i == 0 {
+                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
+                } else {
+                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
+                }
             }
-            out
+            if count > 8 {
+                out.push(format!("  \x1b[2m… {count} total\x1b[0m"));
+            }
+            out.join("\r\n")
         }
         "grep" => {
             let lines: Vec<&str> = result.lines().collect();
             let count = lines.len();
-            let mut out = lines
-                .iter()
-                .copied()
-                .take(MAX_LINES)
-                .map(|l| format!("  \x1b[2m{l}\x1b[0m"))
-                .collect::<Vec<_>>()
-                .join("\r\n");
+            let mut out = Vec::new();
+            for (i, line) in lines.iter().take(MAX_LINES).enumerate() {
+                if i == 0 {
+                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
+                } else {
+                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
+                }
+            }
             if count > MAX_LINES {
-                out.push_str(&format!("\r\n  \x1b[2m({count} matches)\x1b[0m"));
+                out.push(format!("  \x1b[2m… {count} matches\x1b[0m"));
+            }
+            out.join("\r\n")
+        }
+        _ => {
+            let body = truncate_scroll(result, MAX_CHARS);
+            if body.is_empty() {
+                return String::new();
+            }
+            let mut lines: Vec<&str> = body.lines().collect();
+            if lines.is_empty() {
+                return String::new();
+            }
+            let first = lines.remove(0);
+            let mut out = format!("{connector}{first}");
+            for l in lines {
+                out.push_str("\r\n  ");
+                out.push_str(l);
             }
             out
         }
-        _ => truncate_scroll(result, MAX_CHARS),
     }
 }
 
