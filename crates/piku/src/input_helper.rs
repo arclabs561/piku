@@ -524,7 +524,7 @@ impl LineEditor {
                 let _ = execute!(stdout, MoveDown(sat_u16(rendered_lines - 1)));
             }
             let _ = execute!(stdout, MoveToColumn(0));
-            let _ = write!(stdout, "\r\n");
+            let _ = writeln!(stdout);
             let _ = stdout.flush();
         }
 
