@@ -76,7 +76,12 @@ fn ollama_host() -> String {
 
 fn ollama_is_available(host: &str) -> bool {
     Command::new("curl")
-        .args(["-sf", &format!("{}/api/tags", host.trim_end_matches('/'))])
+        .args([
+            "-sf",
+            "-o",
+            "/dev/null",
+            &format!("{}/api/tags", host.trim_end_matches('/')),
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
