@@ -57,8 +57,12 @@ pub struct InputBuffer {
     cursor: usize,
     /// Kill ring (single entry, like Codex). Ctrl+K/U/W store here, Ctrl+Y yanks.
     kill_buffer: String,
-    /// Undo ring.
+    /// Undo stack.
     undo_stack: Vec<UndoEntry>,
+    /// Current position in undo stack (-1 = head, i.e. after all entries).
+    /// When user undoes, this steps back. When user types after undo,
+    /// future entries are truncated (branch truncation, Claude Code pattern).
+    undo_index: usize,
     /// Number of edits since last undo snapshot (debounce).
     edits_since_snapshot: usize,
 }
@@ -87,6 +91,7 @@ impl InputBuffer {
             cursor: 0,
             kill_buffer: String::new(),
             undo_stack: Vec::new(),
+            undo_index: 0,
             edits_since_snapshot: 0,
         }
     }
@@ -104,7 +109,12 @@ impl InputBuffer {
 
     fn force_snapshot(&mut self) {
         self.edits_since_snapshot = 0;
-        // Don't snapshot if nothing changed
+        // Branch truncation: if we've undone past entries and now edit,
+        // discard the future (entries after undo_index).
+        if self.undo_index < self.undo_stack.len() {
+            self.undo_stack.truncate(self.undo_index);
+        }
+        // Dedup: don't snapshot if nothing changed
         if self
             .undo_stack
             .last()
@@ -116,21 +126,41 @@ impl InputBuffer {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
         });
+        self.undo_index = self.undo_stack.len();
         if self.undo_stack.len() > UNDO_MAX {
             self.undo_stack.remove(0);
+            self.undo_index = self.undo_stack.len();
         }
     }
 
-    /// Undo: restore the previous buffer state. Returns true if state changed.
+    /// Undo: step back in the undo stack. Returns true if state changed.
     pub fn undo(&mut self) -> bool {
-        if let Some(entry) = self.undo_stack.pop() {
-            self.buffer = entry.buffer;
+        if self.undo_index == 0 {
+            return false;
+        }
+        // Save current state if we're at the head (first undo)
+        if self.undo_index == self.undo_stack.len() {
+            self.undo_stack.push(UndoEntry {
+                buffer: self.buffer.clone(),
+                cursor: self.cursor,
+            });
+        }
+        self.undo_index = self.undo_index.saturating_sub(1);
+        if let Some(entry) = self.undo_stack.get(self.undo_index) {
+            self.buffer = entry.buffer.clone();
             self.cursor = entry.cursor.min(self.buffer.len());
             self.edits_since_snapshot = 0;
             true
         } else {
             false
         }
+    }
+
+    /// Clear undo history (call on submit).
+    pub fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+        self.undo_index = 0;
+        self.edits_since_snapshot = 0;
     }
 
     pub fn insert(&mut self, ch: char) {
@@ -594,7 +624,7 @@ impl LineEditor {
         Ok(ReadOutcome::Submit(buf))
     }
 
-    fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
+    pub fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
         // Clear sticky column on any key except Up/Down
         if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
             self.preferred_col = None;
@@ -1002,7 +1032,12 @@ impl LineEditor {
                 } else {
                     &self.continuation_prompt
                 };
-                lines.push(format!("{prefix}{line}"));
+                // Highlight slash commands in cyan (like Claude Code)
+                if i == 0 && line.starts_with('/') && !line.contains(' ') {
+                    lines.push(format!("{prefix}\x1b[36m{line}\x1b[0m"));
+                } else {
+                    lines.push(format!("{prefix}{line}"));
+                }
             }
             // Ghost text: show dim hint from matching history entry (single-line only).
             // Only when cursor is at end and input has no newlines.
@@ -1064,7 +1099,7 @@ impl LineEditor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
+pub enum Action {
     Continue,
     Submit,
     Cancel,
