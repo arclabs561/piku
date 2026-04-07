@@ -1248,6 +1248,8 @@ fn handle_slash_cmd(
   Ctrl+A / E     Move to start / end of line\r
   Ctrl+K / U     Kill to end / start of line\r
   Ctrl+W         Kill previous word\r
+  Ctrl+Y         Yank (paste killed text)\r
+  Right          Accept history suggestion\r
   Esc            Clear input\r"
             );
         }
