@@ -11,6 +11,8 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -33,12 +35,40 @@ fn is_word_sep(c: char) -> bool {
     WORD_SEPS.contains(c)
 }
 
+const UNDO_MAX: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndoEntry {
+    buffer: String,
+    cursor: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputBuffer {
     buffer: String,
     cursor: usize,
     /// Kill ring (single entry, like Codex). Ctrl+K/U/W store here, Ctrl+Y yanks.
     kill_buffer: String,
+    /// Undo ring.
+    undo_stack: Vec<UndoEntry>,
+    /// Number of edits since last undo snapshot (debounce).
+    edits_since_snapshot: usize,
+}
+
+/// Find the byte offset of the grapheme cluster boundary before `pos`.
+fn prev_grapheme(s: &str, pos: usize) -> usize {
+    s[..pos]
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(i, _)| i)
+}
+
+/// Find the byte offset after the grapheme cluster at `pos`.
+fn next_grapheme(s: &str, pos: usize) -> usize {
+    s[pos..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map_or(s.len(), |(i, _)| pos + i)
 }
 
 impl InputBuffer {
@@ -48,12 +78,74 @@ impl InputBuffer {
             buffer: String::new(),
             cursor: 0,
             kill_buffer: String::new(),
+            undo_stack: Vec::new(),
+            edits_since_snapshot: 0,
+        }
+    }
+
+    /// Save an undo snapshot. Called before destructive operations.
+    fn snapshot(&mut self) {
+        // Debounce: don't snapshot on every character, only every ~5 edits
+        // or on major operations (kill, yank, etc.)
+        self.edits_since_snapshot += 1;
+        if self.edits_since_snapshot < 5 {
+            return;
+        }
+        self.force_snapshot();
+    }
+
+    fn force_snapshot(&mut self) {
+        self.edits_since_snapshot = 0;
+        // Don't snapshot if nothing changed
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|e| e.buffer == self.buffer)
+        {
+            return;
+        }
+        self.undo_stack.push(UndoEntry {
+            buffer: self.buffer.clone(),
+            cursor: self.cursor,
+        });
+        if self.undo_stack.len() > UNDO_MAX {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Undo: restore the previous buffer state. Returns true if state changed.
+    pub fn undo(&mut self) -> bool {
+        if let Some(entry) = self.undo_stack.pop() {
+            self.buffer = entry.buffer;
+            self.cursor = entry.cursor.min(self.buffer.len());
+            self.edits_since_snapshot = 0;
+            true
+        } else {
+            false
         }
     }
 
     pub fn insert(&mut self, ch: char) {
+        self.snapshot();
+        // Normalize: tabs → 4 spaces, \r → \n
+        if ch == '\t' {
+            for _ in 0..4 {
+                self.buffer.insert(self.cursor, ' ');
+                self.cursor += 1;
+            }
+            return;
+        }
+        let ch = if ch == '\r' { '\n' } else { ch };
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+    }
+
+    /// Insert a string (e.g. from bracketed paste). Normalizes ANSI, \r, tabs.
+    pub fn insert_str(&mut self, s: &str) {
+        let cleaned = strip_ansi_from_paste(s);
+        for ch in cleaned.chars() {
+            self.insert(ch);
+        }
     }
 
     pub fn insert_newline(&mut self) {
@@ -64,41 +156,32 @@ impl InputBuffer {
         if self.cursor == 0 {
             return;
         }
-        let prev = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map_or(0, |(i, _)| i);
+        let prev = prev_grapheme(&self.buffer, self.cursor);
         self.buffer.drain(prev..self.cursor);
         self.cursor = prev;
     }
 
-    /// Delete character under cursor (Ctrl+D behavior when buffer non-empty).
+    /// Delete grapheme under cursor (Ctrl+D behavior when buffer non-empty).
     pub fn delete_char(&mut self) {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
-            self.buffer.drain(self.cursor..self.cursor + ch.len_utf8());
-        }
+        let next = next_grapheme(&self.buffer, self.cursor);
+        self.buffer.drain(self.cursor..next);
     }
 
     pub fn move_left(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        self.cursor = self.buffer[..self.cursor]
-            .char_indices()
-            .last()
-            .map_or(0, |(i, _)| i);
+        self.cursor = prev_grapheme(&self.buffer, self.cursor);
     }
 
     pub fn move_right(&mut self) {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
-            self.cursor += ch.len_utf8();
-        }
+        self.cursor = next_grapheme(&self.buffer, self.cursor);
     }
 
     pub fn move_home(&mut self) {
@@ -174,12 +257,14 @@ impl InputBuffer {
 
     /// Kill from cursor to end of line (Ctrl+K). Stores killed text.
     pub fn kill_to_end(&mut self) {
+        self.force_snapshot();
         self.kill_buffer = self.buffer[self.cursor..].to_string();
         self.buffer.truncate(self.cursor);
     }
 
     /// Kill from start to cursor (Ctrl+U). Stores killed text.
     pub fn kill_to_start(&mut self) {
+        self.force_snapshot();
         self.kill_buffer = self.buffer[..self.cursor].to_string();
         self.buffer.drain(..self.cursor);
         self.cursor = 0;
@@ -187,6 +272,7 @@ impl InputBuffer {
 
     /// Kill previous word (Ctrl+W). Stores killed text.
     pub fn kill_word_back(&mut self) {
+        self.force_snapshot();
         let old_cursor = self.cursor;
         self.move_word_back();
         self.kill_buffer = self.buffer[self.cursor..old_cursor].to_string();
@@ -275,6 +361,9 @@ pub struct LineEditor {
     history: Vec<String>,
     history_index: Option<usize>,
     draft: Option<String>,
+    /// Sticky column for vertical cursor movement in multiline text.
+    /// Cleared on any horizontal movement.
+    preferred_col: Option<usize>,
 }
 
 impl LineEditor {
@@ -287,6 +376,7 @@ impl LineEditor {
             history: Vec::new(),
             history_index: None,
             draft: None,
+            preferred_col: None,
         }
     }
 
@@ -397,6 +487,13 @@ impl LineEditor {
                         break ReadOutcome::Exit;
                     }
                 },
+                Ok(Event::Paste(text)) => {
+                    // Bracketed paste: normalize and insert
+                    input.insert_str(&text);
+                    self.history_index = None;
+                    self.draft = None;
+                    rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                }
                 Ok(Event::Resize(..)) => {
                     rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
                 }
@@ -524,6 +621,15 @@ impl LineEditor {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 input.kill_word_back();
+                Action::Continue
+            }
+            // Undo: Ctrl+Z
+            KeyEvent {
+                code: KeyCode::Char('z'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                input.undo();
                 Action::Continue
             }
             // Readline: Ctrl+Y = yank (paste kill buffer)
@@ -785,9 +891,9 @@ impl LineEditor {
         } else {
             &self.continuation_prompt
         };
-        // Account for visible prompt width (strip ANSI)
+        // Account for visible prompt width (strip ANSI) and display width
         let prompt_width = visible_width(cursor_prompt);
-        let cursor_col = prompt_width + cursor_line.chars().count();
+        let cursor_col = prompt_width + UnicodeWidthStr::width(cursor_line);
 
         // Build display lines
         let mut lines = Vec::new();
@@ -882,6 +988,37 @@ struct Rendered {
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 
+/// Strip ANSI escape sequences from pasted text.
+fn strip_ansi_from_paste(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip ESC [ ... letter sequences
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            // Skip ESC ] ... BEL/ST sequences (OSC)
+            else if chars.peek() == Some(&']') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\x07' || c == '\\' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn longest_common_prefix(values: &[&str]) -> String {
     let Some(first) = values.first() else {
         return String::new();
@@ -898,7 +1035,7 @@ fn longest_common_prefix(values: &[&str]) -> String {
     prefix
 }
 
-/// Count visible characters (strip ANSI escape sequences).
+/// Count visible display width (strip ANSI escape sequences, use Unicode width).
 pub fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut in_escape = false;
@@ -910,7 +1047,7 @@ pub fn visible_width(s: &str) -> usize {
         } else if ch == '\x1b' {
             in_escape = true;
         } else {
-            width += 1;
+            width += UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4]) as &str);
         }
     }
     width

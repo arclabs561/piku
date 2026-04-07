@@ -956,6 +956,8 @@ async fn run_tui_repl_core(
                 let indicator_row = rows;
                 tokio::task::spawn_local(async move {
                     const FRAMES: &[&str] = &["·", "✦", "✶", "✻", "✽", "✻", "✶", "✦"];
+                    const STALL_THRESHOLD_SECS: u64 = 30;
+                    const STALL_RAMP_SECS: u64 = 30; // 30-60s ramps to full red
                     let start = std::time::Instant::now();
                     let mut tick: usize = 0;
                     loop {
@@ -971,16 +973,29 @@ async fn run_tui_repl_core(
                         } else {
                             format!("{}m {}s", elapsed / 60, elapsed % 60)
                         };
+                        // Stalled state: after 30s, interpolate color toward red
+                        let color = if elapsed > STALL_THRESHOLD_SECS {
+                            let intensity = ((elapsed - STALL_THRESHOLD_SECS) as f32
+                                / STALL_RAMP_SECS as f32)
+                                .min(1.0);
+                            // Interpolate from gray (153,153,153) toward red (171,43,63)
+                            let r = (153.0 + (171.0 - 153.0) * intensity) as u8;
+                            let g = (153.0 + (43.0 - 153.0) * intensity) as u8;
+                            let b = (153.0 + (63.0 - 153.0) * intensity) as u8;
+                            format!("\x1b[38;2;{r};{g};{b}m")
+                        } else {
+                            "\x1b[2m".to_string() // dim
+                        };
                         let mut out = io::stdout();
-                        let _ = out.write_all(b"\x1b[s"); // save cursor
+                        let _ = out.write_all(b"\x1b[s");
                         goto(indicator_row, 1);
                         let _ = out.write_all(
                             format!(
-                                "\x1b[2K\x1b[2m❯ {frame} thinking… ({time_str})\x1b[0m"
+                                "\x1b[2K{color}❯ {frame} thinking… ({time_str})\x1b[0m"
                             )
                             .as_bytes(),
                         );
-                        let _ = out.write_all(b"\x1b[u"); // restore cursor
+                        let _ = out.write_all(b"\x1b[u");
                         let _ = out.flush();
                     }
                 });
