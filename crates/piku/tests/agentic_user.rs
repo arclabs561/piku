@@ -1244,7 +1244,7 @@ fn deterministic_checks(
                 severity: Severity::Major,
                 description: "prompt glyph missing from input row".to_string(),
                 expected: "input row should start with ❯, >, or !".to_string(),
-                actual: format!("input row: {:?}", &input[..input.len().min(40)]),
+                actual: format!("input row: {:?}", safe_truncate(input, 40)),
             });
         }
     }
@@ -1261,10 +1261,7 @@ fn deterministic_checks(
                 severity: Severity::Minor,
                 description: "footer row not rendered in reverse video".to_string(),
                 expected: "footer should use reverse video for status bar".to_string(),
-                actual: format!(
-                    "footer text: {:?}",
-                    &footer.text[..footer.text.len().min(60)]
-                ),
+                actual: format!("footer text: {:?}", safe_truncate(&footer.text, 60)),
             });
         }
     }
@@ -1280,7 +1277,7 @@ fn deterministic_checks(
                     severity: Severity::Info,
                     description: "user message echoed in scroll zone".to_string(),
                     expected: String::new(),
-                    actual: format!("found echo of: {:?}", &text[..text.len().min(40)]),
+                    actual: format!("found echo of: {:?}", safe_truncate(text, 40)),
                 });
             }
         }
@@ -1296,7 +1293,7 @@ fn deterministic_checks(
                 severity: Severity::Major,
                 description: format!("control characters in rendered row {i}"),
                 expected: "rendered rows should contain only printable text".to_string(),
-                actual: format!("row {i}: {:?}", &row[..row.len().min(60)]),
+                actual: format!("row {i}: {:?}", safe_truncate(row, 60)),
             });
         }
     }
@@ -1312,8 +1309,8 @@ fn deterministic_checks(
                 expected: String::new(),
                 actual: format!(
                     "{:?} -> {:?}",
-                    &before_input[..before_input.len().min(40)],
-                    &after_input[..after_input.len().min(40)]
+                    safe_truncate(before_input, 40),
+                    safe_truncate(after_input, 40)
                 ),
             });
         } else {
@@ -1321,10 +1318,7 @@ fn deterministic_checks(
                 severity: Severity::Info,
                 description: "tab had no effect on input".to_string(),
                 expected: String::new(),
-                actual: format!(
-                    "input unchanged: {:?}",
-                    &after_input[..after_input.len().min(40)]
-                ),
+                actual: format!("input unchanged: {:?}", safe_truncate(after_input, 40)),
             });
         }
     }
@@ -1822,7 +1816,7 @@ impl LlmClient {
                 _ => {
                     if attempt == 0 {
                         eprintln!("[user_agent] JSON parse failed, retrying");
-                        eprintln!("[user_agent] raw: {}", &raw[..raw.len().min(300)]);
+                        eprintln!("[user_agent] raw: {}", safe_truncate(&raw, 300));
                         messages.push(("assistant".into(), raw));
                         messages.push((
                             "user".into(),
@@ -2043,7 +2037,7 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
             non_empty.len()
         );
         for line in non_empty.iter().take(8) {
-            let t = if line.len() > 100 { &line[..100] } else { line };
+            let t = safe_truncate(line, 100);
             println!("    {t}");
         }
         if non_empty.len() > 8 {
@@ -2324,7 +2318,7 @@ fn run_agentic_session(persona: &Persona) {
         eprintln!("[agentic_user] piku did not become ready within 30s, proceeding anyway");
         eprintln!(
             "[agentic_user] screen contents: {:?}",
-            &startup_snap.contents[..startup_snap.contents.len().min(200)]
+            safe_truncate(&startup_snap.contents, 200)
         );
     } else {
         eprintln!(
@@ -2519,7 +2513,7 @@ fn run_agentic_session(persona: &Persona) {
 
             match next {
                 NextAction::Send(msg) => {
-                    eprintln!("[agentic_user] freeform: {:?}", &msg[..msg.len().min(60)]);
+                    eprintln!("[agentic_user] freeform: {:?}", safe_truncate(&msg, 60));
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
                     // Two-phase wait for freeform too
                     let pre_free = observer.snapshot().contents.clone();
@@ -2564,7 +2558,7 @@ fn run_agentic_session(persona: &Persona) {
                         &ua_llm,
                         persona,
                         phase,
-                        &format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        &format!("freeform: {:?}", safe_truncate(&msg, 40)),
                         &free_screen,
                         &det_report_free,
                         &ws_diff_free.summary(),
@@ -2574,7 +2568,7 @@ fn run_agentic_session(persona: &Persona) {
 
                     memory.push(TurnSummary {
                         turn: total_turns + 1,
-                        action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        action_desc: format!("freeform: {:?}", safe_truncate(&msg, 40)),
                         observations: obs2.clone(),
                         bugs: bugs2
                             .iter()
@@ -2587,7 +2581,7 @@ fn run_agentic_session(persona: &Persona) {
 
                     entries.push(CritiqueEntry {
                         phase: phase.name.to_string(),
-                        action_desc: format!("freeform: {:?}", &msg[..msg.len().min(40)]),
+                        action_desc: format!("freeform: {:?}", safe_truncate(&msg, 40)),
                         screen_text: free_captured,
                         observations: obs2,
                         bugs: bugs2,
