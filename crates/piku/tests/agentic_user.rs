@@ -2117,8 +2117,26 @@ fn run_agentic_session(persona: &Persona) {
             eprintln!("[agentic_user] scripted: {action}");
             pty.execute_action(action, &mut observer);
 
-            // After Submit, wait for piku to respond and capture scrolling content
+            // After Submit: wait for screen to change (thinking/response starts),
+            // then wait for ready to come back (response complete).
             if matches!(action, Action::Submit(_)) {
+                // Phase 1: wait until screen changes from the pre-submit state
+                let pre_contents = observer.snapshot().contents.clone();
+                let change_deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    pty.drain(&mut observer);
+                    let snap = observer.snapshot();
+                    if snap.contents != pre_contents {
+                        break;
+                    }
+                    if Instant::now() >= change_deadline {
+                        eprintln!("[agentic_user] screen did not change within 15s after submit");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+
+                // Phase 2: wait for ready (response complete), capturing transcript
                 let (_snap, transcript) =
                     pty.wait_for_ready(&mut observer, Duration::from_secs(90));
                 turn_transcript.push_str(&transcript);
