@@ -123,7 +123,11 @@ impl StreamingMarkdown {
 
         // If we're mid-code-block, render what we have
         if self.in_code_block {
-            out.push_str(&render_code_block(&self.code_lang, &self.code_buf, self.eol));
+            out.push_str(&render_code_block(
+                &self.code_lang,
+                &self.code_buf,
+                self.eol,
+            ));
             self.in_code_block = false;
             self.code_lang.clear();
             self.code_buf.clear();
@@ -341,27 +345,25 @@ fn render_inline(text: &str) -> String {
 }
 
 fn find_char_from(chars: &[char], target: char, start: usize) -> Option<usize> {
-    chars.iter().enumerate().skip(start).find_map(|(i, &c)| {
-        if c == target {
+    chars.iter().enumerate().skip(start).find_map(
+        |(i, &c)| {
+            if c == target {
+                Some(i)
+            } else {
+                None
+            }
+        },
+    )
+}
+
+fn find_double_star(chars: &[char], start: usize) -> Option<usize> {
+    chars.windows(2).enumerate().skip(start).find_map(|(i, w)| {
+        if w[0] == '*' && w[1] == '*' {
             Some(i)
         } else {
             None
         }
     })
-}
-
-fn find_double_star(chars: &[char], start: usize) -> Option<usize> {
-    chars
-        .windows(2)
-        .enumerate()
-        .skip(start)
-        .find_map(|(i, w)| {
-            if w[0] == '*' && w[1] == '*' {
-                Some(i)
-            } else {
-                None
-            }
-        })
 }
 
 fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
@@ -707,7 +709,10 @@ mod tests {
         }
         all.push_str(&md.flush());
         let plain = strip_ansi(&all);
-        assert!(plain.contains("## Title"), "heading should survive token streaming");
+        assert!(
+            plain.contains("## Title"),
+            "heading should survive token streaming"
+        );
         assert!(plain.contains("world"), "bold text should survive");
     }
 
