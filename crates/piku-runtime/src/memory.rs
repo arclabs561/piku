@@ -173,6 +173,64 @@ fn replace_or_append_section(existing: &str, heading: &str, entry: &str) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// Per-agent-type memory (mirrors CC's agent-memory/<type>/MEMORY.md)
+// ---------------------------------------------------------------------------
+
+/// Directory for an agent type's memory.
+/// Path: `<cwd>/.piku/agent-memory/<agent_type>/`
+#[must_use]
+pub fn agent_memory_dir(cwd: &Path, agent_type: &str) -> PathBuf {
+    cwd.join(".piku").join("agent-memory").join(agent_type)
+}
+
+/// Read an agent's MEMORY.md. Returns `None` if missing or empty.
+#[must_use]
+pub fn read_agent_memory(cwd: &Path, agent_type: &str) -> Option<String> {
+    let path = agent_memory_dir(cwd, agent_type).join(MEMORY_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(truncate_memory(&raw))
+}
+
+/// Write to an agent's MEMORY.md (same section-replace logic as global memory).
+pub fn write_agent_memory(cwd: &Path, agent_type: &str, entry: &str) -> Result<(), String> {
+    let dir = agent_memory_dir(cwd, agent_type);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
+    let path = dir.join(MEMORY_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let heading = entry.lines().find(|l| l.starts_with("## ")).map(str::trim);
+    let updated = if let Some(h) = heading {
+        replace_or_append_section(&existing, h, entry)
+    } else if existing.trim().is_empty() {
+        entry.to_string()
+    } else {
+        let mut s = existing.trim_end().to_string();
+        s.push_str("\n\n");
+        s.push_str(entry);
+        s
+    };
+    std::fs::write(&path, updated).map_err(|e| format!("write failed: {e}"))
+}
+
+/// Build the memory prompt section to inject into a subagent's system prompt.
+/// Reads the agent-type-specific MEMORY.md and wraps it with instructions.
+#[must_use]
+pub fn build_agent_memory_prompt(cwd: &Path, agent_type: &str) -> Option<String> {
+    let content = read_agent_memory(cwd, agent_type)?;
+    let dir = agent_memory_dir(cwd, agent_type);
+    Some(format!(
+        "\n\n# Agent Memory\n\n\
+         You have persistent memory at `{}`.\n\
+         The following is your memory from previous sessions:\n\n{}\n\n\
+         Update your memory with write_memory when you learn something worth remembering.",
+        dir.display(),
+        content
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // System prompt injection
 // ---------------------------------------------------------------------------
 
@@ -272,6 +330,37 @@ mod tests {
     fn build_memory_prompt_none_when_empty() {
         let dir = tempdir();
         assert!(build_memory_prompt(dir.path()).is_none());
+    }
+
+    #[test]
+    fn write_and_read_agent_memory() {
+        let dir = tempdir();
+        let cwd = dir.path();
+        write_agent_memory(cwd, "reviewer", "## Patterns\n\nwatch for unwrap").unwrap();
+        let content = read_agent_memory(cwd, "reviewer").unwrap();
+        assert!(content.contains("watch for unwrap"));
+        // Different agent type has no memory
+        assert!(read_agent_memory(cwd, "explorer").is_none());
+    }
+
+    #[test]
+    fn agent_memory_dir_layout() {
+        let dir = tempdir();
+        let cwd = dir.path();
+        write_agent_memory(cwd, "verifier", "## Note\n\ntest").unwrap();
+        let expected = cwd.join(".piku").join("agent-memory").join("verifier").join("MEMORY.md");
+        assert!(expected.exists());
+    }
+
+    #[test]
+    fn build_agent_memory_prompt_works() {
+        let dir = tempdir();
+        let cwd = dir.path();
+        assert!(build_agent_memory_prompt(cwd, "reviewer").is_none());
+        write_agent_memory(cwd, "reviewer", "## Tip\n\ncheck bounds").unwrap();
+        let prompt = build_agent_memory_prompt(cwd, "reviewer").unwrap();
+        assert!(prompt.contains("check bounds"));
+        assert!(prompt.contains("Agent Memory"));
     }
 
     #[test]

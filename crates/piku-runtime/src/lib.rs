@@ -22,7 +22,10 @@ pub use compact::{
     format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,
     CompactionResult,
 };
-pub use memory::{build_memory_prompt, read_memory, write_memory, MemoryScope};
+pub use memory::{
+    build_agent_memory_prompt, build_memory_prompt, read_agent_memory, read_memory,
+    write_agent_memory, write_memory, MemoryScope,
+};
 pub use permission::{AllowAll, PermissionOutcome, PermissionPrompter, PermissionRequest};
 pub use piku_api::Provider;
 pub use piku_api::TokenUsage;

@@ -673,8 +673,17 @@ fn execute_spawn_agent(
     // Build system prompt for subagent:
     // - named agent type overrides the main prompt
     // - otherwise use the parent's system prompt unchanged
+    // Agent-type-specific memory is appended when available.
     let sub_system_prompt: Vec<String> = if let Some(ref def) = agent_def {
-        vec![def.system_prompt().to_string()]
+        let mut prompt = def.system_prompt().to_string();
+        // Inject per-agent-type persistent memory
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(mem_prompt) =
+            crate::memory::build_agent_memory_prompt(&cwd, def.agent_type())
+        {
+            prompt.push_str(&mem_prompt);
+        }
+        vec![prompt]
     } else {
         system_prompt.to_vec()
     };
