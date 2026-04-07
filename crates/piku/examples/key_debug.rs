@@ -5,8 +5,8 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal;
 use crossterm::execute;
+use crossterm::terminal;
 use std::io::stdout;
 
 fn main() -> std::io::Result<()> {
@@ -23,7 +23,10 @@ fn main() -> std::io::Result<()> {
     )
     .is_ok();
     print!("\r\x1b[2K");
-    println!("Keyboard enhancement: {}\r", if enhanced { "enabled" } else { "NOT supported" });
+    println!(
+        "Keyboard enhancement: {}\r",
+        if enhanced { "enabled" } else { "NOT supported" }
+    );
 
     loop {
         match event::read()? {
@@ -37,9 +40,13 @@ fn main() -> std::io::Result<()> {
 
                 // Human-readable description
                 let desc = match (&code, &modifiers) {
-                    (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => "SHIFT+ENTER (newline) ",
+                    (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+                        "SHIFT+ENTER (newline) "
+                    }
                     (KeyCode::Enter, _) => "ENTER (submit) ",
-                    (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => "CTRL+J (newline) ",
+                    (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        "CTRL+J (newline) "
+                    }
                     _ => "",
                 };
 

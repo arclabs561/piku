@@ -1,7 +1,5 @@
-/// Tests for TUI formatting functions: tool input, path shortening, visible_width.
-///
-/// These test actual output values, not source patterns.
-
+/// Tests for TUI formatting: tool input, path shortening, visible_width, markdown edge cases.
+/// Footer/tool-result tests are unit tests in tui_repl.rs (need pub(crate) access).
 mod test_helpers;
 use test_helpers::strip_ansi;
 
@@ -25,8 +23,14 @@ fn tool_input_bash_multiline_shows_count() {
         "command": "cd /tmp\nls -la\necho done"
     });
     let result = piku::format_tool_input("bash", &input);
-    assert!(result.contains("(+2 lines)"), "should show extra line count: {result}");
-    assert!(result.contains("cd /tmp"), "should show first line: {result}");
+    assert!(
+        result.contains("(+2 lines)"),
+        "should show extra line count: {result}"
+    );
+    assert!(
+        result.contains("cd /tmp"),
+        "should show first line: {result}"
+    );
 }
 
 #[test]
@@ -34,7 +38,11 @@ fn tool_input_bash_very_long_truncated() {
     let cmd = "a".repeat(200);
     let input = serde_json::json!({ "command": cmd });
     let result = piku::format_tool_input("bash", &input);
-    assert!(result.len() < 80, "should be truncated: len={}", result.len());
+    assert!(
+        result.len() < 80,
+        "should be truncated: len={}",
+        result.len()
+    );
     assert!(result.ends_with('…'));
 }
 
@@ -45,7 +53,10 @@ fn tool_input_read_file_with_lines() {
         "start_line": 10,
         "end_line": 20,
     });
-    assert_eq!(piku::format_tool_input("read_file", &input), "src/main.rs:10-20");
+    assert_eq!(
+        piku::format_tool_input("read_file", &input),
+        "src/main.rs:10-20"
+    );
 }
 
 #[test]
@@ -54,7 +65,10 @@ fn tool_input_read_file_long_path_shortened() {
         "path": "/Users/arc/Documents/dev/piku/crates/piku/src/tui_repl.rs"
     });
     let result = piku::format_tool_input("read_file", &input);
-    assert!(result.starts_with("…/"), "long path should be shortened: {result}");
+    assert!(
+        result.starts_with("…/"),
+        "long path should be shortened: {result}"
+    );
     assert!(result.contains("tui_repl.rs"));
 }
 
@@ -85,7 +99,10 @@ fn tool_input_grep_with_long_path() {
 fn tool_input_unknown_tool_first_string() {
     let input = serde_json::json!({ "count": 5, "query": "hello" });
     let result = piku::format_tool_input("custom", &input);
-    assert!(result.contains("hello"), "should show first string value: {result}");
+    assert!(
+        result.contains("hello"),
+        "should show first string value: {result}"
+    );
 }
 
 // ── visible_width ───────────────────────────────────────────────────────────
@@ -112,7 +129,6 @@ fn visible_width_empty() {
 
 #[test]
 fn visible_width_complex_ansi() {
-    // 24-bit color: \x1b[38;2;R;G;Bm
     assert_eq!(
         piku::input_helper::visible_width("\x1b[38;2;100;200;50mtext\x1b[0m"),
         4
@@ -123,7 +139,6 @@ fn visible_width_complex_ansi() {
 
 #[test]
 fn markdown_fast_path_plain_text() {
-    // Text with no markdown syntax should pass through unchanged
     let mut md = piku::markdown::StreamingMarkdown::new_stdout();
     let out = md.push("This is plain text with no special chars.\n");
     let plain = strip_ansi(&out);
@@ -132,7 +147,6 @@ fn markdown_fast_path_plain_text() {
 
 #[test]
 fn markdown_fast_path_still_handles_code_blocks() {
-    // Even with fast path, code fences must work
     let mut md = piku::markdown::StreamingMarkdown::new_stdout();
     let out = md.push("plain line\n```\ncode\n```\n");
     let plain = strip_ansi(&out);
@@ -143,7 +157,6 @@ fn markdown_fast_path_still_handles_code_blocks() {
 
 #[test]
 fn markdown_flush_adds_eol_to_partial() {
-    // Bug that was fixed: flush of partial line must add EOL
     let mut md = piku::markdown::StreamingMarkdown::new_stdout();
     let _ = md.push("partial");
     let flushed = md.flush();

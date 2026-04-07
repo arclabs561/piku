@@ -1150,7 +1150,10 @@ fn run_agentic_session(persona: &Persona) {
         // stripping. This catches bugs the LLM can't see.
         let cursor_bugs = check_cursor_visibility(&screen_raw);
         for bug in &cursor_bugs {
-            eprintln!("[agentic_user] [DETERMINISTIC] [{:}] {}", bug.severity, bug.description);
+            eprintln!(
+                "[agentic_user] [DETERMINISTIC] [{:}] {}",
+                bug.severity, bug.description
+            );
         }
 
         // Ask the user-agent to critique

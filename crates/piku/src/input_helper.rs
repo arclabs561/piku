@@ -11,18 +11,26 @@
 use std::io::{self, IsTerminal, Write};
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// All known slash commands (used for completion).
 pub const SLASH_CMDS: &[&str] = &[
-    "/help", "/status", "/cost", "/model", "/tasks", "/agents", "/sessions", "/clear", "/exit",
+    "/help",
+    "/status",
+    "/cost",
+    "/model",
+    "/tasks",
+    "/agents",
+    "/sessions",
+    "/clear",
+    "/exit",
     "/quit",
 ];
 
@@ -341,7 +349,7 @@ impl InputBuffer {
         &self.buffer
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
@@ -508,9 +516,7 @@ impl LineEditor {
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
 
         let mut input = InputBuffer::new();
@@ -956,10 +962,7 @@ impl LineEditor {
         let mut lines = Vec::new();
         if text.is_empty() {
             // Show placeholder hint
-            lines.push(format!(
-                "{}\x1b[2m{}\x1b[0m",
-                self.prompt, self.placeholder
-            ));
+            lines.push(format!("{}\x1b[2m{}\x1b[0m", self.prompt, self.placeholder));
         } else {
             for (i, line) in text.split('\n').enumerate() {
                 let prefix = if i == 0 {
@@ -1469,7 +1472,7 @@ mod tests {
         buf.clear();
         assert!(buf.is_empty());
         buf.yank(); // kill buffer should still have "test"
-        // Actually kill_to_end at cursor=4 kills nothing. Let me redo:
+                    // Actually kill_to_end at cursor=4 kills nothing. Let me redo:
         let mut buf = InputBuffer::new();
         for ch in "test".chars() {
             buf.insert(ch);

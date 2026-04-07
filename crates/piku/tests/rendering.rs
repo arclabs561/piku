@@ -2,7 +2,6 @@
 ///
 /// These test the actual output of the markdown renderer and tool input
 /// formatter with realistic inputs, not source-code pattern matching.
-
 mod test_helpers;
 use test_helpers::strip_ansi;
 
@@ -121,7 +120,10 @@ fn eol_modes_consistent() {
 
     let mut stdout = StreamingMarkdown::new_stdout();
     let stdout_out = stdout.push(input);
-    assert!(!stdout_out.contains("\r\n"), "stdout mode must not use \\r\\n");
+    assert!(
+        !stdout_out.contains("\r\n"),
+        "stdout mode must not use \\r\\n"
+    );
     assert!(stdout_out.contains('\n'), "stdout mode must use \\n");
 }
 

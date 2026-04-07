@@ -27,7 +27,6 @@ tests/fixture/tmp/
 /src/
 assets/
 rust/
-.github/
 tests/test_porting_workspace.py
 
 # Legacy / not for this repo

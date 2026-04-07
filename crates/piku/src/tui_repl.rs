@@ -19,19 +19,19 @@
 /// a line. Submit by pressing Enter on an empty continuation line.
 use std::io::{self, Write};
 
-use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
-use piku_api::TokenUsage;
-use piku_runtime::{
-    build_system_prompt, run_turn_with_registry, InterjectionRx, InterjectionTx,
-    OutputSink, PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, Session,
-    TaskRegistry, TaskStatus, TurnResult,
-};
-use piku_tools::{all_tool_definitions, Destructiveness};
 use crate::cli::ResolvedProvider;
 use crate::input_helper::{LineEditor, ReadOutcome};
 use crate::markdown::StreamingMarkdown;
 use crate::self_update;
+use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
+use piku_api::TokenUsage;
+use piku_runtime::{
+    build_system_prompt, run_turn_with_registry, InterjectionRx, InterjectionTx, OutputSink,
+    PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, Session,
+    TaskRegistry, TaskStatus, TurnResult,
+};
+use piku_tools::{all_tool_definitions, Destructiveness};
 
 // ── Permission prompter ───────────────────────────────────────────────────────
 
@@ -156,7 +156,7 @@ impl PermissionPrompter for TuiPrompter {
         // before the tool executes (or the denial message prints).
         goto(input_row, 1);
         print!("\x1b[2K"); // erase prompt
-        // Echo decision into scroll zone
+                           // Echo decision into scroll zone
         let (_, scroll_bot_rows) = term_size();
         let scroll_bot = scroll_bot_rows.saturating_sub(2);
         goto(scroll_bot, 1);
@@ -209,18 +209,15 @@ fn term_size() -> (u16, u16) {
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 /// All the state needed to render the footer bar.
-struct FooterState<'a> {
-    provider: &'a str,
-    model: &'a str,
-    session_id: &'a str,
-    input_tokens: u32,
-    output_tokens: u32,
-    /// Number of tool calls executed this session (running total).
-    turns: u32,
-    /// Number of currently running background agents.
-    running_agents: usize,
-    /// Context window usage 0–100. None = unknown.
-    context_pct: Option<u8>,
+pub(crate) struct FooterState<'a> {
+    pub(crate) provider: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) input_tokens: u32,
+    pub(crate) output_tokens: u32,
+    pub(crate) turns: u32,
+    pub(crate) running_agents: usize,
+    pub(crate) context_pct: Option<u8>,
 }
 
 /// Draw the sticky footer at `row`.
@@ -231,6 +228,18 @@ struct FooterState<'a> {
 /// Everything is on one line. If the terminal is too narrow, rightmost
 /// segments are dropped first.
 fn draw_footer(row: u16, cols: u16, s: &FooterState) {
+    let line = render_footer(cols, s);
+    goto(row, 1);
+    print!("\x1b[2K\x1b[7m{line}\x1b[0m");
+}
+
+/// Render the footer bar content as a String (no cursor movement).
+/// Testable independently of terminal state.
+pub(crate) fn render_footer(cols: u16, s: &FooterState) -> String {
+    render_footer_inner(cols, s)
+}
+
+fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     // ── Segments ──────────────────────────────────────────────────────────────
     // Left anchor: provider · model (normal weight, always shown)
     let model_seg = format!(" {} · {} ", s.provider, s.model);
@@ -278,15 +287,15 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     let sep = "│";
 
     // ── Measure ───────────────────────────────────────────────────────────────
-    // We work with display widths (ASCII only in these segments, so len() == width).
     let cols = cols as usize;
 
-    // Build from left, dropping rightmost optional segments when too narrow.
-    // Required: model_seg | hint_seg
-    // Optional (drop right-to-left): sess_seg, turns_seg, tok_seg
+    // Helper: visible width of a segment (strips ANSI escape codes).
+    let vis = |s: &str| -> usize { crate::input_helper::visible_width(s) };
 
-    // Compute what fits
-    let base_width = model_seg.len() + sep.len() + hint_seg.len();
+    let sep_vis = vis(sep); // │ is 1 display column but 3 UTF-8 bytes
+
+    // Required: model_seg + separator + hint_seg
+    let base_width = vis(&model_seg) + sep_vis + vis(hint_seg);
     let mut budget = if cols > base_width {
         cols - base_width
     } else {
@@ -299,30 +308,25 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     let mut show_agents = false;
     let mut show_sess = false;
 
-    // Helper: visible width of a segment (strips ANSI escape codes).
-    let vis = |s: &str| -> usize {
-        crate::input_helper::visible_width(s)
-    };
-
     // agents always shown if there are any (highest priority optional)
-    if !agents_seg.is_empty() && budget >= vis(&agents_seg) + sep.len() {
-        budget -= vis(&agents_seg) + sep.len();
+    if !agents_seg.is_empty() && budget >= vis(&agents_seg) + sep_vis {
+        budget -= vis(&agents_seg) + sep_vis;
         show_agents = true;
     }
     // context % — shown when ≥50%, high priority (user needs to know)
-    if !ctx_seg.is_empty() && budget >= vis(&ctx_seg) + sep.len() {
-        budget -= vis(&ctx_seg) + sep.len();
+    if !ctx_seg.is_empty() && budget >= vis(&ctx_seg) + sep_vis {
+        budget -= vis(&ctx_seg) + sep_vis;
         show_ctx = true;
     }
-    if !tok_seg.is_empty() && budget >= vis(&tok_seg) + sep.len() {
-        budget -= vis(&tok_seg) + sep.len();
+    if !tok_seg.is_empty() && budget >= vis(&tok_seg) + sep_vis {
+        budget -= vis(&tok_seg) + sep_vis;
         show_tok = true;
     }
-    if !turns_seg.is_empty() && budget >= vis(&turns_seg) + sep.len() {
-        budget -= vis(&turns_seg) + sep.len();
+    if !turns_seg.is_empty() && budget >= vis(&turns_seg) + sep_vis {
+        budget -= vis(&turns_seg) + sep_vis;
         show_turns = true;
     }
-    if budget >= vis(&sess_seg) + sep.len() {
+    if budget >= vis(&sess_seg) + sep_vis {
         show_sess = true;
     }
 
@@ -392,7 +396,7 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
         } else {
             0
         }
-        + sep.len()
+        + sep_vis
         + vis(hint_seg);
 
     let padding = cols.saturating_sub(visible_len);
@@ -402,18 +406,14 @@ fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     line.push_str(&hint_seg);
     line.push_str(reset);
 
-    // ── Print ─────────────────────────────────────────────────────────────────
-    goto(row, 1);
-    print!("\x1b[2K\x1b[7m"); // erase line, enter reverse-video for the bar
-    print!("{line}");
-    print!("\x1b[0m"); // reset
+    line
 }
 
 /// Format a token count compactly: 1234 → "1.2k", 123456 → "123k", 12 → "12".
 /// Estimate context window % from cumulative input tokens.
 /// Uses 200k as the default window size (accurate for claude-3.x/4.x).
 /// Returns None when tokens are zero (no usage yet).
-fn context_pct(input_tokens: u32) -> Option<u8> {
+pub(crate) fn context_pct(input_tokens: u32) -> Option<u8> {
     if input_tokens == 0 {
         return None;
     }
@@ -422,7 +422,7 @@ fn context_pct(input_tokens: u32) -> Option<u8> {
     Some(pct.min(100))
 }
 
-fn fmt_tokens(n: u32) -> String {
+pub(crate) fn fmt_tokens(n: u32) -> String {
     if n >= 10_000 {
         format!("{}k", n / 1000)
     } else if n >= 1_000 {
@@ -434,7 +434,7 @@ fn fmt_tokens(n: u32) -> String {
 
 /// Return a short recognisable suffix of a session id.
 /// "session-1775307696040353000-75082" → "…75082"
-fn short_session_id(id: &str) -> String {
+pub(crate) fn short_session_id(id: &str) -> String {
     // Take the last segment after the final '-', or last 8 chars
     if let Some(pos) = id.rfind('-') {
         let suffix = &id[pos + 1..];
@@ -985,10 +985,8 @@ async fn run_tui_repl_core(
                         let _ = out.write_all(b"\x1b[s");
                         goto(indicator_row, 1);
                         let _ = out.write_all(
-                            format!(
-                                "\x1b[2K{color}❯ {frame} thinking… ({time_str})\x1b[0m"
-                            )
-                            .as_bytes(),
+                            format!("\x1b[2K{color}❯ {frame} thinking… ({time_str})\x1b[0m")
+                                .as_bytes(),
                         );
                         let _ = out.write_all(b"\x1b[u");
                         let _ = out.flush();
@@ -1402,7 +1400,7 @@ fn tool_display_name(tool_name: &str) -> &str {
 /// Format tool result lines with tree connector and truncation.
 /// `max_lines`: how many preview lines to show.
 /// `dim`: whether the content lines should be dim.
-fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
+pub(crate) fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
     const MAX_LINE_WIDTH: usize = 200;
 
     if result.trim().is_empty() {
@@ -1438,16 +1436,13 @@ fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
     }
 
     if total > show_lines {
-        out.push(format!(
-            "  \x1b[2m… +{} lines\x1b[0m",
-            total - show_lines
-        ));
+        out.push(format!("  \x1b[2m… +{} lines\x1b[0m", total - show_lines));
     }
 
     out.join("\r\n")
 }
 
-fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
+pub(crate) fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
     if result.trim().is_empty() {
         return String::new();
     }
@@ -1524,4 +1519,242 @@ fn announce_self_update(new_binary: &std::path::Path) {
         "\x1b[u\x1b[2K\x1b[1;32m↺ new binary ready — restarting now\x1b[0m  \x1b[2m{bin_name}\x1b[0m"
     );
     let _ = stdout.flush();
+}
+
+// ── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input_helper::visible_width;
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn make_footer() -> FooterState<'static> {
+        FooterState {
+            provider: "openrouter",
+            model: "claude-sonnet",
+            session_id: "session-123456789-42",
+            input_tokens: 5000,
+            output_tokens: 200,
+            turns: 3,
+            running_agents: 0,
+            context_pct: Some(60),
+        }
+    }
+
+    // ── Footer ──────────────────────────────────────────────────────
+
+    #[test]
+    fn footer_contains_provider_and_model() {
+        let s = make_footer();
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("openrouter"), "provider: {plain}");
+        assert!(plain.contains("claude-sonnet"), "model: {plain}");
+    }
+
+    #[test]
+    fn footer_contains_token_counts() {
+        let s = make_footer();
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("5.0k"), "input tokens: {plain}");
+    }
+
+    #[test]
+    fn footer_contains_context_pct() {
+        let s = make_footer();
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("60%"), "context pct: {plain}");
+    }
+
+    #[test]
+    fn footer_contains_help_hint() {
+        let s = make_footer();
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("/help"), "hint: {plain}");
+    }
+
+    #[test]
+    fn footer_drops_segments_when_narrow() {
+        let s = make_footer();
+        let line = render_footer(40, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("openrouter"), "model always shown: {plain}");
+    }
+
+    #[test]
+    fn footer_shows_agents_when_nonzero() {
+        let mut s = make_footer();
+        s.running_agents = 2;
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(plain.contains("2 bg"), "agents: {plain}");
+    }
+
+    #[test]
+    fn footer_hides_tokens_when_zero() {
+        let mut s = make_footer();
+        s.input_tokens = 0;
+        s.output_tokens = 0;
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        assert!(!plain.contains('↑'), "no token arrows when zero: {plain}");
+    }
+
+    #[test]
+    fn footer_amber_at_75_pct() {
+        let mut s = make_footer();
+        s.context_pct = Some(80);
+        let line = render_footer(120, &s);
+        assert!(line.contains("\x1b[33m"), "80% should be amber");
+    }
+
+    #[test]
+    fn footer_red_at_90_pct() {
+        let mut s = make_footer();
+        s.context_pct = Some(95);
+        let line = render_footer(120, &s);
+        assert!(line.contains("\x1b[31m"), "95% should be red");
+    }
+
+    #[test]
+    fn footer_all_segments_present_wide() {
+        let s = make_footer();
+        let line = render_footer(120, &s);
+        let plain = strip_ansi(&line);
+        // All segments should be present at 120 cols
+        assert!(plain.contains("openrouter"), "provider");
+        assert!(plain.contains("60%"), "context");
+        assert!(plain.contains("5.0k"), "tokens");
+        assert!(plain.contains("turns"), "turns");
+        assert!(plain.contains("…42"), "session");
+        assert!(plain.contains("/help"), "hint");
+    }
+
+    // ── fmt_tokens ──────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_tokens_small() {
+        assert_eq!(fmt_tokens(42), "42");
+        assert_eq!(fmt_tokens(999), "999");
+    }
+
+    #[test]
+    fn fmt_tokens_thousands() {
+        assert_eq!(fmt_tokens(1500), "1.5k");
+    }
+
+    #[test]
+    fn fmt_tokens_large() {
+        assert_eq!(fmt_tokens(15000), "15k");
+        assert_eq!(fmt_tokens(123456), "123k");
+    }
+
+    // ── short_session_id ────────────────────────────────────────────
+
+    #[test]
+    fn session_id_extracts_suffix() {
+        assert_eq!(short_session_id("session-12345-678"), "…678");
+    }
+
+    // ── context_pct ─────────────────────────────────────────────────
+
+    #[test]
+    fn context_pct_zero_is_none() {
+        assert_eq!(context_pct(0), None);
+    }
+
+    #[test]
+    fn context_pct_half() {
+        assert_eq!(context_pct(100_000), Some(50));
+    }
+
+    #[test]
+    fn context_pct_caps() {
+        assert_eq!(context_pct(300_000), Some(100));
+    }
+
+    // ── format_result_lines ─────────────────────────────────────────
+
+    #[test]
+    fn result_lines_empty() {
+        assert!(format_result_lines("", 5, false).is_empty());
+    }
+
+    #[test]
+    fn result_lines_connector_first() {
+        let out = format_result_lines("line1\nline2", 5, false);
+        let plain = strip_ansi(&out);
+        assert!(plain.contains('⎿'), "connector: {plain}");
+    }
+
+    #[test]
+    fn result_lines_plus_one_exception() {
+        let out = format_result_lines("a\nb\nc\nd\ne", 4, false);
+        let plain = strip_ansi(&out);
+        assert!(plain.contains('e'), "5th line should show");
+        assert!(!plain.contains('+'), "no +1 truncation");
+    }
+
+    #[test]
+    fn result_lines_truncates_long() {
+        let long = "x".repeat(300);
+        let out = format_result_lines(&long, 5, false);
+        let plain = strip_ansi(&out);
+        assert!(plain.contains('…'), "long line truncated");
+    }
+
+    #[test]
+    fn result_lines_dim_mode() {
+        let out = format_result_lines("hello", 5, true);
+        assert!(out.contains("\x1b[2m"), "dim mode");
+    }
+
+    // ── format_tool_result ──────────────────────────────────────────
+
+    #[test]
+    fn tool_result_bash_not_dimmed() {
+        let out = format_tool_result("bash", "output", false);
+        let after = out.split('⎿').nth(1).unwrap_or("");
+        assert!(!after.starts_with(" \x1b[2m"), "bash not dimmed");
+    }
+
+    #[test]
+    fn tool_result_read_dimmed() {
+        let out = format_tool_result("read_file", "content", false);
+        assert!(out.contains("\x1b[2m"), "read_file dimmed");
+    }
+
+    #[test]
+    fn tool_result_error_red() {
+        let out = format_tool_result("bash", "fail", true);
+        assert!(out.contains("\x1b[31m"), "error red");
+    }
+
+    #[test]
+    fn tool_result_empty() {
+        assert!(format_tool_result("bash", "", false).is_empty());
+    }
 }
