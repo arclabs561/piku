@@ -1,6 +1,7 @@
 pub mod agent_loop;
 pub mod agents;
 pub mod compact;
+pub mod embed_memory;
 pub mod memory;
 pub mod permission;
 pub mod prompt;
@@ -21,6 +22,10 @@ pub use compact::{
     apply_compact_summary, compact_session, compact_system_prompt, estimate_session_tokens,
     format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,
     CompactionResult,
+};
+pub use embed_memory::{
+    default_store_path, embed_text, format_retrieved_memories, MemoryEntry, MemoryStore,
+    RetrievedMemory,
 };
 pub use memory::{
     build_agent_memory_prompt, build_memory_prompt, read_agent_memory, read_memory,
