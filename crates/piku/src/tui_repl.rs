@@ -883,6 +883,8 @@ async fn run_tui_repl_core(
                 }
 
                 // ! prefix: direct bash command (bypass AI)
+                // TODO: route through runtime's bash tool so the command appears in
+                // session history, respects permissions, and shows in session replay.
                 if full_input.starts_with('!') {
                     let cmd = full_input[1..].trim();
                     if !cmd.is_empty() {

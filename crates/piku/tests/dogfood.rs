@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 /// Dogfooding harness — piku tests itself using a real LLM.
 ///

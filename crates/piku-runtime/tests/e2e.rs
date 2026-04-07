@@ -1,4 +1,4 @@
-#![allow(warnings)]
+
 
 /// End-to-end integration tests for the piku agentic runtime.
 ///
