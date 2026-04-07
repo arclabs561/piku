@@ -488,8 +488,12 @@ pub struct TuiSink {
     binary_mtime_baseline: Option<std::time::SystemTime>,
     /// Path to check for a new build.
     build_candidate: std::path::PathBuf,
-    /// Whether the "thinking" indicator on the input row needs clearing.
+    /// Whether the thinking indicator on the input row needs clearing.
     needs_indicator_clear: bool,
+    /// Signal to stop the background thinking ticker.
+    thinking_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the turn started (for elapsed time display).
+    turn_start: std::time::Instant,
     /// Streaming markdown renderer for assistant text.
     md: StreamingMarkdown,
 }
@@ -501,15 +505,20 @@ impl TuiSink {
             binary_mtime_baseline,
             build_candidate: self_update::default_build_output(),
             needs_indicator_clear: true,
+            thinking_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_start: std::time::Instant::now(),
             md: StreamingMarkdown::new(),
         }
     }
 
-    /// Clear the "…" thinking indicator from the input row and move cursor
+    /// Clear the thinking indicator from the input row and move cursor
     /// back into the scroll zone. Called once on first output.
     fn clear_thinking_indicator(&mut self) {
         if self.needs_indicator_clear {
             self.needs_indicator_clear = false;
+            // Stop the background ticker
+            self.thinking_stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let (_, rows) = term_size();
             let scroll_bot = rows.saturating_sub(2);
             // Clear the input row's thinking indicator
@@ -924,13 +933,35 @@ async fn run_tui_repl_core(
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
 
-                // Show a thinking indicator on the input row while the API
-                // call is in flight. This keeps the cursor visible in a
-                // predictable location and gives feedback that piku is working.
-                // The indicator is cleared when the first text/tool output arrives.
+                // Show a ticking thinking indicator on the input row.
+                // A background task updates it every second with elapsed time.
+                // Cleared by clear_thinking_indicator() on first output.
+                let stop_flag = sink.thinking_stop.clone();
+                stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 goto(rows, 1);
-                print!("\x1b[2K\x1b[2m  …\x1b[0m\x1b[?25h");
+                print!("\x1b[2K\x1b[2m· thinking…\x1b[0m\x1b[?25h");
                 let _ = io::stdout().flush();
+                let indicator_rows = rows;
+                tokio::task::spawn_local(async move {
+                    let start = std::time::Instant::now();
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let elapsed = start.elapsed().as_secs();
+                        let mut out = io::stdout();
+                        // Save cursor, draw indicator, restore cursor
+                        let _ = out.write_all(b"\x1b[s");
+                        goto(indicator_rows, 1);
+                        let _ = out.write_all(
+                            format!("\x1b[2K\x1b[2m· thinking… ({elapsed}s)\x1b[0m\x1b[?25h")
+                                .as_bytes(),
+                        );
+                        let _ = out.write_all(b"\x1b[u");
+                        let _ = out.flush();
+                    }
+                });
 
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,
@@ -1334,117 +1365,87 @@ fn tool_display_name(tool_name: &str) -> &str {
     }
 }
 
-fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
-    const MAX_LINES: usize = 12;
-    const MAX_CHARS: usize = 600;
+/// Format tool result lines with tree connector and truncation.
+/// `max_lines`: how many preview lines to show.
+/// `dim`: whether the content lines should be dim.
+fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> String {
+    const MAX_LINE_WIDTH: usize = 200;
 
-    // Tree connector prefix for result lines
+    if result.trim().is_empty() {
+        return String::new();
+    }
+
     let connector = "\x1b[2m└\x1b[0m ";
+    let lines: Vec<&str> = result.lines().collect();
+    let total = lines.len();
+    let mut out = Vec::new();
+
+    for (i, line) in lines.iter().take(max_lines).enumerate() {
+        // Truncate very long lines (minified JSON, binary-ish content)
+        let display = if line.len() > MAX_LINE_WIDTH {
+            format!("{}…", &line[..MAX_LINE_WIDTH])
+        } else {
+            (*line).to_string()
+        };
+
+        let prefix = if i == 0 { connector } else { "  " };
+        if dim {
+            out.push(format!("{prefix}\x1b[2m{display}\x1b[0m"));
+        } else {
+            out.push(format!("{prefix}{display}"));
+        }
+    }
+
+    if total > max_lines {
+        out.push(format!(
+            "  \x1b[2m… +{} lines\x1b[0m",
+            total - max_lines
+        ));
+    }
+
+    out.join("\r\n")
+}
+
+fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {
+    if result.trim().is_empty() {
+        return String::new();
+    }
 
     if is_error {
-        let body = truncate_scroll(result, MAX_CHARS);
-        let mut lines: Vec<String> = body
-            .lines()
-            .take(MAX_LINES)
-            .map(|l| format!("  \x1b[31m{l}\x1b[0m"))
-            .collect();
-        if let Some(first) = lines.first_mut() {
-            *first = format!("{connector}\x1b[31m{}\x1b[0m", body.lines().next().unwrap_or(""));
+        // Errors in red, show generously
+        let connector = "\x1b[2m└\x1b[0m ";
+        let lines: Vec<&str> = result.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().take(8).enumerate() {
+            let prefix = if i == 0 { connector } else { "  " };
+            out.push(format!("{prefix}\x1b[31m{line}\x1b[0m"));
         }
-        return lines.join("\r\n");
+        if lines.len() > 8 {
+            out.push(format!("  \x1b[2m… +{} lines\x1b[0m", lines.len() - 8));
+        }
+        return out.join("\r\n");
     }
 
     match tool_name {
-        "bash" => {
-            let lines: Vec<&str> = result.lines().collect();
-            if lines.is_empty() {
-                return String::new();
-            }
-            let shown: usize = MAX_LINES.min(lines.len());
-            let mut out = Vec::with_capacity(shown + 1);
-            for (i, line) in lines.iter().take(shown).enumerate() {
-                if i == 0 {
-                    out.push(format!("{connector}{line}"));
-                } else {
-                    out.push(format!("  {line}"));
-                }
-            }
-            if lines.len() > MAX_LINES {
-                out.push(format!(
-                    "  \x1b[2m… +{} lines\x1b[0m",
-                    lines.len() - MAX_LINES
-                ));
-            }
-            out.join("\r\n")
-        }
-        "read_file" => {
-            let lines: Vec<&str> = result.lines().collect();
-            let total = lines.len();
-            let mut out = Vec::new();
-            for (i, line) in lines.iter().take(6).enumerate() {
-                if i == 0 {
-                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
-                } else {
-                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
-                }
-            }
-            if total > 6 {
-                out.push(format!("  \x1b[2m… {total} lines\x1b[0m"));
-            }
-            out.join("\r\n")
-        }
+        // Bash output is primary content — not dimmed, generous preview
+        "bash" => format_result_lines(result, 8, false),
+        // File reads are context — dim, shorter
+        "read_file" => format_result_lines(result, 4, true),
+        // Edit/write just show the success summary
         "edit_file" | "write_file" => {
-            format!("{connector}{}", result.trim())
+            let trimmed = result.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("\x1b[2m└\x1b[0m {trimmed}")
+            }
         }
-        "glob" | "list_dir" => {
-            let lines: Vec<&str> = result.lines().collect();
-            let count = lines.len();
-            let mut out = Vec::new();
-            for (i, line) in lines.iter().take(8).enumerate() {
-                if i == 0 {
-                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
-                } else {
-                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
-                }
-            }
-            if count > 8 {
-                out.push(format!("  \x1b[2m… {count} total\x1b[0m"));
-            }
-            out.join("\r\n")
-        }
-        "grep" => {
-            let lines: Vec<&str> = result.lines().collect();
-            let count = lines.len();
-            let mut out = Vec::new();
-            for (i, line) in lines.iter().take(MAX_LINES).enumerate() {
-                if i == 0 {
-                    out.push(format!("{connector}\x1b[2m{line}\x1b[0m"));
-                } else {
-                    out.push(format!("  \x1b[2m{line}\x1b[0m"));
-                }
-            }
-            if count > MAX_LINES {
-                out.push(format!("  \x1b[2m… {count} matches\x1b[0m"));
-            }
-            out.join("\r\n")
-        }
-        _ => {
-            let body = truncate_scroll(result, MAX_CHARS);
-            if body.is_empty() {
-                return String::new();
-            }
-            let mut lines: Vec<&str> = body.lines().collect();
-            if lines.is_empty() {
-                return String::new();
-            }
-            let first = lines.remove(0);
-            let mut out = format!("{connector}{first}");
-            for l in lines {
-                out.push_str("\r\n  ");
-                out.push_str(l);
-            }
-            out
-        }
+        // File lists — dim, moderate
+        "glob" | "list_dir" => format_result_lines(result, 6, true),
+        // Search results — dim, moderate
+        "grep" => format_result_lines(result, 6, true),
+        // Unknown tools — dim, short
+        _ => format_result_lines(result, 4, true),
     }
 }
 

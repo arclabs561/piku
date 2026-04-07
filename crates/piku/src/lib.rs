@@ -100,7 +100,7 @@ pub fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
 
     match tool_name {
         "read_file" => {
-            let path = get_str("path").unwrap_or("");
+            let path = shorten_path(get_str("path").unwrap_or(""));
             let start = input.get("start_line").and_then(serde_json::Value::as_u64);
             let end = input.get("end_line").and_then(serde_json::Value::as_u64);
             match (start, end) {
@@ -109,27 +109,56 @@ pub fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
                 _ => path.to_string(),
             }
         }
-        "write_file" | "edit_file" | "list_dir" => get_str("path").unwrap_or("").to_string(),
+        "write_file" | "list_dir" => shorten_path(get_str("path").unwrap_or("")).to_string(),
+        "edit_file" => {
+            let path = shorten_path(get_str("path").unwrap_or(""));
+            path.to_string()
+        }
         "bash" => {
-            // Show the command, truncated
             let cmd = get_str("command").unwrap_or("");
-            truncate_arg(cmd, 60)
+            let line_count = cmd.lines().count();
+            let first = cmd.lines().next().unwrap_or("");
+            if line_count > 1 {
+                // Multiline: show first line + line count
+                format!("{} (+{} lines)", truncate_arg(first, 50), line_count - 1)
+            } else {
+                truncate_arg(first, 72)
+            }
         }
         "glob" | "grep" => {
             let pattern = get_str("pattern").unwrap_or("");
             let path = get_str("path").unwrap_or("");
             if path.is_empty() {
-                pattern.to_string()
+                truncate_arg(pattern, 60)
             } else {
-                format!("{pattern} in {path}")
+                format!("{} in {}", truncate_arg(pattern, 40), shorten_path(path))
             }
         }
-        _ => String::new(),
+        _ => {
+            // Generic: show first string-valued key
+            if let Some(obj) = input.as_object() {
+                for (_, v) in obj.iter().take(1) {
+                    if let Some(s) = v.as_str() {
+                        return truncate_arg(s, 60);
+                    }
+                }
+            }
+            String::new()
+        }
     }
 }
 
+/// Shorten a file path for display. If the path has more than 3 components,
+/// show …/last_two_components. Keeps paths readable in tool headers.
+fn shorten_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 3 {
+        return path.to_string();
+    }
+    format!("…/{}", parts[parts.len() - 2..].join("/"))
+}
+
 fn truncate_arg(s: &str, max: usize) -> String {
-    // Take only the first line (avoid multiline commands cluttering the header)
     let first_line = s.lines().next().unwrap_or(s);
     if first_line.len() <= max {
         first_line.to_string()
