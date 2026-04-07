@@ -34,6 +34,7 @@ use rustyline::error::ReadlineError;
 
 use crate::cli::ResolvedProvider;
 use crate::input_helper;
+use crate::markdown::StreamingMarkdown;
 use crate::self_update;
 
 // ── Permission prompter ───────────────────────────────────────────────────────
@@ -491,6 +492,8 @@ pub struct TuiSink {
     build_candidate: std::path::PathBuf,
     /// Whether the "thinking" indicator on the input row needs clearing.
     needs_indicator_clear: bool,
+    /// Streaming markdown renderer for assistant text.
+    md: StreamingMarkdown,
 }
 
 impl TuiSink {
@@ -500,6 +503,7 @@ impl TuiSink {
             binary_mtime_baseline,
             build_candidate: self_update::default_build_output(),
             needs_indicator_clear: true,
+            md: StreamingMarkdown::new(),
         }
     }
 
@@ -532,16 +536,23 @@ impl TuiSink {
 impl OutputSink for TuiSink {
     fn on_text(&mut self, text: &str) {
         self.clear_thinking_indicator();
-        // Stream text directly — DECSTBM keeps it in the scroll zone.
-        // Replace bare \n with \r\n so the terminal doesn't lose the column.
-        let fixed = text.replace('\n', "\r\n");
-        self.print("\x1b[?25h");
-        self.print(&fixed);
-        let _ = self.stdout.flush();
+        // Render markdown formatting as text streams in.
+        // The renderer buffers partial lines and emits \r\n-terminated output.
+        let rendered = self.md.push(text);
+        if !rendered.is_empty() {
+            self.print("\x1b[?25h");
+            self.print(&rendered);
+            let _ = self.stdout.flush();
+        }
     }
 
     fn on_tool_start(&mut self, tool_name: &str, _tool_id: &str, input: &serde_json::Value) {
         self.clear_thinking_indicator();
+        // Flush any pending markdown before showing the tool label.
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            self.print(&flushed);
+        }
         let label = tool_label(tool_name);
         let args = crate::format_tool_input(tool_name, input);
         self.print("\x1b[?25h");
@@ -596,6 +607,11 @@ impl OutputSink for TuiSink {
     }
 
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        // Flush any remaining markdown before the turn summary.
+        let flushed = self.md.flush();
+        if !flushed.is_empty() {
+            self.print(&flushed);
+        }
         self.println(&format!(
             "\r\n\x1b[2m[{iterations} iter · {}↑ {}↓]\x1b[0m",
             usage.input_tokens, usage.output_tokens
