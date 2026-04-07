@@ -1,5 +1,3 @@
-#![allow(warnings)]
-
 use piku::cli::{parse_args, CliAction, ResolvedProvider};
 use piku::self_update;
 use piku::trace::TraceWriter;

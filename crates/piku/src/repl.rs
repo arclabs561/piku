@@ -1,5 +1,3 @@
-#![allow(warnings)]
-
 /// Interactive REPL for piku.
 ///
 /// Drops into a persistent session loop when piku is run with no prompt argument.

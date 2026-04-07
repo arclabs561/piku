@@ -1,5 +1,3 @@
-#![allow(warnings)]
-
 /// Sticky-bottom REPL: output scrolls above a fixed readline prompt.
 ///
 /// Layout (terminal rows, 1-indexed):
@@ -25,13 +23,13 @@ use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use piku_api::TokenUsage;
 use piku_runtime::{
-    build_system_prompt, run_turn_with_registry, AllowAll, InterjectionRx, InterjectionTx,
+    build_system_prompt, run_turn_with_registry, InterjectionRx, InterjectionTx,
     OutputSink, PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, Session,
     TaskRegistry, TaskStatus, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 use crate::cli::ResolvedProvider;
-use crate::input_helper::{self, LineEditor, ReadOutcome};
+use crate::input_helper::{LineEditor, ReadOutcome};
 use crate::markdown::StreamingMarkdown;
 use crate::self_update;
 
@@ -496,8 +494,6 @@ pub struct TuiSink {
     needs_indicator_clear: bool,
     /// Signal to stop the background thinking ticker.
     thinking_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// When the turn started (for elapsed time display).
-    turn_start: std::time::Instant,
     /// Streaming markdown renderer for assistant text.
     md: StreamingMarkdown,
 }
@@ -510,7 +506,6 @@ impl TuiSink {
             build_candidate: self_update::default_build_output(),
             needs_indicator_clear: true,
             thinking_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            turn_start: std::time::Instant::now(),
             md: StreamingMarkdown::new(),
         }
     }
@@ -862,7 +857,7 @@ async fn run_tui_repl_core(
         reset_scroll_region();
         let readline = editor.read_line_raw();
         // Restore scroll region and re-position cursor.
-        let (cols, rows) = term_size();
+        let (_cols, rows) = term_size();
         set_scroll_region(1, rows.saturating_sub(2));
         // Park cursor in scroll zone bottom so output lands there.
         let scroll_bot = rows.saturating_sub(2);

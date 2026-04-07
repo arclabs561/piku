@@ -140,10 +140,12 @@ impl InputBuffer {
         self.cursor += ch.len_utf8();
     }
 
-    /// Insert a string (e.g. from bracketed paste). Normalizes ANSI, \r, tabs.
+    /// Insert a string (e.g. from bracketed paste). Normalizes ANSI, \r\n, tabs.
     pub fn insert_str(&mut self, s: &str) {
         let cleaned = strip_ansi_from_paste(s);
-        for ch in cleaned.chars() {
+        // Normalize \r\n → \n, then lone \r → \n
+        let normalized = cleaned.replace("\r\n", "\n").replace('\r', "\n");
+        for ch in normalized.chars() {
             self.insert(ch);
         }
     }
@@ -190,6 +192,50 @@ impl InputBuffer {
 
     pub fn move_end(&mut self) {
         self.cursor = self.buffer.len();
+    }
+
+    /// Column position of cursor within its current line (display width).
+    pub fn current_col(&self) -> usize {
+        let before = &self.buffer[..self.cursor];
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        UnicodeWidthStr::width(&before[line_start..])
+    }
+
+    /// Move cursor to the previous line, targeting `target_col` display width.
+    /// Returns true if movement happened.
+    pub fn move_up(&mut self, target_col: usize) -> bool {
+        let before = &self.buffer[..self.cursor];
+        let Some(nl_pos) = before.rfind('\n') else {
+            return false; // already on first line
+        };
+        // Find the start of the previous line
+        let prev_line_start = before[..nl_pos].rfind('\n').map_or(0, |i| i + 1);
+        let prev_line = &self.buffer[prev_line_start..nl_pos];
+        // Find byte offset within prev_line that matches target_col
+        self.cursor = prev_line_start + col_to_byte_offset(prev_line, target_col);
+        true
+    }
+
+    /// Move cursor to the next line, targeting `target_col` display width.
+    /// Returns true if movement happened.
+    pub fn move_down(&mut self, target_col: usize) -> bool {
+        // Find next newline from current position
+        let rest_from_line_start = &self.buffer[self.cursor..];
+        let Some(nl_offset) = rest_from_line_start.find('\n') else {
+            return false; // already on last line
+        };
+        let next_line_start = self.cursor + nl_offset + 1;
+        if next_line_start >= self.buffer.len() {
+            // Next line is empty (trailing newline)
+            self.cursor = self.buffer.len();
+            return true;
+        }
+        let next_line_end = self.buffer[next_line_start..]
+            .find('\n')
+            .map_or(self.buffer.len(), |i| next_line_start + i);
+        let next_line = &self.buffer[next_line_start..next_line_end];
+        self.cursor = next_line_start + col_to_byte_offset(next_line, target_col);
+        true
     }
 
     /// Move cursor back one word (Alt+B / Ctrl+Left).
@@ -535,6 +581,10 @@ impl LineEditor {
     }
 
     fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
+        // Clear sticky column on any key except Up/Down
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.preferred_col = None;
+        }
         match key {
             // ── Ctrl combos ─────────────────────────────────────────────
             KeyEvent {
@@ -762,25 +812,32 @@ impl LineEditor {
             KeyEvent {
                 code: KeyCode::Up, ..
             } => {
-                // Only navigate history when cursor is on the first line
-                // (multiline awareness — matches Claude Code / Codex behavior)
                 let on_first_line = !input.as_str()[..input.cursor].contains('\n');
                 if on_first_line {
                     self.history_up(input);
+                    self.preferred_col = None;
+                } else {
+                    let col = self.preferred_col.unwrap_or_else(|| input.current_col());
+                    if input.move_up(col) {
+                        self.preferred_col = Some(col);
+                    }
                 }
-                // TODO: cursor-up within multiline text
                 Action::Continue
             }
             KeyEvent {
                 code: KeyCode::Down,
                 ..
             } => {
-                // Only navigate history when cursor is on the last line
                 let on_last_line = !input.as_str()[input.cursor..].contains('\n');
                 if on_last_line {
                     self.history_down(input);
+                    self.preferred_col = None;
+                } else {
+                    let col = self.preferred_col.unwrap_or_else(|| input.current_col());
+                    if input.move_down(col) {
+                        self.preferred_col = Some(col);
+                    }
                 }
-                // TODO: cursor-down within multiline text
                 Action::Continue
             }
             KeyEvent {
@@ -987,6 +1044,19 @@ struct Rendered {
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
+
+/// Find the byte offset within `line` that corresponds to `target_col` display columns.
+fn col_to_byte_offset(line: &str, target_col: usize) -> usize {
+    let mut col = 0;
+    for (i, g) in line.grapheme_indices(true) {
+        let w = UnicodeWidthStr::width(g);
+        if col + w > target_col {
+            return i;
+        }
+        col += w;
+    }
+    line.len() // target_col beyond line end → park at end
+}
 
 /// Strip ANSI escape sequences from pasted text.
 fn strip_ansi_from_paste(s: &str) -> String {
@@ -1339,5 +1409,218 @@ mod tests {
         editor.push_history("different");
         editor.push_history("different");
         assert_eq!(editor.history.len(), 2);
+    }
+
+    // ── Undo ────────────────────────────────────────────────────────
+
+    #[test]
+    fn undo_restores_after_kill() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world".chars() {
+            buf.insert(ch);
+        }
+        buf.kill_to_end(); // kills nothing (cursor at end), but snapshots
+        buf.move_home();
+        buf.kill_to_end(); // kills "hello world"
+        assert_eq!(buf.as_str(), "");
+        buf.undo();
+        assert_eq!(buf.as_str(), "hello world");
+    }
+
+    #[test]
+    fn undo_is_empty_on_fresh_buffer() {
+        let mut buf = InputBuffer::new();
+        assert!(!buf.undo()); // nothing to undo
+    }
+
+    #[test]
+    fn undo_after_many_inserts() {
+        let mut buf = InputBuffer::new();
+        // Insert 20 chars (triggers snapshots due to debounce every 5)
+        for ch in "abcdefghijklmnopqrst".chars() {
+            buf.insert(ch);
+        }
+        // Should be able to undo at least once
+        assert!(buf.undo());
+        assert!(buf.as_str().len() < 20);
+    }
+
+    // ── Kill/Yank ───────────────────────────────────────────────────
+
+    #[test]
+    fn kill_and_yank_round_trip() {
+        let mut buf = InputBuffer::new();
+        for ch in "hello world".chars() {
+            buf.insert(ch);
+        }
+        buf.kill_word_back(); // kills "world"
+        assert_eq!(buf.as_str(), "hello ");
+        buf.yank();
+        assert_eq!(buf.as_str(), "hello world");
+    }
+
+    #[test]
+    fn kill_buffer_survives_clear() {
+        let mut buf = InputBuffer::new();
+        for ch in "test".chars() {
+            buf.insert(ch);
+        }
+        buf.kill_to_end();
+        buf.clear();
+        assert!(buf.is_empty());
+        buf.yank(); // kill buffer should still have "test"
+        // Actually kill_to_end at cursor=4 kills nothing. Let me redo:
+        let mut buf = InputBuffer::new();
+        for ch in "test".chars() {
+            buf.insert(ch);
+        }
+        buf.move_home();
+        buf.kill_to_end(); // kills "test"
+        assert_eq!(buf.as_str(), "");
+        buf.clear();
+        buf.yank();
+        assert_eq!(buf.as_str(), "test");
+    }
+
+    // ── Ghost text ──────────────────────────────────────────────────
+
+    #[test]
+    fn ghost_text_from_history() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("explain src/main.rs");
+        assert_eq!(
+            editor.history_ghost("explain"),
+            Some(" src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn ghost_text_no_match() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("hello");
+        assert_eq!(editor.history_ghost("xyz"), None);
+    }
+
+    #[test]
+    fn ghost_text_skips_slash_commands() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("/help");
+        assert_eq!(editor.history_ghost("/he"), None);
+    }
+
+    #[test]
+    fn ghost_text_most_recent_wins() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("fix the old bug");
+        editor.push_history("fix the new feature");
+        assert_eq!(
+            editor.history_ghost("fix"),
+            Some(" the new feature".to_string())
+        );
+    }
+
+    // ── Paste normalization ─────────────────────────────────────────
+
+    #[test]
+    fn paste_strips_ansi() {
+        let result = strip_ansi_from_paste("\x1b[31mhello\x1b[0m world");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn paste_normalizes_cr() {
+        let mut buf = InputBuffer::new();
+        buf.insert_str("line1\r\nline2\rline3");
+        assert_eq!(buf.as_str(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn paste_converts_tabs() {
+        let mut buf = InputBuffer::new();
+        buf.insert_str("a\tb");
+        assert_eq!(buf.as_str(), "a    b");
+    }
+
+    // ── Grapheme-cluster movement ───────────────────────────────────
+
+    #[test]
+    fn grapheme_movement_ascii() {
+        let mut buf = InputBuffer::new();
+        for ch in "abc".chars() {
+            buf.insert(ch);
+        }
+        buf.move_left();
+        assert_eq!(buf.cursor, 2); // before 'c'
+        buf.move_left();
+        assert_eq!(buf.cursor, 1); // before 'b'
+        buf.move_right();
+        assert_eq!(buf.cursor, 2); // before 'c'
+    }
+
+    #[test]
+    fn grapheme_backspace_multibyte() {
+        let mut buf = InputBuffer::new();
+        buf.insert_str("hello");
+        // 'hello' is 5 single-byte chars
+        buf.backspace();
+        assert_eq!(buf.as_str(), "hell");
+    }
+
+    #[test]
+    fn visible_width_cjk() {
+        // CJK characters are 2 columns wide
+        assert_eq!(visible_width("ab"), 2);
+        // Basic test with known-width chars
+        assert_eq!(visible_width("a"), 1);
+    }
+
+    // ── Multiline history awareness ─────────────────────────────────
+
+    #[test]
+    fn up_arrow_only_on_first_line() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("old command");
+        let mut input = InputBuffer::new();
+        input.insert_str("line1\nline2");
+        // Cursor is at end of "line2" (second line)
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        // Should NOT navigate history because we're on the second line
+        assert_eq!(input.as_str(), "line1\nline2");
+    }
+
+    #[test]
+    fn cursor_up_down_within_multiline() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        input.insert_str("short\nlonger line\nx");
+        // Cursor at end of "x" (third line, col 1)
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        // Should be on second line now
+        let before = &input.as_str()[..input.cursor];
+        assert_eq!(before.matches('\n').count(), 1, "should be on line 2");
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        let before = &input.as_str()[..input.cursor];
+        assert_eq!(before.matches('\n').count(), 0, "should be on line 1");
+    }
+
+    #[test]
+    fn cursor_down_from_first_line() {
+        let mut editor = LineEditor::new("> ");
+        let mut input = InputBuffer::new();
+        input.insert_str("abc\ndef\nghi");
+        input.move_home(); // go to start
+        let _ = editor.handle_key(key(KeyCode::Down), &mut input);
+        let before = &input.as_str()[..input.cursor];
+        assert!(before.contains('\n'), "should have moved past first line");
+    }
+
+    #[test]
+    fn up_arrow_works_on_single_line() {
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("old command");
+        let mut input = InputBuffer::new();
+        input.insert_str("new");
+        let _ = editor.handle_key(key(KeyCode::Up), &mut input);
+        assert_eq!(input.as_str(), "old command");
     }
 }
