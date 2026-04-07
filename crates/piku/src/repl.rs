@@ -79,22 +79,21 @@ pub async fn run_repl(
     // Print welcome banner
     println!("{}", banner(&model, resolved.name(), &session_id));
 
-    // Set up rustyline editor with slash-command completion and hints
-    let mut rl = input_helper::build_editor()?;
+    let mut editor = input_helper::LineEditor::new("\x1b[34m>\x1b[0m ");
     let history_path = sessions_dir.join(".repl_history");
-    let _ = rl.load_history(&history_path);
+    editor.load_history_file(&history_path);
 
     loop {
         let system_sections = build_system_prompt(&cwd, &date, &model);
 
-        let readline = rl.readline("\x1b[34m>\x1b[0m ");
+        let readline = editor.read_line();
         match readline {
-            Ok(line) => {
+            Ok(input_helper::ReadOutcome::Submit(line)) => {
                 let trimmed = line.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
-                rl.add_history_entry(&trimmed)?;
+                editor.push_history(&trimmed);
 
                 // Slash command?
                 if let Some(cmd) = parse_slash(&trimmed) {
@@ -157,18 +156,14 @@ pub async fn run_repl(
                 }
             }
 
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                // Ctrl-C — clear current line, continue
-                println!();
+            Ok(input_helper::ReadOutcome::Cancel) => {
                 continue;
             }
-            Err(rustyline::error::ReadlineError::Eof) => {
-                // Ctrl-D — exit gracefully
-                println!();
+            Ok(input_helper::ReadOutcome::Exit) => {
                 break;
             }
             Err(err) => {
-                eprintln!("\x1b[31m[readline error]\x1b[0m {err}");
+                eprintln!("\x1b[31m[input error]\x1b[0m {err}");
                 break;
             }
         }
@@ -180,7 +175,7 @@ pub async fn run_repl(
     } else if !session.messages.is_empty() {
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
     }
-    let _ = rl.save_history(&history_path);
+    editor.save_history_file(&history_path);
 
     Ok(())
 }

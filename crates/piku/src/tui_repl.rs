@@ -30,10 +30,8 @@ use piku_runtime::{
     TaskRegistry, TaskStatus, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
-use rustyline::error::ReadlineError;
-
 use crate::cli::ResolvedProvider;
-use crate::input_helper;
+use crate::input_helper::{self, LineEditor, ReadOutcome};
 use crate::markdown::StreamingMarkdown;
 use crate::self_update;
 
@@ -797,14 +795,10 @@ async fn run_tui_repl_core(
         let _ = io::stdout().flush();
     }
 
-    // ── rustyline ─────────────────────────────────────────────────────────────
+    // ── Line editor ──────────────────────────────────────────────────────────
     let history_path = sessions_dir.join(".repl_history");
-
-    // We need rustyline to draw its prompt at the very bottom row.
-    // Build a custom helper that draws \r\n before printing the prompt so
-    // readline always appears on the last line.
-    let mut rl = build_editor()?;
-    let _ = rl.load_history(&history_path);
+    let mut editor = LineEditor::new("\x1b[34m>\x1b[0m ");
+    editor.load_history_file(&history_path);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     // Track whether the last turn had an error, to change the prompt glyph.
@@ -831,35 +825,33 @@ async fn run_tui_repl_core(
             }
         }
 
-        // Position readline at the bottom row.
-        // rustyline will overwrite row H when it draws its prompt.
+        // Position editor at the bottom row.
         let (_, rows) = term_size();
         let input_row = rows;
         goto(input_row, 1);
-        print!("\x1b[2K"); // clear current line before readline redraws
+        print!("\x1b[2K"); // clear current line before editor redraws
         let _ = io::stdout().flush();
 
         // Prompt glyph reflects state: red after error, blue normally.
-        let prompt = if last_turn_error {
-            "\x1b[31m>\x1b[0m "
+        if last_turn_error {
+            editor.set_prompt("\x1b[31m>\x1b[0m ");
         } else {
-            "\x1b[34m>\x1b[0m "
-        };
+            editor.set_prompt("\x1b[34m>\x1b[0m ");
+        }
 
-        let readline = rl.readline(prompt);
-        // rustyline hides the cursor while processing input — restore it immediately
-        // so it's always visible whether the user is typing or the agent is running.
+        // Temporarily reset scroll region so the editor can use the
+        // full input row without DECSTBM interference.
+        reset_scroll_region();
+        let readline = editor.read_line();
+        // Restore scroll region after input
+        let (_, rows) = term_size();
+        set_scroll_region(1, rows.saturating_sub(2));
         print!("\x1b[?25h");
         let _ = io::stdout().flush();
 
         match readline {
-            Ok(line) => {
-                let _ = rl.add_history_entry(&line);
-
-                // Validator handles multiline: the buffer may contain
-                // embedded newlines from pasted text or continuation.
-                // Trim trailing blank lines that the Validator uses as
-                // the submit signal.
+            Ok(ReadOutcome::Submit(line)) => {
+                editor.push_history(&line);
                 let full_input = line.trim().to_string();
 
                 if full_input.is_empty() {
@@ -1008,8 +1000,8 @@ async fn run_tui_repl_core(
                 }
             }
 
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-C: cancel current input
+            Ok(ReadOutcome::Cancel) => {
+                // Ctrl-C / Esc: cancel current input
                 let (_, rows) = term_size();
                 let scroll_bot = rows.saturating_sub(2);
                 goto(scroll_bot, 1);
@@ -1029,19 +1021,18 @@ async fn run_tui_repl_core(
                         context_pct: None,
                     },
                 );
-                // Restore cursor — it may be hidden after Ctrl-C during a turn
                 print!("\x1b[?25h");
                 let _ = io::stdout().flush();
                 continue;
             }
 
-            Err(ReadlineError::Eof) => {
-                // Ctrl-D: exit
+            Ok(ReadOutcome::Exit) => {
+                // Ctrl-D / Ctrl-C on empty: exit
                 break;
             }
 
             Err(err) => {
-                eprintln!("\x1b[31m[readline error]\x1b[0m {err}");
+                eprintln!("\x1b[31m[input error]\x1b[0m {err}");
                 break;
             }
         }
@@ -1057,7 +1048,7 @@ async fn run_tui_repl_core(
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
     }
 
-    let _ = rl.save_history(&history_path);
+    editor.save_history_file(&history_path);
 
     Ok(())
 }
@@ -1463,10 +1454,4 @@ fn announce_self_update(new_binary: &std::path::Path) {
         "\x1b[u\x1b[2K\x1b[1;32m↺ new binary ready — restarting now\x1b[0m  \x1b[2m{bin_name}\x1b[0m"
     );
     let _ = stdout.flush();
-}
-
-// ── rustyline factory ─────────────────────────────────────────────────────────
-
-fn build_editor() -> anyhow::Result<input_helper::PikuEditor> {
-    input_helper::build_editor()
 }
