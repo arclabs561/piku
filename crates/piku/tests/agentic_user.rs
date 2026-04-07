@@ -664,6 +664,119 @@ fn set_pty_winsize(file: &std::fs::File, rows: u16, cols: u16) {
     }
 }
 
+/// Strip ANSI escape sequences from raw bytes, returning plain text.
+/// Handles CSI, OSC, and simple escape sequences. Collapses whitespace runs.
+fn strip_ansi_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\x1b' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI sequence: skip until final byte (ASCII letter or ~)
+                    i += 1;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if c.is_ascii_alphabetic() || c == b'~' {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC sequence: skip until BEL or ST
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\x07' {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == b'\x1b' {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 1; // skip one char after ESC
+                }
+            }
+        } else if b == b'\r' {
+            // Carriage return — skip (often paired with \n)
+            i += 1;
+        } else if b == b'\n' {
+            out.push('\n');
+            i += 1;
+        } else if b == b'\t' {
+            out.push(' ');
+            i += 1;
+        } else if b < 0x20 && b != b'\n' {
+            // Other control characters — skip
+            i += 1;
+        } else {
+            // Regular byte — decode as UTF-8
+            if b < 0x80 {
+                out.push(b as char);
+                i += 1;
+            } else {
+                // Multi-byte UTF-8: find the char boundary
+                let start = i;
+                let remaining = &bytes[i..];
+                match std::str::from_utf8(remaining) {
+                    Ok(s) => {
+                        if let Some(c) = s.chars().next() {
+                            out.push(c);
+                            i += c.len_utf8();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // Try to get at least one valid char
+                        let valid = e.valid_up_to();
+                        if valid > 0 {
+                            let s = std::str::from_utf8(&bytes[start..start + valid]).unwrap();
+                            if let Some(c) = s.chars().next() {
+                                out.push(c);
+                                i += c.len_utf8();
+                            } else {
+                                i += 1;
+                            }
+                        } else {
+                            i += 1; // skip invalid byte
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collapse 3+ consecutive newlines
+    let mut result = String::new();
+    let mut nl_count = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            nl_count += 1;
+            if nl_count <= 1 {
+                result.push('\n');
+            }
+        } else {
+            if nl_count > 0 {
+                nl_count = 0;
+            }
+            result.push_str(line.trim_end());
+            result.push('\n');
+        }
+    }
+    result
+}
+
 /// Strip DECSTBM scroll region sequences from raw terminal bytes.
 /// Matches `ESC [ <digits> ; <digits> r` and `ESC [ r` (reset).
 /// Also strips cursor save/restore sequences that interact with DECSTBM.
@@ -851,32 +964,13 @@ impl PtyHandle {
         self.raw_capture.clear();
     }
 
-    /// Extract text content from captured bytes by running through a tall
-    /// VT100 parser with DECSTBM sequences stripped. This prevents the
-    /// replay parser from creating its own scroll region, so all content
-    /// stays visible in the 500-row grid.
+    /// Extract text content from captured raw bytes by stripping ANSI escape
+    /// sequences. This gives us the complete text stream — what the user
+    /// would read if they watched the terminal character by character.
+    /// Unlike VT100 replay, this doesn't lose content to cursor positioning
+    /// or scroll region overwrites.
     fn captured_text(&self) -> String {
-        // Strip DECSTBM sequences (CSI <n>;<n> r and CSI r) from the raw bytes
-        // so the replay parser doesn't confine content to a scroll region.
-        let cleaned = strip_decstbm(&self.raw_capture);
-        let mut parser = vt100::Parser::new(500, 120, 0);
-        parser.process(&cleaned);
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let mut lines = Vec::new();
-        for r in 0..rows {
-            let mut line = String::new();
-            for c in 0..cols {
-                if let Some(cell) = screen.cell(r, c) {
-                    line.push_str(cell.contents());
-                }
-            }
-            let trimmed = line.trim_end().to_string();
-            if !trimmed.is_empty() {
-                lines.push(trimmed);
-            }
-        }
-        lines.join("\n")
+        strip_ansi_bytes(&self.raw_capture)
     }
 
     /// Drain then sleep, repeat until no new bytes arrive.
