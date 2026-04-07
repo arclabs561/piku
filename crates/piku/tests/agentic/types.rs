@@ -203,16 +203,24 @@ impl ScreenSnapshot {
         }
     }
 
-    /// Check if piku is ready for input.
+    /// Check if piku is ready for input (not thinking, not streaming).
     pub fn is_ready(&self) -> bool {
         if !self.cursor_visible {
             return false;
         }
         let input = self.input_row().trim_start();
-        input.starts_with('\u{276F}')
+        let has_prompt = input.starts_with('\u{276F}')
             || input.starts_with('>')
             || input.starts_with('!')
-            || input.contains("Send a message")
+            || input.contains("Send a message");
+        if !has_prompt {
+            return false;
+        }
+        // Reject thinking/streaming indicators
+        if input.contains("thinking") || input.contains("\u{00B7}") || input.contains("\u{273B}") {
+            return false;
+        }
+        true
     }
 
     /// All non-empty visible rows for LLM context.
@@ -230,7 +238,7 @@ impl ScreenSnapshot {
                 out.push_str(&format!("  ... ({} more lines)\n", visible.len() - i));
                 break;
             }
-            let truncated = if line.len() > 120 { &line[..120] } else { line };
+            let truncated = safe_truncate(line, 120);
             out.push_str(truncated);
             out.push('\n');
         }
