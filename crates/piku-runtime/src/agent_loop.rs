@@ -435,15 +435,27 @@ async fn run_turn_inner(
                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
 
                 let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("");
-                let approach = params.get("approach").and_then(|v| v.as_str()).unwrap_or("");
+                let approach = params
+                    .get("approach")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
 
                 if goal.trim().is_empty() || approach.trim().is_empty() {
-                    ("record_attempt requires non-empty 'goal' and 'approach'".to_string(), true)
+                    (
+                        "record_attempt requires non-empty 'goal' and 'approach'".to_string(),
+                        true,
+                    )
                 } else if let Some(existing_id) = attempt_id {
                     // Updating an existing attempt's outcome
-                    let outcome = params.get("outcome").and_then(|v| v.as_str()).unwrap_or("pending");
-                    let detail = params.get("outcome_detail").and_then(|v| v.as_str()).map(String::from);
+                    let outcome = params
+                        .get("outcome")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending");
+                    let detail = params
+                        .get("outcome_detail")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let outcome_enum = match outcome {
                         "success" => crate::embed_memory::Outcome::Success,
                         "failure" => crate::embed_memory::Outcome::Failure,
@@ -469,7 +481,8 @@ async fn run_turn_inner(
                     .await;
                     match embed_result {
                         Ok(Ok(embedding)) => {
-                            let parent_id = params.get("parent_id").and_then(serde_json::Value::as_u64);
+                            let parent_id =
+                                params.get("parent_id").and_then(serde_json::Value::as_u64);
                             #[allow(clippy::cast_possible_truncation)]
                             let importance = params
                                 .get("importance")
@@ -485,7 +498,10 @@ async fn run_turn_inner(
                             // Apply immediate outcome if provided
                             let outcome = params.get("outcome").and_then(|v| v.as_str());
                             if let Some(outcome_str) = outcome {
-                                let detail = params.get("outcome_detail").and_then(|v| v.as_str()).map(String::from);
+                                let detail = params
+                                    .get("outcome_detail")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
                                 let outcome_enum = match outcome_str {
                                     "success" => crate::embed_memory::Outcome::Success,
                                     "failure" => crate::embed_memory::Outcome::Failure,
@@ -494,8 +510,14 @@ async fn run_turn_inner(
                                 store.record_outcome(id, outcome_enum, detail);
                             }
                             let _ = store.save(&store_path);
-                            let status = params.get("outcome").and_then(|v| v.as_str()).unwrap_or("pending");
-                            (format!("attempt recorded (id={id}, status={status})"), false)
+                            let status = params
+                                .get("outcome")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("pending");
+                            (
+                                format!("attempt recorded (id={id}, status={status})"),
+                                false,
+                            )
                         }
                         _ => (
                             "record_attempt: embedding service unavailable".to_string(),
@@ -510,9 +532,16 @@ async fn run_turn_inner(
                 let store = crate::embed_memory::MemoryStore::load(&store_path);
                 let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("");
                 if goal.trim().is_empty() {
-                    ("query_attempts requires a non-empty 'goal'".to_string(), true)
+                    (
+                        "query_attempts requires a non-empty 'goal'".to_string(),
+                        true,
+                    )
                 } else if store.valid_count() == 0 {
-                    ("No attempts recorded yet. Use record_attempt to log what you try.".to_string(), false)
+                    (
+                        "No attempts recorded yet. Use record_attempt to log what you try."
+                            .to_string(),
+                        false,
+                    )
                 } else {
                     let ollama_url = std::env::var("OLLAMA_HOST")
                         .unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -533,7 +562,10 @@ async fn run_turn_inner(
                             // find_attempt_trees takes &self, no need for mut
                             let trees = store.find_attempt_trees(&goal_vec, goal, max_trees);
                             if trees.is_empty() {
-                                ("No prior attempts found for a similar goal.".to_string(), false)
+                                (
+                                    "No prior attempts found for a similar goal.".to_string(),
+                                    false,
+                                )
                             } else {
                                 (crate::embed_memory::format_attempt_trees(&trees), false)
                             }

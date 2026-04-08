@@ -75,7 +75,21 @@ fn static_task_guidelines() -> String {
 - Report outcomes faithfully. If something failed, say so.\n\
 - Prefer reversible operations. Flag high blast-radius actions before executing.\n\
 - Tool results and user messages may include <system-reminder> tags — these are \
-  automatic and not directly from the user."
+  automatic and not directly from the user.\n\n\
+# Attempt tracking\n\n\
+You have tools to build a persistent tree of what approaches work and what don't:\n\
+- `query_attempts`: BEFORE starting a complex or previously-attempted task, search for \
+  prior attempt trees. This surfaces what was tried before, what failed, and why.\n\
+- `record_attempt`: When you try an approach to a non-trivial problem, record it. \
+  Update with outcome (success/failure) and detail when done. Use `parent_id` to build \
+  trees of alternatives (approach A failed, so tried B as a sibling).\n\n\
+When to use:\n\
+- Debugging: record each hypothesis and result\n\
+- Multi-approach problems: record alternatives as siblings under a shared parent\n\
+- After failures: record WHY it failed (the detail is what future agents learn from)\n\n\
+When NOT to use:\n\
+- Trivial operations (file reads, simple edits, one-shot fixes)\n\
+- Tasks where the approach is obvious and unlikely to be retried"
         .to_string()
 }
 
