@@ -11,7 +11,7 @@
 ///
 /// rustyline owns row H.  Between readline calls we:
 ///   1. move cursor into the scroll zone (row H-2)
-///   2. call run_turn (agent streams into scroll zone)
+///   2. call `run_turn` (agent streams into scroll zone)
 ///   3. redraw the divider at H-1
 ///   4. call readline again (it redraws at H)
 ///
@@ -46,14 +46,21 @@ use piku_tools::{all_tool_definitions, Destructiveness};
 /// Key bindings:
 ///   y / Enter  → Allow
 ///   n / Escape → Deny
-///   a          → Allow all (upgrades self to AllowAll for the rest of the turn)
+///   a          → Allow all (upgrades self to `AllowAll` for the rest of the turn)
 ///
 pub struct TuiPrompter {
     /// If true, skip all future prompts and allow everything.
     allow_all: std::sync::atomic::AtomicBool,
 }
 
+impl Default for TuiPrompter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiPrompter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             allow_all: std::sync::atomic::AtomicBool::new(false),
@@ -112,7 +119,7 @@ impl PermissionPrompter for TuiPrompter {
                 })) => {
                     // Ctrl-C / Ctrl-D → deny
                     if modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
+                        && matches!(code, KeyCode::Char('c' | 'd'))
                     {
                         break PermissionOutcome::Deny {
                             reason: "user aborted with Ctrl-C".to_string(),
@@ -187,7 +194,7 @@ impl PermissionPrompter for TuiPrompter {
 
 /// Set terminal scrolling region rows [top..=bot] (1-indexed).
 fn set_scroll_region(top: u16, bot: u16) {
-    print!("\x1b[{};{}r", top, bot);
+    print!("\x1b[{top};{bot}r");
 }
 
 /// Reset scrolling region to the full screen.
@@ -197,7 +204,7 @@ fn reset_scroll_region() {
 
 /// Move cursor to (row, col) — 1-indexed.
 fn goto(row: u16, col: u16) {
-    print!("\x1b[{};{}H", row, col);
+    print!("\x1b[{row};{col}H");
 }
 
 fn term_size() -> (u16, u16) {
@@ -264,9 +271,9 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 
     // Context window % — amber >75%, red >90%
     let ctx_seg = match s.context_pct {
-        Some(pct) if pct >= 90 => format!(" \x1b[31m{}%\x1b[0m ", pct),
-        Some(pct) if pct >= 75 => format!(" \x1b[33m{}%\x1b[0m ", pct),
-        Some(pct) if pct >= 50 => format!(" {}% ", pct),
+        Some(pct) if pct >= 90 => format!(" \x1b[31m{pct}%\x1b[0m "),
+        Some(pct) if pct >= 75 => format!(" \x1b[33m{pct}%\x1b[0m "),
+        Some(pct) if pct >= 50 => format!(" {pct}% "),
         _ => String::new(),
     };
 
@@ -279,7 +286,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 
     // Session id — show last 8 chars so it's recognisable but short
     let short_id = short_session_id(s.session_id);
-    let sess_seg = format!(" {} ", short_id);
+    let sess_seg = format!(" {short_id} ");
 
     // Right anchor: hint (always shown if space allows)
     let hint_seg = " /help ";
@@ -296,11 +303,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 
     // Required: model_seg + separator + hint_seg
     let base_width = vis(&model_seg) + sep_vis + vis(hint_seg);
-    let mut budget = if cols > base_width {
-        cols - base_width
-    } else {
-        0
-    };
+    let mut budget = cols.saturating_sub(base_width);
 
     let mut show_ctx = false;
     let mut show_tok = false;
@@ -403,7 +406,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     line.push_str(&" ".repeat(padding));
     line.push_str(&sep_s);
     line.push_str(dim);
-    line.push_str(&hint_seg);
+    line.push_str(hint_seg);
     line.push_str(reset);
 
     line
@@ -486,7 +489,7 @@ fn teardown_layout(rows: u16) {
 pub struct TuiSink {
     stdout: io::Stdout,
     /// Mtime of the running binary at startup — used to detect self-rebuilds
-    /// even when current_exe() and the build output path resolve to the same file.
+    /// even when `current_exe()` and the build output path resolve to the same file.
     binary_mtime_baseline: Option<std::time::SystemTime>,
     /// Path to check for a new build.
     build_candidate: std::path::PathBuf,
@@ -727,8 +730,7 @@ async fn run_tui_repl_core(
             if stale + weak > 0 {
                 let _ = store.save(&store_path);
                 eprintln!(
-                    "\x1b[2m[memory maintenance: {} stale + {} weak entries evicted]\x1b[0m",
-                    stale, weak
+                    "\x1b[2m[memory maintenance: {stale} stale + {weak} weak entries evicted]\x1b[0m"
                 );
             }
         }
@@ -766,9 +768,10 @@ async fn run_tui_repl_core(
     // exec before drawing any UI. The session (possibly empty) is persisted
     // first so the restarted process can resume it via PIKU_SESSION_ID.
     if !post_restart {
-        let newer = binary_mtime_baseline
-            .map(|b| self_update::is_newer_than_mtime(&build_candidate, b))
-            .unwrap_or_else(|| self_update::is_newer_than_running(&build_candidate));
+        let newer = binary_mtime_baseline.map_or_else(
+            || self_update::is_newer_than_running(&build_candidate),
+            |b| self_update::is_newer_than_mtime(&build_candidate, b),
+        );
         if newer {
             // Persist session (may be empty — that's fine)
             if !session.messages.is_empty() {
@@ -837,9 +840,10 @@ async fn run_tui_repl_core(
         // Check for a newer binary on every iteration — catches the case where
         // `cargo build` was run externally while the REPL was already running.
         {
-            let newer = binary_mtime_baseline
-                .map(|b| self_update::is_newer_than_mtime(&build_candidate, b))
-                .unwrap_or_else(|| self_update::is_newer_than_running(&build_candidate));
+            let newer = binary_mtime_baseline.map_or_else(
+                || self_update::is_newer_than_running(&build_candidate),
+                |b| self_update::is_newer_than_mtime(&build_candidate, b),
+            );
             if newer {
                 let _ = session.save(&session_path);
                 let (_, rows) = term_size();
@@ -903,8 +907,8 @@ async fn run_tui_repl_core(
                 // ! prefix: direct bash command (bypass AI)
                 // TODO: route through runtime's bash tool so the command appears in
                 // session history, respects permissions, and shows in session replay.
-                if full_input.starts_with('!') {
-                    let cmd = full_input[1..].trim();
+                if let Some(cmd) = full_input.strip_prefix('!') {
+                    let cmd = cmd.trim();
                     if !cmd.is_empty() {
                         let (_, rows) = term_size();
                         let scroll_bot = rows.saturating_sub(2);
@@ -1176,7 +1180,6 @@ async fn run_tui_repl_core(
                 );
                 print!("\x1b[?25h");
                 let _ = io::stdout().flush();
-                continue;
             }
 
             Ok(ReadOutcome::Exit) => {
@@ -1289,7 +1292,7 @@ fn print_session_tail(session: &Session, _scroll_bot: u16) {
                             let dname = tool_display_name(name);
                             println!("\x1b[2m  ● {dname}\x1b[0m\r");
                         }
-                        _ => {}
+                        ContentBlock::ToolResult { .. } => {}
                     }
                 }
             }
@@ -1305,12 +1308,10 @@ fn print_session_tail(session: &Session, _scroll_bot: u16) {
                         } else {
                             "\x1b[32mok\x1b[0m"
                         };
-                        let preview: String = output
-                            .lines()
-                            .take(3)
-                            .map(|l| format!("    \x1b[2m{l}\x1b[0m\r\n"))
-                            .collect();
-                        print!("  \x1b[2m→ {status}\x1b[0m\r\n{preview}");
+                        println!("  \x1b[2m→ {status}\x1b[0m\r");
+                        for l in output.lines().take(3) {
+                            println!("    \x1b[2m{l}\x1b[0m\r");
+                        }
                     }
                 }
             }
@@ -1400,7 +1401,7 @@ fn handle_slash_cmd(
         "model" => match arg {
             None => println!("model: {current_model}\r"),
             Some(m) => {
-                *model = m.clone();
+                m.clone_into(model);
                 println!("\x1b[2m[model → {m}]\x1b[0m\r");
                 let (cols, rows) = term_size();
                 draw_footer(
@@ -1424,8 +1425,8 @@ fn handle_slash_cmd(
                 println!("\x1b[1mSessions:\x1b[0m  {}\r", dir.display());
                 if let Ok(entries) = std::fs::read_dir(&dir) {
                     let mut files: Vec<_> = entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
                         .collect();
                     files.sort_by_key(|e| {
                         e.metadata()
@@ -1437,7 +1438,7 @@ fn handle_slash_cmd(
                         let raw_name = f.file_name();
                         let name = raw_name.to_string_lossy();
                         let name = name.trim_end_matches(".json");
-                        println!("  {}\r", name);
+                        println!("  {name}\r");
                     }
                 }
             }
@@ -1647,7 +1648,6 @@ fn announce_self_update(new_binary: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input_helper::visible_width;
 
     fn strip_ansi(s: &str) -> String {
         let mut out = String::new();
@@ -1790,7 +1790,7 @@ mod tests {
     #[test]
     fn fmt_tokens_large() {
         assert_eq!(fmt_tokens(15000), "15k");
-        assert_eq!(fmt_tokens(123456), "123k");
+        assert_eq!(fmt_tokens(123_456), "123k");
     }
 
     // ── short_session_id ────────────────────────────────────────────

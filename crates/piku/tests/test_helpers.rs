@@ -1,6 +1,7 @@
-/// Shared test helpers.
+// Shared test helpers.
 
 /// Strip ANSI escape sequences from a string for plain-text assertions.
+#[must_use]
 pub fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();

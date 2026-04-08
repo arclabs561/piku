@@ -1,5 +1,5 @@
-/// Standalone test for the LineEditor outside the TUI layout.
-/// Run with: cargo run -p piku --example test_input
+/// Standalone test for the `LineEditor` outside the TUI layout.
+/// Run with: cargo run -p piku --example `test_input`
 use piku::input_helper::{LineEditor, ReadOutcome};
 
 fn main() {

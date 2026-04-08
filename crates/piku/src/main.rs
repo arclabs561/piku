@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 // Post-restart helpers (self-update seamless resume)
 // ---------------------------------------------------------------------------
 
-/// Load the session indicated by PIKU_SESSION_ID (set by tui_repl before exec).
+/// Load the session indicated by `PIKU_SESSION_ID` (set by `tui_repl` before exec).
 /// Returns None if the env var is missing or the session can't be loaded.
 fn try_load_restart_session() -> Option<Session> {
     let session_id = std::env::var("PIKU_SESSION_ID").ok()?;
@@ -136,7 +136,7 @@ async fn run_resume(
     if !session_path.exists() {
         // Try partial match: find any session file whose name contains session_id
         let matches: Vec<_> = std::fs::read_dir(&sessions_dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(session_id))
             .collect();
 
@@ -219,9 +219,10 @@ async fn run_single_shot_then_repl(
 
     let tool_defs = all_tool_definitions();
     let prompter = AllowAll;
-    let trace = traces_dir()
-        .map(|dir| TraceWriter::open(&dir, &session_id))
-        .unwrap_or_else(|_| TraceWriter::disabled());
+    let trace = traces_dir().map_or_else(
+        |_| TraceWriter::disabled(),
+        |dir| TraceWriter::open(&dir, &session_id),
+    );
     let mut sink = StdoutSink::new(trace);
     sink.trace.prompt(prompt);
 
@@ -285,8 +286,8 @@ async fn run_single_shot_then_repl(
 struct StdoutSink {
     stdout: io::Stdout,
     trace: TraceWriter,
-    /// Track tool_id so on_tool_end can log it (the trait doesn't pass it there).
-    /// Maps tool_name → most recent tool_id (good enough for sequential execution).
+    /// Track `tool_id` so `on_tool_end` can log it (the trait doesn't pass it there).
+    /// Maps `tool_name` → most recent `tool_id` (good enough for sequential execution).
     pending_tool_id: std::collections::HashMap<String, String>,
     /// Streaming markdown renderer.
     md: piku::markdown::StreamingMarkdown,
@@ -435,13 +436,13 @@ fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn traces_dir() -> anyhow::Result<std::path::PathBuf> {
-    let base = env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".config"))
-                .unwrap_or_else(|_| std::path::PathBuf::from(".config"))
-        });
+    let base = match env::var("XDG_CONFIG_HOME") {
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => env::var("HOME").map_or_else(
+            |_| std::path::PathBuf::from(".config"),
+            |h| std::path::PathBuf::from(h).join(".config"),
+        ),
+    };
     let path = base.join("piku").join("traces");
     std::fs::create_dir_all(&path)?;
     Ok(path)

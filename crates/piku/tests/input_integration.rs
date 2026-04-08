@@ -4,7 +4,7 @@
 /// during a real piku session: type, edit, undo, stash, navigate
 /// history, accept ghost text, paste, etc.
 ///
-/// Tests use only the public API (handle_key, as_str, is_empty, etc.)
+/// Tests use only the public API (`handle_key`, `as_str`, `is_empty`, etc.)
 /// without accessing private fields.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use piku::input_helper::{Action, InputBuffer, LineEditor};

@@ -1,8 +1,24 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::struct_excessive_bools,
+    clippy::format_push_string,
+    clippy::items_after_statements,
+    clippy::cast_precision_loss,
+    clippy::unused_self,
+    clippy::unreadable_literal,
+    clippy::module_name_repetitions,
+    clippy::filter_map_identity,
+    clippy::map_unwrap_or,
+    clippy::struct_field_names,
+    clippy::unnecessary_filter_map
+)]
+
 /// Agentic user harness — an LLM plays the role of a developer using piku.
 ///
 /// Architecture (v2):
 ///   - **Keystroke-level action space**: Type(char), Key(Tab/Enter/Arrow/Ctrl-*),
-///     Observe, Wait — not just send_line.
+///     Observe, Wait — not just `send_line`.
 ///   - **VT100 screen observation**: a persistent `vt100::Parser` processes raw PTY
 ///     bytes. Snapshots return the rendered screen grid, cursor position, cell styles.
 ///   - **Deterministic + LLM split**: cursor visibility, prompt glyph, echo styling,
@@ -13,15 +29,15 @@
 ///   - **Phase-based personas**: scripted keystroke sequences for reproducible coverage
 ///     + LLM freeform exploration for discovery.
 ///
-/// GATING: Requires PIKU_AGENTIC_USER=1 AND an API key.
+/// GATING: Requires `PIKU_AGENTIC_USER=1` AND an API key.
 ///
-/// QUICK RUN (confident_dev persona):
+/// QUICK RUN (`confident_dev` persona):
 ///   cargo build --release -p piku
-///   PIKU_AGENTIC_USER=1 OPENROUTER_API_KEY=sk-or-... \
-///     cargo test --test agentic_user -- agentic_user_confident_dev --nocapture
+///   `PIKU_AGENTIC_USER=1` OPENROUTER_API_KEY=sk-or-... \
+///     cargo test --test `agentic_user` -- `agentic_user_confident_dev` --nocapture
 ///
 /// ALL PERSONAS:
-///   PIKU_AGENTIC_USER=1 cargo test --test agentic_user -- --nocapture
+///   `PIKU_AGENTIC_USER=1` cargo test --test `agentic_user` -- --nocapture
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -347,7 +363,7 @@ enum Action {
     Wait(Duration),
     /// Type a string char-by-char with inter-key delay
     TypeString { text: String, delay_ms: u64 },
-    /// Type string + Enter (convenience, like old send_line)
+    /// Type string + Enter (convenience, like old `send_line`)
     Submit(String),
 }
 
@@ -462,7 +478,7 @@ impl ScreenSnapshot {
         if r < self.rows.len() {
             &self.rows[r]
         } else {
-            self.rows.last().map(|s| s.as_str()).unwrap_or("")
+            self.rows.last().map_or("", std::string::String::as_str)
         }
     }
 
@@ -513,7 +529,7 @@ impl ScreenSnapshot {
         let visible: Vec<&str> = self
             .rows
             .iter()
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
             .filter(|l| !l.trim().is_empty())
             .collect();
 
@@ -559,7 +575,7 @@ impl TerminalObserver {
             let mut row = String::new();
             for c in 0..term_cols {
                 if let Some(cell) = screen.cell(r, c) {
-                    row.push_str(&cell.contents());
+                    row.push_str(cell.contents());
                 }
             }
             rows.push(row.trim_end().to_string());
@@ -569,7 +585,7 @@ impl TerminalObserver {
         let interesting_rows = [term_rows.saturating_sub(1), term_rows.saturating_sub(2)];
         let styled_rows = interesting_rows
             .iter()
-            .map(|&r| self.extract_styled_row(&screen, r, term_cols))
+            .map(|&r| self.extract_styled_row(screen, r, term_cols))
             .collect();
 
         ScreenSnapshot {
@@ -1047,7 +1063,7 @@ impl WorkspaceObserver {
                 .filter(|(k, (mtime, size))| {
                     self.baseline
                         .get(*k)
-                        .map_or(false, |(bt, bs)| mtime != bt || size != bs)
+                        .is_some_and(|(bt, bs)| mtime != bt || size != bs)
                 })
                 .map(|(k, _)| k.clone())
                 .collect(),
@@ -1076,7 +1092,7 @@ impl WorkspaceObserver {
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map_or(false, |n| n.starts_with('.'))
+                .is_some_and(|n| n.starts_with('.'))
             {
                 continue;
             }
@@ -1293,7 +1309,14 @@ fn deterministic_checks(
     if matches!(action, Action::Key(SpecialKey::Tab)) {
         let before_input = before.input_row();
         let after_input = after.input_row();
-        if before_input != after_input {
+        if before_input == after_input {
+            findings.push(Finding {
+                severity: Severity::Info,
+                description: "tab had no effect on input".to_string(),
+                expected: String::new(),
+                actual: format!("input unchanged: {:?}", safe_truncate(after_input, 40)),
+            });
+        } else {
             findings.push(Finding {
                 severity: Severity::Info,
                 description: "tab completion changed input".to_string(),
@@ -1303,13 +1326,6 @@ fn deterministic_checks(
                     safe_truncate(before_input, 40),
                     safe_truncate(after_input, 40)
                 ),
-            });
-        } else {
-            findings.push(Finding {
-                severity: Severity::Info,
-                description: "tab had no effect on input".to_string(),
-                expected: String::new(),
-                actual: format!("input unchanged: {:?}", safe_truncate(after_input, 40)),
             });
         }
     }
@@ -2007,8 +2023,7 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
         entries.len()
     );
     println!(
-        "    {} CRITICAL  {} MAJOR  {} minor  {} deterministic findings",
-        n_critical, n_major, n_minor, n_det
+        "    {n_critical} CRITICAL  {n_major} MAJOR  {n_minor} minor  {n_det} deterministic findings"
     );
     println!("---");
 
@@ -2067,7 +2082,7 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
         }
 
         match &entry.next_action {
-            NextAction::Send(m) => println!("  next: {:?}", m),
+            NextAction::Send(m) => println!("  next: {m:?}"),
             NextAction::Quit => println!("  next: QUIT"),
         }
     }
@@ -2143,7 +2158,7 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
                 "actual": bug.actual,
                 "source": "llm",
             });
-            let _ = writeln!(file, "{}", record);
+            let _ = writeln!(file, "{record}");
         }
         for finding in &entry.deterministic_findings {
             if finding.severity == Severity::Info {
@@ -2159,7 +2174,7 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
                 "actual": finding.actual,
                 "source": "deterministic",
             });
-            let _ = writeln!(file, "{}", record);
+            let _ = writeln!(file, "{record}");
         }
     }
     eprintln!(
@@ -2301,16 +2316,16 @@ fn run_agentic_session(persona: &Persona) {
     // Wait for piku to be ready
     eprintln!("[agentic_user] waiting for piku startup...");
     let startup_snap = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
-    if !startup_snap.is_ready() {
+    if startup_snap.is_ready() {
+        eprintln!(
+            "[agentic_user] piku ready (footer: {:?})",
+            startup_snap.footer_row()
+        );
+    } else {
         eprintln!("[agentic_user] piku did not become ready within 30s, proceeding anyway");
         eprintln!(
             "[agentic_user] screen contents: {:?}",
             safe_truncate(&startup_snap.contents, 200)
-        );
-    } else {
-        eprintln!(
-            "[agentic_user] piku ready (footer: {:?})",
-            startup_snap.footer_row()
         );
     }
 

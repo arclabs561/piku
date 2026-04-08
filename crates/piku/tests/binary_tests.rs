@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_debug_formatting)]
+
 use std::path::PathBuf;
 /// Subprocess tests against the compiled piku binary.
 ///
@@ -10,7 +12,7 @@ use std::path::PathBuf;
 ///
 /// Run:
 ///   cargo build --release -p piku  # required before these tests
-///   cargo test --test binary_tests
+///   cargo test --test `binary_tests`
 use std::process::{Command, Output};
 
 // ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ fn missing_api_key_exits_nonzero_with_actionable_error() {
 #[test]
 fn unknown_provider_exits_nonzero_and_names_it() {
     let out = piku_clean_env()
-        .args(&["--provider", "xyzzy-unknown", "do something"])
+        .args(["--provider", "xyzzy-unknown", "do something"])
         .output()
         .unwrap();
 
@@ -226,7 +228,7 @@ fn unknown_provider_exits_nonzero_and_names_it() {
 #[test]
 fn openrouter_without_key_exits_nonzero_mentions_key() {
     let out = piku_clean_env()
-        .args(&["--provider=openrouter", "do something"])
+        .args(["--provider=openrouter", "do something"])
         .output()
         .unwrap();
 
@@ -241,7 +243,7 @@ fn openrouter_without_key_exits_nonzero_mentions_key() {
 #[test]
 fn anthropic_without_key_exits_nonzero() {
     let out = piku_clean_env()
-        .args(&["--provider=anthropic", "do something"])
+        .args(["--provider=anthropic", "do something"])
         .output()
         .unwrap();
 
@@ -256,7 +258,7 @@ fn anthropic_without_key_exits_nonzero() {
 #[test]
 fn groq_without_key_exits_nonzero() {
     let out = piku_clean_env()
-        .args(&["--provider=groq", "do something"])
+        .args(["--provider=groq", "do something"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -305,7 +307,7 @@ fn model_equals_form_is_accepted() {
     // --model=value should parse identically to --model value
     // We can verify by checking that it reaches provider resolution (not arg parse error)
     let out = piku_clean_env()
-        .args(&["--model=claude-opus-4", "do something"])
+        .args(["--model=claude-opus-4", "do something"])
         .output()
         .unwrap();
     // Should fail at provider resolution (no key), not at arg parsing
@@ -326,7 +328,7 @@ fn ollama_provider_resolves_without_key() {
     // We verify the error is about connection, not "missing key".
     // (Ollama may not be running, that's expected.)
     let out = piku_clean_env()
-        .args(&["--provider=ollama", "do something"])
+        .args(["--provider=ollama", "do something"])
         .output()
         .unwrap();
 
@@ -435,7 +437,7 @@ fn resume_flag_without_value_exits_nonzero() {
 #[test]
 fn resume_nonexistent_session_exits_nonzero() {
     let out = piku_clean_env()
-        .args(&["--resume", "nonexistent-session-xyz-abc-123"])
+        .args(["--resume", "nonexistent-session-xyz-abc-123"])
         .output()
         .unwrap();
     // Will fail because the session doesn't exist

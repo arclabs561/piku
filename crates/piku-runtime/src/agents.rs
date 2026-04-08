@@ -16,7 +16,6 @@
 ///
 /// You are a code reviewer. Read the diff and report issues...
 /// ```
-
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -133,11 +132,11 @@ pub fn find_built_in(agent_type: &str) -> Option<&'static AgentDef> {
 
 /// Load custom agent definitions from `.piku/agents/` in the given directory.
 /// Returns an empty vec if the directory doesn't exist.
+#[must_use]
 pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
     let agents_dir = project_root.join(".piku").join("agents");
-    let entries = match std::fs::read_dir(&agents_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return Vec::new();
     };
 
     let mut agents = Vec::new();
@@ -149,7 +148,10 @@ pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
         match parse_agent_markdown(&path) {
             Ok(def) => agents.push(def),
             Err(e) => {
-                eprintln!("[piku] warning: failed to parse agent {}: {e}", path.display());
+                eprintln!(
+                    "[piku] warning: failed to parse agent {}: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -159,10 +161,7 @@ pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
 /// Find an agent by type name across built-ins and custom agents.
 /// Custom agents override built-ins -- a warning is printed when this happens.
 #[must_use]
-pub fn find_agent(
-    agent_type: &str,
-    custom_agents: &[CustomAgentDef],
-) -> Option<AnyAgentDef> {
+pub fn find_agent(agent_type: &str, custom_agents: &[CustomAgentDef]) -> Option<AnyAgentDef> {
     if let Some(custom) = custom_agents.iter().find(|a| a.agent_type == agent_type) {
         if find_built_in(agent_type).is_some() {
             eprintln!(
@@ -215,8 +214,7 @@ pub fn agent_listing_prompt() -> String {
 // ---------------------------------------------------------------------------
 
 fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("read error: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
 
     let (frontmatter, body) = split_frontmatter(&content)
         .ok_or_else(|| "missing --- frontmatter delimiters".to_string())?;
@@ -228,8 +226,7 @@ fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
 
     let disallowed_tools = extract_list_field(&frontmatter, "disallowed_tools");
     let allowed_tools = extract_list_field(&frontmatter, "allowed_tools");
-    let max_turns = extract_field(&frontmatter, "max_turns")
-        .and_then(|v| v.parse::<u32>().ok());
+    let max_turns = extract_field(&frontmatter, "max_turns").and_then(|v| v.parse::<u32>().ok());
 
     Ok(CustomAgentDef {
         agent_type: name,
@@ -252,7 +249,9 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
     }
     // Skip the opening "---" and one newline
     let rest = &trimmed[3..];
-    let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))?;
 
     // Find closing "---" that sits on its own line (handles both \n and \r\n)
     let end = rest
@@ -264,7 +263,7 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
                 let after = &rest[3..];
                 return after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n");
             }
-            let before = &rest[..* pos];
+            let before = &rest[..*pos];
             let on_own_line = before.ends_with('\n');
             if !on_own_line {
                 return false;
@@ -458,7 +457,10 @@ mod tests {
     fn extract_field_basic() {
         let fm = "name: reviewer\ndescription: Review code";
         assert_eq!(extract_field(fm, "name"), Some("reviewer".to_string()));
-        assert_eq!(extract_field(fm, "description"), Some("Review code".to_string()));
+        assert_eq!(
+            extract_field(fm, "description"),
+            Some("Review code".to_string())
+        );
         assert_eq!(extract_field(fm, "missing"), None);
     }
 
@@ -483,7 +485,9 @@ mod tests {
         fs::create_dir_all(&agent_dir).unwrap();
 
         let agent_md = agent_dir.join("reviewer.md");
-        fs::write(&agent_md, "\
+        fs::write(
+            &agent_md,
+            "\
 ---
 name: reviewer
 description: Review code for correctness
@@ -492,7 +496,9 @@ max_turns: 25
 ---
 
 You are a code reviewer. Check the diff carefully.
-").unwrap();
+",
+        )
+        .unwrap();
 
         let agents = load_custom_agents(dir.path());
         assert_eq!(agents.len(), 1);
@@ -624,7 +630,9 @@ You are a code reviewer. Check the diff carefully.
         let agent_dir = dir.path().join(".piku").join("agents");
         fs::create_dir_all(&agent_dir).unwrap();
 
-        fs::write(agent_dir.join("full.md"), "\
+        fs::write(
+            agent_dir.join("full.md"),
+            "\
 ---
 name: full-agent
 description: An agent with all fields
@@ -633,7 +641,9 @@ max_turns: 10
 ---
 
 You are a test agent.
-").unwrap();
+",
+        )
+        .unwrap();
 
         let agents = load_custom_agents(dir.path());
         assert_eq!(agents.len(), 1);
@@ -654,13 +664,17 @@ You are a test agent.
         let agent_dir = dir.path().join(".piku").join("agents");
         fs::create_dir_all(&agent_dir).unwrap();
 
-        fs::write(agent_dir.join("bad.md"), "\
+        fs::write(
+            agent_dir.join("bad.md"),
+            "\
 ---
 name: no-desc
 ---
 
 body
-").unwrap();
+",
+        )
+        .unwrap();
 
         let agents = load_custom_agents(dir.path());
         assert!(agents.is_empty()); // should be skipped

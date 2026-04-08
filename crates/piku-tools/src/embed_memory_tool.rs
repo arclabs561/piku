@@ -1,10 +1,12 @@
 /// `search_memory` and `manage_memory` tools for embedding-based memory.
 ///
-/// search_memory: semantic search over the embedding store.
-/// manage_memory: list, inspect, invalidate, query by tags.
+/// `search_memory`: semantic search over the embedding store.
+/// `manage_memory`: list, inspect, invalidate, query by tags.
 ///
 /// These give the agent (and operator) full visibility into what's stored,
 /// what's being retrieved, and the ability to curate memory actively.
+use std::fmt::Write;
+
 use serde::Deserialize;
 
 use crate::{Destructiveness, ToolResult};
@@ -36,8 +38,8 @@ pub fn search_memory_destructiveness(_params: &serde_json::Value) -> Destructive
     Destructiveness::Safe
 }
 
-/// Execute search_memory. Requires embedding the query first (async, handled by runtime).
-/// This is a stub — the actual embedding + search is done in the runtime's agent loop.
+/// Execute `search_memory`. Requires embedding the query first (async, handled by runtime).
+/// This is a stub -- the actual embedding + search is done in the runtime's agent loop.
 #[must_use]
 pub fn execute_search_memory_stub(_params: serde_json::Value) -> ToolResult {
     ToolResult::ok(
@@ -52,13 +54,13 @@ pub fn execute_search_memory_stub(_params: serde_json::Value) -> ToolResult {
 
 #[derive(Debug, Deserialize)]
 struct ManageMemoryParams {
-    /// Action: "list", "inspect", "invalidate", "stats", "query_tags"
+    /// Action: `list`, `inspect`, `invalidate`, `stats`, `query_tags`.
     action: String,
     /// Memory ID (for inspect/invalidate).
     id: Option<u64>,
-    /// Tag query (for query_tags).
+    /// Tag query (for `query_tags`).
     tag: Option<String>,
-    /// Max results for list/query_tags (default 10).
+    /// Max results for `list`/`query_tags` (default 10).
     max_results: Option<usize>,
 }
 
@@ -97,7 +99,7 @@ pub fn manage_memory_destructiveness(params: &serde_json::Value) -> Destructiven
     }
 }
 
-/// Execute manage_memory against a MemoryStore.
+/// Execute `manage_memory` against a `MemoryStore`.
 /// Called by the runtime with the actual store instance.
 pub fn execute_manage_memory(
     params: serde_json::Value,
@@ -126,9 +128,10 @@ pub fn execute_manage_memory(
             let mut out = String::from("Recent memories:\n");
             for (id, content, valid, access_count) in entries {
                 let status = if valid { "valid" } else { "INVALID" };
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "\n[{id}] ({status}, accessed {access_count}x) {content}"
-                ));
+                );
             }
             ToolResult::ok(out)
         }
@@ -162,7 +165,7 @@ pub fn execute_manage_memory(
             }
             let mut out = format!("Memories tagged '{tag}':\n");
             for (id, content) in entries {
-                out.push_str(&format!("\n[{id}] {content}"));
+                let _ = write!(out, "\n[{id}] {content}");
             }
             ToolResult::ok(out)
         }
@@ -172,7 +175,7 @@ pub fn execute_manage_memory(
     }
 }
 
-/// Trait for memory store operations needed by manage_memory.
+/// Trait for memory store operations needed by `manage_memory`.
 /// This avoids a circular dep between piku-tools and piku-runtime.
 pub mod piku_runtime_types {
     pub trait MemoryStoreView {

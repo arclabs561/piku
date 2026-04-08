@@ -6,6 +6,8 @@
     clippy::too_many_lines
 )]
 
+use std::fmt::Write;
+
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
@@ -193,10 +195,14 @@ async fn run_turn_inner(
         // Tries LLM summarisation first (richer summaries); falls back to
         // structural (no-LLM) if the provider call fails or times out.
         if crate::compact::should_compact(session, compact_cfg) {
-            let (result, method) = match try_llm_compact(session, provider, model, compact_cfg).await {
-                Some(r) => (r, "llm"),
-                None => (crate::compact::compact_session(session, compact_cfg), "structural"),
-            };
+            let (result, method) =
+                match try_llm_compact(session, provider, model, compact_cfg).await {
+                    Some(r) => (r, "llm"),
+                    None => (
+                        crate::compact::compact_session(session, compact_cfg),
+                        "structural",
+                    ),
+                };
             if result.removed_message_count > 0 {
                 // Trigger memory extraction on the messages being compacted away.
                 // Guarded: skip if a previous extraction is still in flight (prevents
@@ -307,7 +313,7 @@ async fn run_turn_inner(
                 "read_file" | "glob" | "grep" | "list_dir"
             );
             if is_dedup_eligible {
-                let call_key = format!("{}:{}", tool_name, params);
+                let call_key = format!("{tool_name}:{params}");
                 if !seen_tool_calls.insert(call_key) {
                     let dedup_msg = format!(
                         "You already called {tool_name} with the same arguments. \
@@ -333,13 +339,20 @@ async fn run_turn_inner(
                 let store_path = crate::embed_memory::default_store_path(&cwd);
                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
                 if store.valid_count() == 0 {
-                    ("No memories stored yet. Use write_memory to save facts.".to_string(), false)
+                    (
+                        "No memories stored yet. Use write_memory to save facts.".to_string(),
+                        false,
+                    )
                 } else {
                     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
                     if query.trim().is_empty() {
                         ("search_memory requires a non-empty query".to_string(), true)
                     } else {
-                        let max_k = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                        #[allow(clippy::cast_possible_truncation)] // max_results is always small
+                        let max_k = params
+                            .get("max_results")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(5) as usize;
                         let ollama_url = std::env::var("OLLAMA_HOST")
                             .unwrap_or_else(|_| "http://localhost:11434".to_string());
                         let embed_model = std::env::var("PIKU_EMBED_MODEL")
@@ -349,18 +362,28 @@ async fn run_turn_inner(
                         let embed_result = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             crate::embed_memory::embed_text(query, &ollama_url, &embed_model),
-                        ).await;
+                        )
+                        .await;
                         match embed_result {
                             Ok(Ok(query_vec)) => {
                                 let retrieved = store.hybrid_retrieve(&query_vec, query, max_k);
                                 let _ = store.save(&store_path);
                                 if retrieved.is_empty() {
-                                    ("No relevant memories found for that query.".to_string(), false)
+                                    (
+                                        "No relevant memories found for that query.".to_string(),
+                                        false,
+                                    )
                                 } else {
-                                    (crate::embed_memory::format_retrieved_memories(&retrieved), false)
+                                    (
+                                        crate::embed_memory::format_retrieved_memories(&retrieved),
+                                        false,
+                                    )
                                 }
                             }
-                            _ => ("search_memory: embedding service unavailable".to_string(), true),
+                            _ => (
+                                "search_memory: embedding service unavailable".to_string(),
+                                true,
+                            ),
                         }
                     }
                 }
@@ -369,8 +392,10 @@ async fn run_turn_inner(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
-                let is_mutating = params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
-                let result = piku_tools::embed_memory_tool::execute_manage_memory(params, &mut store);
+                let is_mutating =
+                    params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
+                let result =
+                    piku_tools::embed_memory_tool::execute_manage_memory(params, &mut store);
                 // Only save on mutating actions
                 if is_mutating {
                     let _ = store.save(&store_path);
@@ -849,7 +874,7 @@ fn execute_spawn_agent(
                         fork_ctx.push_str("[tool_result]: ");
                         if output.len() > 200 {
                             let preview: String = output.chars().take(100).collect();
-                            fork_ctx.push_str(&format!("{preview}... ({} chars)", output.len()));
+                            let _ = write!(fork_ctx, "{preview}... ({} chars)", output.len());
                         } else {
                             fork_ctx.push_str(output);
                         }
@@ -912,8 +937,7 @@ fn execute_spawn_agent(
             if let Ok(Ok(query_vec)) = query_result {
                 let retrieved = store.hybrid_retrieve(&query_vec, &query_text, 5);
                 if !retrieved.is_empty() {
-                    let mem_section =
-                        crate::embed_memory::format_retrieved_memories(&retrieved);
+                    let mem_section = crate::embed_memory::format_retrieved_memories(&retrieved);
                     prompt.push_str(&mem_section);
                     let _ = store.save(&store_path);
                 }
@@ -952,8 +976,10 @@ fn execute_spawn_agent(
     // Build transparent spawn hint showing what the agent got.
     let tool_count = sub_tool_defs.len();
     let type_info = if let Some(ref def) = agent_def {
-        format!(" [type={}, tools={tool_count}, max_turns={effective_max_turns}]",
-                def.agent_type())
+        format!(
+            " [type={}, tools={tool_count}, max_turns={effective_max_turns}]",
+            def.agent_type()
+        )
     } else {
         format!(" [tools={tool_count}, max_turns={effective_max_turns}]")
     };
@@ -1240,9 +1266,9 @@ async fn try_llm_compact(
     .await;
 
     match collect_result {
-        Ok(Ok(())) if !summary.trim().is_empty() => {
-            Some(crate::compact::apply_compact_summary(session, &summary, config))
-        }
+        Ok(Ok(())) if !summary.trim().is_empty() => Some(crate::compact::apply_compact_summary(
+            session, &summary, config,
+        )),
         _ => None, // Timeout or error — caller falls back to structural
     }
 }

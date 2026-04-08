@@ -725,8 +725,8 @@ mod tests {
         let out = md.push("Calculate 2 * 3 * 4\n");
         // Just verify no panic
         let plain = strip_ansi(&out);
-        assert!(plain.contains("2"));
-        assert!(plain.contains("4"));
+        assert!(plain.contains('2'));
+        assert!(plain.contains('4'));
     }
 
     #[test]

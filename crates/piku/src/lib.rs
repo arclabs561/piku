@@ -1,3 +1,14 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::format_push_string,
+    clippy::match_same_arms
+)]
+
 pub mod cli;
 pub mod input_helper;
 pub mod markdown;
@@ -106,13 +117,13 @@ pub fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
             match (start, end) {
                 (Some(s), Some(e)) => format!("{path}:{s}-{e}"),
                 (Some(s), None) => format!("{path}:{s}-"),
-                _ => path.to_string(),
+                _ => path.clone(),
             }
         }
-        "write_file" | "list_dir" => shorten_path(get_str("path").unwrap_or("")).to_string(),
+        "write_file" | "list_dir" => shorten_path(get_str("path").unwrap_or("")).clone(),
         "edit_file" => {
             let path = shorten_path(get_str("path").unwrap_or(""));
-            path.to_string()
+            path.clone()
         }
         "bash" => {
             let cmd = get_str("command").unwrap_or("");
@@ -149,7 +160,7 @@ pub fn format_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
 }
 
 /// Shorten a file path for display. If the path has more than 3 components,
-/// show …/last_two_components. Keeps paths readable in tool headers.
+/// show …/`last_two_components`. Keeps paths readable in tool headers.
 fn shorten_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() <= 3 {
@@ -160,6 +171,7 @@ fn shorten_path(path: &str) -> String {
 
 /// Format a duration compactly: 45s, 2m 30s, 1h 5m 0s.
 /// Matches Claude Code's formatDuration pattern.
+#[must_use]
 pub fn fmt_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
@@ -181,6 +193,7 @@ pub fn fmt_duration(secs: u64) -> String {
 
 /// Try to pretty-print a JSON string. Returns the original if not valid JSON
 /// or too large. Cap at 10k chars to avoid pathological inputs (Claude Code pattern).
+#[must_use]
 pub fn try_pretty_json(s: &str) -> String {
     const MAX_JSON_LEN: usize = 10_000;
     if s.len() > MAX_JSON_LEN {

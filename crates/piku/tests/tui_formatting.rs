@@ -1,5 +1,5 @@
-/// Tests for TUI formatting: tool input, path shortening, visible_width, markdown edge cases.
-/// Footer/tool-result tests are unit tests in tui_repl.rs (need pub(crate) access).
+/// Tests for TUI formatting: tool input, path shortening, `visible_width`, markdown edge cases.
+/// Footer/tool-result tests are unit tests in `tui_repl.rs` (need pub(crate) access).
 
 // ── fmt_duration ────────────────────────────────────────────────────────────
 

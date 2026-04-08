@@ -1,13 +1,15 @@
+#![allow(clippy::items_after_statements)]
+
 /// Integration tests for the self-update mechanism.
 ///
 /// These tests cover the full self-update chain including:
 /// - CLI argument parsing
 /// - Provider resolution error paths  
-/// - do_replace with real binary content
-/// - detect_self_build with controlled filesystem state
+/// - `do_replace` with real binary content
+/// - `detect_self_build` with controlled filesystem state
 /// - Session resume after mid-turn interrupt (protocol violation fix)
-/// - PIKU_RESTARTED env var lifecycle
-/// - The full runtime → self-update signal → TurnResult chain
+/// - `PIKU_RESTARTED` env var lifecycle
+/// - The full runtime → self-update signal → `TurnResult` chain
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ mod cli_parsing {
     use piku::cli::CliAction;
 
     fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
@@ -454,7 +456,7 @@ mod do_replace_real_binary {
         // No .tmp files should remain in the dir
         let tmp_count = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .count();
         assert_eq!(tmp_count, 0, "no .tmp files should remain after replace");
@@ -663,10 +665,10 @@ mod session_resume {
         fn on_turn_complete(&mut self, _: &TokenUsage, _: u32) {}
     }
 
-    /// Provider that captures every MessageRequest it receives.
+    /// Provider that captures every `MessageRequest` it receives.
     struct RequestCapture(Arc<Mutex<Vec<Vec<RequestMessage>>>>);
     impl Provider for RequestCapture {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "capture"
         }
         fn stream_message(
@@ -817,16 +819,12 @@ mod session_resume {
 
         // Detect the orphaned state
         fn has_orphaned_tool_use(session: &Session) -> bool {
-            session
-                .messages
-                .last()
-                .map(|m| {
-                    m.role == MessageRole::Assistant
-                        && m.blocks
-                            .iter()
-                            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-                })
-                .unwrap_or(false)
+            session.messages.last().is_some_and(|m| {
+                m.role == MessageRole::Assistant
+                    && m.blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            })
         }
 
         assert!(

@@ -1,4 +1,6 @@
-/// Dogfooding harness — piku tests itself using a real LLM.
+#![allow(dead_code)] // Experience fields read via Debug formatting in assertions
+
+/// Dogfooding harness -- piku tests itself using a real LLM.
 ///
 /// Each scenario describes an idea, seeds a workspace, runs piku against it,
 /// and produces a structured "experience report" of what piku actually did:
@@ -9,11 +11,11 @@
 ///
 /// SETUP:
 ///   cargo build --release -p piku
-///   export OPENROUTER_API_KEY=sk-or-...   # or ANTHROPIC_API_KEY
-///   PIKU_DOGFOOD=1 cargo test --test dogfood -- --nocapture
+///   export OPENROUTER_API_KEY=sk-or-...   # or `ANTHROPIC_API_KEY`
+///   `PIKU_DOGFOOD=1` cargo test --test dogfood -- --nocapture
 ///
 /// TO RUN ONE SCENARIO:
-///   PIKU_DOGFOOD=1 cargo test --test dogfood scenario_name -- --nocapture
+///   `PIKU_DOGFOOD=1` cargo test --test dogfood `scenario_name` -- --nocapture
 ///
 /// The test never fails on LLM output quality — it only fails on crashes,
 /// tool errors that shouldn't happen, or explicit structural assertions.
@@ -176,7 +178,7 @@ fn strip_ansi(s: &str) -> String {
 // Parse piku single-shot output into an Experience
 // ---------------------------------------------------------------------------
 
-/// Parse the stdout of `piku "prompt"` (single-shot StdoutSink format).
+/// Parse the stdout of `piku "prompt"` (single-shot `StdoutSink` format).
 ///
 /// Tool start line:  `[tool_name args …]`  (after ANSI strip)
 /// Tool end line:    `[tool_name → ok]` or `[tool_name → err]`
@@ -189,7 +191,6 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
 
     // State: we may be inside a tool result block
     let mut current_tool: Option<(String, String)> = None; // (name, args)
-    let mut in_result = false;
     let mut result_lines: Vec<String> = Vec::new();
 
     for line in clean.lines() {
@@ -207,7 +208,6 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
                 (inner, "")
             };
             current_tool = Some((name.to_string(), args.to_string()));
-            in_result = false;
             result_lines.clear();
             continue;
         }
@@ -224,7 +224,6 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
                     result_preview: result_lines.join("\n"),
                 });
             }
-            in_result = false;
             result_lines.clear();
             continue;
         }
@@ -240,10 +239,8 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
         } else if current_tool.is_some() {
             // Between start and end — shouldn't happen in single-shot format
             // (start → end are consecutive), but handle gracefully.
-        } else {
-            if !trimmed.is_empty() {
-                response_lines.push(line.to_string());
-            }
+        } else if !trimmed.is_empty() {
+            response_lines.push(line.to_string());
         }
     }
 
@@ -263,7 +260,7 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
 fn collect_workspace_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') || name == "config" {
@@ -343,7 +340,7 @@ fn dogfood_add_function_to_existing_file() {
     // Seed: a real Rust file with a gap for a new function
     std::fs::write(
         workspace.join("math.rs"),
-        r#"// Simple math utilities
+        r"// Simple math utilities
 
 pub fn add(a: i32, b: i32) -> i32 {
     a + b
@@ -352,7 +349,7 @@ pub fn add(a: i32, b: i32) -> i32 {
 pub fn subtract(a: i32, b: i32) -> i32 {
     a - b
 }
-"#,
+",
     )
     .unwrap();
 
@@ -398,7 +395,7 @@ pub fn subtract(a: i32, b: i32) -> i32 {
 
 /// Scenario: piku reads a file and answers a question — does it read before answering?
 ///
-/// Idea: verify the full read_file → response loop works, and that the
+/// Idea: verify the full `read_file` → response loop works, and that the
 /// answer actually reflects the file contents (not a hallucination).
 #[test]
 fn dogfood_read_and_answer() {
@@ -523,7 +520,7 @@ pub fn greet(name: &str) -> String {
 
 /// Scenario: piku surgically edits a file with an ambiguous pattern, then retries.
 ///
-/// Idea: does edit_file correctly reject ambiguous matches and does the model
+/// Idea: does `edit_file` correctly reject ambiguous matches and does the model
 /// recover by providing more context on a retry?
 #[test]
 fn dogfood_edit_with_ambiguous_pattern() {
@@ -719,10 +716,10 @@ fn dogfood_multifile_rename() {
     // lib.rs defines the function
     std::fs::write(
         workspace.join("src/lib.rs"),
-        r#"pub fn compute_total(items: &[i32]) -> i32 {
+        r"pub fn compute_total(items: &[i32]) -> i32 {
     items.iter().sum()
 }
-"#,
+",
     )
     .unwrap();
 
@@ -806,7 +803,7 @@ fn dogfood_find_off_by_one_bug() {
     // The bug: `i < n - 1` skips the last element
     std::fs::write(
         workspace.join("stats.rs"),
-        r#"/// Returns the sum of all elements in the slice.
+        r"/// Returns the sum of all elements in the slice.
 // PIKU_DOGFOOD_BUG: this function has an off-by-one error
 pub fn sum(values: &[i32]) -> i32 {
     let n = values.len();
@@ -818,7 +815,7 @@ pub fn sum(values: &[i32]) -> i32 {
     }
     total
 }
-"#,
+",
     )
     .unwrap();
 
@@ -868,13 +865,13 @@ fn dogfood_write_tests_for_function() {
 
     std::fs::write(
         workspace.join("parser.rs"),
-        r#"/// Splits a `key=value` string into `(key, value)`.
+        r"/// Splits a `key=value` string into `(key, value)`.
 /// Returns None if the string does not contain `=`.
 pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
     let pos = s.find('=')?;
     Some((&s[..pos], &s[pos+1..]))
 }
-"#,
+",
     )
     .unwrap();
 
@@ -972,7 +969,7 @@ fn dogfood_self_describe_architecture() {
 /// Scenario: verify the trace file was written after a run.
 ///
 /// Idea: pure infrastructure check — the JSONL trace must exist and contain
-/// at least the expected event types (prompt, tool_start, turn_end).
+/// at least the expected event types (prompt, `tool_start`, `turn_end`).
 #[test]
 fn dogfood_trace_file_is_written() {
     if !is_enabled() {
@@ -1023,8 +1020,8 @@ fn dogfood_trace_file_is_written() {
 
     let trace_files: Vec<_> = std::fs::read_dir(&traces_dir)
         .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .collect();
 
     assert!(
@@ -1040,8 +1037,8 @@ fn dogfood_trace_file_is_written() {
     // Each line should be valid JSON
     let mut events: Vec<serde_json::Value> = Vec::new();
     for line in trace_content.lines() {
-        let v: serde_json::Value =
-            serde_json::from_str(line).expect(&format!("trace line should be valid JSON: {line}"));
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|_| panic!("trace line should be valid JSON: {line}"));
         events.push(v);
     }
 

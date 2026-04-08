@@ -10,7 +10,7 @@ use piku::markdown::StreamingMarkdown;
 // ── Codex-inspired edge cases ───────────────────────────────────────────────
 
 /// Four-backtick fences: our line-based parser doesn't support these
-/// (it treats any ``` as a fence toggle). This test documents the limitation.
+/// (it treats any ```` ``` ```` as a fence toggle). This test documents the limitation.
 /// Full pulldown-cmark support would fix this.
 #[test]
 fn four_backtick_fence_known_limitation() {

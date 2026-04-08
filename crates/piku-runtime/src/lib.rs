@@ -16,7 +16,7 @@ pub use agent_loop::{
 };
 pub use agents::{
     agent_listing_prompt, agent_listing_prompt_with_custom, all_built_ins, find_agent,
-    find_built_in, AgentDef, AnyAgentDef, CustomAgentDef, load_custom_agents,
+    find_built_in, load_custom_agents, AgentDef, AnyAgentDef, CustomAgentDef,
 };
 pub use compact::{
     apply_compact_summary, compact_session, compact_system_prompt, estimate_session_tokens,

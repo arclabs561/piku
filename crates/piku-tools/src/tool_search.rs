@@ -104,7 +104,11 @@ pub fn execute_tool_search(
         ));
     }
 
-    let mut output = format!("Found {} tool(s) matching '{}':\n\n", results.len(), p.query);
+    let mut output = format!(
+        "Found {} tool(s) matching '{}':\n\n",
+        results.len(),
+        p.query
+    );
     for entry in &results {
         output.push_str("- **");
         output.push_str(&entry.name);
@@ -149,10 +153,7 @@ mod tests {
     #[test]
     fn search_finds_matching_tools() {
         let catalog = sample_catalog();
-        let result = execute_tool_search(
-            serde_json::json!({"query": "file"}),
-            &catalog,
-        );
+        let result = execute_tool_search(serde_json::json!({"query": "file"}), &catalog);
         assert!(!result.is_error);
         assert!(result.output.contains("read_file"));
         assert!(result.output.contains("write_file"));
@@ -174,10 +175,8 @@ mod tests {
     #[test]
     fn search_no_matches() {
         let catalog = sample_catalog();
-        let result = execute_tool_search(
-            serde_json::json!({"query": "database migration"}),
-            &catalog,
-        );
+        let result =
+            execute_tool_search(serde_json::json!({"query": "database migration"}), &catalog);
         assert!(!result.is_error);
         assert!(result.output.contains("No tools matching"));
     }
@@ -185,10 +184,7 @@ mod tests {
     #[test]
     fn search_empty_query_is_error() {
         let catalog = sample_catalog();
-        let result = execute_tool_search(
-            serde_json::json!({"query": "  "}),
-            &catalog,
-        );
+        let result = execute_tool_search(serde_json::json!({"query": "  "}), &catalog);
         assert!(result.is_error);
     }
 
