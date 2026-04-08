@@ -24,8 +24,8 @@ pub use compact::{
     CompactionResult,
 };
 pub use embed_memory::{
-    default_store_path, embed_text, format_retrieved_memories, MemoryEntry, MemoryStore,
-    RetrievedMemory,
+    build_extraction_transcript, default_store_path, embed_text, extract_and_store,
+    extract_memories, format_retrieved_memories, MemoryEntry, MemoryStore, RetrievedMemory,
 };
 pub use memory::{
     build_agent_memory_prompt, build_memory_prompt, read_agent_memory, read_memory,
