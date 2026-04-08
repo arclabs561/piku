@@ -488,9 +488,14 @@ fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
 fn strip_tag_block(content: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
-    if let (Some(s), Some(e_rel)) = (content.find(&open), content.find(&close)) {
-        let e = e_rel + close.len();
-        format!("{}{}", &content[..s], &content[e..])
+    if let Some(s) = content.find(&open) {
+        // Search for close tag AFTER the open tag
+        if let Some(e_rel) = content[s + open.len()..].find(&close) {
+            let e = s + open.len() + e_rel + close.len();
+            format!("{}{}", &content[..s], &content[e..])
+        } else {
+            content.to_string()
+        }
     } else {
         content.to_string()
     }

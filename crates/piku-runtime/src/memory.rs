@@ -177,10 +177,22 @@ fn replace_or_append_section(existing: &str, heading: &str, entry: &str) -> Stri
 // ---------------------------------------------------------------------------
 
 /// Directory for an agent type's memory.
-/// Path: `<cwd>/.piku/agent-memory/<agent_type>/`
+/// Path: `<cwd>/.piku/agent-memory/<sanitized_agent_type>/`
+/// Agent type is sanitized to prevent path traversal.
 #[must_use]
 pub fn agent_memory_dir(cwd: &Path, agent_type: &str) -> PathBuf {
-    cwd.join(".piku").join("agent-memory").join(agent_type)
+    let sanitized = sanitize_path_component(agent_type);
+    cwd.join(".piku").join("agent-memory").join(sanitized)
+}
+
+/// Sanitize a string for use as a directory name.
+/// Strips path separators, `..`, and leading dots to prevent traversal.
+fn sanitize_path_component(s: &str) -> String {
+    s.replace(['/', '\\'], "-")
+        .replace("..", "")
+        .trim_start_matches('.')
+        .trim_start_matches('-')
+        .to_string()
 }
 
 /// Read an agent's MEMORY.md. Returns `None` if missing or empty.
@@ -350,6 +362,22 @@ mod tests {
         write_agent_memory(cwd, "verifier", "## Note\n\ntest").unwrap();
         let expected = cwd.join(".piku").join("agent-memory").join("verifier").join("MEMORY.md");
         assert!(expected.exists());
+    }
+
+    #[test]
+    fn agent_memory_dir_sanitizes_traversal() {
+        let dir = tempdir();
+        let cwd = dir.path();
+        // Path traversal attempts should be sanitized
+        let d = super::agent_memory_dir(cwd, "../../etc");
+        assert!(!d.to_str().unwrap().contains(".."));
+        assert!(d.starts_with(cwd));
+
+        let d2 = super::agent_memory_dir(cwd, "/tmp/evil");
+        assert!(!d2.to_str().unwrap().contains("/tmp/evil"));
+
+        let d3 = super::agent_memory_dir(cwd, "normal-agent");
+        assert!(d3.ends_with("normal-agent"));
     }
 
     #[test]

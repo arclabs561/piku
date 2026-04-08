@@ -131,11 +131,26 @@ fn normalize(v: &mut [f32]) {
 
 impl MemoryStore {
     /// Load from a JSON file. Returns empty store if file doesn't exist.
+    /// If the file exists but is corrupt, backs it up before returning empty.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(), // File doesn't exist
+        };
+        match serde_json::from_str(&content) {
+            Ok(store) => store,
+            Err(e) => {
+                // Corrupt file — back up before returning empty to avoid data loss
+                let backup = path.with_extension("json.bak");
+                let _ = std::fs::copy(path, &backup);
+                eprintln!(
+                    "[piku] warning: corrupt memories at {}, backed up to {}: {e}",
+                    path.display(),
+                    backup.display()
+                );
+                Self::default()
+            }
+        }
     }
 
     /// Save to a JSON file.
