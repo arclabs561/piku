@@ -158,7 +158,6 @@ pub enum TaskStatus {
     Running,
     Done,
     Failed,
-    Cancelled,
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -167,7 +166,6 @@ impl std::fmt::Display for TaskStatus {
             Self::Running => write!(f, "running"),
             Self::Done => write!(f, "done"),
             Self::Failed => write!(f, "failed"),
-            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -299,17 +297,6 @@ impl TaskRegistry {
         if let (Some(msg), Some(tx)) = (notification, &inner.notification_tx) {
             let _ = tx.try_send(msg);
         }
-    }
-
-    /// Cancel a running task.
-    pub fn cancel(&self, id: &AgentTaskId) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.tasks.get_mut(id) {
-            if entry.status == TaskStatus::Running {
-                entry.status = TaskStatus::Cancelled;
-            }
-        }
-        Self::notify_waiters(&mut inner, id);
     }
 
     /// Poll the status of a task without blocking.

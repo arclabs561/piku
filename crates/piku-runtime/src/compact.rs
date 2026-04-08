@@ -8,12 +8,9 @@
 /// `src/services/compact/prompt.ts` — 9 sections, <analysis> scratchpad
 /// stripped before returning the formatted summary.
 ///
-/// Unlike Claude Code, piku does not (yet) call a second model to write the
-/// summary — that is a future extension. For now `compact_session` returns
-/// a continuation message built from the session's own message history, and
-/// callers are responsible for deciding when and how to run the full
-/// LLM-summarisation pass (e.g. by injecting the compact prompt as a new
-/// user turn before the next agent turn).
+/// piku supports LLM-based compaction via `try_llm_compact` in the agent loop,
+/// which calls the same model to write a summary. If that fails or times out,
+/// the structural `compact_session` is used as a fallback.
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 // ---------------------------------------------------------------------------

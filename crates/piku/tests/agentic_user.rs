@@ -539,8 +539,12 @@ impl ScreenSnapshot {
                 out.push_str(&format!("  ... ({} more lines)\n", visible.len() - i));
                 break;
             }
-            let truncated = if line.len() > 120 { &line[..120] } else { line };
-            out.push_str(truncated);
+            if line.len() > 120 {
+                let truncated: String = line.chars().take(120).collect();
+                out.push_str(&truncated);
+            } else {
+                out.push_str(line);
+            }
             out.push('\n');
         }
         out

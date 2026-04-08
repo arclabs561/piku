@@ -114,12 +114,6 @@ impl AnyAgentDef {
 
 static BUILT_INS: &[AgentDef] = &[VERIFICATION_AGENT, EXPLORER_AGENT];
 
-/// Return all built-in agent definitions.
-#[must_use]
-pub fn all_built_ins() -> &'static [AgentDef] {
-    BUILT_INS
-}
-
 /// Look up a built-in agent by type name.
 #[must_use]
 pub fn find_built_in(agent_type: &str) -> Option<&'static AgentDef> {
@@ -201,12 +195,6 @@ pub fn agent_listing_prompt_with_custom(custom_agents: &[CustomAgentDef]) -> Str
          with no specialized system prompt.",
     );
     out
-}
-
-/// Build the agent listing (built-ins only, for backward compat).
-#[must_use]
-pub fn agent_listing_prompt() -> String {
-    agent_listing_prompt_with_custom(&[])
 }
 
 // ---------------------------------------------------------------------------

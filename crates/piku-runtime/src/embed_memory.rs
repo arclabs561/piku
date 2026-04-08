@@ -345,12 +345,6 @@ impl MemoryStore {
     }
 
     /// Find the top-k most similar existing memories to a candidate
-    /// (for contradiction detection at write time).
-    #[must_use]
-    pub fn find_similar(&self, embedding: &[f32], k: usize) -> Vec<RetrievedMemory> {
-        self.search(embedding, k)
-    }
-
     /// Hybrid retrieval: combines embedding similarity with keyword matching.
     /// Boosts memories whose tags or content match query keywords.
     /// This is the default search mode -- works at all scales.
@@ -623,7 +617,7 @@ pub async fn extract_and_store(
         };
 
         // Find top-3 similar existing memories for contradiction check
-        let similar = store.find_similar(&embedding, 3);
+        let similar = store.search(&embedding, 3);
 
         if similar.first().is_some_and(|s| s.similarity > 0.7) {
             // High similarity -- ask LLM to judge: ADD, UPDATE, or IGNORE
@@ -766,7 +760,11 @@ impl MemoryStore {
         let now = now_unix();
         let mut evicted = 0;
         for entry in &mut self.entries {
-            if entry.is_valid && memory_strength(entry, now) < threshold {
+            // Protect high-importance memories from strength-based eviction.
+            // Without this floor, the multiplicative strength formula (importance *
+            // recency * access) lets recency decay dominate, evicting important old
+            // memories that evict_stale would protect.
+            if entry.is_valid && entry.importance < 5 && memory_strength(entry, now) < threshold {
                 entry.is_valid = false;
                 evicted += 1;
             }
@@ -1372,6 +1370,38 @@ mod tests {
         // Recent, medium importance -- should not be evicted
         assert_eq!(stale, 0);
         assert_eq!(weak, 0);
+    }
+
+    #[test]
+    fn maintain_preserves_high_importance_old_memories() {
+        // Regression: evict_weak's multiplicative strength formula would kill
+        // high-importance old memories that evict_stale protects. The importance
+        // floor in evict_weak must prevent this.
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+
+        // High importance, very old (90 days), accessed only once
+        store.insert("critical safety rule".to_string(), vec![], e.clone(), 9);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].created_at = 0;
+        store.entries[0].access_count = 1;
+
+        // Low importance, also old
+        store.insert("trivial note".to_string(), vec![], e.clone(), 3);
+        store.entries[1].last_accessed = 0;
+        store.entries[1].created_at = 0;
+        store.entries[1].access_count = 0;
+
+        let (stale, weak) = store.maintain();
+
+        // The trivial note should be evicted (low importance + old)
+        assert!(stale + weak > 0, "trivial note should be evicted");
+
+        // The critical rule MUST survive both eviction passes
+        assert!(
+            store.entries[0].is_valid,
+            "high-importance old memory must survive maintain()"
+        );
     }
 
     // --- LLM judge parsing ---

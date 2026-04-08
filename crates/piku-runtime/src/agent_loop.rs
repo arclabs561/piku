@@ -60,7 +60,6 @@ pub trait OutputSink: Send {
 pub struct TurnResult {
     pub iterations: u32,
     pub usage: TokenUsage,
-    pub stop_reason: StopReason,
     /// Set if a stream-level error was encountered during any iteration.
     pub stream_error: Option<String>,
     /// Set if the loop was interrupted for a self-update restart.
@@ -166,7 +165,6 @@ async fn run_turn_inner(
 
     let mut tracker = UsageTracker::default();
     let mut iterations = 0u32;
-    let mut final_stop_reason = StopReason::EndTurn;
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
 
@@ -186,7 +184,6 @@ async fn run_turn_inner(
 
     loop {
         if iterations >= max {
-            final_stop_reason = StopReason::Other("max_turns".to_string());
             break;
         }
         iterations += 1;
@@ -264,7 +261,6 @@ async fn run_turn_inner(
             break;
         }
 
-        final_stop_reason = stop_reason.clone();
         tracker.record(usage.clone());
 
         // extract tool calls from this assistant message
@@ -477,8 +473,6 @@ async fn run_turn_inner(
             }
             if injected {
                 // Force another iteration so the model can respond to the interjection.
-                // Must override BOTH the return value and the local loop-continuation variable.
-                final_stop_reason = StopReason::ToolUse;
                 stop_reason = StopReason::ToolUse;
             }
         }
@@ -495,7 +489,6 @@ async fn run_turn_inner(
     TurnResult {
         iterations,
         usage: tracker.cumulative.clone(),
-        stop_reason: final_stop_reason,
         stream_error,
         replace_and_exec,
     }
