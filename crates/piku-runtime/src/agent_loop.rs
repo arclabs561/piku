@@ -168,8 +168,9 @@ async fn run_turn_inner(
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
 
-    // Dedup detection: hash (tool_name, args) to catch repeated identical calls.
-    let mut seen_tool_calls: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Dedup detection: canonical string key (tool_name + args JSON) for exact match.
+    // Uses String keys instead of hashing to avoid collision risk on safety-critical dedup.
+    let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Track where we last extracted memories (message index).
     // Periodic extraction happens after compaction events.
@@ -306,12 +307,8 @@ async fn run_turn_inner(
                 "read_file" | "glob" | "grep" | "list_dir"
             );
             if is_dedup_eligible {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                tool_name.hash(&mut hasher);
-                params.to_string().hash(&mut hasher);
-                let call_hash = hasher.finish();
-                if !seen_tool_calls.insert(call_hash) {
+                let call_key = format!("{}:{}", tool_name, params);
+                if !seen_tool_calls.insert(call_key) {
                     let dedup_msg = format!(
                         "You already called {tool_name} with the same arguments. \
                          The result hasn't changed — try a different approach."

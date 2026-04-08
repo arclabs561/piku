@@ -488,17 +488,15 @@ fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
 fn strip_tag_block(content: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
-    if let Some(s) = content.find(&open) {
-        // Search for close tag AFTER the open tag
-        if let Some(e_rel) = content[s + open.len()..].find(&close) {
-            let e = s + open.len() + e_rel + close.len();
-            format!("{}{}", &content[..s], &content[e..])
-        } else {
-            content.to_string()
-        }
-    } else {
-        content.to_string()
+    let mut result = content.to_string();
+    // Strip all occurrences (handles multiple <analysis> blocks from reasoning models)
+    loop {
+        let Some(s) = result.find(&open) else { break };
+        let Some(e_rel) = result[s + open.len()..].find(&close) else { break };
+        let e = s + open.len() + e_rel + close.len();
+        result = format!("{}{}", &result[..s], &result[e..]);
     }
+    result
 }
 
 fn collapse_blank_lines(s: &str) -> String {
@@ -602,6 +600,15 @@ mod tests {
         assert!(!f.contains("<analysis>"));
         assert!(f.contains("Summary:"));
         assert!(f.contains("The work"));
+    }
+
+    #[test]
+    fn strip_tag_block_multiple_occurrences() {
+        let input = "<analysis>first</analysis>text<analysis>second</analysis>more";
+        let result = super::strip_tag_block(input, "analysis");
+        assert!(!result.contains("<analysis>"));
+        assert!(result.contains("text"));
+        assert!(result.contains("more"));
     }
 
     #[test]
