@@ -237,17 +237,37 @@ fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
 }
 
 /// Split `---\nfrontmatter\n---\nbody` into (frontmatter, body).
+/// The closing `---` must be on its own line (prevents confusion with
+/// `---` inside code blocks in the body).
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return None;
     }
-    let after_first = &trimmed[3..].trim_start_matches(['\r', '\n']);
-    let end = after_first.find("\n---")?;
-    let frontmatter = after_first[..end].to_string();
+    // Skip the opening "---" and one newline
+    let rest = &trimmed[3..];
+    let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
+
+    // Find closing "---" that sits on its own line
+    let end = rest
+        .match_indices("\n---")
+        .find(|(pos, _)| {
+            // Check that after "\n---" is either EOF, \n, or \r\n
+            let after = &rest[pos + 4..];
+            after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n")
+        })
+        .map(|(pos, _)| pos)?;
+
+    let frontmatter = rest[..end].to_string();
     let body_start = end + 4; // skip "\n---"
-    let body = if body_start < after_first.len() {
-        after_first[body_start..].to_string()
+    let body = if body_start < rest.len() {
+        // Skip the newline after closing ---
+        let remaining = &rest[body_start..];
+        let remaining = remaining
+            .strip_prefix('\n')
+            .or_else(|| remaining.strip_prefix("\r\n"))
+            .unwrap_or(remaining);
+        remaining.to_string()
     } else {
         String::new()
     };
@@ -406,6 +426,14 @@ mod tests {
         let (fm, body) = split_frontmatter(content).unwrap();
         assert_eq!(fm, "name: test");
         assert!(body.contains("body text"));
+    }
+
+    #[test]
+    fn split_frontmatter_ignores_inline_dashes() {
+        let content = "---\nname: test\n---\nbody with --- inside it\nand ---more--- dashes";
+        let (fm, body) = split_frontmatter(content).unwrap();
+        assert_eq!(fm, "name: test");
+        assert!(body.contains("body with --- inside"));
     }
 
     #[test]

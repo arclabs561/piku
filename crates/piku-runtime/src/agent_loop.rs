@@ -774,8 +774,9 @@ fn execute_spawn_agent(
                         fork_ctx.push('[');
                         fork_ctx.push_str(role);
                         fork_ctx.push_str("]: ");
-                        let trunc = if text.len() > 500 {
-                            format!("{}...", &text[..text.len().min(500)])
+                        let trunc = if text.chars().count() > 500 {
+                            let s: String = text.chars().take(500).collect();
+                            format!("{s}...")
                         } else {
                             text.clone()
                         };
@@ -1032,8 +1033,9 @@ fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> 
             Some(entry) => {
                 let elapsed = entry.elapsed().as_secs();
                 let out = entry.output.as_deref().unwrap_or("");
-                let summary = if out.len() > 300 {
-                    format!("{}…", &out[..300])
+                let summary = if out.chars().count() > 300 {
+                    let s: String = out.chars().take(300).collect();
+                    format!("{s}…")
                 } else {
                     out.to_string()
                 };
