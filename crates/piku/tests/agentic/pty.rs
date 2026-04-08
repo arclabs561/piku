@@ -14,6 +14,8 @@ pub struct PtyHandle {
     reader: std::fs::File,
     /// Raw bytes captured since last clear -- used to extract response text.
     pub raw_capture: Vec<u8>,
+    /// Set when the PTY reader returns EOF or EIO (process dead).
+    eof: bool,
 }
 
 impl Drop for PtyHandle {
@@ -77,6 +79,7 @@ impl PtyHandle {
             writer,
             reader,
             raw_capture: Vec::new(),
+            eof: false,
         }
     }
 
@@ -134,22 +137,38 @@ impl PtyHandle {
         }
     }
 
+    /// Returns bytes read. Sets `self.eof` if the process is dead.
     pub fn drain(&mut self, observer: &mut TerminalObserver) -> usize {
         let mut buf = [0u8; 4096];
         let mut total = 0;
         loop {
             match self.reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(n) => {
                     observer.process(&buf[..n]);
                     self.raw_capture.extend_from_slice(&buf[..n]);
                     total += n;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(e) => {
+                    // EIO on macOS means the PTY slave closed (process exited).
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        self.eof = true;
+                    }
+                    break;
+                }
             }
         }
         total
+    }
+
+    /// True if the PTY subprocess has exited (reader returned EOF or EIO).
+    #[must_use]
+    pub fn is_dead(&self) -> bool {
+        self.eof
     }
 
     /// Clear the raw capture buffer.
@@ -184,6 +203,10 @@ impl PtyHandle {
             self.drain(observer);
             let snap = observer.snapshot();
             if snap.is_ready() {
+                return snap;
+            }
+            if self.eof {
+                eprintln!("[pty] process died during ready-wait");
                 return snap;
             }
             if Instant::now() >= deadline {
