@@ -10,6 +10,7 @@
 )]
 
 pub mod cli;
+pub mod config;
 pub mod input_helper;
 pub mod markdown;
 /// Public library surface — used by integration tests and main.rs.

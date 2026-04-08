@@ -451,6 +451,7 @@ async fn run_turn_inner(
                         depth,
                         &session.messages,
                         custom_agents,
+                        hook_registry,
                     ),
                     "agent_status" => execute_agent_status(params, registry),
                     "agent_join" => execute_agent_join(params, registry).await,
@@ -823,6 +824,7 @@ fn execute_spawn_agent(
     depth: u32,
     parent_session_messages: &[crate::session::ConversationMessage],
     custom_agents: &[crate::agents::AgentDef],
+    hook_registry: Option<&crate::hooks::HookRegistry>,
 ) -> (String, bool) {
     if depth >= MAX_SPAWN_DEPTH {
         return (
@@ -1068,6 +1070,7 @@ fn execute_spawn_agent(
     };
 
     let custom_agents_owned = custom_agents.to_vec();
+    let hooks_owned = hook_registry.cloned();
     let _handle = tokio::task::spawn_local(run_subagent_task(
         task_id_clone,
         prompt,
@@ -1081,6 +1084,7 @@ fn execute_spawn_agent(
         wt_path_clone,
         wt_branch,
         custom_agents_owned,
+        hooks_owned,
     ));
 
     (hint, false)
@@ -1099,6 +1103,7 @@ async fn run_subagent_task(
     worktree_cwd: Option<std::path::PathBuf>,
     worktree_branch: Option<String>,
     custom_agents: Vec<crate::agents::AgentDef>,
+    hook_registry: Option<crate::hooks::HookRegistry>,
 ) {
     let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
     let mut sink = crate::task::DevNullSink;
@@ -1134,7 +1139,7 @@ async fn run_subagent_task(
         Some(&registry),
         depth,
         &custom_agents,
-        None, // subagents don't inherit hooks
+        hook_registry.as_ref(),
     )
     .await;
 

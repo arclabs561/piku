@@ -34,6 +34,8 @@ async-stream = "0.3"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
+serial_test = "3"
+tempfile = "3"
 vt100 = "0.16"
 
 [lints]
