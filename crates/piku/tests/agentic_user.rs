@@ -1844,6 +1844,7 @@ impl LlmClient {
                     "messages": all,
                     "stream": false,
                     "format": "json",
+                    "options": { "num_predict": 1024 },
                 })
             }
         };
@@ -1880,7 +1881,9 @@ impl LlmClient {
         let mut args: Vec<String> = vec![
             "-s".into(),
             "--max-time".into(),
-            "120".into(),
+            "90".into(),
+            "--connect-timeout".into(),
+            "10".into(),
             "-X".into(),
             "POST".into(),
             url,
@@ -2902,13 +2905,11 @@ fn check_attempt_store(workspace: &Path) -> (usize, usize, Vec<String>) {
     let content = std::fs::read_to_string(&store_path).unwrap_or_default();
     let store: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
     let entries = store["entries"].as_array().map_or(0, Vec::len);
-    let attempts = store["entries"]
-        .as_array()
-        .map_or(0, |a| {
-            a.iter()
-                .filter(|e| e["entry_type"].as_str() == Some("attempt"))
-                .count()
-        });
+    let attempts = store["entries"].as_array().map_or(0, |a| {
+        a.iter()
+            .filter(|e| e["entry_type"].as_str() == Some("attempt"))
+            .count()
+    });
     let goals: Vec<String> = store["entries"]
         .as_array()
         .map(|a| {
