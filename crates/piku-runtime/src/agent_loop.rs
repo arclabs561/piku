@@ -171,6 +171,10 @@ async fn run_turn_inner(
     // Dedup detection: hash (tool_name, args) to catch repeated identical calls.
     let mut seen_tool_calls: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+    // Track where we last extracted memories (message index).
+    // Periodic extraction happens after compaction events.
+    let mut last_extraction_idx: usize = session.messages.len();
+
     // Auto-compaction config — compact when session tokens exceed this threshold.
     // 10k tokens is ~40k chars, roughly 200 exchanges of average length.
     let compact_cfg = crate::compact::CompactionConfig::default();
@@ -191,7 +195,41 @@ async fn run_turn_inner(
                 None => (crate::compact::compact_session(session, compact_cfg), "structural"),
             };
             if result.removed_message_count > 0 {
+                // Trigger memory extraction on the messages being compacted away.
+                // This ensures long sessions don't lose important context to compaction.
+                let new_messages = &session.messages[last_extraction_idx..];
+                if !new_messages.is_empty() {
+                    let transcript = crate::embed_memory::build_extraction_transcript(new_messages);
+                    if !transcript.trim().is_empty() {
+                        // Fire-and-forget: extract in background, don't block the loop.
+                        let provider_clone = provider.boxed_clone();
+                        let model_owned = model.to_string();
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let store_path = crate::embed_memory::default_store_path(&cwd);
+                        let ollama_url = std::env::var("OLLAMA_HOST")
+                            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                        let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                        tokio::task::spawn_local(async move {
+                            let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                            let n = crate::embed_memory::extract_and_store(
+                                &transcript,
+                                provider_clone.as_ref(),
+                                &model_owned,
+                                &mut store,
+                                &ollama_url,
+                                &embed_model,
+                            )
+                            .await;
+                            if n > 0 {
+                                let _ = store.save(&store_path);
+                            }
+                        });
+                    }
+                }
+
                 *session = result.compacted_session;
+                last_extraction_idx = 0; // reset after compaction replaces messages
                 sink.on_text(&format!(
                     "\x1b[2m[context compacted: {} messages summarised ({method})]\x1b[0m\n",
                     result.removed_message_count

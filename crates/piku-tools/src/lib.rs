@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod edit_file;
+pub mod embed_memory_tool;
 pub mod glob;
 pub mod grep;
 pub mod list_dir;
@@ -130,9 +131,14 @@ pub async fn execute_tool(name: &str, params: serde_json::Value) -> Option<ToolR
         "agent_join" => Some(spawn_agent::execute_agent_join_stub(params)),
         "read_memory" => Some(memory_tool::execute_read_memory(params)),
         "write_memory" => Some(memory_tool::execute_write_memory(params)),
-        // tool_search is routed by the runtime (needs catalog), but provide a stub here
+        // These tools are routed by the runtime (need catalog/store), stubs here
         "tool_search" => Some(ToolResult::ok(
             "tool_search requires a tool catalog. Use it in an interactive session.".to_string(),
+        )),
+        "search_memory" => Some(embed_memory_tool::execute_search_memory_stub(params)),
+        "manage_memory" => Some(ToolResult::ok(
+            "manage_memory requires the embedding runtime. Use it in an interactive session."
+                .to_string(),
         )),
         _ => None,
     }
@@ -216,5 +222,17 @@ static TOOLS: &[ToolEntry] = &[
         description: "Search for available tools by keyword. Use when you need a capability not in your current tool set. Returns matching tool names and descriptions.",
         schema_fn: tool_search::tool_search_schema,
         destructiveness_fn: tool_search::tool_search_destructiveness,
+    },
+    ToolEntry {
+        name: "search_memory",
+        description: "Semantic search over your embedding-based memory store. Finds memories by meaning, not just keywords. Use to recall past decisions, error patterns, or user preferences.",
+        schema_fn: embed_memory_tool::search_memory_schema,
+        destructiveness_fn: embed_memory_tool::search_memory_destructiveness,
+    },
+    ToolEntry {
+        name: "manage_memory",
+        description: "Manage your embedding memory store. Actions: 'stats' (counts), 'list' (recent entries), 'inspect' (full detail by ID), 'invalidate' (mark as outdated), 'query_tags' (find by tag).",
+        schema_fn: embed_memory_tool::manage_memory_schema,
+        destructiveness_fn: embed_memory_tool::manage_memory_destructiveness,
     },
 ];
