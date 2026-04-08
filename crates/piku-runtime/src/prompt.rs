@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agents::agent_listing_prompt;
+use crate::agents::{agent_listing_prompt_with_custom, CustomAgentDef};
 use crate::memory::build_memory_prompt;
 
 /// Marker between the static (prompt-cacheable) and dynamic sections.
@@ -17,15 +17,20 @@ const BOUNDARY: &str = "__PIKU_SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 ///
 /// Returns a vec of sections; join with "\n\n" before sending to the API.
 /// Everything before `BOUNDARY` is stable across turns and can be cached.
-pub fn build_system_prompt(cwd: &Path, date: &str, model: &str) -> Vec<String> {
+pub fn build_system_prompt(
+    cwd: &Path,
+    date: &str,
+    model: &str,
+    custom_agents: &[CustomAgentDef],
+) -> Vec<String> {
     let mut sections = Vec::new();
 
     // --- STATIC ---
     sections.push(static_intro());
     sections.push(static_task_guidelines());
     sections.push(static_safety_rules());
-    // Agent listing is stable unless agents change — include in cacheable section.
-    sections.push(agent_listing_prompt());
+    // Agent listing includes both built-in and custom agents.
+    sections.push(agent_listing_prompt_with_custom(custom_agents));
     sections.push(BOUNDARY.to_string());
 
     // --- DYNAMIC ---
@@ -175,8 +180,9 @@ fn load_piku_md(cwd: &Path) -> String {
         if !visited.insert(key) {
             continue;
         }
-        let chunk = if content.len() > MAX_PER_FILE {
-            format!("{}\n[truncated]", &content[..MAX_PER_FILE])
+        let chunk = if content.chars().count() > MAX_PER_FILE {
+            let trunc: String = content.chars().take(MAX_PER_FILE).collect();
+            format!("{trunc}\n[truncated]")
         } else {
             content
         };

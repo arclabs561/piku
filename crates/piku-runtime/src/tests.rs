@@ -961,7 +961,7 @@ mod prompt_extended {
     #[test]
     fn contains_cache_boundary_marker() {
         let dir = tempdir();
-        let sections = build_system_prompt(&dir, "2026-04-03", "test-model");
+        let sections = build_system_prompt(&dir, "2026-04-03", "test-model", &[]);
         let full = sections.join("\n\n");
         assert!(
             full.contains("__PIKU_SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"),
@@ -972,7 +972,7 @@ mod prompt_extended {
     #[test]
     fn contains_cwd_and_model() {
         let dir = tempdir();
-        let sections = build_system_prompt(&dir, "2026-04-03", "my-model");
+        let sections = build_system_prompt(&dir, "2026-04-03", "my-model", &[]);
         let full = sections.join("\n\n");
         assert!(
             full.contains("my-model"),
@@ -985,7 +985,7 @@ mod prompt_extended {
     fn loads_piku_md_from_directory() {
         let dir = tempdir();
         std::fs::write(dir.join("PIKU.md"), "# Project rules\nAlways use tabs.").unwrap();
-        let sections = build_system_prompt(&dir, "2026-04-03", "m");
+        let sections = build_system_prompt(&dir, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
         assert!(
             full.contains("Always use tabs"),
@@ -998,7 +998,7 @@ mod prompt_extended {
         let dir = tempdir();
         let large = "x".repeat(5000); // > MAX_PER_FILE (4000)
         std::fs::write(dir.join("PIKU.md"), &large).unwrap();
-        let sections = build_system_prompt(&dir, "2026-04-03", "m");
+        let sections = build_system_prompt(&dir, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
         assert!(
             full.contains("[truncated]"),
