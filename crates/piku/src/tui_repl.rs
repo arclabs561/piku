@@ -760,15 +760,13 @@ async fn run_tui_repl_core(
 
     let mut total_usage = initial_usage;
 
-    // Run SessionStart hooks (inject context into system prompt)
-    if let Some(hook_context) = hook_registry.run_session_start(&session_id, &cwd) {
+    // Run SessionStart hooks -- captured context is appended to system prompt each turn.
+    let hook_session_context = hook_registry.run_session_start(&session_id, &cwd);
+    if let Some(ref ctx) = hook_session_context {
         eprintln!(
             "\x1b[2m[session-start hook injected {} chars]\x1b[0m",
-            hook_context.len()
+            ctx.len()
         );
-        // Context will be included in the system prompt via a dynamic section
-        // For now, we'd need to append to system_sections later. This is a placeholder.
-        let _ = hook_context; // TODO: inject into system prompt sections
     }
 
     // Capture the running binary's mtime as a baseline. After a `cargo build`
@@ -1033,7 +1031,10 @@ async fn run_tui_repl_core(
                 println!("\x1b[2;34m❯\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
-                let system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                let mut system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                if let Some(ref ctx) = hook_session_context {
+                    system_sections.push(format!("# Hook Context\n\n{ctx}"));
+                }
                 let tool_defs = all_tool_definitions();
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);

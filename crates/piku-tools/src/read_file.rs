@@ -31,10 +31,26 @@ pub fn destructiveness(_params: &serde_json::Value) -> Destructiveness {
 
 #[must_use]
 pub fn execute(params: serde_json::Value) -> ToolResult {
+    const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
     let p: ReadFileParams = match serde_json::from_value(params) {
         Ok(v) => v,
         Err(e) => return ToolResult::error(format!("invalid params: {e}")),
     };
+
+    // Size guard: prevent OOM on huge files or special files (/dev/zero).
+    match std::fs::metadata(&p.path) {
+        Ok(meta) if meta.len() > MAX_FILE_SIZE => {
+            return ToolResult::error(format!(
+                "read_file: {} is too large ({} bytes, limit {})",
+                p.path,
+                meta.len(),
+                MAX_FILE_SIZE
+            ));
+        }
+        Err(e) => return ToolResult::error(format!("read_file: {}: {e}", p.path)),
+        _ => {}
+    }
 
     let content = match std::fs::read_to_string(&p.path) {
         Ok(c) => c,

@@ -923,8 +923,25 @@ fn execute_spawn_agent(
     }
 
     if !p.context_files.is_empty() {
+        let project_root = std::env::current_dir().unwrap_or_default();
         let mut ctx = String::from("\n\n<context>\n");
         for path in &p.context_files {
+            // Path validation: restrict to project directory to prevent
+            // sensitive file exfiltration (e.g. ~/.ssh/id_rsa sent to LLM).
+            let resolved = std::path::Path::new(path);
+            let abs_path = if resolved.is_absolute() {
+                resolved.to_path_buf()
+            } else {
+                project_root.join(resolved)
+            };
+            if let Ok(canonical) = abs_path.canonicalize() {
+                if !canonical.starts_with(&project_root) {
+                    ctx.push_str("# ");
+                    ctx.push_str(path);
+                    ctx.push_str("\n[blocked: path is outside the project directory]\n\n");
+                    continue;
+                }
+            }
             match std::fs::read_to_string(path) {
                 Ok(content) => {
                     ctx.push_str("# ");
