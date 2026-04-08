@@ -1006,3 +1006,438 @@ mod prompt_extended {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attempt tree simulation: full lifecycle without external deps
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod attempt_tree_simulation {
+    use super::tempdir;
+    use crate::embed_memory::{
+        format_attempt_trees, AttemptTree, EntryType, MemoryStore, Outcome,
+    };
+
+    /// Deterministic embedding from a seed string (hash-based, 768d).
+    fn embed(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0f32; 768];
+        // Simple hash-based embedding: spread bytes across dimensions
+        for (i, b) in text.bytes().enumerate() {
+            let idx = (i * 37 + b as usize) % 768;
+            v[idx] += (f32::from(b) - 96.0) * 0.01;
+        }
+        // Normalize
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    /// Simulate: agent debugging a compile error, tries 3 approaches.
+    /// Session 1: record attempts. Session 2: query and find them.
+    #[test]
+    fn full_lifecycle_record_then_query() {
+        let dir = tempdir();
+        let store_path = dir.join("memories.json");
+
+        // === Session 1: agent encounters a compile error ===
+        let mut store = MemoryStore::default();
+
+        // Root attempt: the goal
+        let root = store.record_attempt(
+            "fix lifetime error in handler function".to_string(),
+            "add explicit lifetime annotation".to_string(),
+            None,
+            embed("fix lifetime error | add explicit lifetime annotation"),
+            7,
+        );
+        store.record_outcome(
+            root,
+            Outcome::Failure,
+            Some("introduced second lifetime that conflicted with trait bound".to_string()),
+        );
+
+        // Sibling: different approach
+        let attempt2 = store.record_attempt(
+            "fix lifetime error in handler function".to_string(),
+            "clone the borrowed value to avoid lifetime".to_string(),
+            Some(root),
+            embed("fix lifetime error | clone borrowed value"),
+            6,
+        );
+        store.record_outcome(
+            attempt2,
+            Outcome::Failure,
+            Some("value does not implement Clone".to_string()),
+        );
+
+        // Sibling: what worked
+        let attempt3 = store.record_attempt(
+            "fix lifetime error in handler function".to_string(),
+            "restructure to use owned String instead of &str".to_string(),
+            Some(root),
+            embed("fix lifetime error | use owned String"),
+            8,
+        );
+        store.record_outcome(attempt3, Outcome::Success, Some("compiles and tests pass".to_string()));
+
+        store.save(&store_path).unwrap();
+        assert_eq!(store.entries.len(), 3);
+
+        // === Session 2: new agent faces similar problem ===
+        let store2 = MemoryStore::load(&store_path);
+        assert_eq!(store2.entries.len(), 3);
+
+        // Query with a similar goal
+        let query_embed = embed("fix lifetime error in handler function");
+        let trees = store2.find_attempt_trees(&query_embed, "fix lifetime error in handler", 5);
+
+        assert!(!trees.is_empty(), "should find the attempt tree");
+
+        // Verify tree structure
+        let tree = &trees[0];
+        assert!(tree.goal.as_deref().unwrap_or("").contains("lifetime"));
+        // Root should have children
+        assert!(
+            !tree.children.is_empty(),
+            "root should have child attempts"
+        );
+
+        // Verify the formatted output is useful
+        let formatted = format_attempt_trees(&trees);
+        assert!(formatted.contains("[FAIL]"), "should show failed attempts");
+        assert!(formatted.contains("[OK]"), "should show successful attempt");
+        assert!(
+            formatted.contains("owned String"),
+            "should show the successful approach"
+        );
+        assert!(
+            formatted.contains("does not implement Clone"),
+            "should show failure reasons"
+        );
+    }
+
+    /// Simulate: multiple independent goals in the same store.
+    #[test]
+    fn multiple_goals_stay_separate() {
+        let mut store = MemoryStore::default();
+
+        // Goal A: fix a compile error
+        let a1 = store.record_attempt(
+            "fix compile error".to_string(),
+            "add missing import".to_string(),
+            None,
+            embed("fix compile error | add missing import"),
+            6,
+        );
+        store.record_outcome(a1, Outcome::Success, None);
+
+        // Goal B: optimize query performance
+        let b1 = store.record_attempt(
+            "optimize query performance".to_string(),
+            "add database index".to_string(),
+            None,
+            embed("optimize query performance | add database index"),
+            7,
+        );
+        store.record_outcome(b1, Outcome::Failure, Some("index too large".to_string()));
+
+        let b2 = store.record_attempt(
+            "optimize query performance".to_string(),
+            "rewrite as batch query".to_string(),
+            Some(b1),
+            embed("optimize query performance | batch query"),
+            7,
+        );
+        store.record_outcome(b2, Outcome::Success, None);
+
+        // Query for compile error -- should find goal A, not B
+        let trees = store.find_attempt_trees(
+            &embed("fix compile error"),
+            "fix compile error",
+            5,
+        );
+        // The tree for "fix compile error" should be found
+        assert!(!trees.is_empty());
+        let first_goal = trees[0].goal.as_deref().unwrap_or("");
+        assert!(
+            first_goal.contains("compile"),
+            "first tree should match the query goal, got: {first_goal}"
+        );
+    }
+
+    /// Simulate: eviction preserves unresolved trees.
+    #[test]
+    fn eviction_preserves_unresolved_across_sessions() {
+        let dir = tempdir();
+        let store_path = dir.join("memories.json");
+
+        // Session 1: record a failed attempt tree (unresolved)
+        let mut store = MemoryStore::default();
+        let root = store.record_attempt(
+            "fix flaky test".to_string(),
+            "add retry logic".to_string(),
+            None,
+            embed("fix flaky test | retry"),
+            4, // low importance -- normally evictable
+        );
+        store.record_outcome(
+            root,
+            Outcome::Failure,
+            Some("retry masks the real bug".to_string()),
+        );
+        let child = store.record_attempt(
+            "fix flaky test".to_string(),
+            "increase timeout".to_string(),
+            Some(root),
+            embed("fix flaky test | timeout"),
+            4,
+        );
+        store.record_outcome(
+            child,
+            Outcome::Failure,
+            Some("still flaky at 30s".to_string()),
+        );
+        // Make them old
+        for entry in &mut store.entries {
+            entry.last_accessed = 0;
+            entry.created_at = 0;
+        }
+        store.save(&store_path).unwrap();
+
+        // Session 2: run maintenance -- unresolved tree should survive
+        let mut store2 = MemoryStore::load(&store_path);
+        let (stale, weak) = store2.maintain();
+        assert_eq!(
+            stale + weak,
+            0,
+            "unresolved attempt tree should not be evicted"
+        );
+        assert_eq!(store2.valid_count(), 2);
+    }
+
+    /// Simulate: eviction CAN remove resolved trees after aging.
+    #[test]
+    fn eviction_removes_resolved_tree_leaves() {
+        let mut store = MemoryStore::default();
+
+        // Resolved tree: root -> child (success)
+        let root = store.record_attempt(
+            "goal".to_string(),
+            "approach A".to_string(),
+            None,
+            embed("goal | approach A"),
+            3, // low importance
+        );
+        store.record_outcome(root, Outcome::Failure, None);
+        let child = store.record_attempt(
+            "goal".to_string(),
+            "approach B".to_string(),
+            Some(root),
+            embed("goal | approach B"),
+            3,
+        );
+        store.record_outcome(child, Outcome::Success, None);
+
+        // Make old
+        for entry in &mut store.entries {
+            entry.last_accessed = 0;
+            entry.created_at = 0;
+        }
+
+        let (stale, weak) = store.maintain();
+        // At least the leaf (child with no children) should be evictable
+        // since the tree is resolved and both are old+low-importance
+        assert!(stale + weak >= 1, "resolved tree leaves should be evictable");
+    }
+
+    /// Simulate: extraction parser handles mixed output correctly.
+    #[test]
+    fn extraction_parser_simulation() {
+        // Simulate what the LLM would return at compaction
+        let llm_response = "\
+- [importance:8] The handler function requires owned String, not &str {tags: rust, lifetime}
+- [attempt] goal: fix lifetime error in handler | approach: add explicit lifetime | outcome: failure | detail: conflicted with trait bound
+- [attempt] goal: fix lifetime error in handler | approach: use owned String | outcome: success | detail: compiles and tests pass
+- [importance:6] Project uses tokio 1.x runtime {tags: rust, async}";
+
+        let facts = crate::embed_memory::tests::parse_extraction_response_pub(llm_response);
+        assert_eq!(facts.len(), 2, "should extract 2 facts (not attempt lines)");
+        assert!(facts[0].0.contains("owned String"));
+        assert!(facts[1].0.contains("tokio"));
+
+        let attempts = crate::embed_memory::tests::parse_attempt_lines_pub(llm_response);
+        assert_eq!(attempts.len(), 2, "should extract 2 attempts");
+        assert_eq!(attempts[0].2, "failure");
+        assert_eq!(attempts[1].2, "success");
+    }
+
+    /// Simulate: compaction dedup skips already-recorded attempts.
+    #[test]
+    fn compaction_dedup_skips_existing() {
+        let mut store = MemoryStore::default();
+        let e = embed("fix bug | add null check");
+
+        // Agent manually recorded this attempt during the session
+        let id = store.record_attempt(
+            "fix bug".to_string(),
+            "add null check".to_string(),
+            None,
+            e.clone(),
+            7,
+        );
+        store.record_outcome(id, Outcome::Success, Some("fixed".to_string()));
+
+        // Now simulate what compaction would do: search for similar before inserting
+        let similar = store.search(&e, 1);
+        assert!(
+            similar
+                .first()
+                .is_some_and(|s| s.similarity > 0.85 && s.entry.entry_type == EntryType::Attempt),
+            "should find the existing attempt as near-duplicate"
+        );
+        // Compaction would skip this attempt (similarity > 0.85)
+    }
+
+    /// Simulate: subagent prompt injection includes attempt trees.
+    #[test]
+    fn subagent_prompt_includes_attempts() {
+        let mut store = MemoryStore::default();
+
+        // Record some attempts
+        let root = store.record_attempt(
+            "deploy to production".to_string(),
+            "use blue-green deployment".to_string(),
+            None,
+            embed("deploy to production | blue-green"),
+            7,
+        );
+        store.record_outcome(
+            root,
+            Outcome::Failure,
+            Some("load balancer config missing".to_string()),
+        );
+        let child = store.record_attempt(
+            "deploy to production".to_string(),
+            "use rolling deployment".to_string(),
+            Some(root),
+            embed("deploy to production | rolling"),
+            7,
+        );
+        store.record_outcome(child, Outcome::Success, None);
+
+        // Simulate what spawn_agent does: embed the task, find attempt trees
+        let task_embed = embed("deploy the new version to production");
+        let trees = store.find_attempt_trees(&task_embed, "deploy to production", 3);
+        let formatted = format_attempt_trees(&trees);
+
+        assert!(
+            !formatted.is_empty(),
+            "should find relevant attempt trees for subagent"
+        );
+        assert!(
+            formatted.contains("Prior Attempts"),
+            "should have the header"
+        );
+        assert!(
+            formatted.contains("blue-green"),
+            "should include the failed approach"
+        );
+        assert!(
+            formatted.contains("rolling"),
+            "should include the successful approach"
+        );
+    }
+
+    /// Simulate: tree formatting renders correct structure.
+    #[test]
+    fn tree_formatting_structure() {
+        let tree = AttemptTree {
+            id: 0,
+            approach: "root approach".to_string(),
+            goal: Some("fix the system".to_string()),
+            outcome: Some(Outcome::Failure),
+            outcome_detail: Some("too broad".to_string()),
+            children: vec![
+                AttemptTree {
+                    id: 1,
+                    approach: "narrow to module A".to_string(),
+                    goal: None,
+                    outcome: Some(Outcome::Failure),
+                    outcome_detail: Some("wrong module".to_string()),
+                    children: vec![],
+                },
+                AttemptTree {
+                    id: 2,
+                    approach: "narrow to module B".to_string(),
+                    goal: None,
+                    outcome: Some(Outcome::Success),
+                    outcome_detail: Some("found the bug".to_string()),
+                    children: vec![AttemptTree {
+                        id: 3,
+                        approach: "apply fix to module B".to_string(),
+                        goal: None,
+                        outcome: Some(Outcome::Success),
+                        outcome_detail: None,
+                        children: vec![],
+                    }],
+                },
+            ],
+        };
+        let formatted = tree.format(0);
+
+        // Verify hierarchy through indentation
+        assert!(formatted.contains("goal: fix the system"));
+        assert!(formatted.contains("[FAIL] root approach -- too broad"));
+        assert!(formatted.contains("  [FAIL] narrow to module A -- wrong module"));
+        assert!(formatted.contains("  [OK] narrow to module B -- found the bug"));
+        assert!(formatted.contains("    [OK] apply fix to module B"));
+    }
+
+    /// Simulate: persistence roundtrip preserves attempt tree across sessions.
+    #[test]
+    fn persistence_roundtrip_preserves_tree() {
+        let dir = tempdir();
+        let path = dir.join("mem.json");
+
+        // Session 1: build a tree
+        let mut store = MemoryStore::default();
+        let root = store.record_attempt(
+            "goal".to_string(),
+            "approach 1".to_string(),
+            None,
+            embed("goal | approach 1"),
+            7,
+        );
+        store.record_outcome(root, Outcome::Failure, Some("reason".to_string()));
+        let child = store.record_attempt(
+            "goal".to_string(),
+            "approach 2".to_string(),
+            Some(root),
+            embed("goal | approach 2"),
+            8,
+        );
+        store.record_outcome(child, Outcome::Success, Some("worked".to_string()));
+        store.save(&path).unwrap();
+
+        // Session 2: load and verify
+        let loaded = MemoryStore::load(&path);
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[0].entry_type, EntryType::Attempt);
+        assert_eq!(loaded.entries[0].goal.as_deref(), Some("goal"));
+        assert_eq!(loaded.entries[0].outcome, Some(Outcome::Failure));
+        assert_eq!(loaded.entries[1].parent, Some(root));
+        assert_eq!(loaded.entries[1].outcome, Some(Outcome::Success));
+
+        // Verify tree operations work on loaded data
+        let children = loaded.children(root);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].content, "approach 2");
+
+        let path_to_root = loaded.path_to_root(child);
+        assert_eq!(path_to_root.len(), 2);
+    }
+}

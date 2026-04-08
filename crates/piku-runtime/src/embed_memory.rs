@@ -1245,11 +1245,7 @@ impl MemoryStore {
         let to_evict: Vec<u64> = self
             .entries
             .iter()
-            .filter(|e| {
-                e.is_valid
-                    && e.importance < 5
-                    && memory_strength(e, now) < threshold
-            })
+            .filter(|e| e.is_valid && e.importance < 5 && memory_strength(e, now) < threshold)
             .map(|e| e.id)
             .collect();
         let mut evicted = 0;
@@ -1281,9 +1277,7 @@ impl MemoryStore {
             .entries
             .iter()
             .filter(|e| {
-                e.is_valid
-                    && e.importance < 5
-                    && now.saturating_sub(e.last_accessed) > max_age_secs
+                e.is_valid && e.importance < 5 && now.saturating_sub(e.last_accessed) > max_age_secs
             })
             .map(|e| e.id)
             .collect();
@@ -1455,8 +1449,32 @@ pub fn build_extraction_transcript(messages: &[crate::session::ConversationMessa
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    /// Expose `parse_extraction_response` for cross-module tests.
+    /// Returns (fact, tags, importance) tuples.
+    #[must_use]
+    pub fn parse_extraction_response_pub(response: &str) -> Vec<(String, Vec<String>, u8)> {
+        super::parse_extraction_response(response)
+    }
+
+    /// Expose `parse_attempt_lines` for cross-module tests.
+    /// Returns (goal, approach, outcome, detail) tuples.
+    #[must_use]
+    pub fn parse_attempt_lines_pub(response: &str) -> Vec<(String, String, String, String)> {
+        super::parse_attempt_lines(response)
+            .into_iter()
+            .map(|a| {
+                let outcome_str = match a.outcome {
+                    Outcome::Success => "success",
+                    Outcome::Failure => "failure",
+                    Outcome::Pending => "pending",
+                };
+                (a.goal, a.approach, outcome_str.to_string(), a.detail)
+            })
+            .collect()
+    }
 
     #[allow(clippy::cast_precision_loss)] // test helper, precision doesn't matter
     fn make_embedding(seed: f32) -> Vec<f32> {
@@ -2475,8 +2493,7 @@ mod tests {
         let e = make_embedding(1.0);
         let root = store.record_attempt("g".into(), "root".into(), None, e.clone(), 6);
         let child = store.record_attempt("g".into(), "child".into(), Some(root), e.clone(), 6);
-        let grandchild =
-            store.record_attempt("g".into(), "gc".into(), Some(child), e.clone(), 6);
+        let grandchild = store.record_attempt("g".into(), "gc".into(), Some(child), e.clone(), 6);
         store.record_outcome(grandchild, Outcome::Success, None);
 
         assert!(store.tree_is_resolved(root));
