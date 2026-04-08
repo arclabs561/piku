@@ -435,6 +435,66 @@ pub async fn extract_and_store(
     count
 }
 
+// ---------------------------------------------------------------------------
+// MemoryStoreView trait impl (for manage_memory tool)
+// ---------------------------------------------------------------------------
+
+impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for MemoryStore {
+    fn total_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn valid_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_valid).count()
+    }
+
+    fn list_recent(&self, max: usize) -> Vec<(u64, String, bool, u32)> {
+        let mut sorted: Vec<&MemoryEntry> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sorted
+            .into_iter()
+            .take(max)
+            .map(|e| (e.id, e.content.clone(), e.is_valid, e.access_count))
+            .collect()
+    }
+
+    fn inspect(&self, id: u64) -> Option<String> {
+        self.entries.iter().find(|e| e.id == id).map(|e| {
+            format!(
+                "ID: {}\nContent: {}\nTags: {}\nCreated: {}\nLast accessed: {}\nAccess count: {}\nValid: {}\nSupersedes: {:?}\nEmbedding dims: {}",
+                e.id,
+                e.content,
+                e.tags.join(", "),
+                e.created_at,
+                e.last_accessed,
+                e.access_count,
+                e.is_valid,
+                e.supersedes,
+                e.embedding.len()
+            )
+        })
+    }
+
+    fn invalidate(&mut self, id: u64) -> bool {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.is_valid = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn query_by_tag(&self, tag: &str, max: usize) -> Vec<(u64, String)> {
+        let tag_lower = tag.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| e.is_valid && e.tags.iter().any(|t| t.to_lowercase().contains(&tag_lower)))
+            .take(max)
+            .map(|e| (e.id, e.content.clone()))
+            .collect()
+    }
+}
+
 /// Build a compact conversation transcript for memory extraction.
 /// Includes only user and assistant text blocks, truncated to keep
 /// the extraction prompt manageable.
