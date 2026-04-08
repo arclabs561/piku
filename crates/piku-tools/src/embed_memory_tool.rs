@@ -5,7 +5,6 @@
 ///
 /// These give the agent (and operator) full visibility into what's stored,
 /// what's being retrieved, and the ability to curate memory actively.
-
 use serde::Deserialize;
 
 use crate::{Destructiveness, ToolResult};
@@ -13,14 +12,6 @@ use crate::{Destructiveness, ToolResult};
 // ---------------------------------------------------------------------------
 // search_memory
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SearchMemoryParams {
-    /// Natural language query to search for.
-    query: String,
-    /// Max results (default 5).
-    max_results: Option<usize>,
-}
 
 #[must_use]
 pub fn search_memory_schema() -> serde_json::Value {
