@@ -720,6 +720,10 @@ async fn run_tui_repl_core(
     let cwd = std::env::current_dir()?;
     let date = crate::current_date();
     let custom_agents = piku_runtime::load_custom_agents(&cwd);
+    let hook_registry = piku_runtime::HookRegistry::load(&cwd);
+    if hook_registry.has_hooks() {
+        eprintln!("\x1b[2m[hooks loaded from .piku/hooks.json]\x1b[0m");
+    }
 
     // Session-start maintenance: evict stale/weak memories from embedding store.
     {
@@ -755,6 +759,17 @@ async fn run_tui_repl_core(
     let session_path = sessions_dir.join(format!("{session_id}.json"));
 
     let mut total_usage = initial_usage;
+
+    // Run SessionStart hooks (inject context into system prompt)
+    if let Some(hook_context) = hook_registry.run_session_start(&session_id, &cwd) {
+        eprintln!(
+            "\x1b[2m[session-start hook injected {} chars]\x1b[0m",
+            hook_context.len()
+        );
+        // Context will be included in the system prompt via a dynamic section
+        // For now, we'd need to append to system_sections later. This is a placeholder.
+        let _ = hook_context; // TODO: inject into system prompt sections
+    }
 
     // Capture the running binary's mtime as a baseline. After a `cargo build`
     // the file is overwritten in-place (we exec a new copy), so comparing
@@ -1092,6 +1107,7 @@ async fn run_tui_repl_core(
                     &task_registry,
                     0,
                     &custom_agents,
+                    Some(&hook_registry),
                 )
                 .await;
 
