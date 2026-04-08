@@ -293,34 +293,36 @@ async fn run_turn_inner(
         let cwd_for_hooks = std::env::current_dir().unwrap_or_default();
         let session_id_for_hooks = session.id.clone();
 
-        for (tool_use_id, tool_name, params) in tool_calls {
+        for (tool_use_id, tool_name, params) in &tool_calls {
             // PreToolUse hooks (can block before permission check)
+            let mut hook_context: Option<String> = None;
             if let Some(hooks) = hook_registry {
                 let hook_result = hooks.run_pre_tool_use(
-                    &tool_name,
-                    &params,
+                    tool_name,
+                    params,
                     &session_id_for_hooks,
                     &cwd_for_hooks,
                 );
                 if let crate::hooks::HookDecision::Deny(reason) = hook_result.decision {
-                    sink.on_tool_start(&tool_name, &tool_use_id, &params);
-                    sink.on_tool_end(&tool_name, &reason, true);
+                    sink.on_tool_start(tool_name, tool_use_id, params);
+                    sink.on_tool_end(tool_name, &reason, true);
                     session.push(ConversationMessage::tool_result(
-                        tool_use_id,
+                        tool_use_id.clone(),
                         format!("Blocked by hook: {reason}"),
                         true,
                     ));
                     continue;
                 }
+                hook_context = hook_result.context;
             }
 
             // permission check
-            match check_permission(&tool_name, &params, prompter) {
+            match check_permission(tool_name, params, prompter) {
                 PermissionOutcome::Allow => {}
                 PermissionOutcome::Deny { reason } => {
-                    sink.on_permission_denied(&tool_name, &reason);
+                    sink.on_permission_denied(tool_name, &reason);
                     session.push(ConversationMessage::tool_result(
-                        tool_use_id,
+                        tool_use_id.clone(),
                         format!("Permission denied: {reason}"),
                         true,
                     ));
@@ -342,10 +344,10 @@ async fn run_turn_inner(
                         "You already called {tool_name} with the same arguments. \
                          The result hasn't changed — try a different approach."
                     );
-                    sink.on_tool_start(&tool_name, &tool_use_id, &params);
-                    sink.on_tool_end(&tool_name, &dedup_msg, true);
+                    sink.on_tool_start(tool_name, tool_use_id, params);
+                    sink.on_tool_end(tool_name, &dedup_msg, true);
                     session.push(ConversationMessage::tool_result(
-                        tool_use_id,
+                        tool_use_id.clone(),
                         dedup_msg,
                         true,
                     ));
@@ -353,7 +355,7 @@ async fn run_turn_inner(
                 }
             }
 
-            sink.on_tool_start(&tool_name, &tool_use_id, &params);
+            sink.on_tool_start(tool_name, tool_use_id, params);
 
             // Route special tools through the runtime; everything else through execute_tool.
             let (output, is_error) = if tool_name == "search_memory" {
@@ -417,8 +419,10 @@ async fn run_turn_inner(
                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
                 let is_mutating =
                     params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
-                let result =
-                    piku_tools::embed_memory_tool::execute_manage_memory(params, &mut store);
+                let result = piku_tools::embed_memory_tool::execute_manage_memory(
+                    params.clone(),
+                    &mut store,
+                );
                 // Only save on mutating actions
                 if is_mutating {
                     let _ = store.save(&store_path);
@@ -433,12 +437,12 @@ async fn run_turn_inner(
                         description: t.description.clone(),
                     })
                     .collect();
-                let r = piku_tools::tool_search::execute_tool_search(params, &catalog);
+                let r = piku_tools::tool_search::execute_tool_search(params.clone(), &catalog);
                 (r.output, r.is_error)
             } else if let Some(registry) = task_registry {
                 match tool_name.as_str() {
                     "spawn_agent" => execute_spawn_agent(
-                        &params,
+                        params,
                         registry,
                         provider,
                         model,
@@ -448,10 +452,10 @@ async fn run_turn_inner(
                         &session.messages,
                         custom_agents,
                     ),
-                    "agent_status" => execute_agent_status(&params, registry),
-                    "agent_join" => execute_agent_join(&params, registry).await,
+                    "agent_status" => execute_agent_status(params, registry),
+                    "agent_join" => execute_agent_join(params, registry).await,
                     _ => {
-                        let r = execute_tool(&tool_name, params).await;
+                        let r = execute_tool(tool_name, params.clone()).await;
                         match r {
                             Some(r) => (r.output, r.is_error),
                             None => (format!("unknown tool: {tool_name}"), true),
@@ -459,21 +463,27 @@ async fn run_turn_inner(
                     }
                 }
             } else {
-                let result = execute_tool(&tool_name, params).await;
+                let result = execute_tool(tool_name, params.clone()).await;
                 match result {
                     Some(r) => (r.output, r.is_error),
                     None => (format!("unknown tool: {tool_name}"), true),
                 }
             };
 
-            let action = sink.on_tool_end(&tool_name, &output, is_error);
+            // Append hook-injected context to the tool output so the model sees it.
+            let output = if let Some(ctx) = hook_context {
+                format!("{output}\n\n<hook-context>\n{ctx}\n</hook-context>")
+            } else {
+                output
+            };
 
-            // PostToolUse hooks (fire-and-forget)
+            let action = sink.on_tool_end(tool_name, &output, is_error);
+
+            // PostToolUse hooks -- params is still available since we borrow tool_calls.
             if let Some(hooks) = hook_registry {
-                let params_for_hook = serde_json::json!({}); // params consumed by tool execution
                 hooks.run_post_tool_use(
-                    &tool_name,
-                    &params_for_hook,
+                    tool_name,
+                    params,
                     &output,
                     is_error,
                     &session_id_for_hooks,
@@ -482,7 +492,7 @@ async fn run_turn_inner(
             }
 
             session.push(ConversationMessage::tool_result(
-                tool_use_id,
+                tool_use_id.clone(),
                 output,
                 is_error,
             ));
@@ -526,6 +536,19 @@ async fn run_turn_inner(
 
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
+
+    // Stop hooks -- fire after turn completes (notifications, logging, cleanup).
+    if let Some(hooks) = hook_registry {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let reason = if replace_and_exec.is_some() {
+            "replace_and_exec"
+        } else if stream_error.is_some() {
+            "error"
+        } else {
+            "end_turn"
+        };
+        hooks.run_stop(&session.id, &cwd, iterations, reason);
+    }
 
     TurnResult {
         iterations,
