@@ -103,6 +103,7 @@ pub async fn run_turn(
         None,
         0,
         &[],
+        None,
     )
     .await
 }
@@ -123,6 +124,7 @@ pub async fn run_turn_with_registry(
     registry: &TaskRegistry,
     depth: u32,
     custom_agents: &[crate::agents::AgentDef],
+    hook_registry: Option<&crate::hooks::HookRegistry>,
 ) -> TurnResult {
     run_turn_inner(
         input,
@@ -138,6 +140,7 @@ pub async fn run_turn_with_registry(
         Some(registry),
         depth,
         custom_agents,
+        hook_registry,
     )
     .await
 }
@@ -156,6 +159,7 @@ async fn run_turn_inner(
     task_registry: Option<&TaskRegistry>,
     depth: u32,
     custom_agents: &[crate::agents::AgentDef],
+    hook_registry: Option<&crate::hooks::HookRegistry>,
 ) -> TurnResult {
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let mut interjections = interjections;
@@ -286,7 +290,30 @@ async fn run_turn_inner(
         }
 
         // execute each tool call sequentially (v0 — concurrent in a future phase)
+        let cwd_for_hooks = std::env::current_dir().unwrap_or_default();
+        let session_id_for_hooks = session.id.clone();
+
         for (tool_use_id, tool_name, params) in tool_calls {
+            // PreToolUse hooks (can block before permission check)
+            if let Some(hooks) = hook_registry {
+                let hook_result = hooks.run_pre_tool_use(
+                    &tool_name,
+                    &params,
+                    &session_id_for_hooks,
+                    &cwd_for_hooks,
+                );
+                if let crate::hooks::HookDecision::Deny(reason) = hook_result.decision {
+                    sink.on_tool_start(&tool_name, &tool_use_id, &params);
+                    sink.on_tool_end(&tool_name, &reason, true);
+                    session.push(ConversationMessage::tool_result(
+                        tool_use_id,
+                        format!("Blocked by hook: {reason}"),
+                        true,
+                    ));
+                    continue;
+                }
+            }
+
             // permission check
             match check_permission(&tool_name, &params, prompter) {
                 PermissionOutcome::Allow => {}
@@ -440,6 +467,20 @@ async fn run_turn_inner(
             };
 
             let action = sink.on_tool_end(&tool_name, &output, is_error);
+
+            // PostToolUse hooks (fire-and-forget)
+            if let Some(hooks) = hook_registry {
+                let params_for_hook = serde_json::json!({}); // params consumed by tool execution
+                hooks.run_post_tool_use(
+                    &tool_name,
+                    &params_for_hook,
+                    &output,
+                    is_error,
+                    &session_id_for_hooks,
+                    &cwd_for_hooks,
+                );
+            }
+
             session.push(ConversationMessage::tool_result(
                 tool_use_id,
                 output,
@@ -1053,6 +1094,7 @@ async fn run_subagent_task(
         Some(&registry),
         depth,
         &custom_agents,
+        None, // subagents don't inherit hooks
     )
     .await;
 
