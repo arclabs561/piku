@@ -1,5 +1,5 @@
 /// Debug what key events crossterm sees for each keypress.
-/// Run: cargo run -p piku --example key_debug
+/// Run: cargo run -p piku --example `key_debug`
 /// Press keys to see their crossterm representation. Ctrl+C to exit.
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,

@@ -34,7 +34,7 @@ impl ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "scripted"
     }
 
@@ -67,7 +67,7 @@ impl SequenceProvider {
 }
 
 impl Provider for SequenceProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "sequence"
     }
 
@@ -97,7 +97,7 @@ struct CollectSink {
     tool_ends: Vec<(String, String, bool)>, // (name, output, is_error)
     denied: Vec<(String, String)>,          // (name, reason)
     turn_complete: Option<(TokenUsage, u32)>,
-    /// If set, return ReplaceAndExec for the next tool_end that matches
+    /// If set, return `ReplaceAndExec` for the next `tool_end` that matches
     trigger_replace_for_tool: Option<String>,
     replace_triggered: Option<PathBuf>,
 }
@@ -745,7 +745,7 @@ async fn e2e_self_update_signal_breaks_loop() {
 async fn e2e_stream_error_session_not_corrupted() {
     struct ErrorMidStream;
     impl Provider for ErrorMidStream {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "error-mid"
         }
         fn stream_message(
@@ -790,7 +790,7 @@ async fn e2e_stream_error_session_not_corrupted() {
 async fn e2e_stream_error_no_partial_assistant_message() {
     struct ErrorMidStream;
     impl Provider for ErrorMidStream {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "error-mid"
         }
         fn stream_message(
@@ -837,7 +837,6 @@ async fn e2e_stream_error_no_partial_assistant_message() {
 #[tokio::test]
 async fn e2e_system_prompt_reaches_provider() {
     use piku_api::SystemBlock;
-    let captured_system: Arc<Mutex<Option<Vec<SystemBlock>>>> = Arc::new(Mutex::new(None));
 
     struct SystemCapture(Arc<Mutex<Option<Vec<SystemBlock>>>>);
     impl Provider for SystemCapture {
@@ -856,6 +855,7 @@ async fn e2e_system_prompt_reaches_provider() {
         }
     }
 
+    let captured_system: Arc<Mutex<Option<Vec<SystemBlock>>>> = Arc::new(Mutex::new(None));
     let provider = SystemCapture(captured_system.clone());
     let dir = tempdir();
     let system = build_system_prompt(&dir, "2026-04-03", "test-model", &[]);
@@ -1012,7 +1012,7 @@ async fn regression_bug_c_coalesced_tool_result_plus_text_not_dropped() {
 
     struct RequestCapture(Arc<Mutex<Vec<piku_api::MessageRequest>>>);
     impl piku_api::Provider for RequestCapture {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "capture"
         }
         fn stream_message(
@@ -1287,10 +1287,10 @@ async fn e2e_edit_real_rust_source_adds_comment() {
     let target = dir.join("lib.rs");
 
     // Use realistic Rust source with doc comments, imports, etc.
-    let source = r#"/// Public library surface — used by integration tests and main.rs.
+    let source = r"/// Public library surface — used by integration tests and main.rs.
 pub mod self_update;
 pub mod cli;
-"#;
+";
     std::fs::write(&target, source).unwrap();
 
     let edit_input = serde_json::json!({
@@ -1348,7 +1348,7 @@ async fn e2e_edit_ambiguous_recovers_with_context() {
 
     std::fs::write(
         &target,
-        r#"struct Foo;
+        r"struct Foo;
 impl Foo {
     pub fn new() -> Self { Foo }
 }
@@ -1357,7 +1357,7 @@ struct Bar;
 impl Bar {
     pub fn new() -> Self { Bar }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1424,8 +1424,8 @@ impl Bar {
 // Background agent / TaskRegistry integration
 // ===========================================================================
 
-/// Verify that spawn_local inside a LocalSet completes correctly.
-/// This is the critical regression test for the "spawn_local without LocalSet" bug.
+/// Verify that `spawn_local` inside a `LocalSet` completes correctly.
+/// This is the critical regression test for the "`spawn_local` without `LocalSet`" bug.
 #[tokio::test]
 async fn spawn_agent_completes_in_local_set() {
     use piku_runtime::{TaskRegistry, TaskStatus};
@@ -1466,7 +1466,7 @@ async fn spawn_agent_completes_in_local_set() {
 /// Verify completion notification reaches an interjection channel.
 #[tokio::test]
 async fn completion_notification_fires() {
-    use piku_runtime::{TaskRegistry, TaskStatus};
+    use piku_runtime::TaskRegistry;
     use tokio::task::LocalSet;
 
     let registry = TaskRegistry::new();
@@ -1507,7 +1507,7 @@ async fn completion_notification_fires() {
         .await;
 }
 
-/// Verify subagent_type routing applies built-in system prompt.
+/// Verify `subagent_type` routing applies built-in system prompt.
 #[test]
 fn subagent_type_routes_to_builtin_system_prompt() {
     use piku_runtime::agents::find_built_in;
@@ -1614,7 +1614,7 @@ async fn auto_compact_triggers_at_threshold() {
     );
 }
 
-/// Verify TaskRegistry.fail() marks task and fires notification.
+/// Verify `TaskRegistry.fail()` marks task and fires notification.
 #[tokio::test]
 async fn task_failure_notification_fires() {
     use piku_runtime::TaskRegistry;

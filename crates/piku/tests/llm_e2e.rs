@@ -4,8 +4,8 @@
 ///
 /// SETUP:
 ///   cargo build --release -p piku
-///   export OPENROUTER_API_KEY=sk-or-...   # or ANTHROPIC_API_KEY / GROQ_API_KEY
-///   PIKU_LLM_E2E=1 cargo test --test llm_e2e -- --nocapture
+///   export OPENROUTER_API_KEY=sk-or-...   # or `ANTHROPIC_API_KEY` / `GROQ_API_KEY`
+///   `PIKU_LLM_E2E=1` cargo test --test `llm_e2e` -- --nocapture
 ///
 /// DESIGN PRINCIPLES:
 ///   1. Assert on filesystem side-effects, not LLM prose (deterministic)
@@ -52,7 +52,7 @@ fn has_key(var: &str) -> bool {
 
 /// Choose the cheapest/fastest available provider and model for tool-use tests.
 ///
-/// Priority: OpenRouter (gpt-4o-mini has reliable tool use), then Anthropic, then Groq.
+/// Priority: `OpenRouter` (gpt-4o-mini has reliable tool use), then Anthropic, then Groq.
 /// Groq's llama models sometimes generate malformed tool calls — de-prioritized.
 fn detect_provider() -> Option<(&'static str, &'static str, &'static str)> {
     // Returns (provider_name, env_var, model)
@@ -83,7 +83,7 @@ fn tempdir() -> PathBuf {
 }
 
 /// Run piku with a prompt against a controlled directory.
-/// Returns (stdout, stderr, exit_success).
+/// Returns (stdout, stderr, `exit_success`).
 fn run_piku(
     prompt: &str,
     provider: &str,
@@ -145,11 +145,11 @@ fn piku_adds_doc_comment_to_rust_function() {
     std::fs::create_dir_all(&src_dir).unwrap();
 
     let target = src_dir.join("lib.rs");
-    let original = r#"// PIKU_TEST_MARKER: add a doc comment to the add function below
+    let original = r"// PIKU_TEST_MARKER: add a doc comment to the add function below
 pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
-"#;
+";
     std::fs::write(&target, original).unwrap();
 
     let prompt = format!(
@@ -204,7 +204,7 @@ pub fn add(a: i32, b: i32) -> i32 {
     // Session was saved
     let session_dir = config.join("piku").join("sessions");
     let session_count = std::fs::read_dir(&session_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).count())
+        .map(|rd| rd.filter_map(std::result::Result::ok).count())
         .unwrap_or(0);
     assert!(session_count > 0, "piku should have saved a session file");
 }
@@ -250,7 +250,7 @@ fn piku_creates_new_file_with_content() {
 // Test 3: piku reads a file and answers a question about it
 // ---------------------------------------------------------------------------
 
-/// Verifies the read_file tool works end-to-end with a real LLM.
+/// Verifies the `read_file` tool works end-to-end with a real LLM.
 /// We can't assert the exact answer but we can assert:
 /// - piku produced non-empty output
 /// - The output contains words from the file (demonstrates it was read)

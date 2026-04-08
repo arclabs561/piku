@@ -275,7 +275,7 @@ const MASK_THRESHOLD: usize = 200;
 
 /// Replace large tool results with a short preview.
 /// Preserves text blocks and tool-use blocks (reasoning chain) intact.
-/// Only ToolResult outputs above `MASK_THRESHOLD` chars are masked.
+/// Only `ToolResult` outputs above `MASK_THRESHOLD` chars are masked.
 fn mask_observations(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
     messages
         .iter()
@@ -490,9 +490,10 @@ fn strip_tag_block(content: &str, tag: &str) -> String {
     let close = format!("</{tag}>");
     let mut result = content.to_string();
     // Strip all occurrences (handles multiple <analysis> blocks from reasoning models)
-    loop {
-        let Some(s) = result.find(&open) else { break };
-        let Some(e_rel) = result[s + open.len()..].find(&close) else { break };
+    while let Some(s) = result.find(&open) {
+        let Some(e_rel) = result[s + open.len()..].find(&close) else {
+            break;
+        };
         let e = s + open.len() + e_rel + close.len();
         result = format!("{}{}", &result[..s], &result[e..]);
     }
@@ -630,9 +631,8 @@ mod tests {
             usage: None,
         }];
         let masked = super::mask_observations(&msgs);
-        let output = match &masked[0].blocks[0] {
-            ContentBlock::ToolResult { output, .. } => output,
-            _ => panic!("expected ToolResult"),
+        let ContentBlock::ToolResult { output, .. } = &masked[0].blocks[0] else {
+            panic!("expected ToolResult");
         };
         assert!(output.starts_with("[masked:"));
         assert!(output.contains("500 chars"));
@@ -650,9 +650,8 @@ mod tests {
             usage: None,
         }];
         let masked = super::mask_observations(&msgs);
-        let output = match &masked[0].blocks[0] {
-            ContentBlock::ToolResult { output, .. } => output,
-            _ => panic!("expected ToolResult"),
+        let ContentBlock::ToolResult { output, .. } = &masked[0].blocks[0] else {
+            panic!("expected ToolResult");
         };
         assert_eq!(output, "small");
     }
@@ -703,7 +702,10 @@ mod tests {
         let result = compact_session(&s, cfg);
         // Should have been compacted (hard phase, since masking alone won't
         // bring 22 messages with tool-use blocks under 100 tokens)
-        assert!(result.removed_message_count > 0 || result.compacted_session.messages.len() < s.messages.len());
+        assert!(
+            result.removed_message_count > 0
+                || result.compacted_session.messages.len() < s.messages.len()
+        );
     }
 
     #[test]

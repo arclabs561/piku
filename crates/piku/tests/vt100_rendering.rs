@@ -1,10 +1,10 @@
 /// VT100-based rendering tests.
 ///
-/// These write ANSI output to a vt100::Parser (in-memory terminal emulator)
+/// These write ANSI output to a `vt100::Parser` (in-memory terminal emulator)
 /// and read back the screen contents. This tests the full ANSI pipeline
-/// as a real terminal would see it -- no strip_ansi heuristics needed.
+/// as a real terminal would see it -- no `strip_ansi` heuristics needed.
 ///
-/// Pattern from Codex: CrosstermBackend<vt100::Parser> → screen().contents()
+/// Pattern from Codex: `CrosstermBackend`<vt100::Parser> → `screen().contents()`
 use piku::markdown::StreamingMarkdown;
 
 /// Create a VT100 parser, write text to it, return screen contents.
@@ -16,6 +16,7 @@ fn render_to_vt100(ansi_text: &str) -> String {
 }
 
 /// Same but returns the specific row contents (trimmed).
+#[allow(dead_code)] // available for targeted row assertions
 fn render_row(ansi_text: &str, row: u16) -> String {
     let mut parser = vt100::Parser::new(50, 120, 0);
     parser.process(ansi_text.as_bytes());
@@ -24,7 +25,7 @@ fn render_row(ansi_text: &str, row: u16) -> String {
     for col in 0..120 {
         let cell = screen.cell(row, col);
         if let Some(cell) = cell {
-            line.push_str(&cell.contents());
+            line.push_str(cell.contents());
         }
     }
     line.trim_end().to_string()

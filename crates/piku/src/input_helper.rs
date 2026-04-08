@@ -36,7 +36,7 @@ pub const SLASH_CMDS: &[&str] = &[
 
 // ── Input buffer ────────────────────────────────────────────────────────────
 
-/// Characters that define word boundaries (matches Codex's WORD_SEPARATORS).
+/// Characters that define word boundaries (matches Codex's `WORD_SEPARATORS`).
 const WORD_SEPS: &str = " \t\n`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
 fn is_word_sep(c: char) -> bool {
@@ -81,6 +81,12 @@ fn next_grapheme(s: &str, pos: usize) -> usize {
         .grapheme_indices(true)
         .nth(1)
         .map_or(s.len(), |(i, _)| pos + i)
+}
+
+impl Default for InputBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InputBuffer {
@@ -233,6 +239,7 @@ impl InputBuffer {
     }
 
     /// Column position of cursor within its current line (display width).
+    #[must_use]
     pub fn current_col(&self) -> usize {
         let before = &self.buffer[..self.cursor];
         let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -482,6 +489,7 @@ impl LineEditor {
 
     /// Expand any paste pills in the text, replacing `[Pasted text #N ...]`
     /// with the actual pasted content. Call on submit.
+    #[must_use]
     pub fn expand_paste_pills(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (i, content) in self.pasted_contents.iter().enumerate() {
@@ -490,7 +498,7 @@ impl LineEditor {
             let prefix = format!("[Pasted text #{id}");
             if let Some(start) = result.find(&prefix) {
                 if let Some(end) = result[start..].find(']') {
-                    result.replace_range(start..start + end + 1, content);
+                    result.replace_range(start..=(start + end), content);
                 }
             }
         }
@@ -533,10 +541,7 @@ impl LineEditor {
     pub fn save_history_file(&self, path: &std::path::Path) {
         // Keep last 500 entries
         let start = self.history.len().saturating_sub(500);
-        let contents: String = self.history[start..]
-            .iter()
-            .map(|s| format!("{s}\n"))
-            .collect();
+        let contents = self.history[start..].join("\n") + "\n";
         let _ = std::fs::write(path, contents);
     }
 
@@ -1189,8 +1194,8 @@ fn highlight_input_line(line: &str, is_first_line: bool) -> String {
 
     let mut out = String::new();
     let mut in_backtick = false;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let chars = line.chars().peekable();
+    for ch in chars {
         if ch == '`' {
             if in_backtick {
                 out.push('`');
@@ -1259,6 +1264,7 @@ fn longest_common_prefix(values: &[&str]) -> String {
 }
 
 /// Count visible display width (strip ANSI escape sequences, use Unicode width).
+#[must_use]
 pub fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut in_escape = false;

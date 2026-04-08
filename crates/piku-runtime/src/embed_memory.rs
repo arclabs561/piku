@@ -9,9 +9,10 @@
 /// - Write-time investment: tag and validate at insert, not retrieval
 /// - Atomic notes: one fact per entry, not paragraphs (A-MEM pattern)
 /// - Mark invalid rather than delete (preserves audit trail)
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,7 +74,7 @@ const MIN_SIMILARITY: f32 = 0.3;
 pub const MIN_IMPORTANCE: u8 = 3;
 
 /// Scoring weights (Park et al. formula + access frequency).
-/// score = w_rel * relevance + w_rec * recency + w_imp * importance + w_acc * access
+/// score = `w_rel` * relevance + `w_rec` * recency + `w_imp` * importance + `w_acc` * access
 const W_RELEVANCE: f32 = 0.4;
 const W_RECENCY: f32 = 0.3;
 const W_IMPORTANCE: f32 = 0.2;
@@ -88,13 +89,16 @@ fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
     let relevance = similarity; // already [0, 1] for normalized vectors
 
     // Recency: exponential decay with configurable half-life
+    #[allow(clippy::cast_precision_loss)] // age_secs: u64 -> f64, fine for time deltas
     let age_secs = now.saturating_sub(entry.last_accessed) as f64;
+    #[allow(clippy::cast_possible_truncation)] // f64 -> f32 is intentional (scoring precision)
     let recency = (-(age_secs * (2.0_f64.ln())) / RECENCY_HALF_LIFE).exp() as f32;
 
     // Importance: normalize 1-10 to [0, 1], clamping at 1 for legacy data with 0
-    let importance = (entry.importance.max(1) as f32 - 1.0) / 9.0;
+    let importance = (f32::from(entry.importance.max(1)) - 1.0) / 9.0;
 
     // Access frequency: log scale, capped at 1.0
+    #[allow(clippy::cast_precision_loss)] // u32 -> f32, access_count won't exceed 2^23
     let access = (1.0 + entry.access_count as f32).ln() / 5.0_f32.ln(); // ln(1+n)/ln(5)
     let access = access.min(1.0);
 
@@ -107,11 +111,7 @@ fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
 
 /// Embed text using ollama's /api/embed endpoint.
 /// Returns a normalized 768-dim vector.
-pub async fn embed_text(
-    text: &str,
-    ollama_url: &str,
-    model: &str,
-) -> Result<Vec<f32>, String> {
+pub async fn embed_text(text: &str, ollama_url: &str, model: &str) -> Result<Vec<f32>, String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "model": model,
@@ -164,7 +164,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 fn normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
-        v.iter_mut().for_each(|x| *x /= norm);
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 }
 
@@ -175,10 +177,10 @@ fn normalize(v: &mut [f32]) {
 impl MemoryStore {
     /// Load from a JSON file. Returns empty store if file doesn't exist.
     /// If the file exists but is corrupt, backs it up before returning empty.
+    #[must_use]
     pub fn load(path: &Path) -> Self {
-        let content = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return Self::default(), // File doesn't exist
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Self::default(); // File doesn't exist
         };
         match serde_json::from_str(&content) {
             Ok(store) => store,
@@ -199,11 +201,10 @@ impl MemoryStore {
     /// Save to a JSON file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create_dir_all failed: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("serialize failed: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| format!("serialize failed: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("write failed: {e}"))
     }
 
@@ -272,7 +273,7 @@ impl MemoryStore {
     }
 
     /// Retrieve the top-k valid memories ranked by composite score.
-    /// Composite: relevance(cosine) + recency(exp_decay) + importance + access_frequency.
+    /// Composite: relevance(cosine) + `recency(exp_decay)` + importance + `access_frequency`.
     /// Confidence-gated: cosine similarity must exceed `MIN_SIMILARITY`.
     /// Updates access metadata on retrieved entries.
     pub fn retrieve(&mut self, query_embedding: &[f32], k: usize) -> Vec<RetrievedMemory> {
@@ -386,6 +387,8 @@ impl MemoryStore {
                     .iter()
                     .filter(|t| haystack.contains(t.as_str()))
                     .count();
+                #[allow(clippy::cast_precision_loss)]
+                // keyword_hits is always small (< query terms)
                 let keyword_boost = (keyword_hits as f32 * 0.05).min(0.15);
 
                 let final_score = base_score + keyword_boost;
@@ -437,14 +440,17 @@ pub fn format_retrieved_memories(memories: &[RetrievedMemory]) -> String {
         return String::new();
     }
     let mut out = String::from("\n\n# Retrieved Memories\n\n");
-    out.push_str("The following memories were retrieved by semantic similarity to the current task.\n\n");
+    out.push_str(
+        "The following memories were retrieved by semantic similarity to the current task.\n\n",
+    );
     for m in memories {
-        out.push_str(&format!(
-            "- [score={:.2}, sim={:.2}, imp={}] {}\n",
+        let _ = writeln!(
+            out,
+            "- [score={:.2}, sim={:.2}, imp={}] {}",
             m.score, m.similarity, m.entry.importance, m.entry.content
-        ));
+        );
         if !m.entry.tags.is_empty() {
-            out.push_str(&format!("  tags: {}\n", m.entry.tags.join(", ")));
+            let _ = writeln!(out, "  tags: {}", m.entry.tags.join(", "));
         }
     }
     out
@@ -612,9 +618,8 @@ pub async fn extract_and_store(
 
     let mut count = 0;
     for (fact, tags, importance) in facts {
-        let embedding = match embed_text(&fact, ollama_url, embed_model).await {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(embedding) = embed_text(&fact, ollama_url, embed_model).await else {
+            continue;
         };
 
         // Find top-3 similar existing memories for contradiction check
@@ -627,13 +632,7 @@ pub async fn extract_and_store(
                 .filter(|s| s.similarity > 0.5)
                 .map(|s| format!("[id:{}] {}", s.entry.id, s.entry.content))
                 .collect();
-            let decision = judge_memory_conflict(
-                &fact,
-                &existing_texts,
-                provider,
-                model,
-            )
-            .await;
+            let decision = judge_memory_conflict(&fact, &existing_texts, provider, model).await;
             match decision {
                 MemoryJudgment::Add => {
                     if store.insert(fact, tags, embedding, importance).is_some() {
@@ -691,9 +690,8 @@ async fn judge_memory_conflict(
     use futures_util::StreamExt;
 
     let existing_text = existing.join("\n");
-    let user_msg = format!(
-        "NEW FACT: {new_fact}\n\nEXISTING MEMORIES:\n{existing_text}\n\nDecision:"
-    );
+    let user_msg =
+        format!("NEW FACT: {new_fact}\n\nEXISTING MEMORIES:\n{existing_text}\n\nDecision:");
 
     let request = piku_api::MessageRequest {
         model: model.to_string(),
@@ -749,10 +747,11 @@ fn parse_judgment(response: &str) -> MemoryJudgment {
 // ---------------------------------------------------------------------------
 
 /// Strength score for eviction decisions.
-/// strength = importance_norm * recency_decay * (1 + log(1 + access_count))
+/// strength = `importance_norm` * `recency_decay` * (1 + log(1 + `access_count`))
 /// Low strength = candidate for eviction.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn memory_strength(entry: &MemoryEntry, now: u64) -> f32 {
-    let importance_norm = entry.importance.max(1) as f32 / 10.0;
+    let importance_norm = f32::from(entry.importance.max(1)) / 10.0;
     let age_secs = now.saturating_sub(entry.last_accessed) as f64;
     let recency = (-(age_secs * (2.0_f64.ln())) / RECENCY_HALF_LIFE).exp() as f32;
     let access_boost = (1.0 + entry.access_count as f32).ln() + 1.0;
@@ -779,7 +778,7 @@ impl MemoryStore {
     /// AND have low importance (< 5).
     pub fn evict_stale(&mut self, max_age_days: u32) -> usize {
         let now = now_unix();
-        let max_age_secs = max_age_days as u64 * 24 * 3600;
+        let max_age_secs = u64::from(max_age_days) * 24 * 3600;
         let mut evicted = 0;
         for entry in &mut self.entries {
             if entry.is_valid
@@ -819,7 +818,11 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
         // Show all entries (including invalid) so operator has full visibility.
         // Sort valid first, then by recency within each group.
         let mut sorted: Vec<&MemoryEntry> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| b.is_valid.cmp(&a.is_valid).then(b.created_at.cmp(&a.created_at)));
+        sorted.sort_by(|a, b| {
+            b.is_valid
+                .cmp(&a.is_valid)
+                .then(b.created_at.cmp(&a.created_at))
+        });
         sorted
             .into_iter()
             .take(max)
@@ -867,9 +870,8 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
 /// Build a compact conversation transcript for memory extraction.
 /// Includes only user and assistant text blocks, truncated to keep
 /// the extraction prompt manageable.
-pub fn build_extraction_transcript(
-    messages: &[crate::session::ConversationMessage],
-) -> String {
+#[must_use]
+pub fn build_extraction_transcript(messages: &[crate::session::ConversationMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = match msg.role {
@@ -905,6 +907,7 @@ pub fn build_extraction_transcript(
 mod tests {
     use super::*;
 
+    #[allow(clippy::cast_precision_loss)] // test helper, precision doesn't matter
     fn make_embedding(seed: f32) -> Vec<f32> {
         let mut v: Vec<f32> = (0..768).map(|i| ((i as f32 + seed) * 0.01).sin()).collect();
         normalize(&mut v);
@@ -916,8 +919,18 @@ mod tests {
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
         let e2 = make_embedding(2.0);
-        store.insert("fact about rust".to_string(), vec!["rust".to_string()], e1.clone(), 7);
-        store.insert("fact about python".to_string(), vec!["python".to_string()], e2, 5);
+        store.insert(
+            "fact about rust".to_string(),
+            vec!["rust".to_string()],
+            e1.clone(),
+            7,
+        );
+        store.insert(
+            "fact about python".to_string(),
+            vec!["python".to_string()],
+            e2,
+            5,
+        );
 
         let results = store.retrieve(&e1, 5);
         assert!(!results.is_empty());
@@ -947,7 +960,9 @@ mod tests {
     fn superseding_marks_old_invalid() {
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
-        let id1 = store.insert("old fact".to_string(), vec![], e1.clone(), 7).unwrap();
+        let id1 = store
+            .insert("old fact".to_string(), vec![], e1.clone(), 7)
+            .unwrap();
         store.insert_superseding("new fact".to_string(), vec![], e1.clone(), id1, 8);
 
         assert!(!store.entries.iter().find(|e| e.id == id1).unwrap().is_valid);
@@ -1067,9 +1082,13 @@ mod tests {
         let mut store = super::MemoryStore::default();
         let e = make_embedding(1.0);
         // Below MIN_IMPORTANCE (3) -- should be rejected
-        assert!(store.insert("low importance".to_string(), vec![], e.clone(), 2).is_none());
+        assert!(store
+            .insert("low importance".to_string(), vec![], e.clone(), 2)
+            .is_none());
         // At MIN_IMPORTANCE -- should be accepted
-        assert!(store.insert("medium importance".to_string(), vec![], e.clone(), 3).is_some());
+        assert!(store
+            .insert("medium importance".to_string(), vec![], e.clone(), 3)
+            .is_some());
         assert_eq!(store.valid_count(), 1);
     }
 
@@ -1094,11 +1113,13 @@ mod tests {
 
     #[test]
     fn build_transcript_filters_roles() {
-        use crate::session::{ConversationMessage, ContentBlock};
+        use crate::session::{ContentBlock, ConversationMessage};
         let messages = vec![
             ConversationMessage::user("hello"),
             ConversationMessage::assistant(
-                vec![ContentBlock::Text { text: "hi there".to_string() }],
+                vec![ContentBlock::Text {
+                    text: "hi there".to_string(),
+                }],
                 None,
             ),
             ConversationMessage {
@@ -1152,7 +1173,9 @@ mod tests {
         use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
-        let id = store.insert("to invalidate".to_string(), vec![], e, 5).unwrap();
+        let id = store
+            .insert("to invalidate".to_string(), vec![], e, 5)
+            .unwrap();
         assert!(store.invalidate(id));
         assert_eq!(store.valid_count(), 0);
         assert!(!store.invalidate(999)); // nonexistent
@@ -1163,8 +1186,18 @@ mod tests {
         use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
-        store.insert("rust fact".to_string(), vec!["rust".to_string(), "lang".to_string()], e.clone(), 5);
-        store.insert("python fact".to_string(), vec!["python".to_string()], e.clone(), 5);
+        store.insert(
+            "rust fact".to_string(),
+            vec!["rust".to_string(), "lang".to_string()],
+            e.clone(),
+            5,
+        );
+        store.insert(
+            "python fact".to_string(),
+            vec!["python".to_string()],
+            e.clone(),
+            5,
+        );
         let results = store.query_by_tag("rust", 10);
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("rust fact"));
@@ -1193,7 +1226,9 @@ mod tests {
         use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
-        let id = store.insert("inspectable".to_string(), vec!["tag1".to_string()], e, 8).unwrap();
+        let id = store
+            .insert("inspectable".to_string(), vec!["tag1".to_string()], e, 8)
+            .unwrap();
         let detail = store.inspect(id).unwrap();
         assert!(detail.contains("inspectable"));
         assert!(detail.contains("tag1"));
@@ -1219,9 +1254,16 @@ mod tests {
     fn composite_score_zero_importance() {
         // importance=0 should not cause division or NaN
         let e = MemoryEntry {
-            id: 0, content: String::new(), tags: vec![], importance: 0,
-            created_at: 0, last_accessed: 0, access_count: 0,
-            is_valid: true, supersedes: None, embedding: vec![],
+            id: 0,
+            content: String::new(),
+            tags: vec![],
+            importance: 0,
+            created_at: 0,
+            last_accessed: 0,
+            access_count: 0,
+            is_valid: true,
+            supersedes: None,
+            embedding: vec![],
         };
         let score = super::composite_score(0.5, &e, super::now_unix());
         assert!(score.is_finite());
@@ -1231,9 +1273,16 @@ mod tests {
     #[test]
     fn composite_score_high_access_count_capped() {
         let e = MemoryEntry {
-            id: 0, content: String::new(), tags: vec![], importance: 5,
-            created_at: super::now_unix(), last_accessed: super::now_unix(),
-            access_count: 1_000_000, is_valid: true, supersedes: None, embedding: vec![],
+            id: 0,
+            content: String::new(),
+            tags: vec![],
+            importance: 5,
+            created_at: super::now_unix(),
+            last_accessed: super::now_unix(),
+            access_count: 1_000_000,
+            is_valid: true,
+            supersedes: None,
+            embedding: vec![],
         };
         let score = super::composite_score(0.5, &e, super::now_unix());
         assert!(score.is_finite());
@@ -1247,8 +1296,18 @@ mod tests {
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
         // Both have similar embeddings, but one has a tag matching the query
-        store.insert("rust fact".to_string(), vec!["rust".to_string()], e.clone(), 5);
-        store.insert("python fact".to_string(), vec!["python".to_string()], e.clone(), 5);
+        store.insert(
+            "rust fact".to_string(),
+            vec!["rust".to_string()],
+            e.clone(),
+            5,
+        );
+        store.insert(
+            "python fact".to_string(),
+            vec!["python".to_string()],
+            e.clone(),
+            5,
+        );
 
         // Query with "rust" keyword should boost the rust-tagged entry
         let results = store.hybrid_retrieve(&e, "rust programming", 2);
@@ -1279,7 +1338,7 @@ mod tests {
         let evicted = store.evict_stale(30);
         assert_eq!(evicted, 1);
         assert!(!store.entries[0].is_valid); // old low evicted
-        assert!(store.entries[1].is_valid);  // recent high kept
+        assert!(store.entries[1].is_valid); // recent high kept
     }
 
     #[test]
@@ -1326,13 +1385,22 @@ mod tests {
 
     #[test]
     fn parse_judgment_ignore() {
-        assert_eq!(super::parse_judgment("IGNORE"), super::MemoryJudgment::Ignore);
+        assert_eq!(
+            super::parse_judgment("IGNORE"),
+            super::MemoryJudgment::Ignore
+        );
     }
 
     #[test]
     fn parse_judgment_update() {
-        assert_eq!(super::parse_judgment("UPDATE 42"), super::MemoryJudgment::Update(42));
-        assert_eq!(super::parse_judgment("update 7"), super::MemoryJudgment::Update(7));
+        assert_eq!(
+            super::parse_judgment("UPDATE 42"),
+            super::MemoryJudgment::Update(42)
+        );
+        assert_eq!(
+            super::parse_judgment("update 7"),
+            super::MemoryJudgment::Update(7)
+        );
     }
 
     #[test]
@@ -1345,8 +1413,15 @@ mod tests {
     fn search_all_invalid_returns_empty() {
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
-        let id = store.insert("will invalidate".to_string(), vec![], e.clone(), 5).unwrap();
-        store.entries.iter_mut().find(|x| x.id == id).unwrap().is_valid = false;
+        let id = store
+            .insert("will invalidate".to_string(), vec![], e.clone(), 5)
+            .unwrap();
+        store
+            .entries
+            .iter_mut()
+            .find(|x| x.id == id)
+            .unwrap()
+            .is_valid = false;
         let results = store.search(&e, 5);
         assert!(results.is_empty());
     }

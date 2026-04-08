@@ -7,10 +7,10 @@
 ///   3. Tool output must be dimmed (ESC[2m) but bash output must NOT be dimmed
 ///
 /// We test the source-level logic (not a subprocess) by checking that
-/// the relevant ANSI sequences are present in the tui_repl.rs source.
+/// the relevant ANSI sequences are present in the `tui_repl.rs` source.
 /// This is a canary test — if someone removes the fix, the test fails.
 ///
-/// For full end-to-end TUI testing, see the PIKU_DOGFOOD suite which
+/// For full end-to-end TUI testing, see the `PIKU_DOGFOOD` suite which
 /// runs the binary against real scenarios (though it uses single-shot mode).
 use std::path::PathBuf;
 
@@ -51,7 +51,7 @@ fn cursor_show_sequence_present_after_turn() {
     );
 }
 
-/// teardown_layout must restore cursor so the terminal isn't left with
+/// `teardown_layout` must restore cursor so the terminal isn't left with
 /// an invisible cursor after piku exits.
 #[test]
 fn cursor_restored_in_teardown() {
@@ -85,8 +85,8 @@ fn cursor_restored_on_ctrl_c() {
 
 // ── User message echo ─────────────────────────────────────────────────────────
 
-/// Before run_turn is called, the user's input must be echoed into the scroll zone.
-/// We verify that the user-input echo appears in the code BEFORE the run_turn
+/// Before `run_turn` is called, the user's input must be echoed into the scroll zone.
+/// We verify that the user-input echo appears in the code BEFORE the `run_turn`
 /// call site, not after. The echo uses a dimmed style with ▸ glyph to
 /// distinguish it from the active prompt.
 #[test]
@@ -152,8 +152,7 @@ fn bash_output_not_dimmed_in_format_tool_result() {
         .expect("format_tool_result must exist");
     let fn_end = src[fmt_fn_pos..]
         .find("\nfn ")
-        .map(|p| fmt_fn_pos + p)
-        .unwrap_or(src.len());
+        .map_or(src.len(), |p| fmt_fn_pos + p);
     let fn_body = &src[fmt_fn_pos..fn_end];
 
     // bash arm must NOT start its output lines with \x1b[2m (dim)

@@ -115,7 +115,7 @@ pub async fn run_repl(
                 let prompter = AllowAll;
                 let mut sink = ReplSink::new();
 
-                print!("\n");
+                println!();
 
                 let result: TurnResult = run_turn(
                     &trimmed,
@@ -131,7 +131,7 @@ pub async fn run_repl(
                 )
                 .await;
 
-                print!("\n");
+                println!();
 
                 total_usage.accumulate(&result.usage);
 
@@ -154,9 +154,7 @@ pub async fn run_repl(
                 }
             }
 
-            Ok(input_helper::ReadOutcome::Cancel) => {
-                continue;
-            }
+            Ok(input_helper::ReadOutcome::Cancel) => {}
             Ok(input_helper::ReadOutcome::Exit) => {
                 break;
             }
@@ -238,7 +236,7 @@ fn handle_slash_cmd(
             println!("\nCurrent model: {current_model}\n");
         }
         SlashCmd::Model(Some(new_model)) => {
-            *model = new_model.clone();
+            new_model.clone_into(model);
             println!("\x1b[2m[model → {new_model}]\x1b[0m");
         }
         SlashCmd::Sessions => {
@@ -246,8 +244,8 @@ fn handle_slash_cmd(
                 println!("\n\x1b[1mSaved sessions:\x1b[0m  ({})\n", dir.display());
                 if let Ok(entries) = std::fs::read_dir(&dir) {
                     let mut files: Vec<_> = entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
                         .collect();
                     files.sort_by_key(|e| {
                         e.metadata()
@@ -296,7 +294,14 @@ pub struct ReplSink {
     md: crate::markdown::StreamingMarkdown,
 }
 
+impl Default for ReplSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReplSink {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stdout: io::stdout(),
@@ -343,8 +348,7 @@ impl OutputSink for ReplSink {
 
         let _ = writeln!(
             self.stdout,
-            "\x1b[2m[{} → {status_color}{tag}\x1b[0m\x1b[2m]\x1b[0m",
-            tool_name,
+            "\x1b[2m[{tool_name} → {status_color}{tag}\x1b[0m\x1b[2m]\x1b[0m",
         );
         if !preview.is_empty() {
             let _ = writeln!(self.stdout, "{preview}");
@@ -404,7 +408,7 @@ fn tool_icon(tool_name: &str) -> &'static str {
 }
 
 /// Format a tool result for display in the REPL.
-/// - edit_file: show a compact diff-style preview
+/// - `edit_file`: show a compact diff-style preview
 /// - bash: show output lines, capped
 /// - others: brief preview
 fn format_tool_result(tool_name: &str, result: &str, is_error: bool) -> String {

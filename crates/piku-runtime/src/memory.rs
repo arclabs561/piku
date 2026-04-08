@@ -360,7 +360,11 @@ mod tests {
         let dir = tempdir();
         let cwd = dir.path();
         write_agent_memory(cwd, "verifier", "## Note\n\ntest").unwrap();
-        let expected = cwd.join(".piku").join("agent-memory").join("verifier").join("MEMORY.md");
+        let expected = cwd
+            .join(".piku")
+            .join("agent-memory")
+            .join("verifier")
+            .join("MEMORY.md");
         assert!(expected.exists());
     }
 
