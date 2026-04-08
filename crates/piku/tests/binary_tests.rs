@@ -256,12 +256,17 @@ fn anthropic_without_key_exits_nonzero() {
 }
 
 #[test]
-fn groq_without_key_exits_nonzero() {
+fn groq_without_key_exits_nonzero_mentions_key() {
     let out = piku_clean_env()
         .args(["--provider=groq", "do something"])
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("GROQ_API_KEY"),
+        "stderr should mention GROQ_API_KEY, got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -453,26 +458,18 @@ fn resume_nonexistent_session_exits_nonzero() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn session_id_includes_nanos_and_pid() {
-    // Indirectly verify via the help text and binary behavior.
-    // We can't directly test new_session_id() as it's private,
-    // but we can verify that two rapid invocations produce different filenames.
-    // Run two versions in quick succession and compare session file names.
-    let tmp1 = std::env::temp_dir().join(format!("piku_sid_test_{}", std::process::id()));
-    let tmp2 = std::env::temp_dir().join(format!("piku_sid_test2_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp1).unwrap();
-    std::fs::create_dir_all(&tmp2).unwrap();
+fn version_runs_with_custom_config_dir() {
+    let tmp = std::env::temp_dir().join(format!("piku_sid_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
 
-    // Just check it runs without panic — session IDs are internal
     let out = piku_clean_env()
         .arg("--version")
-        .env("XDG_CONFIG_HOME", &tmp1)
+        .env("XDG_CONFIG_HOME", &tmp)
         .output()
         .unwrap();
     assert!(out.status.success());
 
-    let _ = std::fs::remove_dir_all(&tmp1);
-    let _ = std::fs::remove_dir_all(&tmp2);
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,4 +491,15 @@ fn version_output_does_not_spawn_date_subprocess() {
         "--version took {}ms — might be spawning subprocesses",
         elapsed.as_millis()
     );
+}
+
+#[test]
+fn new_session_id_is_unique_across_rapid_calls() {
+    let id1 = piku::new_session_id();
+    let id2 = piku::new_session_id();
+    assert_ne!(
+        id1, id2,
+        "rapid session IDs must differ (nanos should advance)"
+    );
+    assert!(id1.starts_with("session-"), "session ID format: {id1}");
 }

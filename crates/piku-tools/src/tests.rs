@@ -34,6 +34,23 @@ mod read_file {
         assert!(result.is_error);
         assert!(result.output.contains("read_file"));
     }
+
+    #[test]
+    fn reads_unicode_content_without_panic() {
+        let dir = tempdir();
+        let path = dir.join("unicode.txt");
+        // Mix of ASCII, CJK, emoji, combining characters
+        let content = "hello\n你好世界\n🦀 Rust\nca\u{0301}fe\u{0301}\nline5";
+        std::fs::write(&path, content).unwrap();
+        let result = read_file::execute(serde_json::json!({ "path": path }));
+        assert!(
+            !result.is_error,
+            "reading Unicode file failed: {}",
+            result.output
+        );
+        assert!(result.output.contains("你好世界"), "CJK content missing");
+        assert!(result.output.contains("🦀"), "emoji content missing");
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +178,39 @@ mod edit_file {
             "new_string": "y",
         }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn replaces_unicode_old_string() {
+        let dir = tempdir();
+        let path = dir.join("unicode_edit.rs");
+        std::fs::write(&path, "// 你好世界\nfn main() {}").unwrap();
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": "你好世界",
+            "new_string": "hello world",
+        }));
+        assert!(!result.is_error, "{}", result.output);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("hello world"));
+        assert!(!content.contains("你好世界"));
+    }
+
+    #[test]
+    fn replaces_emoji_content() {
+        let dir = tempdir();
+        let path = dir.join("emoji_edit.txt");
+        std::fs::write(&path, "status: 🔴 failing").unwrap();
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": "🔴 failing",
+            "new_string": "🟢 passing",
+        }));
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "status: 🟢 passing"
+        );
     }
 }
 
@@ -572,6 +622,36 @@ mod bash_extended {
     fn append_redirect_is_likely_not_definite() {
         // >> is append, less destructive than overwrite
         let d = bash::destructiveness(&serde_json::json!({ "command": "echo hi >> log.txt" }));
+        assert_eq!(d, crate::Destructiveness::Likely);
+    }
+
+    #[test]
+    fn redirect_to_path_with_spaces_is_caught() {
+        let d = bash::destructiveness(
+            &serde_json::json!({ "command": "echo x > \"/path with spaces/file.txt\"" }),
+        );
+        // Should be at least Likely (contains "> ")
+        assert_ne!(d, crate::Destructiveness::Safe);
+    }
+
+    #[test]
+    fn rm_rf_root_is_definite() {
+        let d = bash::destructiveness(&serde_json::json!({ "command": "rm -rf /" }));
+        assert_eq!(d, crate::Destructiveness::Definite);
+    }
+
+    #[test]
+    fn eval_rm_is_definite() {
+        // eval wrapping should still trigger
+        let d = bash::destructiveness(&serde_json::json!({ "command": "eval 'rm -rf /tmp/foo'" }));
+        // eval is in the definite patterns
+        assert_eq!(d, crate::Destructiveness::Definite);
+    }
+
+    #[test]
+    fn benign_command_is_at_least_likely() {
+        // bash is always at least Likely -- any shell command can be destructive
+        let d = bash::destructiveness(&serde_json::json!({ "command": "ls -la" }));
         assert_eq!(d, crate::Destructiveness::Likely);
     }
 }
