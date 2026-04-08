@@ -539,9 +539,7 @@ impl MemoryStore {
             .and_then(|e| e.parent);
         self.entries
             .iter()
-            .filter(|e| {
-                e.id != id && e.parent == parent && e.entry_type == EntryType::Attempt
-            })
+            .filter(|e| e.id != id && e.parent == parent && e.entry_type == EntryType::Attempt)
             .collect()
     }
 
@@ -755,14 +753,22 @@ pub fn format_retrieved_memories(memories: &[RetrievedMemory]) -> String {
 // Session-end memory extraction
 // ---------------------------------------------------------------------------
 
-/// Prompt for extracting atomic facts from a conversation.
+/// Prompt for extracting atomic facts and attempts from a conversation.
 const EXTRACTION_PROMPT: &str = "\
 You are a memory extraction system. Given a conversation between a user and an AI assistant, \
-extract 0-5 atomic facts worth remembering for future sessions.
+extract two kinds of memories:
 
-Rules:
+## 1. Facts (0-5)
+Atomic facts worth remembering for future sessions.
+Format: `- [importance:N] fact text {tags: a, b, c}`
+
+## 2. Attempts (0-3)
+Approaches tried during the conversation and their outcomes. Only extract attempts where \
+the outcome (success or failure) provides useful guidance for future similar tasks.
+Format: `- [attempt] goal: GOAL | approach: APPROACH | outcome: success|failure | detail: WHY`
+
+Rules for facts:
 - Each fact must be self-contained (no pronouns, no \"the project\")
-- One fact per line, format: `- [importance:N] fact text {tags: a, b, c}`
   - importance is 1-10:
     - 1-2: trivial, not worth storing
     - 3-4: mildly useful context
@@ -772,22 +778,32 @@ Rules:
   - tags: 1-4 lowercase keywords for this specific fact
 - Include: user preferences, project conventions, error patterns, key decisions
 - Exclude: transient task details, file contents, code snippets, things derivable from git
-- If nothing is worth remembering, output exactly: NONE
+
+Rules for attempts:
+- Only extract attempts where something was tried and the outcome was observed
+- goal: what the agent was trying to achieve (specific enough to match future queries)
+- approach: the specific strategy or method used
+- outcome: success or failure (skip pending/unclear)
+- detail: concise reason WHY it succeeded or failed (one sentence)
+- Skip trivial operations (file reads, simple edits) -- only meaningful problem-solving attempts
+
+If nothing is worth remembering, output exactly: NONE
 
 Output format:
 - [importance:7] The user prefers snake_case in Rust code {tags: rust, style}
 - [importance:9] Never use byte slicing on UTF-8 strings {tags: rust, safety, unicode}
+- [attempt] goal: fix UTF-8 rendering | approach: byte slicing for truncation | outcome: failure | detail: panics on multi-byte characters
+- [attempt] goal: fix UTF-8 rendering | approach: char iterator with take(n) | outcome: success | detail: handles all unicode correctly
 
 Or:
 NONE";
 
-/// Extract memories from a conversation transcript.
-/// Returns a list of (fact, tags, importance) tuples.
-pub async fn extract_memories(
+/// Raw extraction from the LLM -- returns the full response text.
+async fn extract_raw(
     conversation: &str,
     provider: &dyn piku_api::Provider,
     model: &str,
-) -> Vec<(String, Vec<String>, u8)> {
+) -> Option<String> {
     use futures_util::StreamExt;
 
     let request = piku_api::MessageRequest {
@@ -820,10 +836,23 @@ pub async fn extract_memories(
     .await;
 
     if result.is_err() || response.trim() == "NONE" || response.trim().is_empty() {
-        return Vec::new();
+        return None;
     }
 
-    parse_extraction_response(&response)
+    Some(response)
+}
+
+/// Extract memories from a conversation transcript.
+/// Returns a list of (fact, tags, importance) tuples.
+pub async fn extract_memories(
+    conversation: &str,
+    provider: &dyn piku_api::Provider,
+    model: &str,
+) -> Vec<(String, Vec<String>, u8)> {
+    match extract_raw(conversation, provider, model).await {
+        Some(response) => parse_extraction_response(&response),
+        None => Vec::new(),
+    }
 }
 
 /// Parse the LLM's extraction response into (fact, tags, importance) tuples.
@@ -852,7 +881,7 @@ fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
             continue;
         };
         let fact_text = fact_text.trim();
-        if fact_text.is_empty() || fact_text.starts_with("TAGS:") {
+        if fact_text.is_empty() || fact_text.starts_with("TAGS:") || fact_text.starts_with("[attempt]") {
             continue;
         }
 
@@ -891,11 +920,70 @@ fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
     facts
 }
 
+/// A parsed attempt extraction from the LLM response.
+#[derive(Debug, Clone)]
+struct ExtractedAttempt {
+    goal: String,
+    approach: String,
+    outcome: Outcome,
+    detail: String,
+}
+
+/// Parse attempt lines from the extraction response.
+/// Format: `- [attempt] goal: GOAL | approach: APPROACH | outcome: success|failure | detail: WHY`
+fn parse_attempt_lines(response: &str) -> Vec<ExtractedAttempt> {
+    let mut attempts = Vec::new();
+    for line in response.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("- [attempt]") else {
+            continue;
+        };
+        let rest = rest.trim();
+        // Parse pipe-separated fields
+        let fields: std::collections::HashMap<&str, &str> = rest
+            .split('|')
+            .filter_map(|part| {
+                let part = part.trim();
+                let colon = part.find(':')?;
+                let key = part[..colon].trim();
+                let val = part[colon + 1..].trim();
+                Some((key, val))
+            })
+            .collect();
+
+        let Some(goal) = fields.get("goal") else {
+            continue;
+        };
+        let Some(approach) = fields.get("approach") else {
+            continue;
+        };
+        let Some(outcome_str) = fields.get("outcome") else {
+            continue;
+        };
+        let outcome = match *outcome_str {
+            "success" => Outcome::Success,
+            "failure" => Outcome::Failure,
+            _ => continue, // skip unclear outcomes
+        };
+        let detail = fields.get("detail").unwrap_or(&"");
+
+        if !goal.is_empty() && !approach.is_empty() {
+            attempts.push(ExtractedAttempt {
+                goal: (*goal).to_string(),
+                approach: (*approach).to_string(),
+                outcome,
+                detail: (*detail).to_string(),
+            });
+        }
+    }
+    attempts
+}
+
 /// Full session-end memory pipeline:
-/// 1. Extract atomic facts from the conversation
-/// 2. Embed each fact
+/// 1. Extract atomic facts and attempts from the conversation
+/// 2. Embed each fact/attempt
 /// 3. Check for contradictions against existing memories
-/// 4. Insert or supersede
+/// 4. Insert or supersede (facts) / record as attempt tree nodes (attempts)
 ///
 /// Returns the number of memories added/updated.
 pub async fn extract_and_store(
@@ -906,12 +994,20 @@ pub async fn extract_and_store(
     ollama_url: &str,
     embed_model: &str,
 ) -> usize {
-    let facts = extract_memories(conversation, provider, model).await;
-    if facts.is_empty() {
+    let Some(response) = extract_raw(conversation, provider, model).await else {
+        return 0;
+    };
+
+    let facts = parse_extraction_response(&response);
+    let attempts = parse_attempt_lines(&response);
+
+    if facts.is_empty() && attempts.is_empty() {
         return 0;
     }
 
     let mut count = 0;
+
+    // Process facts (existing pipeline)
     for (fact, tags, importance) in facts {
         let Ok(embedding) = embed_text(&fact, ollama_url, embed_model).await else {
             continue;
@@ -946,6 +1042,29 @@ pub async fn extract_and_store(
                 count += 1;
             }
         }
+    }
+
+    // Process attempts -- group by goal, create tree structure
+    // Attempts with the same goal become siblings under a shared root.
+    let mut goal_roots: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for attempt in attempts {
+        let embed_text_str = format!("{} | {}", attempt.goal, attempt.approach);
+        let Ok(embedding) = embed_text(&embed_text_str, ollama_url, embed_model).await else {
+            continue;
+        };
+        // Reuse or create a root for this goal
+        let parent_id = goal_roots.get(&attempt.goal).copied();
+        let id = store.record_attempt(
+            attempt.goal.clone(),
+            attempt.approach,
+            parent_id,
+            embedding,
+            7, // attempts extracted at compaction are inherently important
+        );
+        store.record_outcome(id, attempt.outcome, Some(attempt.detail));
+        // First attempt for this goal becomes the root
+        goal_roots.entry(attempt.goal).or_insert(id);
+        count += 1;
     }
 
     count
@@ -1193,12 +1312,7 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
             .count()
     }
 
-    fn record_outcome(
-        &mut self,
-        attempt_id: u64,
-        outcome: &str,
-        detail: Option<String>,
-    ) -> bool {
+    fn record_outcome(&mut self, attempt_id: u64, outcome: &str, detail: Option<String>) -> bool {
         let outcome_enum = match outcome {
             "success" => Outcome::Success,
             "failure" => Outcome::Failure,
@@ -1906,9 +2020,16 @@ mod tests {
         let e = make_embedding(1.0);
         let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 6);
         let child1 = store.record_attempt("goal".into(), "child1".into(), Some(root), e.clone(), 6);
-        let _child2 = store.record_attempt("goal".into(), "child2".into(), Some(root), e.clone(), 6);
+        let _child2 =
+            store.record_attempt("goal".into(), "child2".into(), Some(root), e.clone(), 6);
         // Grandchild should not appear
-        store.record_attempt("goal".into(), "grandchild".into(), Some(child1), e.clone(), 6);
+        store.record_attempt(
+            "goal".into(),
+            "grandchild".into(),
+            Some(child1),
+            e.clone(),
+            6,
+        );
 
         let children = store.children(root);
         assert_eq!(children.len(), 2);
@@ -1935,7 +2056,8 @@ mod tests {
         let e = make_embedding(1.0);
         let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 6);
         let child = store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 6);
-        let grandchild = store.record_attempt("goal".into(), "gc".into(), Some(child), e.clone(), 6);
+        let grandchild =
+            store.record_attempt("goal".into(), "gc".into(), Some(child), e.clone(), 6);
 
         let path = store.path_to_root(grandchild);
         assert_eq!(path.len(), 3);
@@ -1960,7 +2082,13 @@ mod tests {
         let e = make_embedding(1.0);
         let root = store.record_attempt("fix bug".into(), "approach A".into(), None, e.clone(), 6);
         store.record_outcome(root, Outcome::Failure, Some("type error".into()));
-        let child = store.record_attempt("fix bug".into(), "approach B".into(), Some(root), e.clone(), 6);
+        let child = store.record_attempt(
+            "fix bug".into(),
+            "approach B".into(),
+            Some(root),
+            e.clone(),
+            6,
+        );
         store.record_outcome(child, Outcome::Success, Some("worked".into()));
 
         let tree = store.build_attempt_tree(&store.entries[0].clone());
@@ -2005,11 +2133,29 @@ mod tests {
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
         // Create two separate attempt trees
-        let root1 = store.record_attempt("fix auth bug".into(), "try reset".into(), None, e.clone(), 6);
+        let root1 = store.record_attempt(
+            "fix auth bug".into(),
+            "try reset".into(),
+            None,
+            e.clone(),
+            6,
+        );
         store.record_outcome(root1, Outcome::Failure, Some("didn't work".into()));
-        store.record_attempt("fix auth bug".into(), "try logout".into(), Some(root1), e.clone(), 6);
+        store.record_attempt(
+            "fix auth bug".into(),
+            "try logout".into(),
+            Some(root1),
+            e.clone(),
+            6,
+        );
 
-        let root2 = store.record_attempt("improve perf".into(), "add cache".into(), None, make_embedding(100.0), 6);
+        let root2 = store.record_attempt(
+            "improve perf".into(),
+            "add cache".into(),
+            None,
+            make_embedding(100.0),
+            6,
+        );
         store.record_outcome(root2, Outcome::Success, None);
 
         // Query with embedding similar to root1
@@ -2076,10 +2222,14 @@ mod tests {
         let mut store = MemoryStore::default();
         let e = make_embedding(1.0);
         let id = store.record_attempt("goal".into(), "approach".into(), None, e, 6);
-        assert!(MemoryStoreView::record_outcome(&mut store, id, "success", None));
+        assert!(MemoryStoreView::record_outcome(
+            &mut store, id, "success", None
+        ));
         assert_eq!(store.entries[0].outcome, Some(Outcome::Success));
         // Invalid outcome string
-        assert!(!MemoryStoreView::record_outcome(&mut store, id, "bogus", None));
+        assert!(!MemoryStoreView::record_outcome(
+            &mut store, id, "bogus", None
+        ));
     }
 
     #[test]
@@ -2097,5 +2247,56 @@ mod tests {
         assert!(detail.contains("Outcome: Failure"));
         assert!(detail.contains("Outcome detail: broke it"));
         assert!(detail.contains("Children:"));
+    }
+
+    // --- Attempt extraction parser tests ---
+
+    #[test]
+    fn parse_attempt_lines_basic() {
+        let response = "\
+- [importance:7] Some fact {tags: test}
+- [attempt] goal: fix UTF-8 rendering | approach: byte slicing | outcome: failure | detail: panics on multi-byte
+- [attempt] goal: fix UTF-8 rendering | approach: char iterator | outcome: success | detail: handles all unicode";
+        let attempts = super::parse_attempt_lines(response);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].goal, "fix UTF-8 rendering");
+        assert_eq!(attempts[0].approach, "byte slicing");
+        assert_eq!(attempts[0].outcome, Outcome::Failure);
+        assert_eq!(attempts[0].detail, "panics on multi-byte");
+        assert_eq!(attempts[1].outcome, Outcome::Success);
+    }
+
+    #[test]
+    fn parse_attempt_lines_skips_pending() {
+        let response = "- [attempt] goal: test | approach: thing | outcome: pending | detail: still going";
+        let attempts = super::parse_attempt_lines(response);
+        assert!(attempts.is_empty()); // pending outcomes are skipped
+    }
+
+    #[test]
+    fn parse_attempt_lines_skips_incomplete() {
+        let response = "- [attempt] goal: test | approach: thing";
+        let attempts = super::parse_attempt_lines(response);
+        assert!(attempts.is_empty()); // missing outcome field
+    }
+
+    #[test]
+    fn parse_attempt_lines_none_response() {
+        let response = "NONE";
+        let attempts = super::parse_attempt_lines(response);
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_facts_and_attempts() {
+        let response = "\
+- [importance:8] User prefers explicit error handling {tags: rust, style}
+- [attempt] goal: reduce compile time | approach: split into subcrates | outcome: success | detail: 40% faster builds
+- [importance:5] Project uses tokio runtime {tags: rust, async}";
+        let facts = super::parse_extraction_response(response);
+        let attempts = super::parse_attempt_lines(response);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].goal, "reduce compile time");
     }
 }
