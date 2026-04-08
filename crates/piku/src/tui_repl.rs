@@ -634,58 +634,32 @@ impl OutputSink for TuiSink {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run_tui_repl(
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
-) -> anyhow::Result<()> {
-    run_tui_repl_with_session(
-        model_override,
-        provider_override,
-        None,
-        TokenUsage::default(),
-    )
-    .await
+pub async fn run_tui_repl(config: &crate::config::PikuConfig) -> anyhow::Result<()> {
+    run_tui_repl_with_session(config, None, TokenUsage::default()).await
 }
 
 /// Like `run_tui_repl` but resumes from an existing session (e.g. after a
 /// single-shot turn).  `initial_usage` is added to the running total so
 /// `/cost` reflects the full conversation.
 pub async fn run_tui_repl_with_session(
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &crate::config::PikuConfig,
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(
-        model_override,
-        provider_override,
-        existing_session,
-        initial_usage,
-        false,
-    )
-    .await
+    run_tui_repl_inner(config, existing_session, initial_usage, false).await
 }
 
-/// Like `run_tui_repl_with_session` but shows a "↺ restarted" banner —
+/// Like `run_tui_repl_with_session` but shows a "restarted" banner --
 /// used after a seamless self-rebuild exec.
 pub async fn run_tui_repl_post_restart(
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &crate::config::PikuConfig,
     existing_session: Option<Session>,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(
-        model_override,
-        provider_override,
-        existing_session,
-        TokenUsage::default(),
-        true,
-    )
-    .await
+    run_tui_repl_inner(config, existing_session, TokenUsage::default(), true).await
 }
 
 async fn run_tui_repl_inner(
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &crate::config::PikuConfig,
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
     post_restart: bool,
@@ -696,8 +670,7 @@ async fn run_tui_repl_inner(
     let local = tokio::task::LocalSet::new();
     local
         .run_until(run_tui_repl_core(
-            model_override,
-            provider_override,
+            config,
             existing_session,
             initial_usage,
             post_restart,
@@ -706,14 +679,15 @@ async fn run_tui_repl_inner(
 }
 
 async fn run_tui_repl_core(
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &crate::config::PikuConfig,
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
     post_restart: bool,
 ) -> anyhow::Result<()> {
-    let resolved = ResolvedProvider::resolve(provider_override)?;
-    let mut model = model_override
+    let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
+    let mut model = config
+        .model
+        .as_deref()
         .unwrap_or(&resolved.default_model)
         .to_string();
 
@@ -747,7 +721,8 @@ async fn run_tui_repl_core(
     task_registry.set_notification_channel(notif_tx);
     let mut notif_rx = notif_rx;
 
-    let sessions_dir = crate::sessions_dir()?;
+    let sessions_dir = config.sessions_dir();
+    std::fs::create_dir_all(&sessions_dir)?;
 
     let (session_id, mut session) = if let Some(s) = existing_session {
         let id = s.id.clone();
