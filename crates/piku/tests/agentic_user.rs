@@ -2689,10 +2689,13 @@ fn run_agentic_session(persona: &Persona) {
 }
 
 // ===========================================================================
-// Test entry points
+// Test entry points — serialized to avoid Ollama model contention
 // ===========================================================================
 
+use serial_test::serial;
+
 #[test]
+#[serial(agentic)]
 fn agentic_user_confident_dev() {
     if !is_enabled() {
         return;
@@ -2702,6 +2705,7 @@ fn agentic_user_confident_dev() {
 }
 
 #[test]
+#[serial(agentic)]
 fn agentic_user_cautious_beginner() {
     if !is_enabled() {
         return;
@@ -2711,6 +2715,7 @@ fn agentic_user_cautious_beginner() {
 }
 
 #[test]
+#[serial(agentic)]
 fn agentic_user_adversarial() {
     if !is_enabled() {
         return;
@@ -2720,6 +2725,7 @@ fn agentic_user_adversarial() {
 }
 
 #[test]
+#[serial(agentic)]
 fn agentic_user_input_explorer() {
     if !is_enabled() {
         return;

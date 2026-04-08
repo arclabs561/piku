@@ -104,20 +104,30 @@ pub struct HookRegistry {
 }
 
 impl HookRegistry {
-    /// Load hooks from `.piku/hooks.json` in the project directory.
+    /// Load hooks from global `~/.config/piku/hooks.json` merged with
+    /// project-local `.piku/hooks.json`. Project hooks are appended (run after global).
     #[must_use]
     pub fn load(project_dir: &Path) -> Self {
-        let hooks_path = project_dir.join(".piku").join("hooks.json");
-        let config = match std::fs::read_to_string(&hooks_path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    eprintln!("[piku] warning: failed to parse hooks.json: {e}");
-                    HookConfig::default()
-                }
-            },
-            Err(_) => HookConfig::default(), // No hooks file = no hooks
-        };
+        // Layer 1: global hooks
+        let global_dir = global_config_dir();
+        let mut config = load_hooks_file(&global_dir.join("hooks.json"));
+
+        // Layer 2: project-local hooks (appended)
+        let project_config = load_hooks_file(&project_dir.join(".piku").join("hooks.json"));
+        merge_hook_config(&mut config, project_config);
+
+        Self {
+            config,
+            project_dir: Some(project_dir.to_path_buf()),
+        }
+    }
+
+    /// Load hooks from a single project directory only (no global merge).
+    /// Used in tests where global config should not interfere.
+    #[cfg(test)]
+    #[must_use]
+    pub fn load_project_only(project_dir: &Path) -> Self {
+        let config = load_hooks_file(&project_dir.join(".piku").join("hooks.json"));
         Self {
             config,
             project_dir: Some(project_dir.to_path_buf()),
@@ -417,6 +427,39 @@ fn run_hook_command_raw(
     }
 }
 
+fn global_config_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from(".config"),
+                |h| PathBuf::from(h).join(".config"),
+            )
+        },
+        PathBuf::from,
+    );
+    base.join("piku")
+}
+
+fn load_hooks_file(path: &Path) -> HookConfig {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("[piku] warning: failed to parse {}: {e}", path.display());
+                HookConfig::default()
+            }
+        },
+        Err(_) => HookConfig::default(),
+    }
+}
+
+fn merge_hook_config(base: &mut HookConfig, overlay: HookConfig) {
+    base.pre_tool_use.extend(overlay.pre_tool_use);
+    base.post_tool_use.extend(overlay.post_tool_use);
+    base.session_start.extend(overlay.session_start);
+    base.stop.extend(overlay.stop);
+}
+
 /// Check if a tool name matches a matcher pattern.
 /// Supports: exact match, pipe-delimited alternation (`"Edit|Write"`), wildcard (`"*"`).
 fn matches_tool(matcher: Option<&str>, tool_name: &str) -> bool {
@@ -466,17 +509,30 @@ fn check_if_condition(
         return false;
     };
 
-    // Simple glob matching: `*` matches anything
+    // Glob matching: `*` wildcard at start, end, or both.
     if pattern == "*" {
         return true;
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return arg.starts_with(prefix);
+    let starts_star = pattern.starts_with('*');
+    let ends_star = pattern.ends_with('*');
+    match (starts_star, ends_star) {
+        (true, true) => {
+            // *contains*
+            let inner = &pattern[1..pattern.len() - 1];
+            arg.contains(inner)
+        }
+        (false, true) => {
+            // prefix*
+            let prefix = &pattern[..pattern.len() - 1];
+            arg.starts_with(prefix)
+        }
+        (true, false) => {
+            // *suffix
+            let suffix = &pattern[1..];
+            arg.ends_with(suffix)
+        }
+        (false, false) => arg == pattern,
     }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return arg.ends_with(suffix);
-    }
-    arg == pattern
 }
 
 /// Parse `PreToolUse` hook JSON output for a decision.
@@ -612,7 +668,7 @@ mod tests {
     #[test]
     fn load_empty_config() {
         let dir = tempfile::tempdir().unwrap();
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         assert!(!registry.has_hooks());
     }
 
@@ -632,7 +688,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         assert!(registry.has_hooks());
         assert_eq!(registry.config.pre_tool_use.len(), 1);
     }
@@ -652,7 +708,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         let context = registry.run_session_start("test-session", dir.path());
         assert!(context.is_some());
         assert!(context.unwrap().contains("hello from hook"));
@@ -674,7 +730,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         let result = registry.run_pre_tool_use(
             "bash",
             &serde_json::json!({"command": "rm -rf /"}),
@@ -703,7 +759,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         let result = registry.run_pre_tool_use(
             "read_file",
             &serde_json::json!({"path": "test.rs"}),
@@ -727,7 +783,7 @@ mod tests {
         });
         std::fs::write(hooks_dir.join("hooks.json"), json.to_string()).unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         registry.run_stop("test-session", dir.path(), 3, "end_turn");
         assert!(marker.exists(), "stop hook should write marker file");
         let content = std::fs::read_to_string(&marker).unwrap();
@@ -750,7 +806,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = HookRegistry::load(dir.path());
+        let registry = HookRegistry::load_project_only(dir.path());
         let start = std::time::Instant::now();
         let context = registry.run_session_start("test-session", dir.path());
         let elapsed = start.elapsed();
@@ -771,5 +827,56 @@ mod tests {
         let result = parse_pre_tool_decision(stdout_json).unwrap();
         assert_eq!(result.decision, HookDecision::Allow);
         assert_eq!(result.context.as_deref(), Some("remember to be careful"));
+    }
+
+    #[test]
+    fn merge_hook_configs() {
+        let mut base = HookConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("Bash".to_string()),
+                hooks: vec![HookHandler {
+                    command: "echo global".to_string(),
+                    if_condition: None,
+                    r#async: false,
+                    timeout: 10,
+                }],
+            }],
+            ..Default::default()
+        };
+        let overlay = HookConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("Edit".to_string()),
+                hooks: vec![HookHandler {
+                    command: "echo project".to_string(),
+                    if_condition: None,
+                    r#async: false,
+                    timeout: 10,
+                }],
+            }],
+            stop: vec![HookEntry {
+                matcher: None,
+                hooks: vec![HookHandler {
+                    command: "echo stop".to_string(),
+                    if_condition: None,
+                    r#async: false,
+                    timeout: 10,
+                }],
+            }],
+            ..Default::default()
+        };
+        merge_hook_config(&mut base, overlay);
+        assert_eq!(base.pre_tool_use.len(), 2);
+        assert_eq!(base.stop.len(), 1);
+    }
+
+    #[test]
+    fn check_if_contains_pattern() {
+        let input = serde_json::json!({"command": "git push --force origin main"});
+        assert!(check_if_condition(Some("bash(*--force*)"), "bash", &input));
+        assert!(!check_if_condition(
+            Some("bash(*--delete*)"),
+            "bash",
+            &input
+        ));
     }
 }
