@@ -352,7 +352,7 @@ async fn run_turn_inner(
                         ).await;
                         match embed_result {
                             Ok(Ok(query_vec)) => {
-                                let retrieved = store.retrieve(&query_vec, max_k);
+                                let retrieved = store.hybrid_retrieve(&query_vec, query, max_k);
                                 let _ = store.save(&store_path);
                                 if retrieved.is_empty() {
                                     ("No relevant memories found for that query.".to_string(), false)
@@ -910,7 +910,7 @@ fn execute_spawn_agent(
                 })
             });
             if let Ok(Ok(query_vec)) = query_result {
-                let retrieved = store.retrieve(&query_vec, 5);
+                let retrieved = store.hybrid_retrieve(&query_vec, &query_text, 5);
                 if !retrieved.is_empty() {
                     let mem_section =
                         crate::embed_memory::format_retrieved_memories(&retrieved);

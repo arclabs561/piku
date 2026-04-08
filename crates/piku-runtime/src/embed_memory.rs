@@ -349,6 +349,67 @@ impl MemoryStore {
     pub fn find_similar(&self, embedding: &[f32], k: usize) -> Vec<RetrievedMemory> {
         self.search(embedding, k)
     }
+
+    /// Hybrid retrieval: combines embedding similarity with keyword matching.
+    /// Boosts memories whose tags or content match query keywords.
+    /// This is the default search mode -- works at all scales.
+    pub fn hybrid_retrieve(
+        &mut self,
+        query_embedding: &[f32],
+        query_text: &str,
+        k: usize,
+    ) -> Vec<RetrievedMemory> {
+        let now = now_unix();
+        let query_terms: Vec<String> = query_text
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 2) // skip short words
+            .map(String::from)
+            .collect();
+
+        let mut scored: Vec<(f32, f32, f32, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_valid)
+            .map(|(i, e)| {
+                let sim = dot(query_embedding, &e.embedding);
+                let base_score = composite_score(sim, e, now);
+
+                // Keyword boost: check tags and content for query term matches
+                let haystack = format!(
+                    "{} {}",
+                    e.content.to_lowercase(),
+                    e.tags.join(" ").to_lowercase()
+                );
+                let keyword_hits = query_terms
+                    .iter()
+                    .filter(|t| haystack.contains(t.as_str()))
+                    .count();
+                let keyword_boost = (keyword_hits as f32 * 0.05).min(0.15);
+
+                let final_score = base_score + keyword_boost;
+                (sim, final_score, keyword_boost, i)
+            })
+            .filter(|(sim, _, _, _)| *sim >= MIN_SIMILARITY)
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(sim, score, _, idx)| {
+                self.entries[idx].last_accessed = now;
+                self.entries[idx].access_count += 1;
+                RetrievedMemory {
+                    entry: self.entries[idx].clone(),
+                    similarity: sim,
+                    score,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Default store path for a project.
@@ -400,20 +461,21 @@ extract 0-5 atomic facts worth remembering for future sessions.
 
 Rules:
 - Each fact must be self-contained (no pronouns, no \"the project\")
-- One fact per line, format: `- [importance:N] fact text` where N is 1-10
-  - 1-2: trivial, not worth storing
-  - 3-4: mildly useful context
-  - 5-6: useful preference or convention
-  - 7-8: important decision or error pattern
-  - 9-10: critical correction or safety constraint
+- One fact per line, format: `- [importance:N] fact text {tags: a, b, c}`
+  - importance is 1-10:
+    - 1-2: trivial, not worth storing
+    - 3-4: mildly useful context
+    - 5-6: useful preference or convention
+    - 7-8: important decision or error pattern
+    - 9-10: critical correction or safety constraint
+  - tags: 1-4 lowercase keywords for this specific fact
 - Include: user preferences, project conventions, error patterns, key decisions
 - Exclude: transient task details, file contents, code snippets, things derivable from git
 - If nothing is worth remembering, output exactly: NONE
 
 Output format:
-- [importance:7] The user prefers snake_case in Rust code
-- [importance:9] Never use byte slicing on UTF-8 strings -- use chars().take(n)
-TAGS: rust, style, safety
+- [importance:7] The user prefers snake_case in Rust code {tags: rust, style}
+- [importance:9] Never use byte slicing on UTF-8 strings {tags: rust, safety, unicode}
 
 Or:
 NONE";
@@ -464,15 +526,17 @@ pub async fn extract_memories(
 }
 
 /// Parse the LLM's extraction response into (fact, tags, importance) tuples.
+/// Supports per-fact tags: `- [importance:N] fact text {tags: a, b, c}`
+/// Falls back to a shared `TAGS:` line if per-fact tags are absent.
 fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
     let mut facts = Vec::new();
-    let mut current_tags: Vec<String> = Vec::new();
 
-    // Extract TAGS line if present
+    // Shared TAGS fallback (last TAGS: line applies to facts without inline tags)
+    let mut shared_tags: Vec<String> = Vec::new();
     for line in response.lines().rev() {
         let trimmed = line.trim();
         if let Some(tags_str) = trimmed.strip_prefix("TAGS:") {
-            current_tags = tags_str
+            shared_tags = tags_str
                 .split(',')
                 .map(|t| t.trim().to_lowercase())
                 .filter(|t| !t.is_empty())
@@ -481,30 +545,45 @@ fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
         }
     }
 
-    // Extract facts (lines starting with "- ")
     for line in response.lines() {
         let trimmed = line.trim();
-        if let Some(fact_text) = trimmed.strip_prefix("- ") {
-            let fact_text = fact_text.trim();
-            if fact_text.is_empty() || fact_text.starts_with("TAGS:") {
-                continue;
-            }
-            // Parse optional [importance:N] prefix
-            let (importance, fact) = if fact_text.starts_with("[importance:") {
-                if let Some(end) = fact_text.find(']') {
-                    let num_str = &fact_text[12..end];
-                    let imp = num_str.parse::<u8>().unwrap_or(5);
-                    let rest = fact_text[end + 1..].trim();
-                    (imp, rest.to_string())
-                } else {
-                    (5, fact_text.to_string())
-                }
+        let Some(fact_text) = trimmed.strip_prefix("- ") else {
+            continue;
+        };
+        let fact_text = fact_text.trim();
+        if fact_text.is_empty() || fact_text.starts_with("TAGS:") {
+            continue;
+        }
+
+        // Parse optional [importance:N] prefix
+        let (importance, rest) = if fact_text.starts_with("[importance:") {
+            if let Some(end) = fact_text.find(']') {
+                let num_str = &fact_text[12..end];
+                let imp = num_str.parse::<u8>().unwrap_or(5);
+                (imp, fact_text[end + 1..].trim())
             } else {
-                (5, fact_text.to_string())
-            };
-            if !fact.is_empty() {
-                facts.push((fact, current_tags.clone(), importance));
+                (5, fact_text)
             }
+        } else {
+            (5, fact_text)
+        };
+
+        // Parse optional inline {tags: a, b, c} suffix
+        let (fact, tags) = if let Some(tag_start) = rest.rfind("{tags:") {
+            let tag_end = rest[tag_start..].find('}').map(|p| tag_start + p + 1);
+            let tag_str = &rest[tag_start + 6..tag_end.unwrap_or(rest.len()).saturating_sub(1)];
+            let inline_tags: Vec<String> = tag_str
+                .split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (rest[..tag_start].trim().to_string(), inline_tags)
+        } else {
+            (rest.to_string(), shared_tags.clone())
+        };
+
+        if !fact.is_empty() {
+            facts.push((fact, tags, importance));
         }
     }
 
@@ -933,16 +1012,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_extraction_basic() {
-        let response = "- [importance:7] The user prefers snake_case in Rust code\n\
-                        - [importance:5] The project uses tokio for async\n\
-                        TAGS: rust, style, async";
+    fn parse_extraction_per_fact_tags() {
+        let response = "- [importance:7] The user prefers snake_case {tags: rust, style}\n\
+                        - [importance:5] The project uses tokio {tags: rust, async}";
         let facts = super::parse_extraction_response(response);
         assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].0, "The user prefers snake_case in Rust code");
-        assert_eq!(facts[0].1, vec!["rust", "style", "async"]);
+        assert_eq!(facts[0].0, "The user prefers snake_case");
+        assert_eq!(facts[0].1, vec!["rust", "style"]);
         assert_eq!(facts[0].2, 7);
-        assert_eq!(facts[1].2, 5);
+        assert_eq!(facts[1].1, vec!["rust", "async"]);
+    }
+
+    #[test]
+    fn parse_extraction_shared_tags_fallback() {
+        // When no inline {tags:}, shared TAGS: line is used
+        let response = "- [importance:7] The user prefers snake_case\n\
+                        TAGS: rust, style";
+        let facts = super::parse_extraction_response(response);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].1, vec!["rust", "style"]);
     }
 
     #[test]
@@ -1151,6 +1239,21 @@ mod tests {
     }
 
     // --- Search with no valid entries ---
+
+    #[test]
+    fn hybrid_retrieve_boosts_keyword_matches() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Both have similar embeddings, but one has a tag matching the query
+        store.insert("rust fact".to_string(), vec!["rust".to_string()], e.clone(), 5);
+        store.insert("python fact".to_string(), vec!["python".to_string()], e.clone(), 5);
+
+        // Query with "rust" keyword should boost the rust-tagged entry
+        let results = store.hybrid_retrieve(&e, "rust programming", 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry.content, "rust fact");
+        assert!(results[0].score >= results[1].score);
+    }
 
     #[test]
     fn search_empty_store_returns_empty() {
