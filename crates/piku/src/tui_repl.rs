@@ -717,6 +717,23 @@ async fn run_tui_repl_core(
     let cwd = std::env::current_dir()?;
     let date = crate::current_date();
     let custom_agents = piku_runtime::load_custom_agents(&cwd);
+
+    // Session-start maintenance: evict stale/weak memories from embedding store.
+    {
+        let store_path = piku_runtime::default_store_path(&cwd);
+        let mut store = piku_runtime::MemoryStore::load(&store_path);
+        if store.valid_count() > 0 {
+            let (stale, weak) = store.maintain();
+            if stale + weak > 0 {
+                let _ = store.save(&store_path);
+                eprintln!(
+                    "\x1b[2m[memory maintenance: {} stale + {} weak entries evicted]\x1b[0m",
+                    stale, weak
+                );
+            }
+        }
+    }
+
     let task_registry = TaskRegistry::new();
     // Wire a notification channel so background agent completions inject
     // a user-role message into the parent's interjection stream.
@@ -1182,6 +1199,36 @@ async fn run_tui_repl_core(
         eprintln!("\x1b[33m[warn]\x1b[0m could not save session: {e}");
     } else if !session.messages.is_empty() {
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
+    }
+
+    // Session-end memory extraction: distill atomic facts from the conversation.
+    if session.messages.len() > 2 {
+        let transcript = piku_runtime::build_extraction_transcript(&session.messages);
+        if !transcript.trim().is_empty() {
+            let store_path = piku_runtime::default_store_path(&cwd);
+            let mut store = piku_runtime::MemoryStore::load(&store_path);
+            let ollama_url = std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            // Use a short timeout — don't make the user wait forever on exit
+            let extraction_future = piku_runtime::extract_and_store(
+                &transcript,
+                resolved.as_provider(),
+                &model,
+                &mut store,
+                &ollama_url,
+                &embed_model,
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(15), extraction_future).await
+            {
+                Ok(n) if n > 0 => {
+                    let _ = store.save(&store_path);
+                    eprintln!("\x1b[2m[{n} memories extracted from session]\x1b[0m");
+                }
+                _ => {} // timeout or no memories — exit silently
+            }
+        }
     }
 
     editor.save_history_file(&history_path);
