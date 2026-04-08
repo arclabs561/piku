@@ -323,7 +323,51 @@ async fn run_turn_inner(
             sink.on_tool_start(&tool_name, &tool_use_id, &params);
 
             // Route special tools through the runtime; everything else through execute_tool.
-            let (output, is_error) = if tool_name == "tool_search" {
+            let (output, is_error) = if tool_name == "search_memory" {
+                // Semantic search over embedding store -- needs embedding the query
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let store_path = crate::embed_memory::default_store_path(&cwd);
+                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                if store.valid_count() == 0 {
+                    ("No memories stored yet. Use write_memory to save facts.".to_string(), false)
+                } else {
+                    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let max_k = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                    let ollama_url = std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let embed_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                crate::embed_memory::embed_text(query, &ollama_url, &embed_model),
+                            ).await
+                        })
+                    });
+                    match embed_result {
+                        Ok(Ok(query_vec)) => {
+                            let retrieved = store.retrieve(&query_vec, max_k);
+                            let _ = store.save(&store_path);
+                            if retrieved.is_empty() {
+                                ("No relevant memories found for that query.".to_string(), false)
+                            } else {
+                                (crate::embed_memory::format_retrieved_memories(&retrieved), false)
+                            }
+                        }
+                        _ => ("search_memory: embedding service unavailable".to_string(), true),
+                    }
+                }
+            } else if tool_name == "manage_memory" {
+                // Memory management -- direct store access, no embedding needed
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let store_path = crate::embed_memory::default_store_path(&cwd);
+                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                let result = piku_tools::embed_memory_tool::execute_manage_memory(params, &mut store);
+                // Save if we might have mutated (invalidate)
+                let _ = store.save(&store_path);
+                (result.output, result.is_error)
+            } else if tool_name == "tool_search" {
                 // Build catalog from current tool_defs for on-demand search
                 let catalog: Vec<piku_tools::tool_search::SearchableToolEntry> = tool_defs
                     .iter()

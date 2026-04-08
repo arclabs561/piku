@@ -550,4 +550,96 @@ You are a code reviewer. Check the diff carefully.
         assert!(listing.contains("Review code"));
         assert!(listing.contains("verification"));
     }
+
+    // --- Frontmatter edge cases ---
+
+    #[test]
+    fn frontmatter_crlf_line_endings() {
+        let content = "---\r\nname: test\r\n---\r\nbody with crlf";
+        let (fm, body) = split_frontmatter(content).unwrap();
+        assert_eq!(fm.trim(), "name: test");
+        assert!(body.contains("body with crlf"));
+    }
+
+    #[test]
+    fn frontmatter_empty_body() {
+        let content = "---\nname: minimal\ndescription: test\n---\n";
+        let (fm, body) = split_frontmatter(content).unwrap();
+        assert!(fm.contains("name: minimal"));
+        assert!(body.trim().is_empty());
+    }
+
+    #[test]
+    fn frontmatter_no_closing_delimiter_returns_none() {
+        let content = "---\nname: broken\nno closing delimiter";
+        assert!(split_frontmatter(content).is_none());
+    }
+
+    #[test]
+    fn frontmatter_not_at_start_returns_none() {
+        let content = "some text\n---\nname: test\n---\nbody";
+        // The leading text means it doesn't start with ---
+        assert!(split_frontmatter(content).is_none());
+    }
+
+    #[test]
+    fn parse_agent_with_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".piku").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        fs::write(agent_dir.join("full.md"), "\
+---
+name: full-agent
+description: An agent with all fields
+allowed_tools: [read_file, grep]
+max_turns: 10
+---
+
+You are a test agent.
+").unwrap();
+
+        let agents = load_custom_agents(dir.path());
+        assert_eq!(agents.len(), 1);
+        let a = &agents[0];
+        assert_eq!(a.agent_type, "full-agent");
+        assert_eq!(a.allowed_tools, vec!["read_file", "grep"]);
+        assert_eq!(a.max_turns, Some(10));
+
+        let def = AnyAgentDef::Custom(a.clone());
+        assert!(def.is_tool_allowed("read_file"));
+        assert!(def.is_tool_allowed("grep"));
+        assert!(!def.is_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn parse_agent_missing_description_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".piku").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        fs::write(agent_dir.join("bad.md"), "\
+---
+name: no-desc
+---
+
+body
+").unwrap();
+
+        let agents = load_custom_agents(dir.path());
+        assert!(agents.is_empty()); // should be skipped
+    }
+
+    #[test]
+    fn non_md_files_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join(".piku").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        fs::write(agent_dir.join("notes.txt"), "not an agent").unwrap();
+        fs::write(agent_dir.join("config.yaml"), "also not").unwrap();
+
+        let agents = load_custom_agents(dir.path());
+        assert!(agents.is_empty());
+    }
 }
