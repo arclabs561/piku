@@ -1852,6 +1852,8 @@ impl LlmClient {
         let body_str = serde_json::to_string(&body).unwrap();
         let mut args: Vec<String> = vec![
             "-s".into(),
+            "--max-time".into(),
+            "120".into(),
             "-X".into(),
             "POST".into(),
             url,

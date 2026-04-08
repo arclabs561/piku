@@ -428,6 +428,122 @@ async fn run_turn_inner(
                     let _ = store.save(&store_path);
                 }
                 (result.output, result.is_error)
+            } else if tool_name == "record_attempt" {
+                // Record an attempt in the embedding store -- needs embedding
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let store_path = crate::embed_memory::default_store_path(&cwd);
+                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+
+                let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+                let approach = params.get("approach").and_then(|v| v.as_str()).unwrap_or("");
+                let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
+
+                if goal.trim().is_empty() || approach.trim().is_empty() {
+                    ("record_attempt requires non-empty 'goal' and 'approach'".to_string(), true)
+                } else if let Some(existing_id) = attempt_id {
+                    // Updating an existing attempt's outcome
+                    let outcome = params.get("outcome").and_then(|v| v.as_str()).unwrap_or("pending");
+                    let detail = params.get("outcome_detail").and_then(|v| v.as_str()).map(String::from);
+                    let outcome_enum = match outcome {
+                        "success" => crate::embed_memory::Outcome::Success,
+                        "failure" => crate::embed_memory::Outcome::Failure,
+                        _ => crate::embed_memory::Outcome::Pending,
+                    };
+                    if store.record_outcome(existing_id, outcome_enum, detail) {
+                        let _ = store.save(&store_path);
+                        (format!("attempt {existing_id} updated: {outcome}"), false)
+                    } else {
+                        (format!("attempt {existing_id} not found"), true)
+                    }
+                } else {
+                    // Creating a new attempt -- need to embed the approach
+                    let ollama_url = std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let embed_text = format!("{goal} | {approach}");
+                    let embed_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        crate::embed_memory::embed_text(&embed_text, &ollama_url, &embed_model),
+                    )
+                    .await;
+                    match embed_result {
+                        Ok(Ok(embedding)) => {
+                            let parent_id = params.get("parent_id").and_then(serde_json::Value::as_u64);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let importance = params
+                                .get("importance")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(6) as u8;
+                            let id = store.record_attempt(
+                                goal.to_string(),
+                                approach.to_string(),
+                                parent_id,
+                                embedding,
+                                importance,
+                            );
+                            // Apply immediate outcome if provided
+                            let outcome = params.get("outcome").and_then(|v| v.as_str());
+                            if let Some(outcome_str) = outcome {
+                                let detail = params.get("outcome_detail").and_then(|v| v.as_str()).map(String::from);
+                                let outcome_enum = match outcome_str {
+                                    "success" => crate::embed_memory::Outcome::Success,
+                                    "failure" => crate::embed_memory::Outcome::Failure,
+                                    _ => crate::embed_memory::Outcome::Pending,
+                                };
+                                store.record_outcome(id, outcome_enum, detail);
+                            }
+                            let _ = store.save(&store_path);
+                            let status = params.get("outcome").and_then(|v| v.as_str()).unwrap_or("pending");
+                            (format!("attempt recorded (id={id}, status={status})"), false)
+                        }
+                        _ => (
+                            "record_attempt: embedding service unavailable".to_string(),
+                            true,
+                        ),
+                    }
+                }
+            } else if tool_name == "query_attempts" {
+                // Query attempt trees by goal similarity -- needs embedding
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let store_path = crate::embed_memory::default_store_path(&cwd);
+                let store = crate::embed_memory::MemoryStore::load(&store_path);
+                let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+                if goal.trim().is_empty() {
+                    ("query_attempts requires a non-empty 'goal'".to_string(), true)
+                } else if store.valid_count() == 0 {
+                    ("No attempts recorded yet. Use record_attempt to log what you try.".to_string(), false)
+                } else {
+                    let ollama_url = std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let embed_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        crate::embed_memory::embed_text(goal, &ollama_url, &embed_model),
+                    )
+                    .await;
+                    match embed_result {
+                        Ok(Ok(goal_vec)) => {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let max_trees = params
+                                .get("max_trees")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(3) as usize;
+                            // find_attempt_trees takes &self, no need for mut
+                            let trees = store.find_attempt_trees(&goal_vec, goal, max_trees);
+                            if trees.is_empty() {
+                                ("No prior attempts found for a similar goal.".to_string(), false)
+                            } else {
+                                (crate::embed_memory::format_attempt_trees(&trees), false)
+                            }
+                        }
+                        _ => (
+                            "query_attempts: embedding service unavailable".to_string(),
+                            true,
+                        ),
+                    }
+                }
             } else if tool_name == "tool_search" {
                 // Build catalog from current tool_defs for on-demand search
                 let catalog: Vec<piku_tools::tool_search::SearchableToolEntry> = tool_defs

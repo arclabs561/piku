@@ -1,3 +1,4 @@
+pub mod attempt_tree_tool;
 pub mod bash;
 pub mod edit_file;
 pub mod embed_memory_tool;
@@ -140,6 +141,8 @@ pub async fn execute_tool(name: &str, params: serde_json::Value) -> Option<ToolR
             "manage_memory requires the embedding runtime. Use it in an interactive session."
                 .to_string(),
         )),
+        "record_attempt" => Some(attempt_tree_tool::execute_record_attempt_stub(params)),
+        "query_attempts" => Some(attempt_tree_tool::execute_query_attempts_stub(params)),
         _ => None,
     }
 }
@@ -234,5 +237,17 @@ static TOOLS: &[ToolEntry] = &[
         description: "Manage your embedding memory store. Actions: 'stats' (counts), 'list' (recent entries), 'inspect' (full detail by ID), 'invalidate' (mark as outdated), 'query_tags' (find by tag).",
         schema_fn: embed_memory_tool::manage_memory_schema,
         destructiveness_fn: embed_memory_tool::manage_memory_destructiveness,
+    },
+    ToolEntry {
+        name: "record_attempt",
+        description: "Record an approach you are trying (or tried) toward a goal. Builds a tree of what works and what doesn't. Use attempt_id to update outcome of an existing attempt. Future agents can query these trees to avoid repeating failures.",
+        schema_fn: attempt_tree_tool::record_attempt_schema,
+        destructiveness_fn: attempt_tree_tool::record_attempt_destructiveness,
+    },
+    ToolEntry {
+        name: "query_attempts",
+        description: "Search for prior attempt trees matching a goal. Returns tree-structured history of approaches tried, their outcomes, and why they succeeded or failed. Use before starting a complex task to learn from past experience.",
+        schema_fn: attempt_tree_tool::query_attempts_schema,
+        destructiveness_fn: attempt_tree_tool::query_attempts_destructiveness,
     },
 ];

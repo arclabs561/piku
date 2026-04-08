@@ -115,8 +115,9 @@ pub fn execute_manage_memory(
             let total = store.total_count();
             let valid = store.valid_count();
             let invalid = total - valid;
+            let attempts = store.attempt_count();
             ToolResult::ok(format!(
-                "Memory store stats:\n- Total entries: {total}\n- Valid: {valid}\n- Invalid: {invalid}"
+                "Memory store stats:\n- Total entries: {total}\n- Valid: {valid}\n- Invalid: {invalid}\n- Attempts: {attempts}"
             ))
         }
         "list" => {
@@ -185,5 +186,14 @@ pub mod piku_runtime_types {
         fn inspect(&self, id: u64) -> Option<String>;
         fn invalidate(&mut self, id: u64) -> bool;
         fn query_by_tag(&self, tag: &str, max: usize) -> Vec<(u64, String)>;
+        /// Count of attempt-type entries (valid only).
+        fn attempt_count(&self) -> usize;
+        /// Record outcome on an attempt. Returns false if not found.
+        fn record_outcome(
+            &mut self,
+            attempt_id: u64,
+            outcome: &str,
+            detail: Option<String>,
+        ) -> bool;
     }
 }
