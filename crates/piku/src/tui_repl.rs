@@ -1454,7 +1454,6 @@ fn handle_slash_cmd(
                         TaskStatus::Running => "\x1b[33m",
                         TaskStatus::Done => "\x1b[32m",
                         TaskStatus::Failed => "\x1b[31m",
-                        TaskStatus::Cancelled => "\x1b[2m",
                     };
                     let elapsed = t.elapsed().as_secs();
                     println!(

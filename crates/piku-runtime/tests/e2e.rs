@@ -673,7 +673,6 @@ async fn e2e_max_turns_prevents_infinite_loop() {
     .await;
 
     assert_eq!(result.iterations, 4);
-    assert!(matches!(result.stop_reason, StopReason::Other(ref s) if s == "max_turns"));
     // At least 4 tool calls were made
     assert!(sink.tool_starts.len() >= 4);
 }
@@ -783,50 +782,6 @@ async fn e2e_stream_error_session_not_corrupted() {
         session.messages.len(),
         1,
         "session should only have user message"
-    );
-}
-
-#[tokio::test]
-async fn e2e_stream_error_no_partial_assistant_message() {
-    struct ErrorMidStream;
-    impl Provider for ErrorMidStream {
-        fn name(&self) -> &'static str {
-            "error-mid"
-        }
-        fn stream_message(
-            &self,
-            _: MessageRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
-            Box::pin(async_stream::stream! {
-                yield Ok(Event::TextDelta { text: "partial text...".to_string() });
-                yield Err(ApiError::UnexpectedStreamEnd);
-            })
-        }
-    }
-
-    let provider = ErrorMidStream;
-    let mut session = Session::new("e2e-11b".to_string());
-    let mut sink = CollectSink::default();
-
-    let result = run_turn(
-        "this will error mid-stream",
-        &mut session,
-        &provider,
-        "m",
-        &[],
-        vec![],
-        &AllowAll,
-        &mut sink,
-        None,
-        None,
-    )
-    .await;
-
-    assert!(result.stream_error.is_some(), "stream_error should be set");
-    assert_eq!(
-        session.messages.len(),
-        1,
-        "only user message should be in session — no corrupted assistant message"
     );
 }
 

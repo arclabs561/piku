@@ -15,13 +15,11 @@ pub use agent_loop::{
     TurnResult,
 };
 pub use agents::{
-    agent_listing_prompt, agent_listing_prompt_with_custom, all_built_ins, find_agent,
-    find_built_in, load_custom_agents, AgentDef, AnyAgentDef, CustomAgentDef,
+    agent_listing_prompt_with_custom, find_agent, find_built_in, load_custom_agents, AgentDef,
+    AnyAgentDef, CustomAgentDef,
 };
 pub use compact::{
-    apply_compact_summary, compact_session, compact_system_prompt, estimate_session_tokens,
-    format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,
-    CompactionResult,
+    apply_compact_summary, compact_session, should_compact, CompactionConfig, CompactionResult,
 };
 pub use embed_memory::{
     build_extraction_transcript, default_store_path, embed_text, extract_and_store,

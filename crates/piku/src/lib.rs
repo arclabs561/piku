@@ -12,7 +12,6 @@
 pub mod cli;
 pub mod input_helper;
 pub mod markdown;
-pub mod repl;
 /// Public library surface — used by integration tests and main.rs.
 pub mod self_update;
 pub mod trace;
@@ -21,7 +20,7 @@ pub mod tui_repl;
 use std::env;
 
 // ---------------------------------------------------------------------------
-// Shared utilities (used by both main.rs and repl.rs)
+// Shared utilities
 // ---------------------------------------------------------------------------
 
 pub fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {

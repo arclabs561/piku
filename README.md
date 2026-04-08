@@ -13,8 +13,7 @@ session persistence, and local dogfood workflows.
 │   ├── piku-runtime/ # agent loop, session, permissions
 │   └── piku-tools/   # built-in tools
 ├── tests/fixture/    # isolated play-dir used by agentic dogfood
-├── justfile          # repo entrypoints
-└── rust/             # legacy/reference workspace, not part of the main build
+└── justfile          # repo entrypoints
 ```
 
 ## Build
@@ -61,7 +60,3 @@ Full multi-turn mode:
 just agentic-user-full
 ```
 
-## Notes
-
-- The root workspace is the active implementation.
-- `rust/` is retained as a legacy/reference workspace and is not part of the default build or test commands above.
