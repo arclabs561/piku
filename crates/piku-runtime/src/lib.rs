@@ -2,6 +2,7 @@ pub mod agent_loop;
 pub mod agents;
 pub mod compact;
 pub mod embed_memory;
+pub mod hooks;
 pub mod memory;
 pub mod permission;
 pub mod prompt;
@@ -25,6 +26,7 @@ pub use embed_memory::{
     extract_memories, format_retrieved_memories, MemoryEntry, MemoryJudgment, MemoryStore,
     RetrievedMemory,
 };
+pub use hooks::{HookConfig, HookRegistry};
 pub use memory::{
     build_agent_memory_prompt, build_memory_prompt, read_agent_memory, read_memory,
     write_agent_memory, write_memory, MemoryScope,
