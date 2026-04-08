@@ -1481,11 +1481,11 @@ fn subagent_type_routes_to_builtin_system_prompt() {
         "wrong system prompt"
     );
     assert!(
-        def.disallowed_tools.contains(&"write_file"),
+        def.disallowed_tools.iter().any(|t| t == "write_file"),
         "write_file must be disallowed"
     );
     assert!(
-        def.disallowed_tools.contains(&"edit_file"),
+        def.disallowed_tools.iter().any(|t| t == "edit_file"),
         "edit_file must be disallowed"
     );
 }
@@ -1496,7 +1496,7 @@ fn explorer_agent_disallows_bash() {
     use piku_runtime::agents::find_built_in;
     let def = find_built_in("explorer").expect("explorer agent must exist");
     assert!(
-        def.disallowed_tools.contains(&"bash"),
+        def.disallowed_tools.iter().any(|t| t == "bash"),
         "explorer must disallow bash"
     );
     assert!(

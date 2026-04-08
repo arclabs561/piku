@@ -1,4 +1,4 @@
-/// Agent definitions — built-in and custom (loaded from `.piku/agents/*.md`).
+/// Agent definitions -- built-in and custom (loaded from `.piku/agents/*.md`).
 ///
 /// Each agent has a type name, a system prompt, and optional tool
 /// restrictions.  The agent loop resolves these when the model calls
@@ -19,92 +19,30 @@
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// Definition types
+// Definition type (unified -- serves both built-in and custom agents)
 // ---------------------------------------------------------------------------
 
-/// A built-in agent definition with `&'static` string references.
 #[derive(Debug, Clone)]
 pub struct AgentDef {
-    pub agent_type: &'static str,
-    pub when_to_use: &'static str,
-    pub system_prompt: &'static str,
-    pub disallowed_tools: &'static [&'static str],
-    /// When non-empty, only these tools are available (`disallowed_tools` ignored).
-    pub allowed_tools: &'static [&'static str],
-    pub max_turns: Option<u32>,
-}
-
-/// A custom agent definition loaded from a `.md` file (owns its strings).
-#[derive(Debug, Clone)]
-pub struct CustomAgentDef {
     pub agent_type: String,
     pub when_to_use: String,
     pub system_prompt: String,
     pub disallowed_tools: Vec<String>,
+    /// When non-empty, only these tools are available (`disallowed_tools` ignored).
     pub allowed_tools: Vec<String>,
     pub max_turns: Option<u32>,
-    /// Source file path (for debugging).
+    /// Source file path (for custom agents loaded from `.md` files).
     pub source_path: String,
 }
 
-/// Unified view over both built-in and custom agents.
-#[derive(Debug, Clone)]
-pub enum AnyAgentDef {
-    BuiltIn(&'static AgentDef),
-    Custom(CustomAgentDef),
-}
-
-impl AnyAgentDef {
-    #[must_use]
-    pub fn agent_type(&self) -> &str {
-        match self {
-            Self::BuiltIn(d) => d.agent_type,
-            Self::Custom(d) => &d.agent_type,
-        }
-    }
-
-    #[must_use]
-    pub fn when_to_use(&self) -> &str {
-        match self {
-            Self::BuiltIn(d) => d.when_to_use,
-            Self::Custom(d) => &d.when_to_use,
-        }
-    }
-
-    #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        match self {
-            Self::BuiltIn(d) => d.system_prompt,
-            Self::Custom(d) => &d.system_prompt,
-        }
-    }
-
-    #[must_use]
-    pub fn max_turns(&self) -> Option<u32> {
-        match self {
-            Self::BuiltIn(d) => d.max_turns,
-            Self::Custom(d) => d.max_turns,
-        }
-    }
-
+impl AgentDef {
     /// Check if a tool is allowed for this agent.
-    /// Returns true if the tool should be included in the subagent's tool set.
     #[must_use]
     pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
-        match self {
-            Self::BuiltIn(d) => {
-                if !d.allowed_tools.is_empty() {
-                    return d.allowed_tools.contains(&tool_name);
-                }
-                !d.disallowed_tools.contains(&tool_name)
-            }
-            Self::Custom(d) => {
-                if !d.allowed_tools.is_empty() {
-                    return d.allowed_tools.iter().any(|t| t == tool_name);
-                }
-                !d.disallowed_tools.iter().any(|t| t == tool_name)
-            }
+        if !self.allowed_tools.is_empty() {
+            return self.allowed_tools.iter().any(|t| t == tool_name);
         }
+        !self.disallowed_tools.iter().any(|t| t == tool_name)
     }
 }
 
@@ -112,12 +50,16 @@ impl AnyAgentDef {
 // Built-in registry
 // ---------------------------------------------------------------------------
 
-static BUILT_INS: &[AgentDef] = &[VERIFICATION_AGENT, EXPLORER_AGENT];
+fn built_in_agents() -> Vec<AgentDef> {
+    vec![verification_agent(), explorer_agent()]
+}
 
 /// Look up a built-in agent by type name.
 #[must_use]
-pub fn find_built_in(agent_type: &str) -> Option<&'static AgentDef> {
-    BUILT_INS.iter().find(|a| a.agent_type == agent_type)
+pub fn find_built_in(agent_type: &str) -> Option<AgentDef> {
+    built_in_agents()
+        .into_iter()
+        .find(|a| a.agent_type == agent_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +69,7 @@ pub fn find_built_in(agent_type: &str) -> Option<&'static AgentDef> {
 /// Load custom agent definitions from `.piku/agents/` in the given directory.
 /// Returns an empty vec if the directory doesn't exist.
 #[must_use]
-pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
+pub fn load_custom_agents(project_root: &Path) -> Vec<AgentDef> {
     let agents_dir = project_root.join(".piku").join("agents");
     let Ok(entries) = std::fs::read_dir(&agents_dir) else {
         return Vec::new();
@@ -155,7 +97,7 @@ pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
 /// Find an agent by type name across built-ins and custom agents.
 /// Custom agents override built-ins -- a warning is printed when this happens.
 #[must_use]
-pub fn find_agent(agent_type: &str, custom_agents: &[CustomAgentDef]) -> Option<AnyAgentDef> {
+pub fn find_agent(agent_type: &str, custom_agents: &[AgentDef]) -> Option<AgentDef> {
     if let Some(custom) = custom_agents.iter().find(|a| a.agent_type == agent_type) {
         if find_built_in(agent_type).is_some() {
             eprintln!(
@@ -163,24 +105,24 @@ pub fn find_agent(agent_type: &str, custom_agents: &[CustomAgentDef]) -> Option<
                 agent_type, custom.source_path
             );
         }
-        return Some(AnyAgentDef::Custom(custom.clone()));
+        return Some(custom.clone());
     }
-    find_built_in(agent_type).map(AnyAgentDef::BuiltIn)
+    find_built_in(agent_type)
 }
 
 /// Build the agent listing prompt including both built-in and custom agents.
 #[must_use]
-pub fn agent_listing_prompt_with_custom(custom_agents: &[CustomAgentDef]) -> String {
+pub fn agent_listing_prompt_with_custom(custom_agents: &[AgentDef]) -> String {
     let mut out = String::from(
         "# Available agents\n\n\
          You can delegate tasks to specialized agents using the `spawn_agent` tool.\n\
          Pass `subagent_type` to use a named agent.\n\n",
     );
-    for a in BUILT_INS {
+    for a in built_in_agents() {
         out.push_str("- **");
-        out.push_str(a.agent_type);
+        out.push_str(&a.agent_type);
         out.push_str("**: ");
-        out.push_str(a.when_to_use);
+        out.push_str(&a.when_to_use);
         out.push('\n');
     }
     for a in custom_agents {
@@ -201,7 +143,7 @@ pub fn agent_listing_prompt_with_custom(custom_agents: &[CustomAgentDef]) -> Str
 // Frontmatter parser (simple, no YAML dep)
 // ---------------------------------------------------------------------------
 
-fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
+fn parse_agent_markdown(path: &Path) -> Result<AgentDef, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
 
     let (frontmatter, body) = split_frontmatter(&content)
@@ -216,7 +158,7 @@ fn parse_agent_markdown(path: &Path) -> Result<CustomAgentDef, String> {
     let allowed_tools = extract_list_field(&frontmatter, "allowed_tools");
     let max_turns = extract_field(&frontmatter, "max_turns").and_then(|v| v.parse::<u32>().ok());
 
-    Ok(CustomAgentDef {
+    Ok(AgentDef {
         agent_type: name,
         when_to_use: description,
         system_prompt: body.trim().to_string(),
@@ -370,17 +312,25 @@ VERDICT: FAIL
 VERDICT: PARTIAL
 (PARTIAL only for environmental limitations — missing tool, server won't start.)";
 
-pub const VERIFICATION_AGENT: AgentDef = AgentDef {
-    agent_type: "verification",
-    when_to_use: "Verify that implementation work is correct before reporting completion. \
-                  Invoke after non-trivial changes (3+ file edits, API changes, bug fixes). \
-                  Pass the original task, files changed, and approach taken. \
-                  Returns PASS / FAIL / PARTIAL verdict with evidence.",
-    system_prompt: VERIFICATION_SYSTEM_PROMPT,
-    disallowed_tools: &["spawn_agent", "write_file", "edit_file"],
-    allowed_tools: &[],
-    max_turns: Some(30),
-};
+fn verification_agent() -> AgentDef {
+    AgentDef {
+        agent_type: "verification".to_string(),
+        when_to_use: "Verify that implementation work is correct before reporting completion. \
+                      Invoke after non-trivial changes (3+ file edits, API changes, bug fixes). \
+                      Pass the original task, files changed, and approach taken. \
+                      Returns PASS / FAIL / PARTIAL verdict with evidence."
+            .to_string(),
+        system_prompt: VERIFICATION_SYSTEM_PROMPT.to_string(),
+        disallowed_tools: vec![
+            "spawn_agent".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+        ],
+        allowed_tools: vec![],
+        max_turns: Some(30),
+        source_path: "<built-in>".to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Explorer agent
@@ -398,16 +348,25 @@ You do NOT write any files or run bash commands that have side effects. \
 You are a read-only research agent. Be thorough — if you are unsure, \
 keep searching rather than guessing.";
 
-pub const EXPLORER_AGENT: AgentDef = AgentDef {
-    agent_type: "explorer",
-    when_to_use: "Explore and research the codebase without making changes. \
-                  Use for 'where is X implemented?', 'how does Y work?', \
-                  'find all usages of Z'. Returns a structured research report.",
-    system_prompt: EXPLORER_SYSTEM_PROMPT,
-    disallowed_tools: &["spawn_agent", "write_file", "edit_file", "bash"],
-    allowed_tools: &[],
-    max_turns: Some(15),
-};
+fn explorer_agent() -> AgentDef {
+    AgentDef {
+        agent_type: "explorer".to_string(),
+        when_to_use: "Explore and research the codebase without making changes. \
+                      Use for 'where is X implemented?', 'how does Y work?', \
+                      'find all usages of Z'. Returns a structured research report."
+            .to_string(),
+        system_prompt: EXPLORER_SYSTEM_PROMPT.to_string(),
+        disallowed_tools: vec![
+            "spawn_agent".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+            "bash".to_string(),
+        ],
+        allowed_tools: vec![],
+        max_turns: Some(15),
+        source_path: "<built-in>".to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -506,7 +465,7 @@ You are a code reviewer. Check the diff carefully.
 
     #[test]
     fn find_agent_custom_overrides_builtin() {
-        let custom = vec![CustomAgentDef {
+        let custom = vec![AgentDef {
             agent_type: "verification".to_string(),
             when_to_use: "custom verifier".to_string(),
             system_prompt: "custom prompt".to_string(),
@@ -516,21 +475,21 @@ You are a code reviewer. Check the diff carefully.
             source_path: "test.md".to_string(),
         }];
         let found = find_agent("verification", &custom).unwrap();
-        assert_eq!(found.when_to_use(), "custom verifier");
-        assert_eq!(found.max_turns(), Some(10));
+        assert_eq!(found.when_to_use, "custom verifier");
+        assert_eq!(found.max_turns, Some(10));
     }
 
     #[test]
-    fn any_agent_def_tool_filtering() {
-        let def = AnyAgentDef::BuiltIn(&EXPLORER_AGENT);
+    fn agent_def_tool_filtering() {
+        let def = explorer_agent();
         assert!(def.is_tool_allowed("read_file"));
         assert!(!def.is_tool_allowed("bash"));
         assert!(!def.is_tool_allowed("write_file"));
     }
 
     #[test]
-    fn any_agent_def_allowlist_precedence() {
-        let custom = CustomAgentDef {
+    fn agent_def_allowlist_precedence() {
+        let def = AgentDef {
             agent_type: "narrow".to_string(),
             when_to_use: "test".to_string(),
             system_prompt: "test".to_string(),
@@ -539,7 +498,6 @@ You are a code reviewer. Check the diff carefully.
             max_turns: None,
             source_path: "test.md".to_string(),
         };
-        let def = AnyAgentDef::Custom(custom);
         assert!(def.is_tool_allowed("read_file"));
         assert!(def.is_tool_allowed("grep"));
         assert!(!def.is_tool_allowed("bash"));
@@ -548,7 +506,7 @@ You are a code reviewer. Check the diff carefully.
 
     #[test]
     fn agent_listing_includes_custom() {
-        let custom = vec![CustomAgentDef {
+        let custom = vec![AgentDef {
             agent_type: "reviewer".to_string(),
             when_to_use: "Review code".to_string(),
             system_prompt: String::new(),
@@ -640,10 +598,9 @@ You are a test agent.
         assert_eq!(a.allowed_tools, vec!["read_file", "grep"]);
         assert_eq!(a.max_turns, Some(10));
 
-        let def = AnyAgentDef::Custom(a.clone());
-        assert!(def.is_tool_allowed("read_file"));
-        assert!(def.is_tool_allowed("grep"));
-        assert!(!def.is_tool_allowed("bash"));
+        assert!(a.is_tool_allowed("read_file"));
+        assert!(a.is_tool_allowed("grep"));
+        assert!(!a.is_tool_allowed("bash"));
     }
 
     #[test]

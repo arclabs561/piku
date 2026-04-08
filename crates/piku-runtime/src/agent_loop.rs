@@ -122,7 +122,7 @@ pub async fn run_turn_with_registry(
     interjections: Option<&mut InterjectionRx>,
     registry: &TaskRegistry,
     depth: u32,
-    custom_agents: &[crate::agents::CustomAgentDef],
+    custom_agents: &[crate::agents::AgentDef],
 ) -> TurnResult {
     run_turn_inner(
         input,
@@ -155,7 +155,7 @@ async fn run_turn_inner(
     interjections: Option<&mut InterjectionRx>,
     task_registry: Option<&TaskRegistry>,
     depth: u32,
-    custom_agents: &[crate::agents::CustomAgentDef],
+    custom_agents: &[crate::agents::AgentDef],
 ) -> TurnResult {
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let mut interjections = interjections;
@@ -758,7 +758,7 @@ fn execute_spawn_agent(
     tool_defs: &[ToolDefinition],
     depth: u32,
     parent_session_messages: &[crate::session::ConversationMessage],
-    custom_agents: &[crate::agents::CustomAgentDef],
+    custom_agents: &[crate::agents::AgentDef],
 ) -> (String, bool) {
     if depth >= MAX_SPAWN_DEPTH {
         return (
@@ -800,10 +800,10 @@ fn execute_spawn_agent(
     // - otherwise use the parent's system prompt unchanged
     // Agent-type-specific memory is appended when available.
     let sub_system_prompt: Vec<String> = if let Some(ref def) = agent_def {
-        let mut prompt = def.system_prompt().to_string();
+        let mut prompt = def.system_prompt.clone();
         // Inject per-agent-type persistent memory
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(mem_prompt) = crate::memory::build_agent_memory_prompt(&cwd, def.agent_type()) {
+        if let Some(mem_prompt) = crate::memory::build_agent_memory_prompt(&cwd, &def.agent_type) {
             prompt.push_str(&mem_prompt);
         }
         vec![prompt]
@@ -947,7 +947,7 @@ fn execute_spawn_agent(
     // Per-agent turn limit: agent def's max_turns overrides the default
     // when the model didn't explicitly set one in the spawn params.
     let effective_max_turns = if let Some(ref def) = agent_def {
-        def.max_turns().unwrap_or(p.max_turns)
+        def.max_turns.unwrap_or(p.max_turns)
     } else {
         p.max_turns
     };
@@ -971,7 +971,7 @@ fn execute_spawn_agent(
     let type_info = if let Some(ref def) = agent_def {
         format!(
             " [type={}, tools={tool_count}, max_turns={effective_max_turns}]",
-            def.agent_type()
+            def.agent_type
         )
     } else {
         format!(" [tools={tool_count}, max_turns={effective_max_turns}]")
@@ -1017,7 +1017,7 @@ async fn run_subagent_task(
     depth: u32,
     worktree_cwd: Option<std::path::PathBuf>,
     worktree_branch: Option<String>,
-    custom_agents: Vec<crate::agents::CustomAgentDef>,
+    custom_agents: Vec<crate::agents::AgentDef>,
 ) {
     let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
     let mut sink = crate::task::DevNullSink;
