@@ -2840,6 +2840,297 @@ fn run_agentic_session(persona: &Persona) {
 }
 
 // ===========================================================================
+// Multi-session attempt tree evaluation
+// ===========================================================================
+
+/// Seed a workspace with a debugging scenario: a Python project with a subtle bug.
+fn seed_attempt_tree_workspace(workspace: &Path) {
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+
+    // A Python file with a bug: off-by-one in pagination
+    std::fs::write(
+        workspace.join("src/paginate.py"),
+        r#"def paginate(items, page_size, page_num):
+    """Return a page of items. page_num is 1-indexed."""
+    start = page_num * page_size  # BUG: should be (page_num - 1) * page_size
+    end = start + page_size
+    return items[start:end]
+
+def total_pages(items, page_size):
+    return len(items) // page_size  # BUG: should use ceil division
+"#,
+    )
+    .unwrap();
+
+    // A test file that demonstrates the bug
+    std::fs::write(
+        workspace.join("src/test_paginate.py"),
+        r#"from paginate import paginate, total_pages
+
+items = list(range(1, 11))  # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+# page 1 should be [1, 2, 3] but returns [4, 5, 6]
+result = paginate(items, 3, 1)
+print(f"Page 1: {result}")
+assert result == [1, 2, 3], f"Expected [1, 2, 3], got {result}"
+"#,
+    )
+    .unwrap();
+
+    // Second file with a similar bug pattern for session 2
+    std::fs::write(
+        workspace.join("src/chunker.py"),
+        r#"def chunk_text(text, chunk_size, chunk_num):
+    """Return the Nth chunk of text. chunk_num is 1-indexed."""
+    start = chunk_num * chunk_size  # Same off-by-one pattern
+    end = start + chunk_size
+    return text[start:end]
+"#,
+    )
+    .unwrap();
+}
+
+/// Check the embed-memory store for attempt entries.
+fn check_attempt_store(workspace: &Path) -> (usize, usize, Vec<String>) {
+    let store_path = workspace
+        .join(".piku")
+        .join("embed-memory")
+        .join("memories.json");
+    if !store_path.exists() {
+        return (0, 0, vec![]);
+    }
+    let content = std::fs::read_to_string(&store_path).unwrap_or_default();
+    let store: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+    let entries = store["entries"].as_array().map_or(0, Vec::len);
+    let attempts = store["entries"]
+        .as_array()
+        .map_or(0, |a| {
+            a.iter()
+                .filter(|e| e["entry_type"].as_str() == Some("attempt"))
+                .count()
+        });
+    let goals: Vec<String> = store["entries"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e["goal"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    (entries, attempts, goals)
+}
+
+/// Run two piku sessions against the same workspace to test attempt tree learning.
+///
+/// Session 1: debug paginate.py -- piku should try approaches and record attempts.
+/// Session 2: debug chunker.py (same bug pattern) -- piku should query prior attempts.
+fn run_attempt_tree_evaluation() {
+    let Some(ua_spec) = user_agent_provider(false) else {
+        eprintln!("[attempt-tree] skipping: no user-agent provider");
+        return;
+    };
+    let Some(piku_spec) = piku_provider() else {
+        eprintln!("[attempt-tree] skipping: no piku provider");
+        return;
+    };
+
+    let workspace = tempdir("attempt_tree");
+    seed_attempt_tree_workspace(&workspace);
+
+    eprintln!("[attempt-tree] workspace: {}", workspace.display());
+    eprintln!(
+        "[attempt-tree] piku: {}/{}",
+        piku_spec.label, piku_spec.model
+    );
+
+    let ua_llm = LlmClient::new(ua_spec.clone());
+
+    // =====================================================================
+    // SESSION 1: Debug paginate.py
+    // =====================================================================
+    eprintln!("[attempt-tree] === SESSION 1: debug paginate.py ===");
+    let (s1_captured_len, s1_used_record_attempt) = {
+        let mut observer = TerminalObserver::new(40, 120);
+        let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
+        let ws_observer = WorkspaceObserver::new(workspace.clone());
+
+        eprintln!("[attempt-tree] waiting for piku startup...");
+        let startup = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+        if !startup.is_ready() {
+            eprintln!("[attempt-tree] piku did not start within 30s");
+            drop(pty);
+            return;
+        }
+
+        // Ask piku to debug the pagination bug
+        let prompt = "Read src/paginate.py and src/test_paginate.py. The test fails -- \
+                      page 1 returns [4, 5, 6] instead of [1, 2, 3]. Debug this. \
+                      Try different approaches and use record_attempt to track what you try. \
+                      Fix the bug when you find the root cause.";
+
+        eprintln!("[attempt-tree] sending debug prompt...");
+        pty.execute_action(&Action::Submit(prompt.to_string()), &mut observer);
+
+        // Wait for screen change
+        let pre = observer.snapshot().contents.clone();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pty.drain(&mut observer);
+            if observer.snapshot().contents != pre {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        pty.clear_capture();
+
+        // Wait for response to complete
+        let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(120));
+        let captured = pty.captured_text();
+        eprintln!(
+            "[attempt-tree] session 1 response: {} chars, ready={}",
+            captured.len(),
+            snap.is_ready()
+        );
+
+        // Check if record_attempt was called
+        let used_ra = captured.contains("record_attempt")
+            || captured.contains("attempt recorded")
+            || captured.contains("attempt");
+        eprintln!("[attempt-tree] session 1: record_attempt evidence: {used_ra}");
+
+        // Check workspace changes
+        let ws_diff = ws_observer.diff_since_checkpoint();
+        eprintln!(
+            "[attempt-tree] session 1: workspace changes: {}",
+            ws_diff.summary()
+        );
+
+        // Exit piku
+        pty.send_bytes(b"\x04");
+        std::thread::sleep(Duration::from_millis(500));
+        drop(pty);
+
+        (captured.len(), used_ra)
+    };
+
+    // Check the memory store after session 1
+    let (total_entries, attempt_count, goals) = check_attempt_store(&workspace);
+    eprintln!(
+        "[attempt-tree] after session 1: {total_entries} entries, {attempt_count} attempts, goals: {goals:?}"
+    );
+
+    // =====================================================================
+    // SESSION 2: Debug chunker.py (similar bug pattern)
+    // =====================================================================
+    eprintln!("[attempt-tree] === SESSION 2: debug chunker.py ===");
+    {
+        let mut observer = TerminalObserver::new(40, 120);
+        let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
+
+        eprintln!("[attempt-tree] waiting for piku startup...");
+        let startup = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+        if !startup.is_ready() {
+            eprintln!("[attempt-tree] piku did not start for session 2");
+            drop(pty);
+            return;
+        }
+
+        // Ask piku to debug chunker.py -- similar bug
+        let prompt = "Read src/chunker.py. The chunk_text function has a bug: \
+                      chunk_text('abcdefghij', 3, 1) returns 'def' instead of 'abc'. \
+                      Before debugging, use query_attempts to check if similar bugs \
+                      have been debugged before. Then fix it.";
+
+        eprintln!("[attempt-tree] sending debug prompt (session 2)...");
+        pty.execute_action(&Action::Submit(prompt.to_string()), &mut observer);
+
+        let pre = observer.snapshot().contents.clone();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pty.drain(&mut observer);
+            if observer.snapshot().contents != pre {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        pty.clear_capture();
+
+        let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(120));
+        let captured = pty.captured_text();
+        eprintln!(
+            "[attempt-tree] session 2 response: {} chars, ready={}",
+            captured.len(),
+            snap.is_ready()
+        );
+
+        // Check if query_attempts was called
+        let used_query = captured.contains("query_attempts")
+            || captured.contains("Prior Attempts")
+            || captured.contains("prior attempt");
+        eprintln!("[attempt-tree] session 2: query_attempts evidence: {used_query}");
+
+        // Exit piku
+        pty.send_bytes(b"\x04");
+        std::thread::sleep(Duration::from_millis(500));
+        drop(pty);
+
+        // Meta-judge: evaluate the two-session interaction
+        let (total_after, attempts_after, goals_after) = check_attempt_store(&workspace);
+        eprintln!(
+            "[attempt-tree] after session 2: {total_after} entries, {attempts_after} attempts, goals: {goals_after:?}"
+        );
+
+        let evidence = format!(
+            "SESSION 1 (debug paginate.py):\n\
+             Response length: {} chars\n\
+             record_attempt evidence in output: {}\n\
+             Memory store after: {} entries, {} attempts\n\
+             Goals recorded: {:?}\n\n\
+             SESSION 2 (debug chunker.py -- same bug pattern):\n\
+             Response length: {} chars\n\
+             query_attempts evidence in output: {}\n\
+             Memory store after: {} entries, {} attempts\n\
+             Goals recorded: {:?}",
+            s1_captured_len,
+            s1_used_record_attempt,
+            total_entries,
+            attempt_count,
+            goals,
+            captured.len(),
+            used_query,
+            total_after,
+            attempts_after,
+            goals_after,
+        );
+
+        let system = "\
+You are evaluating whether piku's attempt tree memory system works across sessions.
+
+Two sessions were run against the same workspace:
+- Session 1: piku debugged an off-by-one bug in paginate.py
+- Session 2: piku debugged an identical bug pattern in chunker.py
+
+Evaluate:
+1. RECORDING: Did session 1 create attempt entries in the memory store?
+2. RETRIEVAL: Did session 2 query prior attempts before debugging?
+3. LEARNING: Did session 2 benefit from session 1's experience? (faster fix, avoided failed approaches)
+4. TOOL_USAGE: Were record_attempt and query_attempts tools used?
+
+Rate each dimension: PASS / PARTIAL / FAIL with one-line reason.
+End with VERDICT: one sentence on whether the attempt tree system is working.";
+
+        let judge_response = ua_llm.call_raw(system, &[("user", &evidence)]);
+        eprintln!("\n[attempt-tree] === META-JUDGE ===\n{judge_response}\n");
+    }
+}
+
+// ===========================================================================
 // Test entry points — serialized to avoid Ollama model contention
 // ===========================================================================
 
@@ -2883,6 +3174,15 @@ fn agentic_user_input_explorer() {
     }
     let ps = personas();
     run_agentic_session(ps.get("input_explorer").unwrap());
+}
+
+#[test]
+#[serial(agentic)]
+fn agentic_attempt_tree_learning() {
+    if !is_enabled() {
+        return;
+    }
+    run_attempt_tree_evaluation();
 }
 
 // ===========================================================================
