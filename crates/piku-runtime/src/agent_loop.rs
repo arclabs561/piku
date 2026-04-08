@@ -793,6 +793,40 @@ fn execute_spawn_agent(
         ctx.push_str("</context>");
         prompt.push_str(&ctx);
     }
+    // Proactive recall: embed the task prompt and retrieve relevant memories.
+    // Skips silently if ollama is unreachable, embed model not pulled, or store is empty.
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let store_path = crate::embed_memory::default_store_path(&cwd);
+        let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+        if store.valid_count() > 0 {
+            let ollama_url = std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            let query_text: String = p.task.chars().take(500).collect();
+            // Embed call is async — use Handle::block_on from the current runtime.
+            let query_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        crate::embed_memory::embed_text(&query_text, &ollama_url, &embed_model),
+                    )
+                    .await
+                })
+            });
+            if let Ok(Ok(query_vec)) = query_result {
+                let retrieved = store.retrieve(&query_vec, 5);
+                if !retrieved.is_empty() {
+                    let mem_section =
+                        crate::embed_memory::format_retrieved_memories(&retrieved);
+                    prompt.push_str(&mem_section);
+                    let _ = store.save(&store_path);
+                }
+            }
+        }
+    }
+
     if let Some(ref wt) = worktree_path {
         prompt.push_str("\n\nYou are running in an isolated git worktree at ");
         prompt.push_str(&wt.display().to_string());

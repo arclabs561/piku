@@ -289,6 +289,186 @@ pub fn format_retrieved_memories(memories: &[RetrievedMemory]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Session-end memory extraction
+// ---------------------------------------------------------------------------
+
+/// Prompt for extracting atomic facts from a conversation.
+const EXTRACTION_PROMPT: &str = "\
+You are a memory extraction system. Given a conversation between a user and an AI assistant, \
+extract 0-5 atomic facts worth remembering for future sessions.
+
+Rules:
+- Each fact must be self-contained (no pronouns, no \"the project\")
+- One fact per line, prefixed with `- `
+- Include: user preferences, project conventions, error patterns, key decisions
+- Exclude: transient task details, file contents, code snippets, things derivable from git
+- If nothing is worth remembering, output exactly: NONE
+
+Output format:
+- fact one
+- fact two
+TAGS: comma, separated, keywords
+
+Or:
+NONE";
+
+/// Extract memories from a conversation transcript.
+/// Returns a list of (fact, tags) pairs.
+pub async fn extract_memories(
+    conversation: &str,
+    provider: &dyn piku_api::Provider,
+    model: &str,
+) -> Vec<(String, Vec<String>)> {
+    use futures_util::StreamExt;
+
+    let request = piku_api::MessageRequest {
+        model: model.to_string(),
+        max_tokens: 1024,
+        messages: vec![piku_api::RequestMessage {
+            role: "user".to_string(),
+            content: vec![piku_api::RequestContent::Text {
+                text: conversation.to_string(),
+            }],
+        }],
+        system: Some(vec![piku_api::SystemBlock::text(
+            EXTRACTION_PROMPT.to_string(),
+        )]),
+        tools: None,
+        stream: true,
+    };
+
+    let mut stream = provider.stream_message(request);
+    let mut response = String::new();
+
+    let timeout = std::time::Duration::from_secs(30);
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(event) = stream.next().await {
+            if let Ok(piku_api::Event::TextDelta { text }) = event {
+                response.push_str(&text);
+            }
+        }
+    })
+    .await;
+
+    if result.is_err() || response.trim() == "NONE" || response.trim().is_empty() {
+        return Vec::new();
+    }
+
+    parse_extraction_response(&response)
+}
+
+/// Parse the LLM's extraction response into (fact, tags) pairs.
+fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>)> {
+    let mut facts = Vec::new();
+    let mut current_tags: Vec<String> = Vec::new();
+
+    // Extract TAGS line if present
+    for line in response.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(tags_str) = trimmed.strip_prefix("TAGS:") {
+            current_tags = tags_str
+                .split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            break;
+        }
+    }
+
+    // Extract facts (lines starting with "- ")
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if let Some(fact) = trimmed.strip_prefix("- ") {
+            let fact = fact.trim();
+            if !fact.is_empty() && !fact.starts_with("TAGS:") {
+                facts.push((fact.to_string(), current_tags.clone()));
+            }
+        }
+    }
+
+    facts
+}
+
+/// Full session-end memory pipeline:
+/// 1. Extract atomic facts from the conversation
+/// 2. Embed each fact
+/// 3. Check for contradictions against existing memories
+/// 4. Insert or supersede
+///
+/// Returns the number of memories added/updated.
+pub async fn extract_and_store(
+    conversation: &str,
+    provider: &dyn piku_api::Provider,
+    model: &str,
+    store: &mut MemoryStore,
+    ollama_url: &str,
+    embed_model: &str,
+) -> usize {
+    let facts = extract_memories(conversation, provider, model).await;
+    if facts.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+    for (fact, tags) in facts {
+        // Embed the new fact
+        let embedding = match embed_text(&fact, ollama_url, embed_model).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Check for contradictions: find top-3 most similar existing memories
+        let similar = store.find_similar(&embedding, 3);
+
+        // If the most similar memory is very close (>0.85), it might be a
+        // duplicate or contradiction. For now, skip near-duplicates.
+        // A future version can use an LLM call to decide add/update/ignore.
+        if similar.first().is_some_and(|s| s.similarity > 0.85) {
+            // Near-duplicate — skip
+            continue;
+        }
+
+        store.insert(fact, tags, embedding);
+        count += 1;
+    }
+
+    count
+}
+
+/// Build a compact conversation transcript for memory extraction.
+/// Includes only user and assistant text blocks, truncated to keep
+/// the extraction prompt manageable.
+pub fn build_extraction_transcript(
+    messages: &[crate::session::ConversationMessage],
+) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = match msg.role {
+            crate::session::MessageRole::User => "User",
+            crate::session::MessageRole::Assistant => "Assistant",
+            _ => continue,
+        };
+        for block in &msg.blocks {
+            if let crate::session::ContentBlock::Text { text } = block {
+                if !text.trim().is_empty() {
+                    transcript.push_str(role);
+                    transcript.push_str(": ");
+                    if text.len() > 500 {
+                        let trunc: String = text.chars().take(500).collect();
+                        transcript.push_str(&trunc);
+                        transcript.push_str("...");
+                    } else {
+                        transcript.push_str(text);
+                    }
+                    transcript.push('\n');
+                }
+            }
+        }
+    }
+    transcript
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -399,6 +579,57 @@ mod tests {
         assert!(formatted.contains("[sim=0.85]"));
         assert!(formatted.contains("rust is good"));
         assert!(formatted.contains("tags: rust"));
+    }
+
+    #[test]
+    fn parse_extraction_basic() {
+        let response = "- The user prefers snake_case in Rust code\n\
+                        - The project uses tokio for async\n\
+                        TAGS: rust, style, async";
+        let facts = super::parse_extraction_response(response);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "The user prefers snake_case in Rust code");
+        assert_eq!(facts[0].1, vec!["rust", "style", "async"]);
+    }
+
+    #[test]
+    fn parse_extraction_none() {
+        let response = "NONE";
+        let facts = super::parse_extraction_response(response);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_extraction_no_tags() {
+        let response = "- Single fact without tags";
+        let facts = super::parse_extraction_response(response);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].1.is_empty());
+    }
+
+    #[test]
+    fn build_transcript_filters_roles() {
+        use crate::session::{ConversationMessage, ContentBlock};
+        let messages = vec![
+            ConversationMessage::user("hello"),
+            ConversationMessage::assistant(
+                vec![ContentBlock::Text { text: "hi there".to_string() }],
+                None,
+            ),
+            ConversationMessage {
+                role: crate::session::MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    output: "tool output".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+        let transcript = super::build_extraction_transcript(&messages);
+        assert!(transcript.contains("User: hello"));
+        assert!(transcript.contains("Assistant: hi there"));
+        assert!(!transcript.contains("tool output")); // tool results excluded
     }
 
     #[test]
