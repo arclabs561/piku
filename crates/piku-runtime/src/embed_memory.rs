@@ -26,6 +26,10 @@ pub struct MemoryEntry {
     pub content: String,
     /// LLM-generated keyword tags for hybrid retrieval.
     pub tags: Vec<String>,
+    /// LLM-rated importance (1-10). Memories below `MIN_IMPORTANCE` are not stored.
+    /// Higher = more likely to be retained long-term and surface in retrieval.
+    #[serde(default = "default_importance")]
+    pub importance: u8,
     /// When this memory was created (Unix timestamp).
     pub created_at: u64,
     /// Last time this memory was retrieved (for access-frequency eviction).
@@ -40,11 +44,18 @@ pub struct MemoryEntry {
     pub embedding: Vec<f32>,
 }
 
-/// A retrieved memory with its similarity score.
+fn default_importance() -> u8 {
+    5
+}
+
+/// A retrieved memory with its composite score.
 #[derive(Debug, Clone)]
 pub struct RetrievedMemory {
     pub entry: MemoryEntry,
+    /// Cosine similarity component.
     pub similarity: f32,
+    /// Composite score: relevance + recency + importance + access frequency.
+    pub score: f32,
 }
 
 /// The in-memory store (loaded from / saved to JSON).
@@ -54,9 +65,41 @@ pub struct MemoryStore {
     pub entries: Vec<MemoryEntry>,
 }
 
-/// Minimum similarity threshold for retrieval.
-/// Below this, no memory is returned (confidence-gated retrieval).
+/// Minimum cosine similarity for retrieval (confidence gate).
 const MIN_SIMILARITY: f32 = 0.3;
+
+/// Minimum importance score for admission (1-10 scale).
+/// Facts below this are not stored. Prevents error propagation.
+pub const MIN_IMPORTANCE: u8 = 3;
+
+/// Scoring weights (Park et al. formula + access frequency).
+/// score = w_rel * relevance + w_rec * recency + w_imp * importance + w_acc * access
+const W_RELEVANCE: f32 = 0.4;
+const W_RECENCY: f32 = 0.3;
+const W_IMPORTANCE: f32 = 0.2;
+const W_ACCESS: f32 = 0.1;
+
+/// Recency half-life in seconds (7 days). After this, recency score = 0.5.
+const RECENCY_HALF_LIFE: f64 = 7.0 * 24.0 * 3600.0;
+
+/// Compute composite retrieval score.
+/// All components normalized to [0, 1].
+fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
+    let relevance = similarity; // already [0, 1] for normalized vectors
+
+    // Recency: exponential decay with configurable half-life
+    let age_secs = now.saturating_sub(entry.last_accessed) as f64;
+    let recency = (-(age_secs * (2.0_f64.ln())) / RECENCY_HALF_LIFE).exp() as f32;
+
+    // Importance: normalize 1-10 to [0, 1]
+    let importance = (entry.importance as f32 - 1.0) / 9.0;
+
+    // Access frequency: log scale, capped at 1.0
+    let access = (1.0 + entry.access_count as f32).ln() / 5.0_f32.ln(); // ln(1+n)/ln(5)
+    let access = access.min(1.0);
+
+    W_RELEVANCE * relevance + W_RECENCY * recency + W_IMPORTANCE * importance + W_ACCESS * access
+}
 
 // ---------------------------------------------------------------------------
 // Embedding client (ollama /api/embed)
@@ -164,8 +207,18 @@ impl MemoryStore {
         std::fs::write(path, json).map_err(|e| format!("write failed: {e}"))
     }
 
-    /// Insert a new memory entry with a pre-computed embedding.
-    pub fn insert(&mut self, content: String, tags: Vec<String>, mut embedding: Vec<f32>) -> u64 {
+    /// Insert a new memory entry with a pre-computed embedding and importance score.
+    /// Returns `None` if importance is below `MIN_IMPORTANCE` (admission gate).
+    pub fn insert(
+        &mut self,
+        content: String,
+        tags: Vec<String>,
+        mut embedding: Vec<f32>,
+        importance: u8,
+    ) -> Option<u64> {
+        if importance < MIN_IMPORTANCE {
+            return None; // Importance gate: don't store low-value facts
+        }
         normalize(&mut embedding);
         let id = self.next_id;
         self.next_id += 1;
@@ -174,6 +227,7 @@ impl MemoryStore {
             id,
             content,
             tags,
+            importance,
             created_at: now,
             last_accessed: now,
             access_count: 0,
@@ -181,52 +235,74 @@ impl MemoryStore {
             supersedes: None,
             embedding,
         });
-        id
+        Some(id)
     }
 
     /// Insert a memory that supersedes an older one (contradiction resolution).
+    /// Superseding entries bypass the importance gate (contradictions are always important).
     pub fn insert_superseding(
         &mut self,
         content: String,
         tags: Vec<String>,
-        embedding: Vec<f32>,
+        mut embedding: Vec<f32>,
         supersedes_id: u64,
+        importance: u8,
     ) -> u64 {
         // Mark the old memory as invalid
         if let Some(old) = self.entries.iter_mut().find(|e| e.id == supersedes_id) {
             old.is_valid = false;
         }
-        let id = self.insert(content, tags, embedding);
-        if let Some(new) = self.entries.iter_mut().find(|e| e.id == id) {
-            new.supersedes = Some(supersedes_id);
-        }
+        normalize(&mut embedding);
+        let id = self.next_id;
+        self.next_id += 1;
+        let now = now_unix();
+        self.entries.push(MemoryEntry {
+            id,
+            content,
+            tags,
+            importance: importance.max(MIN_IMPORTANCE), // always at least MIN
+            created_at: now,
+            last_accessed: now,
+            access_count: 0,
+            is_valid: true,
+            supersedes: Some(supersedes_id),
+            embedding,
+        });
         id
     }
 
-    /// Retrieve the top-k most similar valid memories above the confidence threshold.
+    /// Retrieve the top-k valid memories ranked by composite score.
+    /// Composite: relevance(cosine) + recency(exp_decay) + importance + access_frequency.
+    /// Confidence-gated: cosine similarity must exceed `MIN_SIMILARITY`.
     /// Updates access metadata on retrieved entries.
     pub fn retrieve(&mut self, query_embedding: &[f32], k: usize) -> Vec<RetrievedMemory> {
-        let mut scored: Vec<(f32, usize)> = self
+        let now = now_unix();
+        let mut scored: Vec<(f32, f32, usize)> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| e.is_valid)
-            .map(|(i, e)| (dot(query_embedding, &e.embedding), i))
-            .filter(|(sim, _)| *sim >= MIN_SIMILARITY)
+            .map(|(i, e)| {
+                let sim = dot(query_embedding, &e.embedding);
+                let score = composite_score(sim, e, now);
+                (sim, score, i)
+            })
+            .filter(|(sim, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by composite score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let now = now_unix();
         scored
             .into_iter()
             .take(k)
-            .map(|(sim, idx)| {
+            .map(|(sim, score, idx)| {
                 self.entries[idx].last_accessed = now;
                 self.entries[idx].access_count += 1;
                 RetrievedMemory {
                     entry: self.entries[idx].clone(),
                     similarity: sim,
+                    score,
                 }
             })
             .collect()
@@ -235,22 +311,28 @@ impl MemoryStore {
     /// Read-only retrieval (doesn't update access metadata).
     #[must_use]
     pub fn search(&self, query_embedding: &[f32], k: usize) -> Vec<RetrievedMemory> {
-        let mut scored: Vec<(f32, &MemoryEntry)> = self
+        let now = now_unix();
+        let mut scored: Vec<(f32, f32, &MemoryEntry)> = self
             .entries
             .iter()
             .filter(|e| e.is_valid)
-            .map(|e| (dot(query_embedding, &e.embedding), e))
-            .filter(|(sim, _)| *sim >= MIN_SIMILARITY)
+            .map(|e| {
+                let sim = dot(query_embedding, &e.embedding);
+                let score = composite_score(sim, e, now);
+                (sim, score, e)
+            })
+            .filter(|(sim, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         scored
             .into_iter()
             .take(k)
-            .map(|(sim, entry)| RetrievedMemory {
+            .map(|(sim, score, entry)| RetrievedMemory {
                 entry: entry.clone(),
                 similarity: sim,
+                score,
             })
             .collect()
     }
@@ -297,8 +379,8 @@ pub fn format_retrieved_memories(memories: &[RetrievedMemory]) -> String {
     out.push_str("The following memories were retrieved by semantic similarity to the current task.\n\n");
     for m in memories {
         out.push_str(&format!(
-            "- [sim={:.2}] {}\n",
-            m.similarity, m.entry.content
+            "- [score={:.2}, sim={:.2}, imp={}] {}\n",
+            m.score, m.similarity, m.entry.importance, m.entry.content
         ));
         if !m.entry.tags.is_empty() {
             out.push_str(&format!("  tags: {}\n", m.entry.tags.join(", ")));
@@ -318,26 +400,31 @@ extract 0-5 atomic facts worth remembering for future sessions.
 
 Rules:
 - Each fact must be self-contained (no pronouns, no \"the project\")
-- One fact per line, prefixed with `- `
+- One fact per line, format: `- [importance:N] fact text` where N is 1-10
+  - 1-2: trivial, not worth storing
+  - 3-4: mildly useful context
+  - 5-6: useful preference or convention
+  - 7-8: important decision or error pattern
+  - 9-10: critical correction or safety constraint
 - Include: user preferences, project conventions, error patterns, key decisions
 - Exclude: transient task details, file contents, code snippets, things derivable from git
 - If nothing is worth remembering, output exactly: NONE
 
 Output format:
-- fact one
-- fact two
-TAGS: comma, separated, keywords
+- [importance:7] The user prefers snake_case in Rust code
+- [importance:9] Never use byte slicing on UTF-8 strings -- use chars().take(n)
+TAGS: rust, style, safety
 
 Or:
 NONE";
 
 /// Extract memories from a conversation transcript.
-/// Returns a list of (fact, tags) pairs.
+/// Returns a list of (fact, tags, importance) tuples.
 pub async fn extract_memories(
     conversation: &str,
     provider: &dyn piku_api::Provider,
     model: &str,
-) -> Vec<(String, Vec<String>)> {
+) -> Vec<(String, Vec<String>, u8)> {
     use futures_util::StreamExt;
 
     let request = piku_api::MessageRequest {
@@ -376,8 +463,8 @@ pub async fn extract_memories(
     parse_extraction_response(&response)
 }
 
-/// Parse the LLM's extraction response into (fact, tags) pairs.
-fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>)> {
+/// Parse the LLM's extraction response into (fact, tags, importance) tuples.
+fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
     let mut facts = Vec::new();
     let mut current_tags: Vec<String> = Vec::new();
 
@@ -397,10 +484,26 @@ fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>)> {
     // Extract facts (lines starting with "- ")
     for line in response.lines() {
         let trimmed = line.trim();
-        if let Some(fact) = trimmed.strip_prefix("- ") {
-            let fact = fact.trim();
-            if !fact.is_empty() && !fact.starts_with("TAGS:") {
-                facts.push((fact.to_string(), current_tags.clone()));
+        if let Some(fact_text) = trimmed.strip_prefix("- ") {
+            let fact_text = fact_text.trim();
+            if fact_text.is_empty() || fact_text.starts_with("TAGS:") {
+                continue;
+            }
+            // Parse optional [importance:N] prefix
+            let (importance, fact) = if fact_text.starts_with("[importance:") {
+                if let Some(end) = fact_text.find(']') {
+                    let num_str = &fact_text[12..end];
+                    let imp = num_str.parse::<u8>().unwrap_or(5);
+                    let rest = fact_text[end + 1..].trim();
+                    (imp, rest.to_string())
+                } else {
+                    (5, fact_text.to_string())
+                }
+            } else {
+                (5, fact_text.to_string())
+            };
+            if !fact.is_empty() {
+                facts.push((fact, current_tags.clone(), importance));
             }
         }
     }
@@ -429,7 +532,7 @@ pub async fn extract_and_store(
     }
 
     let mut count = 0;
-    for (fact, tags) in facts {
+    for (fact, tags, importance) in facts {
         // Embed the new fact
         let embedding = match embed_text(&fact, ollama_url, embed_model).await {
             Ok(v) => v,
@@ -441,14 +544,14 @@ pub async fn extract_and_store(
 
         // If the most similar memory is very close (>0.85), it might be a
         // duplicate or contradiction. For now, skip near-duplicates.
-        // A future version can use an LLM call to decide add/update/ignore.
         if similar.first().is_some_and(|s| s.similarity > 0.85) {
-            // Near-duplicate — skip
             continue;
         }
 
-        store.insert(fact, tags, embedding);
-        count += 1;
+        // Importance-gated admission: insert returns None if below threshold
+        if store.insert(fact, tags, embedding, importance).is_some() {
+            count += 1;
+        }
     }
 
     count
@@ -566,8 +669,8 @@ mod tests {
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
         let e2 = make_embedding(2.0);
-        store.insert("fact about rust".to_string(), vec!["rust".to_string()], e1.clone());
-        store.insert("fact about python".to_string(), vec!["python".to_string()], e2);
+        store.insert("fact about rust".to_string(), vec!["rust".to_string()], e1.clone(), 7);
+        store.insert("fact about python".to_string(), vec!["python".to_string()], e2, 5);
 
         let results = store.retrieve(&e1, 5);
         assert!(!results.is_empty());
@@ -583,7 +686,7 @@ mod tests {
         let mut orthogonal = vec![0.0f32; 768];
         orthogonal[0] = 1.0;
         normalize(&mut orthogonal);
-        store.insert("unrelated fact".to_string(), vec![], orthogonal);
+        store.insert("unrelated fact".to_string(), vec![], orthogonal, 5);
 
         let results = store.retrieve(&e1, 5);
         // Should be empty if similarity is below threshold
@@ -597,8 +700,8 @@ mod tests {
     fn superseding_marks_old_invalid() {
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
-        let id1 = store.insert("old fact".to_string(), vec![], e1.clone());
-        store.insert_superseding("new fact".to_string(), vec![], e1.clone(), id1);
+        let id1 = store.insert("old fact".to_string(), vec![], e1.clone(), 7).unwrap();
+        store.insert_superseding("new fact".to_string(), vec![], e1.clone(), id1, 8);
 
         assert!(!store.entries.iter().find(|e| e.id == id1).unwrap().is_valid);
         assert_eq!(store.valid_count(), 1);
@@ -615,7 +718,7 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
-        store.insert("test fact".to_string(), vec!["test".to_string()], e1);
+        store.insert("test fact".to_string(), vec!["test".to_string()], e1, 6);
         store.save(&path).unwrap();
 
         let loaded = MemoryStore::load(&path);
@@ -628,7 +731,7 @@ mod tests {
     fn access_tracking() {
         let mut store = MemoryStore::default();
         let e1 = make_embedding(1.0);
-        store.insert("tracked fact".to_string(), vec![], e1.clone());
+        store.insert("tracked fact".to_string(), vec![], e1.clone(), 5);
 
         assert_eq!(store.entries[0].access_count, 0);
         store.retrieve(&e1, 5);
@@ -643,6 +746,7 @@ mod tests {
             id: 0,
             content: "rust is good".to_string(),
             tags: vec!["rust".to_string()],
+            importance: 7,
             created_at: 0,
             last_accessed: 0,
             access_count: 0,
@@ -653,22 +757,26 @@ mod tests {
         let retrieved = vec![RetrievedMemory {
             entry,
             similarity: 0.85,
+            score: 0.72,
         }];
         let formatted = format_retrieved_memories(&retrieved);
-        assert!(formatted.contains("[sim=0.85]"));
+        assert!(formatted.contains("score=0.72"));
+        assert!(formatted.contains("sim=0.85"));
         assert!(formatted.contains("rust is good"));
         assert!(formatted.contains("tags: rust"));
     }
 
     #[test]
     fn parse_extraction_basic() {
-        let response = "- The user prefers snake_case in Rust code\n\
-                        - The project uses tokio for async\n\
+        let response = "- [importance:7] The user prefers snake_case in Rust code\n\
+                        - [importance:5] The project uses tokio for async\n\
                         TAGS: rust, style, async";
         let facts = super::parse_extraction_response(response);
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].0, "The user prefers snake_case in Rust code");
         assert_eq!(facts[0].1, vec!["rust", "style", "async"]);
+        assert_eq!(facts[0].2, 7);
+        assert_eq!(facts[1].2, 5);
     }
 
     #[test]
@@ -684,6 +792,48 @@ mod tests {
         let facts = super::parse_extraction_response(response);
         assert_eq!(facts.len(), 1);
         assert!(facts[0].1.is_empty());
+        assert_eq!(facts[0].2, 5); // default importance
+    }
+
+    #[test]
+    fn parse_extraction_importance_gate() {
+        let response = "- [importance:2] Trivial fact\n\
+                        - [importance:8] Important fact";
+        let facts = super::parse_extraction_response(response);
+        assert_eq!(facts.len(), 2);
+        // Both parsed, but the store's insert() will gate the importance:2 one
+        assert_eq!(facts[0].2, 2);
+        assert_eq!(facts[1].2, 8);
+    }
+
+    #[test]
+    fn importance_gate_on_insert() {
+        let mut store = super::MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Below MIN_IMPORTANCE (3) -- should be rejected
+        assert!(store.insert("low importance".to_string(), vec![], e.clone(), 2).is_none());
+        // At MIN_IMPORTANCE -- should be accepted
+        assert!(store.insert("medium importance".to_string(), vec![], e.clone(), 3).is_some());
+        assert_eq!(store.valid_count(), 1);
+    }
+
+    #[test]
+    fn composite_scoring_prefers_recent_important() {
+        let mut store = super::MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Old, low importance
+        store.insert("old low".to_string(), vec![], e.clone(), 3);
+        // Make it old by tweaking created_at
+        store.entries[0].created_at = 0;
+        store.entries[0].last_accessed = 0;
+        // New, high importance
+        store.insert("new high".to_string(), vec![], e.clone(), 9);
+
+        let results = store.retrieve(&e, 2);
+        assert_eq!(results.len(), 2);
+        // New high-importance should rank first due to composite scoring
+        assert_eq!(results[0].entry.content, "new high");
+        assert!(results[0].score > results[1].score);
     }
 
     #[test]
