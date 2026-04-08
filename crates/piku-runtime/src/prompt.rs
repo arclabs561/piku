@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agents::{agent_listing_prompt_with_custom, CustomAgentDef};
+use crate::agents::{agent_listing_prompt_with_custom, AgentDef};
 use crate::memory::build_memory_prompt;
 
 /// Marker between the static (prompt-cacheable) and dynamic sections.
@@ -21,7 +21,7 @@ pub fn build_system_prompt(
     cwd: &Path,
     date: &str,
     model: &str,
-    custom_agents: &[CustomAgentDef],
+    custom_agents: &[AgentDef],
 ) -> Vec<String> {
     let mut sections = Vec::new();
 
