@@ -248,24 +248,36 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
     let rest = &trimmed[3..];
     let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
 
-    // Find closing "---" that sits on its own line
+    // Find closing "---" that sits on its own line (handles both \n and \r\n)
     let end = rest
-        .match_indices("\n---")
+        .match_indices("---")
         .find(|(pos, _)| {
-            // Check that after "\n---" is either EOF, \n, or \r\n
-            let after = &rest[pos + 4..];
+            // Must be preceded by \n (or \r\n) — i.e., on its own line
+            if *pos == 0 {
+                // "---" at the very start of rest (empty frontmatter case)
+                let after = &rest[3..];
+                return after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n");
+            }
+            let before = &rest[..* pos];
+            let on_own_line = before.ends_with('\n');
+            if !on_own_line {
+                return false;
+            }
+            let after = &rest[pos + 3..];
             after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n")
         })
         .map(|(pos, _)| pos)?;
 
-    let frontmatter = rest[..end].to_string();
-    let body_start = end + 4; // skip "\n---"
+    // Frontmatter is everything before the closing "---" line.
+    // Strip trailing \r\n or \n from frontmatter.
+    let frontmatter = rest[..end].trim_end_matches(['\r', '\n']).to_string();
+    let body_start = end + 3; // skip "---"
     let body = if body_start < rest.len() {
-        // Skip the newline after closing ---
+        // Skip the newline(s) after closing ---
         let remaining = &rest[body_start..];
         let remaining = remaining
-            .strip_prefix('\n')
-            .or_else(|| remaining.strip_prefix("\r\n"))
+            .strip_prefix("\r\n")
+            .or_else(|| remaining.strip_prefix('\n'))
             .unwrap_or(remaining);
         remaining.to_string()
     } else {
@@ -559,6 +571,24 @@ You are a code reviewer. Check the diff carefully.
         let (fm, body) = split_frontmatter(content).unwrap();
         assert_eq!(fm.trim(), "name: test");
         assert!(body.contains("body with crlf"));
+    }
+
+    #[test]
+    fn frontmatter_crlf_closing_delimiter() {
+        let content = "---\r\nname: test\r\n---\r\nbody";
+        let (fm, body) = split_frontmatter(content).unwrap();
+        assert!(fm.contains("name: test"));
+        assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn frontmatter_empty_returns_some() {
+        let content = "---\n---\nbody text";
+        let result = split_frontmatter(content);
+        assert!(result.is_some());
+        let (fm, body) = result.unwrap();
+        assert!(fm.is_empty());
+        assert!(body.contains("body text"));
     }
 
     #[test]

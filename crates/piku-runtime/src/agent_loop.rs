@@ -174,6 +174,8 @@ async fn run_turn_inner(
     // Track where we last extracted memories (message index).
     // Periodic extraction happens after compaction events.
     let mut last_extraction_idx: usize = session.messages.len();
+    // Guard against concurrent extraction tasks racing on the store file.
+    let extraction_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Auto-compaction config — compact when session tokens exceed this threshold.
     // 10k tokens is ~40k chars, roughly 200 exchanges of average length.
@@ -196,12 +198,14 @@ async fn run_turn_inner(
             };
             if result.removed_message_count > 0 {
                 // Trigger memory extraction on the messages being compacted away.
-                // This ensures long sessions don't lose important context to compaction.
+                // Guarded: skip if a previous extraction is still in flight (prevents
+                // race conditions on the store file).
                 let new_messages = &session.messages[last_extraction_idx..];
-                if !new_messages.is_empty() {
+                if !new_messages.is_empty()
+                    && !extraction_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     let transcript = crate::embed_memory::build_extraction_transcript(new_messages);
                     if !transcript.trim().is_empty() {
-                        // Fire-and-forget: extract in background, don't block the loop.
                         let provider_clone = provider.boxed_clone();
                         let model_owned = model.to_string();
                         let cwd = std::env::current_dir().unwrap_or_default();
@@ -210,6 +214,8 @@ async fn run_turn_inner(
                             .unwrap_or_else(|_| "http://localhost:11434".to_string());
                         let embed_model = std::env::var("PIKU_EMBED_MODEL")
                             .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                        let flag = extraction_in_flight.clone();
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         tokio::task::spawn_local(async move {
                             let mut store = crate::embed_memory::MemoryStore::load(&store_path);
                             let n = crate::embed_memory::extract_and_store(
@@ -224,6 +230,7 @@ async fn run_turn_inner(
                             if n > 0 {
                                 let _ = store.save(&store_path);
                             }
+                            flag.store(false, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                 }
@@ -332,30 +339,32 @@ async fn run_turn_inner(
                     ("No memories stored yet. Use write_memory to save facts.".to_string(), false)
                 } else {
                     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                    let max_k = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                    let ollama_url = std::env::var("OLLAMA_HOST")
-                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
-                    let embed_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                crate::embed_memory::embed_text(query, &ollama_url, &embed_model),
-                            ).await
-                        })
-                    });
-                    match embed_result {
-                        Ok(Ok(query_vec)) => {
-                            let retrieved = store.retrieve(&query_vec, max_k);
-                            let _ = store.save(&store_path);
-                            if retrieved.is_empty() {
-                                ("No relevant memories found for that query.".to_string(), false)
-                            } else {
-                                (crate::embed_memory::format_retrieved_memories(&retrieved), false)
+                    if query.trim().is_empty() {
+                        ("search_memory requires a non-empty query".to_string(), true)
+                    } else {
+                        let max_k = params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                        let ollama_url = std::env::var("OLLAMA_HOST")
+                            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                        let embed_model = std::env::var("PIKU_EMBED_MODEL")
+                            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                        // Use .await directly -- safe in both parent and subagent async contexts.
+                        // Do NOT use block_in_place here (panics inside spawn_local).
+                        let embed_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            crate::embed_memory::embed_text(query, &ollama_url, &embed_model),
+                        ).await;
+                        match embed_result {
+                            Ok(Ok(query_vec)) => {
+                                let retrieved = store.retrieve(&query_vec, max_k);
+                                let _ = store.save(&store_path);
+                                if retrieved.is_empty() {
+                                    ("No relevant memories found for that query.".to_string(), false)
+                                } else {
+                                    (crate::embed_memory::format_retrieved_memories(&retrieved), false)
+                                }
                             }
+                            _ => ("search_memory: embedding service unavailable".to_string(), true),
                         }
-                        _ => ("search_memory: embedding service unavailable".to_string(), true),
                     }
                 }
             } else if tool_name == "manage_memory" {
@@ -363,9 +372,12 @@ async fn run_turn_inner(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                let is_mutating = params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
                 let result = piku_tools::embed_memory_tool::execute_manage_memory(params, &mut store);
-                // Save if we might have mutated (invalidate)
-                let _ = store.save(&store_path);
+                // Only save on mutating actions
+                if is_mutating {
+                    let _ = store.save(&store_path);
+                }
                 (result.output, result.is_error)
             } else if tool_name == "tool_search" {
                 // Build catalog from current tool_defs for on-demand search
@@ -879,8 +891,9 @@ fn execute_spawn_agent(
         prompt.push_str(&ctx);
     }
     // Proactive recall: embed the task prompt and retrieve relevant memories.
-    // Skips silently if ollama is unreachable, embed model not pulled, or store is empty.
-    {
+    // Only for top-level spawns (depth == 0) -- subagents already get focused context,
+    // and block_in_place panics inside spawn_local (which subagents run in).
+    if depth == 0 {
         let cwd = std::env::current_dir().unwrap_or_default();
         let store_path = crate::embed_memory::default_store_path(&cwd);
         let mut store = crate::embed_memory::MemoryStore::load(&store_path);
@@ -890,7 +903,6 @@ fn execute_spawn_agent(
             let embed_model = std::env::var("PIKU_EMBED_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string());
             let query_text: String = p.task.chars().take(500).collect();
-            // Embed call is async — use Handle::block_on from the current runtime.
             let query_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     tokio::time::timeout(
