@@ -877,4 +877,130 @@ mod tests {
         normalize(&mut b);
         assert!((dot(&a, &b) - 1.0).abs() < 1e-6);
     }
+
+    // --- MemoryStoreView trait tests ---
+
+    #[test]
+    fn store_view_stats() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("valid".to_string(), vec![], e.clone(), 5);
+        store.insert("also valid".to_string(), vec![], e.clone(), 7);
+        assert_eq!(store.total_count(), 2);
+        assert_eq!(store.valid_count(), 2);
+    }
+
+    #[test]
+    fn store_view_invalidate() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.insert("to invalidate".to_string(), vec![], e, 5).unwrap();
+        assert!(store.invalidate(id));
+        assert_eq!(store.valid_count(), 0);
+        assert!(!store.invalidate(999)); // nonexistent
+    }
+
+    #[test]
+    fn store_view_query_tags() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("rust fact".to_string(), vec!["rust".to_string(), "lang".to_string()], e.clone(), 5);
+        store.insert("python fact".to_string(), vec!["python".to_string()], e.clone(), 5);
+        let results = store.query_by_tag("rust", 10);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("rust fact"));
+        // Case insensitive
+        let results2 = store.query_by_tag("RUST", 10);
+        assert_eq!(results2.len(), 1);
+    }
+
+    #[test]
+    fn store_view_list_recent() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("first".to_string(), vec![], e.clone(), 5);
+        // Manually set different timestamps since both inserts happen in same ms
+        store.entries[0].created_at = 100;
+        store.insert("second".to_string(), vec![], e.clone(), 5);
+        store.entries[1].created_at = 200;
+        let recent = store.list_recent(1);
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].1.contains("second")); // most recent first
+    }
+
+    #[test]
+    fn store_view_inspect() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.insert("inspectable".to_string(), vec!["tag1".to_string()], e, 8).unwrap();
+        let detail = store.inspect(id).unwrap();
+        assert!(detail.contains("inspectable"));
+        assert!(detail.contains("tag1"));
+        assert!(detail.contains("Valid: true"));
+        assert!(store.inspect(999).is_none());
+    }
+
+    // --- Corrupt file handling ---
+
+    #[test]
+    fn corrupt_json_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        let store = MemoryStore::load(&path);
+        assert!(store.entries.is_empty()); // returns empty
+        assert!(path.with_extension("json.bak").exists()); // backup created
+    }
+
+    // --- Composite scoring edge cases ---
+
+    #[test]
+    fn composite_score_zero_importance() {
+        // importance=0 should not cause division or NaN
+        let e = MemoryEntry {
+            id: 0, content: String::new(), tags: vec![], importance: 0,
+            created_at: 0, last_accessed: 0, access_count: 0,
+            is_valid: true, supersedes: None, embedding: vec![],
+        };
+        let score = super::composite_score(0.5, &e, super::now_unix());
+        assert!(score.is_finite());
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn composite_score_high_access_count_capped() {
+        let e = MemoryEntry {
+            id: 0, content: String::new(), tags: vec![], importance: 5,
+            created_at: super::now_unix(), last_accessed: super::now_unix(),
+            access_count: 1_000_000, is_valid: true, supersedes: None, embedding: vec![],
+        };
+        let score = super::composite_score(0.5, &e, super::now_unix());
+        assert!(score.is_finite());
+        assert!(score <= 1.0); // should be bounded
+    }
+
+    // --- Search with no valid entries ---
+
+    #[test]
+    fn search_empty_store_returns_empty() {
+        let store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let results = store.search(&e, 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_all_invalid_returns_empty() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.insert("will invalidate".to_string(), vec![], e.clone(), 5).unwrap();
+        store.entries.iter_mut().find(|x| x.id == id).unwrap().is_valid = false;
+        let results = store.search(&e, 5);
+        assert!(results.is_empty());
+    }
 }
