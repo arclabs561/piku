@@ -240,7 +240,7 @@ async fn run_turn_inner(
         let request = build_request(session, model, system_prompt, &tool_defs);
 
         // stream the response
-        let (assistant_blocks, usage, stop_reason, maybe_err) =
+        let (assistant_blocks, usage, mut stop_reason, maybe_err) =
             stream_response(provider, request, sink).await;
 
         if let Some(err) = maybe_err {
@@ -398,8 +398,10 @@ async fn run_turn_inner(
                 injected = true;
             }
             if injected {
-                // Force another iteration so the model can respond to the interjection
+                // Force another iteration so the model can respond to the interjection.
+                // Must override BOTH the return value and the local loop-continuation variable.
                 final_stop_reason = StopReason::ToolUse;
+                stop_reason = StopReason::ToolUse;
             }
         }
 
