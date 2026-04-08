@@ -165,10 +165,21 @@ impl PtyHandle {
         total
     }
 
-    /// True if the PTY subprocess has exited (reader returned EOF or EIO).
+    /// True if the PTY subprocess has exited.
+    /// Checks both reader EOF and rexpect's waitpid(WNOHANG).
     #[must_use]
-    pub fn is_dead(&self) -> bool {
-        self.eof
+    pub fn is_dead(&mut self) -> bool {
+        if self.eof {
+            return true;
+        }
+        // waitpid(WNOHANG) on the child -- if it returns an exit status, the process is gone.
+        match self._process.status() {
+            Some(rexpect::process::wait::WaitStatus::StillAlive) | None => false,
+            Some(_) => {
+                self.eof = true;
+                true
+            }
+        }
     }
 
     /// Clear the raw capture buffer.
@@ -199,34 +210,15 @@ impl PtyHandle {
         timeout: Duration,
     ) -> ScreenSnapshot {
         let deadline = Instant::now() + timeout;
-        let mut zero_polls = 0u32;
         loop {
-            let n = self.drain(observer);
+            self.drain(observer);
             let snap = observer.snapshot();
             if snap.is_ready() {
                 return snap;
             }
-            if self.eof {
-                eprintln!("[pty] process died during ready-wait (eof)");
+            if self.is_dead() {
+                eprintln!("[pty] process died during ready-wait");
                 return snap;
-            }
-            // Stall detection: if we get no data for 5s straight, probe with
-            // a null byte. If the write fails (EPIPE/EIO), the process is dead.
-            if n == 0 {
-                zero_polls += 1;
-                if zero_polls >= 50 {
-                    // 50 * 100ms = 5s of no data
-                    // Write a null byte -- harmless to the terminal but
-                    // triggers EPIPE/EIO if the slave is closed.
-                    if self.writer.write_all(b"\x00").is_err() || self.writer.flush().is_err() {
-                        eprintln!("[pty] process died during ready-wait (write probe)");
-                        self.eof = true;
-                        return snap;
-                    }
-                    zero_polls = 0;
-                }
-            } else {
-                zero_polls = 0;
             }
             if Instant::now() >= deadline {
                 eprintln!(
