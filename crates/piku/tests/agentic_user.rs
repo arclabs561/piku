@@ -1,6 +1,3 @@
-#[path = "agentic/mod.rs"]
-mod agentic;
-
 /// Agentic user harness — an LLM plays the role of a developer using piku.
 ///
 /// Architecture (v2):
@@ -262,6 +259,7 @@ fn piku_provider() -> Option<ProviderSpec> {
 // ===========================================================================
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // keystroke vocabulary -- variants used as personas expand
 enum SpecialKey {
     Enter,
     Tab,
@@ -418,6 +416,7 @@ impl From<vt100::Color> for Color {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // style fields parsed from VT100, used in future analysis
 struct StyledCell {
     ch: String,
     bold: bool,
@@ -429,6 +428,7 @@ struct StyledCell {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields used in future style analysis
 struct StyledRow {
     row_index: u16,
     cells: Vec<StyledCell>,
@@ -436,6 +436,7 @@ struct StyledRow {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // size stored for diagnostic output
 struct ScreenSnapshot {
     /// Full rendered screen (what a human would see)
     contents: String,
@@ -497,6 +498,13 @@ impl ScreenSnapshot {
             return false;
         }
         true
+    }
+
+    /// Check if piku is showing a permission prompt (tool confirmation).
+    fn has_permission_prompt(&self) -> bool {
+        // Permission prompts contain "y/n/a?" on the cursor row
+        let input = self.input_row();
+        input.contains("y/n/a?")
     }
 
     /// All non-empty visible rows, for the LLM to critique.
@@ -791,41 +799,6 @@ fn strip_ansi_bytes(bytes: &[u8]) -> String {
     result
 }
 
-/// Strip DECSTBM scroll region sequences from raw terminal bytes.
-/// Matches `ESC [ <digits> ; <digits> r` and `ESC [ r` (reset).
-/// Also strips cursor save/restore sequences that interact with DECSTBM.
-fn strip_decstbm(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            // Check for CSI sequence ending in 'r' (DECSTBM)
-            let start = i;
-            i += 2; // skip ESC [
-                    // Scan for the final byte
-            while i < bytes.len() {
-                let b = bytes[i];
-                if b.is_ascii_alphabetic() || b == b'~' {
-                    if b == b'r' {
-                        // This is a DECSTBM sequence — skip it entirely
-                        i += 1;
-                        break;
-                    }
-                    // Not DECSTBM — emit the whole sequence
-                    out.extend_from_slice(&bytes[start..=i]);
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
 // ===========================================================================
 // PTY handle — raw byte-level I/O, bypassing rexpect's reader
 // ===========================================================================
@@ -1000,6 +973,7 @@ impl PtyHandle {
     }
 
     /// Wait until the screen shows piku is ready (prompt visible, cursor on input row).
+    /// Auto-accepts permission prompts (`y/n/a?`) by sending `a` (allow-all).
     /// Returns the final snapshot.
     fn wait_for_ready(
         &mut self,
@@ -1012,6 +986,13 @@ impl PtyHandle {
             let snap = observer.snapshot();
             if snap.is_ready() {
                 return snap;
+            }
+            // Auto-accept permission prompts so the turn can complete.
+            if snap.has_permission_prompt() {
+                eprintln!("[pty] detected permission prompt, sending 'a' (allow-all)");
+                self.send_bytes(b"a");
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
             if Instant::now() >= deadline {
                 eprintln!(
@@ -1077,10 +1058,6 @@ impl WorkspaceObserver {
                 .cloned()
                 .collect(),
         }
-    }
-
-    fn read_file(&self, relative: &Path) -> Option<String> {
-        std::fs::read_to_string(self.root.join(relative)).ok()
     }
 
     fn scan_files(&self) -> HashMap<PathBuf, (SystemTime, u64)> {
@@ -2253,14 +2230,10 @@ fn load_prior_findings(persona: &str) -> String {
 }
 
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
-    if s.chars().count() <= max_chars {
-        return s;
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
     }
-    let mut idx = 0;
-    for (i, _) in s.char_indices().take(max_chars) {
-        idx = i;
-    }
-    &s[..idx]
 }
 
 // ===========================================================================
@@ -2619,6 +2592,10 @@ fn run_agentic_session(persona: &Persona) {
     // Exit piku cleanly
     pty.send_bytes(b"\x04"); // Ctrl-D
     std::thread::sleep(Duration::from_millis(500));
+
+    // Ensure the PTY child process is killed before printing the report.
+    // Without explicit drop, the process can linger as a zombie.
+    drop(pty);
 
     print_report(persona, &entries);
     persist_findings(persona.name, &entries);
