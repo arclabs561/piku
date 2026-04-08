@@ -573,14 +573,15 @@ mod detect_self_build {
             "current_exe should not be newer than itself"
         );
 
-        // Nonexistent path → None
+        // Nonexistent path → None (test CWD has no target/release/piku)
         let result = self_update::detect_self_build(
             "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
             true,
         );
-        // In test env, target/release/piku relative to test cwd likely doesn't
-        // exist or isn't newer. Either way is acceptable.
-        let _ = result; // documented: may be None or Some depending on test environment
+        assert!(
+            result.is_none(),
+            "detect_self_build should return None when binary doesn't exist at default path"
+        );
     }
 
     #[test]
@@ -590,6 +591,20 @@ mod detect_self_build {
             false,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn returns_none_on_failed_exit_even_with_piku_marker() {
+        // Isolates the exit_success guard: output has both "Compiling piku v"
+        // and "Finished" but exit_success=false. Must return None.
+        let result = self_update::detect_self_build(
+            "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
+            false,
+        );
+        assert!(
+            result.is_none(),
+            "failed exit should prevent self-update even with valid output markers"
+        );
     }
 
     #[test]
@@ -1152,10 +1167,9 @@ mod bug_a_detect_self_build {
         let output = "Finished release [optimized] target(s) in 0.5s";
         // No "Compiling piku v" → should not trigger
         let result = self_update::detect_self_build(output, true);
-        // In test env, target/release/piku likely doesn't exist at cwd
-        // so this should be None — but even if somehow it returns Some,
-        // the important fix is that `cargo check` with ONLY "Finished" doesn't loop.
-        // Documented behavior.
-        let _ = result;
+        assert!(
+            result.is_none(),
+            "output with Finished but no 'Compiling piku v' should not trigger self-update"
+        );
     }
 }

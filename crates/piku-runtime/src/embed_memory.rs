@@ -1404,6 +1404,45 @@ mod tests {
         );
     }
 
+    // --- Embedding edge cases ---
+
+    #[test]
+    fn search_with_mismatched_dimensions_does_not_panic() {
+        // dot() uses zip which silently truncates to the shorter vector.
+        // This test documents the behavior: wrong scores, no panic.
+        let mut store = MemoryStore::default();
+        let e768 = make_embedding(1.0); // 768d
+        store.insert("fact one".to_string(), vec![], e768, 7);
+
+        // Query with a 384d vector (dimension mismatch)
+        let short_query: Vec<f32> = make_embedding(1.0).into_iter().take(384).collect();
+        let results = store.search(&short_query, 5);
+        // Should not panic -- zip truncates silently.
+        // Results may be returned but scores are meaningless.
+        assert!(results.len() <= 1);
+    }
+
+    #[test]
+    fn empty_store_search_returns_empty() {
+        let store = MemoryStore::default();
+        let query = make_embedding(1.0);
+        let results = store.search(&query, 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_excludes_invalid_entries() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("valid fact".to_string(), vec![], e.clone(), 7);
+        store.insert("invalid fact".to_string(), vec![], e.clone(), 7);
+        store.entries[1].is_valid = false;
+
+        let results = store.search(&e, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.content, "valid fact");
+    }
+
     // --- LLM judge parsing ---
 
     #[test]
