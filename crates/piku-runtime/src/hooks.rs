@@ -7,6 +7,7 @@
 /// - `PreToolUse`: before a tool call executes (can block or modify)
 /// - `PostToolUse`: after a tool call succeeds
 /// - `SessionStart`: when a session begins
+/// - `Stop`: after a turn completes (notifications, logging, cleanup)
 ///
 /// Inspired by Claude Code's hooks system (code.claude.com/docs/en/hooks).
 use std::path::{Path, PathBuf};
@@ -40,7 +41,9 @@ fn default_timeout() -> u64 {
 /// A matcher + hooks pair for a specific event.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct HookEntry {
-    /// Regex pattern to match (tool name for tool events, trigger for session events).
+    /// Pattern to match tool names. Supports exact match (`"Bash"`),
+    /// pipe-delimited alternation (`"Edit|Write"`), or wildcard (`"*"`).
+    /// `None` matches all tools.
     pub matcher: Option<String>,
     /// Hook handlers to run when matched.
     pub hooks: Vec<HookHandler>,
@@ -55,6 +58,8 @@ pub struct HookConfig {
     pub post_tool_use: Vec<HookEntry>,
     #[serde(rename = "SessionStart", default)]
     pub session_start: Vec<HookEntry>,
+    #[serde(rename = "Stop", default)]
+    pub stop: Vec<HookEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +130,7 @@ impl HookRegistry {
         !self.config.pre_tool_use.is_empty()
             || !self.config.post_tool_use.is_empty()
             || !self.config.session_start.is_empty()
+            || !self.config.stop.is_empty()
     }
 
     /// Run `PreToolUse` hooks. Returns the decision (allow/deny).
@@ -287,6 +293,42 @@ impl HookRegistry {
             Some(context_parts.join("\n\n"))
         }
     }
+
+    /// Run `Stop` hooks after a turn completes. Fire-and-forget (errors logged).
+    pub fn run_stop(&self, session_id: &str, cwd: &Path, iterations: u32, stop_reason: &str) {
+        let entries = &self.config.stop;
+        if entries.is_empty() {
+            return;
+        }
+
+        let input = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "iterations": iterations,
+            "stop_reason": stop_reason,
+        });
+
+        for entry in entries {
+            for handler in &entry.hooks {
+                if handler.r#async {
+                    let cmd = handler.command.clone();
+                    let input_str = input.to_string();
+                    let project_dir = self.project_dir.clone();
+                    std::thread::spawn(move || {
+                        let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
+                    });
+                } else if let HookCommandResult::Error(msg) = run_hook_command(
+                    &handler.command,
+                    &input,
+                    handler.timeout,
+                    self.project_dir.as_deref(),
+                ) {
+                    eprintln!("[piku] stop hook error: {msg}");
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,19 +377,34 @@ fn run_hook_command_raw(
         Err(e) => return HookCommandResult::Error(format!("spawn failed: {e}")),
     };
 
-    // Write JSON to stdin
+    // Write JSON to stdin then close it so the child sees EOF.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input_json.as_bytes());
     }
 
-    // Wait with timeout
+    // Poll with timeout instead of blocking indefinitely.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap
+                    return HookCommandResult::Error(format!(
+                        "hook timed out after {timeout_secs}s: {command}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return HookCommandResult::Error(format!("wait failed: {e}")),
+        }
+    }
+
     let output = match child.wait_with_output() {
         Ok(o) => o,
         Err(e) => return HookCommandResult::Error(format!("wait failed: {e}")),
     };
-
-    // TODO: implement actual timeout (currently unused -- wait_with_output blocks indefinitely)
-    _ = timeout_secs;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -360,16 +417,14 @@ fn run_hook_command_raw(
     }
 }
 
-/// Check if a tool name matches a matcher pattern (regex).
+/// Check if a tool name matches a matcher pattern.
+/// Supports: exact match, pipe-delimited alternation (`"Edit|Write"`), wildcard (`"*"`).
 fn matches_tool(matcher: Option<&str>, tool_name: &str) -> bool {
     match matcher {
         None => true, // No matcher = match all
-        Some(pattern) => {
-            // Simple regex match -- support `|` for alternation
-            pattern
-                .split('|')
-                .any(|p| p.trim() == tool_name || p.trim() == "*")
-        }
+        Some(pattern) => pattern
+            .split('|')
+            .any(|p| p.trim() == tool_name || p.trim() == "*"),
     }
 }
 
@@ -656,5 +711,65 @@ mod tests {
             dir.path(),
         );
         assert_eq!(result.decision, HookDecision::Allow);
+    }
+
+    #[test]
+    fn stop_hook_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join(".piku");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let marker = dir.path().join("stop_fired.txt");
+        let cmd = format!("cat > {}", marker.display());
+        let json = serde_json::json!({
+            "Stop": [{
+                "hooks": [{"command": cmd}]
+            }]
+        });
+        std::fs::write(hooks_dir.join("hooks.json"), json.to_string()).unwrap();
+
+        let registry = HookRegistry::load(dir.path());
+        registry.run_stop("test-session", dir.path(), 3, "end_turn");
+        assert!(marker.exists(), "stop hook should write marker file");
+        let content = std::fs::read_to_string(&marker).unwrap();
+        assert!(content.contains("\"hook_event_name\":\"Stop\""));
+        assert!(content.contains("\"iterations\":3"));
+    }
+
+    #[test]
+    fn hook_timeout_kills_slow_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join(".piku");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("hooks.json"),
+            r#"{
+                "SessionStart": [{
+                    "hooks": [{"command": "sleep 60", "timeout": 1}]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let registry = HookRegistry::load(dir.path());
+        let start = std::time::Instant::now();
+        let context = registry.run_session_start("test-session", dir.path());
+        let elapsed = start.elapsed();
+        // Should return within ~2s (1s timeout + polling overhead), not 60s.
+        assert!(
+            elapsed.as_secs() < 5,
+            "hook should have been killed by timeout"
+        );
+        assert!(
+            context.is_none(),
+            "timed-out hook should not produce context"
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_additional_context() {
+        let stdout_json = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"remember to be careful"}}"#;
+        let result = parse_pre_tool_decision(stdout_json).unwrap();
+        assert_eq!(result.decision, HookDecision::Allow);
+        assert_eq!(result.context.as_deref(), Some("remember to be careful"));
     }
 }

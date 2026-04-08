@@ -7,11 +7,25 @@ use super::terminal::TerminalObserver;
 use super::types::*;
 
 pub struct PtyHandle {
+    /// Kept for Drop — rexpect sends SIGTERM then SIGKILL after kill_timeout.
+    /// Declared first so it drops last (after writer/reader close).
     _process: rexpect::process::PtyProcess,
     writer: std::fs::File,
     reader: std::fs::File,
     /// Raw bytes captured since last clear -- used to extract response text.
     pub raw_capture: Vec<u8>,
+}
+
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        // Send Ctrl-D (EOF) to trigger piku's clean shutdown before the PTY
+        // process is killed. Without this, SIGTERM arrives mid-render and can
+        // leave zombie child processes (e.g. in-flight ollama requests).
+        let _ = self.writer.write_all(b"\x04");
+        let _ = self.writer.flush();
+        std::thread::sleep(Duration::from_millis(300));
+        // _process drops here via struct field order, triggering rexpect's kill loop.
+    }
 }
 
 impl PtyHandle {
