@@ -98,8 +98,12 @@ pub async fn embed_text(
         .and_then(|e| e.get(0))
         .ok_or_else(|| "no embeddings in response".to_string())?;
 
-    let vec: Vec<f32> = serde_json::from_value(embedding.clone())
+    let mut vec: Vec<f32> = serde_json::from_value(embedding.clone())
         .map_err(|e| format!("embedding parse failed: {e}"))?;
+
+    // Normalize to unit length — ollama usually returns normalized vectors,
+    // but normalize defensively so dot product = cosine similarity.
+    normalize(&mut vec);
 
     Ok(vec)
 }
