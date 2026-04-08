@@ -91,8 +91,8 @@ fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
     let age_secs = now.saturating_sub(entry.last_accessed) as f64;
     let recency = (-(age_secs * (2.0_f64.ln())) / RECENCY_HALF_LIFE).exp() as f32;
 
-    // Importance: normalize 1-10 to [0, 1]
-    let importance = (entry.importance as f32 - 1.0) / 9.0;
+    // Importance: normalize 1-10 to [0, 1], clamping at 1 for legacy data with 0
+    let importance = (entry.importance.max(1) as f32 - 1.0) / 9.0;
 
     // Access frequency: log scale, capped at 1.0
     let access = (1.0 + entry.access_count as f32).ln() / 5.0_f32.ln(); // ln(1+n)/ln(5)
