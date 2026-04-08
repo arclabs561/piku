@@ -157,13 +157,19 @@ pub fn load_custom_agents(project_root: &Path) -> Vec<CustomAgentDef> {
 }
 
 /// Find an agent by type name across built-ins and custom agents.
+/// Custom agents override built-ins -- a warning is printed when this happens.
 #[must_use]
-pub fn find_agent<'a>(
+pub fn find_agent(
     agent_type: &str,
-    custom_agents: &'a [CustomAgentDef],
+    custom_agents: &[CustomAgentDef],
 ) -> Option<AnyAgentDef> {
-    // Custom agents override built-ins with the same name.
     if let Some(custom) = custom_agents.iter().find(|a| a.agent_type == agent_type) {
+        if find_built_in(agent_type).is_some() {
+            eprintln!(
+                "[piku] warning: custom agent '{}' overrides built-in agent (from {})",
+                agent_type, custom.source_path
+            );
+        }
         return Some(AnyAgentDef::Custom(custom.clone()));
     }
     find_built_in(agent_type).map(AnyAgentDef::BuiltIn)

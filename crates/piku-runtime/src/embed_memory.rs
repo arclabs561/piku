@@ -533,28 +533,194 @@ pub async fn extract_and_store(
 
     let mut count = 0;
     for (fact, tags, importance) in facts {
-        // Embed the new fact
         let embedding = match embed_text(&fact, ollama_url, embed_model).await {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        // Check for contradictions: find top-3 most similar existing memories
+        // Find top-3 similar existing memories for contradiction check
         let similar = store.find_similar(&embedding, 3);
 
-        // If the most similar memory is very close (>0.85), it might be a
-        // duplicate or contradiction. For now, skip near-duplicates.
-        if similar.first().is_some_and(|s| s.similarity > 0.85) {
-            continue;
-        }
-
-        // Importance-gated admission: insert returns None if below threshold
-        if store.insert(fact, tags, embedding, importance).is_some() {
-            count += 1;
+        if similar.first().is_some_and(|s| s.similarity > 0.7) {
+            // High similarity -- ask LLM to judge: ADD, UPDATE, or IGNORE
+            let existing_texts: Vec<String> = similar
+                .iter()
+                .filter(|s| s.similarity > 0.5)
+                .map(|s| format!("[id:{}] {}", s.entry.id, s.entry.content))
+                .collect();
+            let decision = judge_memory_conflict(
+                &fact,
+                &existing_texts,
+                provider,
+                model,
+            )
+            .await;
+            match decision {
+                MemoryJudgment::Add => {
+                    if store.insert(fact, tags, embedding, importance).is_some() {
+                        count += 1;
+                    }
+                }
+                MemoryJudgment::Update(supersedes_id) => {
+                    store.insert_superseding(fact, tags, embedding, supersedes_id, importance);
+                    count += 1;
+                }
+                MemoryJudgment::Ignore => {} // duplicate or irrelevant
+            }
+        } else {
+            // No similar memories -- just insert
+            if store.insert(fact, tags, embedding, importance).is_some() {
+                count += 1;
+            }
         }
     }
 
     count
+}
+
+// ---------------------------------------------------------------------------
+// LLM memory judge (Mem0-style ADD/UPDATE/IGNORE)
+// ---------------------------------------------------------------------------
+
+/// Decision from the LLM judge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryJudgment {
+    /// New fact, no conflict with existing memories.
+    Add,
+    /// Updates/supersedes an existing memory (by ID).
+    Update(u64),
+    /// Duplicate or irrelevant -- don't store.
+    Ignore,
+}
+
+const JUDGE_PROMPT: &str = "\
+You are a memory conflict resolver. Given a NEW fact and EXISTING memories, decide:
+
+- ADD: the new fact is genuinely new information (not a duplicate or update)
+- UPDATE <id>: the new fact supersedes/corrects an existing memory (give the id to replace)
+- IGNORE: the new fact is a duplicate or already covered by existing memories
+
+Respond with exactly one line: ADD, UPDATE <id>, or IGNORE.";
+
+/// Ask the LLM to judge whether a new fact should be added, updated, or ignored.
+async fn judge_memory_conflict(
+    new_fact: &str,
+    existing: &[String],
+    provider: &dyn piku_api::Provider,
+    model: &str,
+) -> MemoryJudgment {
+    use futures_util::StreamExt;
+
+    let existing_text = existing.join("\n");
+    let user_msg = format!(
+        "NEW FACT: {new_fact}\n\nEXISTING MEMORIES:\n{existing_text}\n\nDecision:"
+    );
+
+    let request = piku_api::MessageRequest {
+        model: model.to_string(),
+        max_tokens: 32,
+        messages: vec![piku_api::RequestMessage {
+            role: "user".to_string(),
+            content: vec![piku_api::RequestContent::Text { text: user_msg }],
+        }],
+        system: Some(vec![piku_api::SystemBlock::text(JUDGE_PROMPT.to_string())]),
+        tools: None,
+        stream: true,
+    };
+
+    let mut stream = provider.stream_message(request);
+    let mut response = String::new();
+
+    let timeout = std::time::Duration::from_secs(10);
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(event) = stream.next().await {
+            if let Ok(piku_api::Event::TextDelta { text }) = event {
+                response.push_str(&text);
+            }
+        }
+    })
+    .await;
+
+    if result.is_err() {
+        return MemoryJudgment::Add; // timeout → safe default: add
+    }
+
+    parse_judgment(&response)
+}
+
+fn parse_judgment(response: &str) -> MemoryJudgment {
+    let trimmed = response.trim().to_uppercase();
+    if trimmed == "IGNORE" {
+        return MemoryJudgment::Ignore;
+    }
+    if trimmed == "ADD" {
+        return MemoryJudgment::Add;
+    }
+    if let Some(rest) = trimmed.strip_prefix("UPDATE") {
+        let id_str = rest.trim();
+        if let Ok(id) = id_str.parse::<u64>() {
+            return MemoryJudgment::Update(id);
+        }
+    }
+    MemoryJudgment::Add // unparseable → safe default
+}
+
+// ---------------------------------------------------------------------------
+// Ebbinghaus-inspired eviction
+// ---------------------------------------------------------------------------
+
+/// Strength score for eviction decisions.
+/// strength = importance_norm * recency_decay * (1 + log(1 + access_count))
+/// Low strength = candidate for eviction.
+fn memory_strength(entry: &MemoryEntry, now: u64) -> f32 {
+    let importance_norm = entry.importance.max(1) as f32 / 10.0;
+    let age_secs = now.saturating_sub(entry.last_accessed) as f64;
+    let recency = (-(age_secs * (2.0_f64.ln())) / RECENCY_HALF_LIFE).exp() as f32;
+    let access_boost = (1.0 + entry.access_count as f32).ln() + 1.0;
+    importance_norm * recency * access_boost
+}
+
+impl MemoryStore {
+    /// Evict (invalidate) memories with strength below `threshold`.
+    /// Returns the number of entries evicted.
+    /// Does NOT delete -- marks `is_valid = false` to preserve audit trail.
+    pub fn evict_weak(&mut self, threshold: f32) -> usize {
+        let now = now_unix();
+        let mut evicted = 0;
+        for entry in &mut self.entries {
+            if entry.is_valid && memory_strength(entry, now) < threshold {
+                entry.is_valid = false;
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Evict memories that haven't been accessed in `max_age_days` days
+    /// AND have low importance (< 5).
+    pub fn evict_stale(&mut self, max_age_days: u32) -> usize {
+        let now = now_unix();
+        let max_age_secs = max_age_days as u64 * 24 * 3600;
+        let mut evicted = 0;
+        for entry in &mut self.entries {
+            if entry.is_valid
+                && entry.importance < 5
+                && now.saturating_sub(entry.last_accessed) > max_age_secs
+            {
+                entry.is_valid = false;
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Run maintenance: evict weak memories and report.
+    /// Call at session start or periodically.
+    pub fn maintain(&mut self) -> (usize, usize) {
+        let stale = self.evict_stale(30); // 30-day stale threshold
+        let weak = self.evict_weak(0.05); // very low strength threshold
+        (stale, weak)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +801,7 @@ pub fn build_extraction_transcript(
                 if !text.trim().is_empty() {
                     transcript.push_str(role);
                     transcript.push_str(": ");
-                    if text.len() > 500 {
+                    if text.chars().count() > 500 {
                         let trunc: String = text.chars().take(500).collect();
                         transcript.push_str(&trunc);
                         transcript.push_str("...");
@@ -992,6 +1158,82 @@ mod tests {
         let e = make_embedding(1.0);
         let results = store.search(&e, 5);
         assert!(results.is_empty());
+    }
+
+    // --- Eviction tests ---
+
+    #[test]
+    fn evict_stale_removes_old_low_importance() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("old low".to_string(), vec![], e.clone(), 3);
+        store.entries[0].last_accessed = 0; // epoch = very old
+        store.entries[0].created_at = 0;
+        store.insert("recent high".to_string(), vec![], e.clone(), 9);
+
+        let evicted = store.evict_stale(30);
+        assert_eq!(evicted, 1);
+        assert!(!store.entries[0].is_valid); // old low evicted
+        assert!(store.entries[1].is_valid);  // recent high kept
+    }
+
+    #[test]
+    fn evict_stale_keeps_high_importance_old() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("old but important".to_string(), vec![], e.clone(), 8);
+        store.entries[0].last_accessed = 0;
+        let evicted = store.evict_stale(30);
+        assert_eq!(evicted, 0); // importance >= 5, kept
+    }
+
+    #[test]
+    fn evict_weak_removes_zero_strength() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("zero strength".to_string(), vec![], e.clone(), 3);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].created_at = 0;
+        store.entries[0].access_count = 0;
+        let evicted = store.evict_weak(0.05);
+        assert!(evicted > 0);
+    }
+
+    #[test]
+    fn maintain_returns_counts() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("healthy".to_string(), vec![], e.clone(), 7);
+        let (stale, weak) = store.maintain();
+        // Recent, medium importance -- should not be evicted
+        assert_eq!(stale, 0);
+        assert_eq!(weak, 0);
+    }
+
+    // --- LLM judge parsing ---
+
+    #[test]
+    fn parse_judgment_add() {
+        assert_eq!(super::parse_judgment("ADD"), super::MemoryJudgment::Add);
+        assert_eq!(super::parse_judgment("add"), super::MemoryJudgment::Add);
+        assert_eq!(super::parse_judgment("  ADD  "), super::MemoryJudgment::Add);
+    }
+
+    #[test]
+    fn parse_judgment_ignore() {
+        assert_eq!(super::parse_judgment("IGNORE"), super::MemoryJudgment::Ignore);
+    }
+
+    #[test]
+    fn parse_judgment_update() {
+        assert_eq!(super::parse_judgment("UPDATE 42"), super::MemoryJudgment::Update(42));
+        assert_eq!(super::parse_judgment("update 7"), super::MemoryJudgment::Update(7));
+    }
+
+    #[test]
+    fn parse_judgment_garbage_defaults_to_add() {
+        assert_eq!(super::parse_judgment("dunno"), super::MemoryJudgment::Add);
+        assert_eq!(super::parse_judgment(""), super::MemoryJudgment::Add);
     }
 
     #[test]
