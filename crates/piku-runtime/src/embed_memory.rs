@@ -881,7 +881,10 @@ fn parse_extraction_response(response: &str) -> Vec<(String, Vec<String>, u8)> {
             continue;
         };
         let fact_text = fact_text.trim();
-        if fact_text.is_empty() || fact_text.starts_with("TAGS:") || fact_text.starts_with("[attempt]") {
+        if fact_text.is_empty()
+            || fact_text.starts_with("TAGS:")
+            || fact_text.starts_with("[attempt]")
+        {
             continue;
         }
 
@@ -1044,14 +1047,25 @@ pub async fn extract_and_store(
         }
     }
 
-    // Process attempts -- group by goal, create tree structure
-    // Attempts with the same goal become siblings under a shared root.
+    // Process attempts -- group by goal, create tree structure.
+    // Dedup: if an agent already called record_attempt during the session,
+    // the extracted attempt would duplicate it. Check embedding similarity
+    // against existing attempts before inserting.
     let mut goal_roots: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for attempt in attempts {
         let embed_text_str = format!("{} | {}", attempt.goal, attempt.approach);
         let Ok(embedding) = embed_text(&embed_text_str, ollama_url, embed_model).await else {
             continue;
         };
+        // Dedup: check if a similar attempt already exists
+        let similar = store.search(&embedding, 1);
+        if similar
+            .first()
+            .is_some_and(|s| s.similarity > 0.85 && s.entry.entry_type == EntryType::Attempt)
+        {
+            // Near-duplicate attempt already recorded (likely via record_attempt tool)
+            continue;
+        }
         // Reuse or create a root for this goal
         let parent_id = goal_roots.get(&attempt.goal).copied();
         let id = store.record_attempt(
@@ -1173,18 +1187,83 @@ fn memory_strength(entry: &MemoryEntry, now: u64) -> f32 {
 }
 
 impl MemoryStore {
+    /// Whether an attempt has any valid children.
+    fn has_valid_children(&self, id: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.parent == Some(id) && e.is_valid)
+    }
+
+    /// Whether an attempt tree rooted at `id` is resolved (has at least one
+    /// successful descendant). Unresolved trees (all failures, still searching)
+    /// should be retained longer.
+    fn tree_is_resolved(&self, id: u64) -> bool {
+        // Check direct children for success
+        for child in &self.entries {
+            if child.parent == Some(id) && child.is_valid {
+                if child.outcome == Some(Outcome::Success) {
+                    return true;
+                }
+                // Recurse into child subtrees
+                if self.tree_is_resolved(child.id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check whether an attempt entry is safe to evict.
+    /// Returns false if eviction would orphan children or discard an unresolved tree.
+    fn attempt_evictable(&self, entry: &MemoryEntry) -> bool {
+        if entry.entry_type != EntryType::Attempt {
+            return true; // facts use normal eviction rules
+        }
+        // Never orphan children
+        if self.has_valid_children(entry.id) {
+            return false;
+        }
+        // Find the tree root
+        let root_id = self
+            .path_to_root(entry.id)
+            .last()
+            .map_or(entry.id, |r| r.id);
+        // Keep unresolved trees (still useful for guiding future attempts)
+        if !self.tree_is_resolved(root_id) {
+            return false;
+        }
+        true
+    }
+
     /// Evict (invalidate) memories with strength below `threshold`.
     /// Returns the number of entries evicted.
     /// Does NOT delete -- marks `is_valid = false` to preserve audit trail.
+    /// Tree-aware: won't orphan attempt children or discard unresolved attempt trees.
     pub fn evict_weak(&mut self, threshold: f32) -> usize {
         let now = now_unix();
+        // Collect IDs to evict (can't mutate while iterating with tree checks).
+        let to_evict: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.is_valid
+                    && e.importance < 5
+                    && memory_strength(e, now) < threshold
+            })
+            .map(|e| e.id)
+            .collect();
         let mut evicted = 0;
-        for entry in &mut self.entries {
-            // Protect high-importance memories from strength-based eviction.
-            // Without this floor, the multiplicative strength formula (importance *
-            // recency * access) lets recency decay dominate, evicting important old
-            // memories that evict_stale would protect.
-            if entry.is_valid && entry.importance < 5 && memory_strength(entry, now) < threshold {
+        for id in to_evict {
+            // Re-check tree safety (earlier evictions in this pass may have changed the tree)
+            let dominated_by_tree = self
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .is_some_and(|e| !self.attempt_evictable(e));
+            if dominated_by_tree {
+                continue;
+            }
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
                 entry.is_valid = false;
                 evicted += 1;
             }
@@ -1194,15 +1273,31 @@ impl MemoryStore {
 
     /// Evict memories that haven't been accessed in `max_age_days` days
     /// AND have low importance (< 5).
+    /// Tree-aware: won't orphan attempt children or discard unresolved attempt trees.
     pub fn evict_stale(&mut self, max_age_days: u32) -> usize {
         let now = now_unix();
         let max_age_secs = u64::from(max_age_days) * 24 * 3600;
+        let to_evict: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.is_valid
+                    && e.importance < 5
+                    && now.saturating_sub(e.last_accessed) > max_age_secs
+            })
+            .map(|e| e.id)
+            .collect();
         let mut evicted = 0;
-        for entry in &mut self.entries {
-            if entry.is_valid
-                && entry.importance < 5
-                && now.saturating_sub(entry.last_accessed) > max_age_secs
-            {
+        for id in to_evict {
+            let dominated_by_tree = self
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .is_some_and(|e| !self.attempt_evictable(e));
+            if dominated_by_tree {
+                continue;
+            }
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
                 entry.is_valid = false;
                 evicted += 1;
             }
@@ -2268,7 +2363,8 @@ mod tests {
 
     #[test]
     fn parse_attempt_lines_skips_pending() {
-        let response = "- [attempt] goal: test | approach: thing | outcome: pending | detail: still going";
+        let response =
+            "- [attempt] goal: test | approach: thing | outcome: pending | detail: still going";
         let attempts = super::parse_attempt_lines(response);
         assert!(attempts.is_empty()); // pending outcomes are skipped
     }
@@ -2298,5 +2394,117 @@ mod tests {
         assert_eq!(facts.len(), 2);
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].goal, "reduce compile time");
+    }
+
+    // --- Tree-aware eviction tests ---
+
+    #[test]
+    fn evict_stale_wont_orphan_children() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Parent attempt (old, low importance -- normally evictable)
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 3);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].created_at = 0;
+        // Child attempt (recent)
+        store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 3);
+
+        let evicted = store.evict_stale(30);
+        // Root should NOT be evicted because it has a valid child
+        assert_eq!(evicted, 0);
+        assert!(store.entries[0].is_valid);
+    }
+
+    #[test]
+    fn evict_stale_keeps_unresolved_tree() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Unresolved tree: root with one failed child, no successes
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 3);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].created_at = 0;
+        let child = store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 3);
+        store.record_outcome(child, Outcome::Failure, Some("didn't work".into()));
+        store.entries[1].last_accessed = 0;
+        store.entries[1].created_at = 0;
+
+        let evicted = store.evict_stale(30);
+        // Unresolved tree: no successes anywhere, should be kept
+        assert_eq!(evicted, 0);
+    }
+
+    #[test]
+    fn evict_stale_can_evict_resolved_leaf() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Resolved tree: root -> child (success)
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 3);
+        let child = store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 3);
+        store.record_outcome(child, Outcome::Success, Some("worked".into()));
+        // Make both old
+        for entry in &mut store.entries {
+            entry.last_accessed = 0;
+            entry.created_at = 0;
+        }
+
+        let evicted = store.evict_stale(30);
+        // Child (leaf with no children) in resolved tree CAN be evicted.
+        // Root still has a valid child so it's protected until child goes first.
+        // But the child has no children and tree is resolved, so child is evictable.
+        assert!(evicted >= 1);
+    }
+
+    #[test]
+    fn evict_weak_wont_orphan_children() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 3);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].access_count = 0;
+        store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 3);
+
+        let evicted = store.evict_weak(0.05);
+        // Root protected by child
+        assert!(store.entries[0].is_valid);
+        assert_eq!(evicted, 0);
+    }
+
+    #[test]
+    fn tree_is_resolved_checks_descendants() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("g".into(), "root".into(), None, e.clone(), 6);
+        let child = store.record_attempt("g".into(), "child".into(), Some(root), e.clone(), 6);
+        let grandchild =
+            store.record_attempt("g".into(), "gc".into(), Some(child), e.clone(), 6);
+        store.record_outcome(grandchild, Outcome::Success, None);
+
+        assert!(store.tree_is_resolved(root));
+        assert!(store.tree_is_resolved(child));
+    }
+
+    #[test]
+    fn tree_is_resolved_false_when_all_fail() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("g".into(), "root".into(), None, e.clone(), 6);
+        let child = store.record_attempt("g".into(), "child".into(), Some(root), e.clone(), 6);
+        store.record_outcome(child, Outcome::Failure, None);
+
+        assert!(!store.tree_is_resolved(root));
+    }
+
+    #[test]
+    fn facts_still_evict_normally_with_tree_logic() {
+        // Ensure tree-aware eviction doesn't accidentally protect facts
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("old fact".into(), vec![], e.clone(), 3);
+        store.entries[0].last_accessed = 0;
+        store.entries[0].created_at = 0;
+
+        let evicted = store.evict_stale(30);
+        assert_eq!(evicted, 1);
+        assert!(!store.entries[0].is_valid);
     }
 }

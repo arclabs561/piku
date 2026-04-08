@@ -1165,6 +1165,14 @@ fn execute_spawn_agent(
                     prompt.push_str(&mem_section);
                     let _ = store.save(&store_path);
                 }
+                // Also inject relevant attempt trees so subagents avoid repeating failures.
+                let attempt_trees =
+                    store.find_attempt_trees(&query_vec, &query_text, 3);
+                if !attempt_trees.is_empty() {
+                    prompt.push_str(&crate::embed_memory::format_attempt_trees(
+                        &attempt_trees,
+                    ));
+                }
             }
         }
     }
