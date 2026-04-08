@@ -1,4 +1,5 @@
 use piku::cli::{parse_args, CliAction, ResolvedProvider};
+use piku::config::PikuConfig;
 use piku::self_update;
 use piku::trace::TraceWriter;
 use piku::tui_repl;
@@ -20,8 +21,31 @@ const VERSION: &str = env!("CARGO_PKG_VERSION"); // self-update demo
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    let action = parse_args(&args);
 
-    match parse_args(&args) {
+    // Extract CLI-level overrides for config loading.
+    let (cli_model, cli_provider) = match &action {
+        CliAction::SingleShot {
+            model,
+            provider_override,
+            ..
+        }
+        | CliAction::Resume {
+            model,
+            provider_override,
+            ..
+        }
+        | CliAction::Repl {
+            model,
+            provider_override,
+        } => (model.as_deref(), provider_override.as_deref()),
+        _ => (None, None),
+    };
+
+    let cwd = env::current_dir().ok();
+    let config = PikuConfig::load(cli_provider, cli_model, cwd.as_deref());
+
+    match action {
         CliAction::Version => println!("piku {VERSION}"),
         CliAction::Help => print_help(),
         CliAction::ArgError(msg) => {
@@ -29,61 +53,26 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Run `piku --help` for usage.");
             std::process::exit(1);
         }
-        CliAction::SingleShot {
-            prompt,
-            model,
-            provider_override,
-        } => {
-            // If we're restarting after a self-build, recover the session
-            // instead of re-running the original prompt.
+        CliAction::SingleShot { prompt, .. } => {
             if self_update::was_restarted() {
-                if let Some(session) = try_load_restart_session() {
-                    return run_tui_repl_post_restart(
-                        session,
-                        model.as_deref(),
-                        provider_override.as_deref(),
-                    )
-                    .await;
+                if let Some(session) = try_load_restart_session(&config) {
+                    return run_tui_repl_post_restart(session, &config).await;
                 }
             }
-            run_single_shot_then_repl(
-                &prompt,
-                None,
-                model.as_deref(),
-                provider_override.as_deref(),
-            )
-            .await?;
+            run_single_shot_then_repl(&prompt, None, &config).await?;
         }
         CliAction::Resume {
-            session_id,
-            prompt,
-            model,
-            provider_override,
+            session_id, prompt, ..
         } => {
-            run_resume(
-                &session_id,
-                prompt.as_deref(),
-                model.as_deref(),
-                provider_override.as_deref(),
-            )
-            .await?;
+            run_resume(&session_id, prompt.as_deref(), &config).await?;
         }
-        CliAction::Repl {
-            model,
-            provider_override,
-        } => {
-            // If we're restarting after a self-build, reload the session.
+        CliAction::Repl { .. } => {
             if self_update::was_restarted() {
-                if let Some(session) = try_load_restart_session() {
-                    return run_tui_repl_post_restart(
-                        session,
-                        model.as_deref(),
-                        provider_override.as_deref(),
-                    )
-                    .await;
+                if let Some(session) = try_load_restart_session(&config) {
+                    return run_tui_repl_post_restart(session, &config).await;
                 }
             }
-            tui_repl::run_tui_repl(model.as_deref(), provider_override.as_deref()).await?;
+            tui_repl::run_tui_repl(&config).await?;
         }
     }
 
@@ -96,10 +85,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Load the session indicated by `PIKU_SESSION_ID` (set by `tui_repl` before exec).
 /// Returns None if the env var is missing or the session can't be loaded.
-fn try_load_restart_session() -> Option<Session> {
+fn try_load_restart_session(config: &PikuConfig) -> Option<Session> {
     let session_id = std::env::var("PIKU_SESSION_ID").ok()?;
     std::env::remove_var("PIKU_SESSION_ID");
-    let sessions_dir = sessions_dir().ok()?;
+    let sessions_dir = config.sessions_dir();
     let path = sessions_dir.join(format!("{session_id}.json"));
     match Session::load(&path) {
         Ok(s) => Some(s),
@@ -111,13 +100,8 @@ fn try_load_restart_session() -> Option<Session> {
 }
 
 /// Enter the TUI REPL with a session that was just restored after a self-rebuild.
-/// Prints a restart banner in the scroll zone.
-async fn run_tui_repl_post_restart(
-    session: Session,
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
-) -> anyhow::Result<()> {
-    tui_repl::run_tui_repl_post_restart(model_override, provider_override, Some(session)).await
+async fn run_tui_repl_post_restart(session: Session, config: &PikuConfig) -> anyhow::Result<()> {
+    tui_repl::run_tui_repl_post_restart(config, Some(session)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -127,10 +111,10 @@ async fn run_tui_repl_post_restart(
 async fn run_resume(
     session_id: &str,
     prompt: Option<&str>,
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &PikuConfig,
 ) -> anyhow::Result<()> {
-    let sessions_dir = sessions_dir()?;
+    let sessions_dir = config.sessions_dir();
+    std::fs::create_dir_all(&sessions_dir)?;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
 
     if !session_path.exists() {
@@ -155,8 +139,7 @@ async fn run_resume(
                 return run_single_shot_then_repl(
                     prompt.unwrap_or("Continue where we left off."),
                     Some(session),
-                    model_override,
-                    provider_override,
+                    config,
                 )
                 .await;
             }
@@ -182,8 +165,7 @@ async fn run_resume(
     run_single_shot_then_repl(
         prompt.unwrap_or("Continue where we left off."),
         Some(session),
-        model_override,
-        provider_override,
+        config,
     )
     .await
 }
@@ -195,11 +177,12 @@ async fn run_resume(
 async fn run_single_shot_then_repl(
     prompt: &str,
     existing_session: Option<Session>,
-    model_override: Option<&str>,
-    provider_override: Option<&str>,
+    config: &PikuConfig,
 ) -> anyhow::Result<()> {
-    let resolved = ResolvedProvider::resolve(provider_override)?;
-    let model = model_override
+    let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
+    let model = config
+        .model
+        .as_deref()
         .unwrap_or(&resolved.default_model)
         .to_string();
 
@@ -219,10 +202,9 @@ async fn run_single_shot_then_repl(
 
     let tool_defs = all_tool_definitions();
     let prompter = AllowAll;
-    let trace = traces_dir().map_or_else(
-        |_| TraceWriter::disabled(),
-        |dir| TraceWriter::open(&dir, &session_id),
-    );
+    let traces_dir = config.traces_dir();
+    std::fs::create_dir_all(&traces_dir).ok();
+    let trace = TraceWriter::open(&traces_dir, &session_id);
     let mut sink = StdoutSink::new(trace);
     sink.trace.prompt(prompt);
 
@@ -245,7 +227,8 @@ async fn run_single_shot_then_repl(
     }
 
     // Persist session BEFORE self-update — nothing should be lost on restart
-    let sessions_dir = sessions_dir()?;
+    let sessions_dir = config.sessions_dir();
+    std::fs::create_dir_all(&sessions_dir)?;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
     if let Err(e) = session.save(&session_path) {
         eprintln!("warning: could not save session: {e}");
@@ -270,13 +253,7 @@ async fn run_single_shot_then_repl(
 
     // Drop into TUI REPL with the same session for continued conversation
     println!(); // blank line between single-shot output and REPL
-    tui_repl::run_tui_repl_with_session(
-        model_override,
-        provider_override,
-        Some(session),
-        result.usage,
-    )
-    .await
+    tui_repl::run_tui_repl_with_session(config, Some(session), result.usage).await
 }
 
 // ---------------------------------------------------------------------------
@@ -430,23 +407,6 @@ NOTES:
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-
-fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {
-    piku::sessions_dir()
-}
-
-fn traces_dir() -> anyhow::Result<std::path::PathBuf> {
-    let base = match env::var("XDG_CONFIG_HOME") {
-        Ok(v) => std::path::PathBuf::from(v),
-        Err(_) => env::var("HOME").map_or_else(
-            |_| std::path::PathBuf::from(".config"),
-            |h| std::path::PathBuf::from(h).join(".config"),
-        ),
-    };
-    let path = base.join("piku").join("traces");
-    std::fs::create_dir_all(&path)?;
-    Ok(path)
-}
 
 fn new_session_id() -> String {
     piku::new_session_id()
