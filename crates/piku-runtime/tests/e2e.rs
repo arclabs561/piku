@@ -858,7 +858,7 @@ async fn e2e_system_prompt_reaches_provider() {
 
     let provider = SystemCapture(captured_system.clone());
     let dir = tempdir();
-    let system = build_system_prompt(&dir, "2026-04-03", "test-model");
+    let system = build_system_prompt(&dir, "2026-04-03", "test-model", &[]);
 
     let mut session = Session::new("e2e-12".to_string());
     let mut sink = CollectSink::default();

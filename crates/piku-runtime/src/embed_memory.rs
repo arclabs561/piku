@@ -816,8 +816,10 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
     }
 
     fn list_recent(&self, max: usize) -> Vec<(u64, String, bool, u32)> {
+        // Show all entries (including invalid) so operator has full visibility.
+        // Sort valid first, then by recency within each group.
         let mut sorted: Vec<&MemoryEntry> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sorted.sort_by(|a, b| b.is_valid.cmp(&a.is_valid).then(b.created_at.cmp(&a.created_at)));
         sorted
             .into_iter()
             .take(max)

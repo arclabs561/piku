@@ -865,7 +865,7 @@ mod piku_md {
         std::fs::write(parent.join("PIKU.md"), content).unwrap();
         std::fs::write(child.join("PIKU.md"), content).unwrap();
 
-        let sections = build_system_prompt(&child, "2026-04-03", "m");
+        let sections = build_system_prompt(&child, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
 
         let count = full.matches("Always use tabs.").count();
@@ -885,7 +885,7 @@ mod piku_md {
         )
         .unwrap();
 
-        let sections = build_system_prompt(&dir, "2026-04-03", "m");
+        let sections = build_system_prompt(&dir, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
 
         assert!(full.contains("Use snake_case"), "PIKU.md should be loaded");
@@ -901,7 +901,7 @@ mod piku_md {
         let large = "x".repeat(5000); // > 4000 char per-file limit
         std::fs::write(dir.join("PIKU.md"), &large).unwrap();
 
-        let sections = build_system_prompt(&dir, "2026-04-03", "m");
+        let sections = build_system_prompt(&dir, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
 
         assert!(
@@ -925,7 +925,7 @@ mod piku_md {
         )
         .unwrap();
 
-        let sections = build_system_prompt(&dir, "2026-04-03", "m");
+        let sections = build_system_prompt(&dir, "2026-04-03", "m", &[]);
         let full = sections.join("\n\n");
 
         assert!(full.contains("This is a Rust workspace"));

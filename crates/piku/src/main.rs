@@ -207,7 +207,7 @@ async fn run_single_shot_then_repl(
 
     let cwd = env::current_dir()?;
     let date = current_date();
-    let system_sections = build_system_prompt(&cwd, &date, &model);
+    let system_sections = build_system_prompt(&cwd, &date, &model, &[]);
 
     let (session_id, mut session) = if let Some(s) = existing_session {
         eprintln!("[piku] continuing session {}", s.id);

@@ -1014,7 +1014,7 @@ async fn run_tui_repl_core(
                 println!("\x1b[2;34m❯\x1b[0m \x1b[2m{display_input}\x1b[0m\r");
                 let _ = io::stdout().flush();
 
-                let system_sections = build_system_prompt(&cwd, &date, &model);
+                let system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
                 let tool_defs = all_tool_definitions();
                 let prompter = TuiPrompter::new();
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);

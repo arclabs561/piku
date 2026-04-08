@@ -82,7 +82,7 @@ pub async fn run_repl(
     editor.load_history_file(&history_path);
 
     loop {
-        let system_sections = build_system_prompt(&cwd, &date, &model);
+        let system_sections = build_system_prompt(&cwd, &date, &model, &[]);
 
         let readline = editor.read_line();
         match readline {

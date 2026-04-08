@@ -9,7 +9,9 @@ use serde::Deserialize;
 
 use crate::{Destructiveness, ToolResult};
 
-// Memory paths — duplicated from piku-runtime::memory to avoid circular deps.
+// SYNC: Memory paths duplicated from piku-runtime::memory::MemoryScope::dir()
+// to avoid circular deps (piku-tools cannot depend on piku-runtime).
+// If you change paths here, update piku-runtime::memory::MemoryScope::dir() too.
 fn memory_dir(scope: &str, cwd: &Path) -> PathBuf {
     match scope {
         "user" => {
