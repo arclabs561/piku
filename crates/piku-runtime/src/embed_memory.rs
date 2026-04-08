@@ -18,12 +18,35 @@ use serde::{Deserialize, Serialize};
 // Types
 // ---------------------------------------------------------------------------
 
+/// Whether this entry is a static fact or a recorded attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryType {
+    /// An atomic fact (the original memory type).
+    #[default]
+    Fact,
+    /// A recorded attempt: an approach tried toward a goal, with outcome tracking.
+    Attempt,
+}
+
+/// Outcome of an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// Attempt is still in progress (no result yet).
+    Pending,
+    /// Approach succeeded.
+    Success,
+    /// Approach failed.
+    Failure,
+}
+
 /// A single memory entry with its embedding vector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// Unique ID (monotonic counter).
     pub id: u64,
-    /// The memory content (one atomic fact).
+    /// The memory content (one atomic fact or attempt description).
     pub content: String,
     /// LLM-generated keyword tags for hybrid retrieval.
     pub tags: Vec<String>,
@@ -43,6 +66,23 @@ pub struct MemoryEntry {
     pub supersedes: Option<u64>,
     /// Pre-normalized embedding vector (768d for nomic-embed-text).
     pub embedding: Vec<f32>,
+
+    // --- Tree / attempt fields (v2) ---
+    /// Entry type: Fact (default, backward-compat) or Attempt.
+    #[serde(default)]
+    pub entry_type: EntryType,
+    /// Parent attempt ID (forms the tree). Root attempts have `None`.
+    #[serde(default)]
+    pub parent: Option<u64>,
+    /// Outcome of this attempt (`None` for Facts).
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+    /// Why this attempt succeeded or failed.
+    #[serde(default)]
+    pub outcome_detail: Option<String>,
+    /// The goal this attempt is working toward (for tree roots and retrieval).
+    #[serde(default)]
+    pub goal: Option<String>,
 }
 
 fn default_importance() -> u8 {
@@ -235,6 +275,11 @@ impl MemoryStore {
             is_valid: true,
             supersedes: None,
             embedding,
+            entry_type: EntryType::Fact,
+            parent: None,
+            outcome: None,
+            outcome_detail: None,
+            goal: None,
         });
         Some(id)
     }
@@ -268,6 +313,11 @@ impl MemoryStore {
             is_valid: true,
             supersedes: Some(supersedes_id),
             embedding,
+            entry_type: EntryType::Fact,
+            parent: None,
+            outcome: None,
+            outcome_detail: None,
+            goal: None,
         });
         id
     }
@@ -407,6 +457,257 @@ impl MemoryStore {
             })
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tree operations (attempt tracking)
+// ---------------------------------------------------------------------------
+
+impl MemoryStore {
+    /// Record a new attempt. Returns the attempt's ID.
+    ///
+    /// `goal`: what the agent is trying to achieve (used for retrieval).
+    /// `approach`: what specific approach is being tried (stored as `content`).
+    /// `parent`: parent attempt ID if this is a sub-approach or alternative.
+    /// `embedding`: pre-computed embedding of the approach description.
+    pub fn record_attempt(
+        &mut self,
+        goal: String,
+        approach: String,
+        parent: Option<u64>,
+        mut embedding: Vec<f32>,
+        importance: u8,
+    ) -> u64 {
+        normalize(&mut embedding);
+        let id = self.next_id;
+        self.next_id += 1;
+        let now = now_unix();
+        self.entries.push(MemoryEntry {
+            id,
+            content: approach,
+            tags: vec![],
+            importance: importance.max(MIN_IMPORTANCE),
+            created_at: now,
+            last_accessed: now,
+            access_count: 0,
+            is_valid: true,
+            supersedes: None,
+            embedding,
+            entry_type: EntryType::Attempt,
+            parent,
+            outcome: Some(Outcome::Pending),
+            outcome_detail: None,
+            goal: Some(goal),
+        });
+        id
+    }
+
+    /// Record the outcome of an existing attempt.
+    /// Returns `false` if the attempt ID was not found.
+    pub fn record_outcome(
+        &mut self,
+        attempt_id: u64,
+        outcome: Outcome,
+        detail: Option<String>,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == attempt_id) {
+            entry.outcome = Some(outcome);
+            entry.outcome_detail = detail;
+            entry.last_accessed = now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get direct children of an attempt (other attempts with this ID as parent).
+    #[must_use]
+    pub fn children(&self, parent_id: u64) -> Vec<&MemoryEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.parent == Some(parent_id) && e.entry_type == EntryType::Attempt)
+            .collect()
+    }
+
+    /// Get siblings of an attempt (same parent, excluding self).
+    #[must_use]
+    pub fn siblings(&self, id: u64) -> Vec<&MemoryEntry> {
+        let parent = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.parent);
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.id != id && e.parent == parent && e.entry_type == EntryType::Attempt
+            })
+            .collect()
+    }
+
+    /// Trace from an attempt back to the root. Returns entries from leaf to root.
+    #[must_use]
+    pub fn path_to_root(&self, id: u64) -> Vec<&MemoryEntry> {
+        let mut path = Vec::new();
+        let mut current_id = Some(id);
+        // Guard against cycles (max 50 depth).
+        let mut depth = 0;
+        while let Some(cid) = current_id {
+            if depth > 50 {
+                break;
+            }
+            if let Some(entry) = self.entries.iter().find(|e| e.id == cid) {
+                path.push(entry);
+                current_id = entry.parent;
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        path
+    }
+
+    /// Find attempt trees relevant to a goal. Returns root attempts (no parent)
+    /// that match the goal embedding, along with their full subtrees.
+    #[must_use]
+    pub fn find_attempt_trees(
+        &self,
+        goal_embedding: &[f32],
+        goal_text: &str,
+        max_roots: usize,
+    ) -> Vec<AttemptTree> {
+        let now = now_unix();
+        let query_terms: Vec<String> = goal_text
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 2)
+            .map(String::from)
+            .collect();
+
+        // Score all attempt entries by goal similarity.
+        let mut scored: Vec<(f32, &MemoryEntry)> = self
+            .entries
+            .iter()
+            .filter(|e| e.entry_type == EntryType::Attempt && e.is_valid)
+            .map(|e| {
+                // Match against goal text if present, otherwise content.
+                let match_text = e.goal.as_deref().unwrap_or(&e.content).to_lowercase();
+                let sim = dot(goal_embedding, &e.embedding);
+                let keyword_hits = query_terms
+                    .iter()
+                    .filter(|t| match_text.contains(t.as_str()))
+                    .count();
+                #[allow(clippy::cast_precision_loss)]
+                let boost = (keyword_hits as f32 * 0.05).min(0.15);
+                let score = composite_score(sim, e, now) + boost;
+                (score, e)
+            })
+            .filter(|(score, _)| *score > MIN_SIMILARITY)
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Collect unique root IDs from top-scoring attempts.
+        let mut seen_roots = Vec::new();
+        let mut trees = Vec::new();
+
+        for (_, entry) in &scored {
+            let root_id = self
+                .path_to_root(entry.id)
+                .last()
+                .map_or(entry.id, |r| r.id);
+            if seen_roots.contains(&root_id) {
+                continue;
+            }
+            seen_roots.push(root_id);
+            if let Some(root) = self.entries.iter().find(|e| e.id == root_id) {
+                trees.push(self.build_attempt_tree(root));
+            }
+            if trees.len() >= max_roots {
+                break;
+            }
+        }
+
+        trees
+    }
+
+    /// Build a tree structure from a root attempt.
+    fn build_attempt_tree(&self, root: &MemoryEntry) -> AttemptTree {
+        let children_entries = self.children(root.id);
+        let children = children_entries
+            .into_iter()
+            .map(|c| self.build_attempt_tree(c))
+            .collect();
+        AttemptTree {
+            id: root.id,
+            approach: root.content.clone(),
+            goal: root.goal.clone(),
+            outcome: root.outcome,
+            outcome_detail: root.outcome_detail.clone(),
+            children,
+        }
+    }
+}
+
+/// A tree of attempts for display/retrieval.
+#[derive(Debug, Clone)]
+pub struct AttemptTree {
+    pub id: u64,
+    pub approach: String,
+    pub goal: Option<String>,
+    pub outcome: Option<Outcome>,
+    pub outcome_detail: Option<String>,
+    pub children: Vec<AttemptTree>,
+}
+
+impl AttemptTree {
+    /// Format as an indented tree string.
+    #[must_use]
+    pub fn format(&self, indent: usize) -> String {
+        let prefix = "  ".repeat(indent);
+        let icon = match self.outcome {
+            Some(Outcome::Success) => "[OK]",
+            Some(Outcome::Failure) => "[FAIL]",
+            Some(Outcome::Pending) => "[...]",
+            None => "[-]",
+        };
+        let detail = self
+            .outcome_detail
+            .as_deref()
+            .map(|d| format!(" -- {d}"))
+            .unwrap_or_default();
+        let goal_line = if indent == 0 {
+            self.goal
+                .as_deref()
+                .map(|g| format!("{prefix}goal: {g}\n"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mut out = format!("{goal_line}{prefix}{icon} {}{detail}\n", self.approach);
+        for child in &self.children {
+            out.push_str(&child.format(indent + 1));
+        }
+        out
+    }
+}
+
+/// Format attempt trees for prompt injection.
+#[must_use]
+pub fn format_attempt_trees(trees: &[AttemptTree]) -> String {
+    if trees.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n# Prior Attempts\n\n");
+    out.push_str(
+        "The following attempt trees were found for similar goals. \
+         Avoid repeating failed approaches.\n\n",
+    );
+    for tree in trees {
+        out.push_str(&tree.format(0));
+        out.push('\n');
+    }
+    out
 }
 
 /// Default store path for a project.
@@ -830,9 +1131,10 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
 
     fn inspect(&self, id: u64) -> Option<String> {
         self.entries.iter().find(|e| e.id == id).map(|e| {
-            format!(
-                "ID: {}\nContent: {}\nTags: {}\nCreated: {}\nLast accessed: {}\nAccess count: {}\nValid: {}\nSupersedes: {:?}\nEmbedding dims: {}",
+            let mut out = format!(
+                "ID: {}\nType: {:?}\nContent: {}\nTags: {}\nCreated: {}\nLast accessed: {}\nAccess count: {}\nValid: {}\nSupersedes: {:?}\nEmbedding dims: {}",
                 e.id,
+                e.entry_type,
                 e.content,
                 e.tags.join(", "),
                 e.created_at,
@@ -841,7 +1143,27 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
                 e.is_valid,
                 e.supersedes,
                 e.embedding.len()
-            )
+            );
+            if e.entry_type == EntryType::Attempt {
+                if let Some(ref goal) = e.goal {
+                    let _ = write!(out, "\nGoal: {goal}");
+                }
+                if let Some(parent) = e.parent {
+                    let _ = write!(out, "\nParent: {parent}");
+                }
+                if let Some(ref outcome) = e.outcome {
+                    let _ = write!(out, "\nOutcome: {outcome:?}");
+                }
+                if let Some(ref detail) = e.outcome_detail {
+                    let _ = write!(out, "\nOutcome detail: {detail}");
+                }
+                let children = self.children(e.id);
+                if !children.is_empty() {
+                    let child_ids: Vec<String> = children.iter().map(|c| c.id.to_string()).collect();
+                    let _ = write!(out, "\nChildren: [{}]", child_ids.join(", "));
+                }
+            }
+            out
         })
     }
 
@@ -862,6 +1184,28 @@ impl piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView for Memo
             .take(max)
             .map(|e| (e.id, e.content.clone()))
             .collect()
+    }
+
+    fn attempt_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.is_valid && e.entry_type == EntryType::Attempt)
+            .count()
+    }
+
+    fn record_outcome(
+        &mut self,
+        attempt_id: u64,
+        outcome: &str,
+        detail: Option<String>,
+    ) -> bool {
+        let outcome_enum = match outcome {
+            "success" => Outcome::Success,
+            "failure" => Outcome::Failure,
+            "pending" => Outcome::Pending,
+            _ => return false,
+        };
+        self.record_outcome(attempt_id, outcome_enum, detail)
     }
 }
 
@@ -1013,6 +1357,11 @@ mod tests {
             is_valid: true,
             supersedes: None,
             embedding: vec![],
+            entry_type: EntryType::Fact,
+            parent: None,
+            outcome: None,
+            outcome_detail: None,
+            goal: None,
         };
         let retrieved = vec![RetrievedMemory {
             entry,
@@ -1262,6 +1611,11 @@ mod tests {
             is_valid: true,
             supersedes: None,
             embedding: vec![],
+            entry_type: EntryType::Fact,
+            parent: None,
+            outcome: None,
+            outcome_detail: None,
+            goal: None,
         };
         let score = super::composite_score(0.5, &e, super::now_unix());
         assert!(score.is_finite());
@@ -1281,6 +1635,11 @@ mod tests {
             is_valid: true,
             supersedes: None,
             embedding: vec![],
+            entry_type: EntryType::Fact,
+            parent: None,
+            outcome: None,
+            outcome_detail: None,
+            goal: None,
         };
         let score = super::composite_score(0.5, &e, super::now_unix());
         assert!(score.is_finite());
@@ -1493,5 +1852,250 @@ mod tests {
             .is_valid = false;
         let results = store.search(&e, 5);
         assert!(results.is_empty());
+    }
+
+    // --- Attempt tree tests ---
+
+    #[test]
+    fn record_attempt_creates_attempt_entry() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.record_attempt(
+            "fix the bug".to_string(),
+            "change return type".to_string(),
+            None,
+            e,
+            6,
+        );
+        assert_eq!(store.entries.len(), 1);
+        let entry = &store.entries[0];
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.entry_type, EntryType::Attempt);
+        assert_eq!(entry.goal.as_deref(), Some("fix the bug"));
+        assert_eq!(entry.content, "change return type");
+        assert_eq!(entry.outcome, Some(Outcome::Pending));
+        assert!(entry.parent.is_none());
+    }
+
+    #[test]
+    fn record_outcome_updates_attempt() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.record_attempt(
+            "fix the bug".to_string(),
+            "change return type".to_string(),
+            None,
+            e,
+            6,
+        );
+        assert!(store.record_outcome(id, Outcome::Failure, Some("broke 3 call sites".to_string())));
+        let entry = &store.entries[0];
+        assert_eq!(entry.outcome, Some(Outcome::Failure));
+        assert_eq!(entry.outcome_detail.as_deref(), Some("broke 3 call sites"));
+    }
+
+    #[test]
+    fn record_outcome_nonexistent_returns_false() {
+        let mut store = MemoryStore::default();
+        assert!(!store.record_outcome(999, Outcome::Success, None));
+    }
+
+    #[test]
+    fn children_returns_direct_children() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 6);
+        let child1 = store.record_attempt("goal".into(), "child1".into(), Some(root), e.clone(), 6);
+        let _child2 = store.record_attempt("goal".into(), "child2".into(), Some(root), e.clone(), 6);
+        // Grandchild should not appear
+        store.record_attempt("goal".into(), "grandchild".into(), Some(child1), e.clone(), 6);
+
+        let children = store.children(root);
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|c| c.content == "child1"));
+        assert!(children.iter().any(|c| c.content == "child2"));
+    }
+
+    #[test]
+    fn siblings_excludes_self() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 6);
+        let child1 = store.record_attempt("goal".into(), "child1".into(), Some(root), e.clone(), 6);
+        store.record_attempt("goal".into(), "child2".into(), Some(root), e.clone(), 6);
+
+        let siblings = store.siblings(child1);
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].content, "child2");
+    }
+
+    #[test]
+    fn path_to_root_traces_ancestry() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("goal".into(), "root".into(), None, e.clone(), 6);
+        let child = store.record_attempt("goal".into(), "child".into(), Some(root), e.clone(), 6);
+        let grandchild = store.record_attempt("goal".into(), "gc".into(), Some(child), e.clone(), 6);
+
+        let path = store.path_to_root(grandchild);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].content, "gc"); // leaf first
+        assert_eq!(path[1].content, "child");
+        assert_eq!(path[2].content, "root"); // root last
+    }
+
+    #[test]
+    fn path_to_root_single_node() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("goal".into(), "root".into(), None, e, 6);
+        let path = store.path_to_root(root);
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].content, "root");
+    }
+
+    #[test]
+    fn build_attempt_tree_structure() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("fix bug".into(), "approach A".into(), None, e.clone(), 6);
+        store.record_outcome(root, Outcome::Failure, Some("type error".into()));
+        let child = store.record_attempt("fix bug".into(), "approach B".into(), Some(root), e.clone(), 6);
+        store.record_outcome(child, Outcome::Success, Some("worked".into()));
+
+        let tree = store.build_attempt_tree(&store.entries[0].clone());
+        assert_eq!(tree.approach, "approach A");
+        assert_eq!(tree.outcome, Some(Outcome::Failure));
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].approach, "approach B");
+        assert_eq!(tree.children[0].outcome, Some(Outcome::Success));
+    }
+
+    #[test]
+    fn format_attempt_tree_rendering() {
+        let tree = AttemptTree {
+            id: 0,
+            approach: "try X".to_string(),
+            goal: Some("fix the thing".to_string()),
+            outcome: Some(Outcome::Failure),
+            outcome_detail: Some("broke it".to_string()),
+            children: vec![AttemptTree {
+                id: 1,
+                approach: "try Y".to_string(),
+                goal: None,
+                outcome: Some(Outcome::Success),
+                outcome_detail: None,
+                children: vec![],
+            }],
+        };
+        let formatted = tree.format(0);
+        assert!(formatted.contains("goal: fix the thing"));
+        assert!(formatted.contains("[FAIL] try X -- broke it"));
+        assert!(formatted.contains("  [OK] try Y"));
+    }
+
+    #[test]
+    fn format_attempt_trees_empty() {
+        let formatted = format_attempt_trees(&[]);
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn find_attempt_trees_returns_matching() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        // Create two separate attempt trees
+        let root1 = store.record_attempt("fix auth bug".into(), "try reset".into(), None, e.clone(), 6);
+        store.record_outcome(root1, Outcome::Failure, Some("didn't work".into()));
+        store.record_attempt("fix auth bug".into(), "try logout".into(), Some(root1), e.clone(), 6);
+
+        let root2 = store.record_attempt("improve perf".into(), "add cache".into(), None, make_embedding(100.0), 6);
+        store.record_outcome(root2, Outcome::Success, None);
+
+        // Query with embedding similar to root1
+        let trees = store.find_attempt_trees(&e, "fix auth bug", 5);
+        // Should find at least root1's tree (both have similar embeddings)
+        assert!(!trees.is_empty());
+    }
+
+    #[test]
+    fn attempt_backward_compat_serde() {
+        // Old-format JSON (no tree fields) should deserialize with defaults
+        let json = r#"{
+            "next_id": 1,
+            "entries": [{
+                "id": 0,
+                "content": "old fact",
+                "tags": ["test"],
+                "importance": 5,
+                "created_at": 1000,
+                "last_accessed": 1000,
+                "access_count": 0,
+                "is_valid": true,
+                "supersedes": null,
+                "embedding": [1.0, 0.0, 0.0]
+            }]
+        }"#;
+        let store: MemoryStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries[0].entry_type, EntryType::Fact);
+        assert!(store.entries[0].parent.is_none());
+        assert!(store.entries[0].outcome.is_none());
+        assert!(store.entries[0].goal.is_none());
+    }
+
+    #[test]
+    fn attempt_serde_roundtrip() {
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.record_attempt("goal".into(), "approach".into(), None, e, 7);
+        store.record_outcome(id, Outcome::Failure, Some("reason".into()));
+
+        let json = serde_json::to_string(&store).unwrap();
+        let loaded: MemoryStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.entries[0].entry_type, EntryType::Attempt);
+        assert_eq!(loaded.entries[0].outcome, Some(Outcome::Failure));
+        assert_eq!(loaded.entries[0].outcome_detail.as_deref(), Some("reason"));
+        assert_eq!(loaded.entries[0].goal.as_deref(), Some("goal"));
+    }
+
+    #[test]
+    fn attempt_count_via_store_view() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        store.insert("a fact".into(), vec![], e.clone(), 5);
+        store.record_attempt("goal".into(), "approach".into(), None, e, 6);
+        assert_eq!(store.attempt_count(), 1);
+        assert_eq!(store.valid_count(), 2); // both fact and attempt
+    }
+
+    #[test]
+    fn record_outcome_via_store_view() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let id = store.record_attempt("goal".into(), "approach".into(), None, e, 6);
+        assert!(MemoryStoreView::record_outcome(&mut store, id, "success", None));
+        assert_eq!(store.entries[0].outcome, Some(Outcome::Success));
+        // Invalid outcome string
+        assert!(!MemoryStoreView::record_outcome(&mut store, id, "bogus", None));
+    }
+
+    #[test]
+    fn inspect_shows_attempt_fields() {
+        use piku_tools::embed_memory_tool::piku_runtime_types::MemoryStoreView;
+        let mut store = MemoryStore::default();
+        let e = make_embedding(1.0);
+        let root = store.record_attempt("fix bug".into(), "try A".into(), None, e.clone(), 6);
+        store.record_outcome(root, Outcome::Failure, Some("broke it".into()));
+        store.record_attempt("fix bug".into(), "try B".into(), Some(root), e, 6);
+
+        let detail = store.inspect(root).unwrap();
+        assert!(detail.contains("Type: Attempt"));
+        assert!(detail.contains("Goal: fix bug"));
+        assert!(detail.contains("Outcome: Failure"));
+        assert!(detail.contains("Outcome detail: broke it"));
+        assert!(detail.contains("Children:"));
     }
 }
