@@ -218,8 +218,9 @@ impl ProviderSpec {
 
 /// User-agent LLM: cheap model for scripted critique, better for freeform.
 fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
+    let _ = freeform; // same model for both modes when using Ollama
     let ollama = ProviderSpec::ollama(
-        std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "llama3.2:latest".to_string()),
+        std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
     );
     if ollama_is_available(ollama.ollama_host.as_ref().unwrap()) {
         return Some(ollama);
@@ -2256,6 +2257,119 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
     );
 }
 
+/// Meta-judge: after the agentic test completes, send all collected evidence
+/// to an LLM for a second-opinion analysis. Evaluates whether:
+/// 1. The user-agent's findings about piku are valid (not hallucinated)
+/// 2. The deterministic checks caught real issues
+/// 3. piku's behavior was appropriate for the scenario
+///
+/// Output is written to the findings dir as `meta_judge_{persona}.txt`.
+fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+
+    // Build evidence summary from all entries
+    let mut evidence = String::with_capacity(8000);
+    evidence.push_str(&format!(
+        "Persona: {} ({})\n\n",
+        persona.name, persona.description
+    ));
+
+    for (i, entry) in entries.iter().enumerate() {
+        evidence.push_str(&format!(
+            "--- Turn {} [phase: {}] ---\n",
+            i + 1,
+            entry.phase
+        ));
+        evidence.push_str(&format!("Action: {}\n", entry.action_desc));
+
+        // Include captured response (truncated)
+        let response_preview: String = entry.screen_text.chars().take(1500).collect();
+        if !response_preview.trim().is_empty() {
+            evidence.push_str(&format!(
+                "Response captured ({} chars):\n{}\n",
+                entry.screen_text.len(),
+                response_preview
+            ));
+        }
+
+        if !entry.workspace_diff.is_empty() && entry.workspace_diff != "no changes" {
+            evidence.push_str(&format!("Workspace changes: {}\n", entry.workspace_diff));
+        }
+
+        // LLM-reported bugs
+        for bug in &entry.bugs {
+            evidence.push_str(&format!(
+                "  BUG [{}]: {} (expected: {}, actual: {})\n",
+                bug.severity, bug.description, bug.expected, bug.actual
+            ));
+        }
+        // Deterministic findings
+        for f in &entry.deterministic_findings {
+            evidence.push_str(&format!(
+                "  CHECK [{}]: {} (expected: {}, actual: {})\n",
+                f.severity, f.description, f.expected, f.actual
+            ));
+        }
+        evidence.push('\n');
+    }
+
+    let system = "\
+You are a meta-evaluator for an agentic test harness. You receive the full trace \
+of a test session where an LLM user-agent interacted with piku (a terminal AI coding agent). \
+The user-agent filed bug reports about piku's behavior.
+
+Your job:
+1. For each BUG filed by the user-agent, judge whether it is VALID (real issue), \
+   HALLUCINATED (the user-agent misunderstood the output), or INCONCLUSIVE (not enough evidence).
+2. For each deterministic CHECK, confirm it is correctly evaluated.
+3. Rate the overall session: did piku perform well for the given scenario? \
+   Were the user-agent's expectations reasonable?
+4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
+   behave unexpectedly in ways the user-agent missed?
+
+Be terse. Use this format:
+BUGS:
+- [VALID/HALLUCINATED/INCONCLUSIVE] description -- reason
+
+CHECKS:
+- [CORRECT/INCORRECT] description -- reason
+
+OVERALL: 1-2 sentence assessment
+
+MISSED: anything the user-agent should have caught but didn't";
+
+    eprintln!(
+        "[meta-judge] running analysis ({} chars evidence)...",
+        evidence.len()
+    );
+    let response = llm.call_raw(system, &[("user", &evidence)]);
+
+    // Write to findings dir
+    let dir = findings_log_path().parent().unwrap().to_path_buf();
+    let meta_path = dir.join(format!("meta_judge_{}.txt", persona.name));
+    let content = format!(
+        "# Meta-Judge Report: {}\n# Generated: {}\n\n## Evidence Summary\n{}\n\n## Analysis\n{}\n",
+        persona.name,
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        safe_truncate(&evidence, 4000),
+        response
+    );
+    match std::fs::write(&meta_path, &content) {
+        Ok(()) => eprintln!("[meta-judge] report written to {}", meta_path.display()),
+        Err(e) => eprintln!("[meta-judge] failed to write report: {e}"),
+    }
+
+    // Print summary to test output
+    eprintln!("\n=== META-JUDGE ANALYSIS ===");
+    eprintln!("{response}");
+    eprintln!("=== END META-JUDGE ===\n");
+}
+
 /// Load prior findings to give the LLM context on known-weak areas.
 /// Returns a summary string suitable for inclusion in the LLM prompt.
 fn load_prior_findings(persona: &str) -> String {
@@ -2686,6 +2800,9 @@ fn run_agentic_session(persona: &Persona) {
 
     print_report(persona, &entries);
     persist_findings(persona.name, &entries);
+
+    // Meta-judge: use LLM to evaluate whether the collected findings are valid.
+    meta_judge(&ua_llm, persona, &entries);
 }
 
 // ===========================================================================
