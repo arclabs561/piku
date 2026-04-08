@@ -831,6 +831,7 @@ struct PtyHandle {
     /// Raw bytes captured since last clear — used to extract response text
     /// by running through a plain VT100 parser (no DECSTBM interference).
     raw_capture: Vec<u8>,
+    eof: bool,
 }
 
 impl PtyHandle {
@@ -885,7 +886,21 @@ impl PtyHandle {
             writer,
             reader,
             raw_capture: Vec::new(),
+            eof: false,
         }
+    }
+
+    /// True if the PTY subprocess has exited.
+    fn is_dead(&mut self) -> bool {
+        if self.eof {
+            return true;
+        }
+        // Try a zero-byte write probe -- fails with EIO/EPIPE if PTY slave closed.
+        if self.writer.write_all(b"\x00").is_err() || self.writer.flush().is_err() {
+            self.eof = true;
+            return true;
+        }
+        false
     }
 
     /// Send raw bytes to the PTY
@@ -954,14 +969,22 @@ impl PtyHandle {
         let mut total = 0;
         loop {
             match self.reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(n) => {
                     observer.process(&buf[..n]);
                     self.raw_capture.extend_from_slice(&buf[..n]);
                     total += n;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        self.eof = true;
+                    }
+                    break;
+                }
             }
         }
         total
@@ -1006,6 +1029,10 @@ impl PtyHandle {
             self.drain(observer);
             let snap = observer.snapshot();
             if snap.is_ready() {
+                return snap;
+            }
+            if self.is_dead() {
+                eprintln!("[pty] process died during ready-wait");
                 return snap;
             }
             // Auto-accept permission prompts so the turn can complete.
@@ -2706,11 +2733,16 @@ fn run_agentic_session(persona: &Persona) {
                     eprintln!("[agentic_user] freeform: {:?}", safe_truncate(&msg, 60));
                     pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
                     // Two-phase wait for freeform too
+                    if pty.is_dead() {
+                        eprintln!("[agentic_user] freeform: piku died, skipping wait");
+                        break;
+                    }
                     let pre_free = observer.snapshot().contents.clone();
                     let free_deadline = Instant::now() + Duration::from_secs(15);
                     loop {
                         pty.drain(&mut observer);
-                        if observer.snapshot().contents != pre_free
+                        if pty.is_dead()
+                            || observer.snapshot().contents != pre_free
                             || Instant::now() >= free_deadline
                         {
                             break;
