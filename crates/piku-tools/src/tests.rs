@@ -51,6 +51,23 @@ mod read_file {
         assert!(result.output.contains("你好世界"), "CJK content missing");
         assert!(result.output.contains("🦀"), "emoji content missing");
     }
+
+    #[test]
+    fn rejects_file_over_size_limit() {
+        let dir = tempdir();
+        let path = dir.join("huge.bin");
+        // Create a file just over 10 MB
+        let size = 10 * 1024 * 1024 + 1;
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(size).unwrap();
+        let result = read_file::execute(serde_json::json!({ "path": path }));
+        assert!(result.is_error, "should reject files over 10 MB");
+        assert!(
+            result.output.contains("too large"),
+            "error should mention size: {}",
+            result.output
+        );
+    }
 }
 
 #[cfg(test)]
