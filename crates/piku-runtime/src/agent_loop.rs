@@ -699,6 +699,9 @@ async fn run_turn_inner(
         }
     }
 
+    // Score message relevance for context curation.
+    session.score_messages();
+
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
 

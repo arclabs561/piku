@@ -854,6 +854,7 @@ mod agent_loop_extended {
                 text: "compact summary here".to_string(),
             }],
             usage: None,
+            importance: None,
         });
         session.push(ConversationMessage::user("hello"));
 

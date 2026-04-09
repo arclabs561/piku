@@ -55,6 +55,65 @@ impl Session {
         serde_json::from_str(&json)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// Score each message's relevance to the most recent user message.
+    /// Uses keyword overlap (cheap, no LLM). Recent messages get a recency boost.
+    /// User messages always score 1.0 (they are the task definition).
+    #[allow(clippy::cast_precision_loss)] // scoring heuristic -- f32 precision is fine
+    pub fn score_messages(&mut self) {
+        // Extract keywords from the last user message.
+        let query_words: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::User)
+            .map(extract_keywords)
+            .unwrap_or_default();
+
+        if query_words.is_empty() {
+            return;
+        }
+
+        let len = self.messages.len();
+        for (idx, msg) in self.messages.iter_mut().enumerate() {
+            if msg.role == MessageRole::User {
+                msg.importance = Some(1.0);
+                continue;
+            }
+
+            let msg_words = extract_keywords(msg);
+            let overlap = query_words.intersection(&msg_words).count();
+            let denom = query_words.len().min(msg_words.len()).max(1) as f32;
+            let keyword_score = overlap as f32 / denom;
+
+            let recency = if len > 1 {
+                0.5 * (idx as f32) / ((len - 1) as f32)
+            } else {
+                0.5
+            };
+
+            msg.importance = Some((keyword_score * 0.6 + recency).min(1.0));
+        }
+    }
+}
+
+/// Extract lowercase keywords from a message (words > 3 chars, no stop words).
+fn extract_keywords(msg: &ConversationMessage) -> std::collections::HashSet<String> {
+    let mut words = std::collections::HashSet::new();
+    for block in &msg.blocks {
+        let text = match block {
+            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::ToolUse { name, .. } => name.as_str(),
+            ContentBlock::ToolResult { output, .. } => output.as_str(),
+        };
+        for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            let lower = word.to_lowercase();
+            if lower.len() > 3 {
+                words.insert(lower);
+            }
+        }
+    }
+    words
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +126,10 @@ pub struct ConversationMessage {
     pub blocks: Vec<ContentBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// Relevance score for context curation (0.0-1.0, None = unscored).
+    /// Set by `score_messages` after each turn. Higher = more relevant to keep.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub importance: Option<f32>,
 }
 
 impl ConversationMessage {
@@ -75,6 +138,7 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            importance: None,
         }
     }
 
@@ -83,6 +147,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            importance: None,
         }
     }
 
@@ -95,6 +160,7 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            importance: None,
         }
     }
 
@@ -103,6 +169,7 @@ impl ConversationMessage {
             role: MessageRole::System,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            importance: None,
         }
     }
 }

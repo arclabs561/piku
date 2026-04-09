@@ -518,6 +518,8 @@ pub struct TuiSink {
     thinking_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Current activity label shown in the indicator (changes during the turn).
     indicator_label: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Tokens at turn start (for computing delta).
+    turn_start_tokens: u32,
     /// Streaming markdown renderer for assistant text.
     md: StreamingMarkdown,
 }
@@ -531,6 +533,7 @@ impl TuiSink {
             needs_indicator_clear: true,
             thinking_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indicator_label: std::sync::Arc::new(std::sync::Mutex::new("thinking".to_string())),
+            turn_start_tokens: 0,
             md: StreamingMarkdown::new(),
         }
     }
@@ -655,8 +658,11 @@ impl OutputSink for TuiSink {
         if !flushed.is_empty() {
             self.print(&flushed);
         }
+        let total = usage.input_tokens + usage.output_tokens;
+        let delta = total.saturating_sub(self.turn_start_tokens);
+        self.turn_start_tokens = total;
         self.println(&format!(
-            "\r\n\x1b[2m[{iterations} iter · {}↑ {}↓]\x1b[0m",
+            "\r\n\x1b[2m[{iterations} iter · +{delta} tokens · {}↑ {}↓ total]\x1b[0m",
             usage.input_tokens, usage.output_tokens
         ));
         let _ = self.stdout.flush();

@@ -1824,6 +1824,7 @@ pub mod tests {
                 None,
             ),
             ConversationMessage {
+                importance: None,
                 role: crate::session::MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "t1".to_string(),
