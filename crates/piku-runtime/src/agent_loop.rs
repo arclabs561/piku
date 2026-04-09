@@ -167,6 +167,7 @@ async fn run_turn_inner(
     // push user message
     session.push(ConversationMessage::user(input));
 
+    let turn_start = std::time::Instant::now();
     let mut tracker = UsageTracker::default();
     let mut iterations = 0u32;
     let mut stream_error: Option<String> = None;
@@ -680,10 +681,21 @@ async fn run_turn_inner(
             "replace_and_exec"
         } else if stream_error.is_some() {
             "error"
+        } else if iterations >= max {
+            "max_turns"
         } else {
             "end_turn"
         };
-        hooks.run_stop(&session.id, &cwd, iterations, reason);
+        #[allow(clippy::cast_possible_truncation)] // turn durations won't exceed u64::MAX ms
+        let duration_ms = turn_start.elapsed().as_millis() as u64;
+        hooks.run_stop(
+            &session.id,
+            &cwd,
+            iterations,
+            reason,
+            &tracker.cumulative,
+            duration_ms,
+        );
     }
 
     TurnResult {

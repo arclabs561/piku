@@ -134,6 +134,33 @@ impl HookRegistry {
         }
     }
 
+    /// Human-readable summary of configured hooks.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let events = [
+            ("PreToolUse", &self.config.pre_tool_use),
+            ("PostToolUse", &self.config.post_tool_use),
+            ("SessionStart", &self.config.session_start),
+            ("Stop", &self.config.stop),
+        ];
+        for (name, entries) in events {
+            for entry in entries {
+                let matcher = entry.matcher.as_deref().unwrap_or("*");
+                for handler in &entry.hooks {
+                    let cmd: String = handler.command.chars().take(50).collect();
+                    let flags = if handler.r#async { " (async)" } else { "" };
+                    let _ = writeln!(out, "{name} [{matcher}]: {cmd}{flags}");
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(none)");
+        }
+        out
+    }
+
     /// Check if any hooks are configured.
     #[must_use]
     pub fn has_hooks(&self) -> bool {
@@ -305,7 +332,15 @@ impl HookRegistry {
     }
 
     /// Run `Stop` hooks after a turn completes. Fire-and-forget (errors logged).
-    pub fn run_stop(&self, session_id: &str, cwd: &Path, iterations: u32, stop_reason: &str) {
+    pub fn run_stop(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        iterations: u32,
+        stop_reason: &str,
+        usage: &piku_api::TokenUsage,
+        duration_ms: u64,
+    ) {
         let entries = &self.config.stop;
         if entries.is_empty() {
             return;
@@ -317,6 +352,10 @@ impl HookRegistry {
             "cwd": cwd.display().to_string(),
             "iterations": iterations,
             "stop_reason": stop_reason,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.input_tokens + usage.output_tokens,
+            "duration_ms": duration_ms,
         });
 
         for entry in entries {
@@ -784,7 +823,14 @@ mod tests {
         std::fs::write(hooks_dir.join("hooks.json"), json.to_string()).unwrap();
 
         let registry = HookRegistry::load_project_only(dir.path());
-        registry.run_stop("test-session", dir.path(), 3, "end_turn");
+        registry.run_stop(
+            "test-session",
+            dir.path(),
+            3,
+            "end_turn",
+            &piku_api::TokenUsage::default(),
+            1500,
+        );
         assert!(marker.exists(), "stop hook should write marker file");
         let content = std::fs::read_to_string(&marker).unwrap();
         assert!(content.contains("\"hook_event_name\":\"Stop\""));

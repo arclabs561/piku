@@ -1003,6 +1003,8 @@ async fn run_tui_repl_core(
                         &session_id,
                         &mut model,
                         &task_registry,
+                        config,
+                        &hook_registry,
                     );
                     if should_exit {
                         break;
@@ -1362,6 +1364,8 @@ fn handle_slash_cmd(
     session_id: &str,
     model: &mut String,
     task_registry: &TaskRegistry,
+    config: &crate::config::PikuConfig,
+    hook_registry: &piku_runtime::HookRegistry,
 ) -> bool {
     let mut parts = input.trim()[1..].splitn(2, ' ');
     let cmd = parts.next().unwrap_or("").to_lowercase();
@@ -1484,6 +1488,39 @@ fn handle_slash_cmd(
         "clear" => {
             session.messages.clear();
             println!("\x1b[2m[session cleared]\x1b[0m\r");
+        }
+        "permissions" | "perms" => {
+            if config.allow.is_empty() && config.deny.is_empty() {
+                println!("\x1b[2m[no permission rules configured]\x1b[0m\r");
+                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to ~/.config/piku/settings.json or .piku/settings.json\x1b[0m\r");
+            } else {
+                if !config.allow.is_empty() {
+                    println!("\x1b[32mAllow:\x1b[0m\r");
+                    for rule in &config.allow {
+                        println!("  {rule}\r");
+                    }
+                }
+                if !config.deny.is_empty() {
+                    println!("\x1b[31mDeny:\x1b[0m\r");
+                    for rule in &config.deny {
+                        println!("  {rule}\r");
+                    }
+                }
+            }
+        }
+        "hooks" => {
+            if hook_registry.has_hooks() {
+                println!("\x1b[1mActive hooks:\x1b[0m\r");
+                let summary = hook_registry.summary();
+                for line in summary.lines() {
+                    println!("  {line}\r");
+                }
+            } else {
+                println!("\x1b[2m[no hooks configured]\x1b[0m\r");
+                println!(
+                    "\x1b[2mAdd hooks to ~/.config/piku/hooks.json or .piku/hooks.json\x1b[0m\r"
+                );
+            }
         }
         "exit" | "quit" | "q" => {
             return true;

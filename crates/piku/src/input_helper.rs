@@ -29,6 +29,8 @@ pub const SLASH_CMDS: &[&str] = &[
     "/tasks",
     "/agents",
     "/sessions",
+    "/permissions",
+    "/hooks",
     "/clear",
     "/exit",
     "/quit",
