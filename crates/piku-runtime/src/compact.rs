@@ -300,6 +300,7 @@ fn mask_observations(messages: &[ConversationMessage]) -> Vec<ConversationMessag
                 role: msg.role.clone(),
                 blocks,
                 usage: msg.usage.clone(),
+                importance: msg.importance,
             }
         })
         .collect()
@@ -619,6 +620,7 @@ mod tests {
     #[test]
     fn masking_replaces_large_tool_results() {
         let msgs = vec![ConversationMessage {
+            importance: None,
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".to_string(),
@@ -638,6 +640,7 @@ mod tests {
     #[test]
     fn masking_preserves_small_tool_results() {
         let msgs = vec![ConversationMessage {
+            importance: None,
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".to_string(),
@@ -683,6 +686,7 @@ mod tests {
                 None,
             ));
             s.push(ConversationMessage {
+                importance: None,
                 role: MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "t1".to_string(),
