@@ -478,7 +478,7 @@ impl LineEditor {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
-            continuation_prompt: String::from("  "),
+            continuation_prompt: String::from("\x1b[2m\u{22EE}\x1b[0m "),
             placeholder: String::from("Send a message or /help"),
             history: Vec::new(),
             history_index: None,
@@ -1532,7 +1532,12 @@ mod tests {
         let rendered = editor.render(&input);
         assert_eq!(rendered.lines.len(), 2);
         assert!(rendered.lines[0].starts_with("> "));
-        assert!(rendered.lines[1].starts_with("  "));
+        // Continuation prompt: dim ⋮ + space (with ANSI codes)
+        assert!(
+            rendered.lines[1].contains('\u{22EE}'),
+            "continuation line should contain ⋮ glyph: {:?}",
+            rendered.lines[1]
+        );
     }
 
     #[test]
