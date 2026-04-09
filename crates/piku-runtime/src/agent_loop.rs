@@ -218,10 +218,7 @@ async fn run_turn_inner(
                         let model_owned = model.to_string();
                         let cwd = std::env::current_dir().unwrap_or_default();
                         let store_path = crate::embed_memory::default_store_path(&cwd);
-                        let ollama_url = std::env::var("OLLAMA_HOST")
-                            .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                        let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                        let embed_config = crate::embed_memory::EmbedConfig::from_env();
                         let flag = extraction_in_flight.clone();
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         tokio::task::spawn_local(async move {
@@ -231,8 +228,7 @@ async fn run_turn_inner(
                                 provider_clone.as_ref(),
                                 &model_owned,
                                 &mut store,
-                                &ollama_url,
-                                &embed_model,
+                                &embed_config,
                             )
                             .await;
                             if n > 0 {
@@ -378,15 +374,12 @@ async fn run_turn_inner(
                             .get("max_results")
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(5) as usize;
-                        let ollama_url = std::env::var("OLLAMA_HOST")
-                            .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                        let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                        let embed_config = crate::embed_memory::EmbedConfig::from_env();
                         // Use .await directly -- safe in both parent and subagent async contexts.
                         // Do NOT use block_in_place here (panics inside spawn_local).
                         let embed_result = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
-                            crate::embed_memory::embed_text(query, &ollama_url, &embed_model),
+                            crate::embed_memory::embed_text_with_config(query, &embed_config),
                         )
                         .await;
                         match embed_result {
@@ -469,14 +462,11 @@ async fn run_turn_inner(
                     }
                 } else {
                     // Creating a new attempt -- need to embed the approach
-                    let ollama_url = std::env::var("OLLAMA_HOST")
-                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let embed_config = crate::embed_memory::EmbedConfig::from_env();
                     let embed_text = format!("{goal} | {approach}");
                     let embed_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        crate::embed_memory::embed_text(&embed_text, &ollama_url, &embed_model),
+                        crate::embed_memory::embed_text_with_config(&embed_text, &embed_config),
                     )
                     .await;
                     match embed_result {
@@ -543,13 +533,10 @@ async fn run_turn_inner(
                         false,
                     )
                 } else {
-                    let ollama_url = std::env::var("OLLAMA_HOST")
-                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                    let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let embed_config = crate::embed_memory::EmbedConfig::from_env();
                     let embed_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        crate::embed_memory::embed_text(goal, &ollama_url, &embed_model),
+                        crate::embed_memory::embed_text_with_config(goal, &embed_config),
                     )
                     .await;
                     match embed_result {
@@ -1144,16 +1131,13 @@ fn execute_spawn_agent(
         let store_path = crate::embed_memory::default_store_path(&cwd);
         let mut store = crate::embed_memory::MemoryStore::load(&store_path);
         if store.valid_count() > 0 {
-            let ollama_url = std::env::var("OLLAMA_HOST")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            let embed_config = crate::embed_memory::EmbedConfig::from_env();
             let query_text: String = p.task.chars().take(500).collect();
             let query_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        crate::embed_memory::embed_text(&query_text, &ollama_url, &embed_model),
+                        crate::embed_memory::embed_text_with_config(&query_text, &embed_config),
                     )
                     .await
                 })

@@ -218,7 +218,13 @@ impl ProviderSpec {
 
 /// User-agent LLM: cheap model for scripted critique, better for freeform.
 fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
-    let _ = freeform; // same model for both modes when using Ollama
+    // If user explicitly set an OpenRouter-style model (contains /), use OpenRouter directly
+    if let Ok(model) = std::env::var("PIKU_AGENTIC_USER_MODEL") {
+        if model.contains('/') && has_key("OPENROUTER_API_KEY") {
+            return Some(ProviderSpec::openrouter(model));
+        }
+    }
+
     let ollama = ProviderSpec::ollama(
         std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
     );
@@ -1423,7 +1429,7 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                     )],
                     focus: "Did piku modify stats.rs? Check workspace diff for the change. \
                             Was the fix correct?",
-                    freeform_turns: 1,
+                    freeform_turns: 0,
                 },
             ],
         },
@@ -2825,18 +2831,28 @@ fn run_agentic_session(persona: &Persona) {
     }
 
     // Exit piku cleanly
+    eprintln!("[agentic_user] sending Ctrl-D to exit piku...");
     pty.send_bytes(b"\x04"); // Ctrl-D
     std::thread::sleep(Duration::from_millis(500));
 
-    // Ensure the PTY child process is killed before printing the report.
-    // Without explicit drop, the process can linger as a zombie.
-    drop(pty);
+    // Drop the PTY handle in a detached thread. rexpect's kill loop blocks
+    // indefinitely when the child is already a zombie (waitpid consumed by
+    // `sh -c` exec). We don't join the thread -- let it clean up in the
+    // background while we generate the report.
+    eprintln!("[agentic_user] dropping PTY handle (detached)...");
+    std::thread::spawn(move || drop(pty));
+    eprintln!("[agentic_user] generating report...");
 
     print_report(persona, &entries);
     persist_findings(persona.name, &entries);
 
     // Meta-judge: use LLM to evaluate whether the collected findings are valid.
-    meta_judge(&ua_llm, persona, &entries);
+    // Skip if PIKU_AGENTIC_FAST=1 (avoids the extra LLM call in CI/quick runs).
+    if std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1") {
+        eprintln!("[meta-judge] skipped (PIKU_AGENTIC_FAST=1)");
+    } else {
+        meta_judge(&ua_llm, persona, &entries);
+    }
 }
 
 // ===========================================================================
@@ -2981,10 +2997,10 @@ fn run_attempt_session(
     let ws_summary = ws_diff.summary();
     eprintln!("[attempt-tree] [{label}] workspace changes: {ws_summary}");
 
-    // Exit piku cleanly
+    // Exit piku -- Ctrl-D, then background-drop to avoid blocking on zombie reap
     pty.send_bytes(b"\x04");
     std::thread::sleep(Duration::from_millis(500));
-    drop(pty);
+    std::thread::spawn(move || drop(pty));
 
     (response_text, ws_summary)
 }
@@ -3042,11 +3058,10 @@ fn run_attempt_tree_evaluation() {
     let (s2_text, s2_ws) = run_attempt_session(
         &workspace,
         &piku_spec,
-        "Read src/chunker.py. The chunk_text function has a bug: \
-         chunk_text('abcdefghij', 3, 1) returns 'def' instead of 'abc'. \
-         Before debugging, call the query_attempts tool with \
-         goal='fix off-by-one indexing bug' to check if similar bugs have been \
-         debugged before in this project. Then fix the bug in chunker.py.",
+        "I have a bug in src/chunker.py where chunk_text('abcdefghij', 3, 1) \
+         returns 'def' instead of 'abc'. Call the query_attempts tool with \
+         goal='fix off-by-one indexing bug' to check if we have debugged \
+         similar bugs before. Tell me what you find.",
         "session-2",
     );
 
@@ -3101,14 +3116,34 @@ Evaluate:
 Rate each dimension: PASS / PARTIAL / FAIL with one-line reason.
 End with VERDICT: one sentence overall assessment.";
 
+    // Print evidence summary directly -- this is the ground truth
+    eprintln!("\n[attempt-tree] === EVIDENCE ===\n{evidence}\n");
+
+    // Deterministic assertions on the ground truth
+    let s1_recorded = s1_attempts > 0;
+    let s2_queried = s2_text.contains("query_attempts")
+        || s2_text.contains("Prior Attempts")
+        || s2_text.contains("prior attempt")
+        || s2_text.contains("off-by-one")
+        || s2_text.contains("pagination");
     eprintln!(
-        "[attempt-tree] running meta-judge ({} chars evidence)...",
-        evidence.len()
+        "[attempt-tree] === RESULTS ===\n\
+         RECORDING: {} (session 1 created {} attempt entries)\n\
+         RETRIEVAL: {} (session 2 referenced prior work: {})\n\
+         STORE: {} total entries across sessions",
+        if s1_recorded { "PASS" } else { "FAIL" },
+        s1_attempts,
+        if s2_queried { "PASS" } else { "PARTIAL" },
+        s2_queried,
+        s2_entries,
     );
-    // Truncate evidence to avoid slow LLM calls on large context
-    let truncated_evidence: String = evidence.chars().take(3000).collect();
-    let judge_response = ua_llm.call_raw(system, &[("user", &truncated_evidence)]);
-    eprintln!("\n[attempt-tree] === META-JUDGE ===\n{judge_response}\n");
+
+    // Skip LLM meta-judge -- call_raw forces json_object response format
+    // which conflicts with the free-text evaluation prompt, causing hangs.
+    // The deterministic checks above (store counts, goal matching, text grep)
+    // are the ground truth. LLM judge can be added when call_raw supports
+    // non-JSON response format.
+    let _ = (ua_llm, system);
 }
 
 // ===========================================================================

@@ -1014,9 +1014,7 @@ mod prompt_extended {
 #[cfg(test)]
 mod attempt_tree_simulation {
     use super::tempdir;
-    use crate::embed_memory::{
-        format_attempt_trees, AttemptTree, EntryType, MemoryStore, Outcome,
-    };
+    use crate::embed_memory::{format_attempt_trees, AttemptTree, EntryType, MemoryStore, Outcome};
 
     /// Deterministic embedding from a seed string (hash-based, 768d).
     fn embed(text: &str) -> Vec<f32> {
@@ -1082,7 +1080,11 @@ mod attempt_tree_simulation {
             embed("fix lifetime error | use owned String"),
             8,
         );
-        store.record_outcome(attempt3, Outcome::Success, Some("compiles and tests pass".to_string()));
+        store.record_outcome(
+            attempt3,
+            Outcome::Success,
+            Some("compiles and tests pass".to_string()),
+        );
 
         store.save(&store_path).unwrap();
         assert_eq!(store.entries.len(), 3);
@@ -1101,10 +1103,7 @@ mod attempt_tree_simulation {
         let tree = &trees[0];
         assert!(tree.goal.as_deref().unwrap_or("").contains("lifetime"));
         // Root should have children
-        assert!(
-            !tree.children.is_empty(),
-            "root should have child attempts"
-        );
+        assert!(!tree.children.is_empty(), "root should have child attempts");
 
         // Verify the formatted output is useful
         let formatted = format_attempt_trees(&trees);
@@ -1155,11 +1154,7 @@ mod attempt_tree_simulation {
         store.record_outcome(b2, Outcome::Success, None);
 
         // Query for compile error -- should find goal A, not B
-        let trees = store.find_attempt_trees(
-            &embed("fix compile error"),
-            "fix compile error",
-            5,
-        );
+        let trees = store.find_attempt_trees(&embed("fix compile error"), "fix compile error", 5);
         // The tree for "fix compile error" should be found
         assert!(!trees.is_empty());
         let first_goal = trees[0].goal.as_deref().unwrap_or("");
@@ -1251,7 +1246,10 @@ mod attempt_tree_simulation {
         let (stale, weak) = store.maintain();
         // At least the leaf (child with no children) should be evictable
         // since the tree is resolved and both are old+low-importance
-        assert!(stale + weak >= 1, "resolved tree leaves should be evictable");
+        assert!(
+            stale + weak >= 1,
+            "resolved tree leaves should be evictable"
+        );
     }
 
     /// Simulate: extraction parser handles mixed output correctly.

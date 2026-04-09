@@ -22,9 +22,9 @@ pub use compact::{
     apply_compact_summary, compact_session, should_compact, CompactionConfig, CompactionResult,
 };
 pub use embed_memory::{
-    build_extraction_transcript, default_store_path, embed_text, extract_and_store,
-    extract_memories, format_retrieved_memories, MemoryEntry, MemoryJudgment, MemoryStore,
-    RetrievedMemory,
+    build_extraction_transcript, default_store_path, embed_text, embed_text_with_config,
+    extract_and_store, extract_memories, format_retrieved_memories, EmbedBackend, EmbedConfig,
+    MemoryEntry, MemoryJudgment, MemoryStore, RetrievedMemory,
 };
 pub use hooks::{HookConfig, HookRegistry};
 pub use memory::{
