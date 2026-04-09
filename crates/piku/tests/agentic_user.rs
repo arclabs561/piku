@@ -1429,7 +1429,7 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                     )],
                     focus: "Did piku modify stats.rs? Check workspace diff for the change. \
                             Was the fix correct?",
-                    freeform_turns: 0,
+                    freeform_turns: 1,
                 },
             ],
         },

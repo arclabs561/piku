@@ -19,6 +19,14 @@ pub struct SettingsFile {
     pub model: Option<String>,
     /// Maximum turns per agent turn (overrides the runtime default).
     pub max_turns: Option<u32>,
+    /// Tool names or patterns to auto-allow without prompting.
+    /// Supports: exact match (`"bash"`), glob prefix (`"bash(git *)"`)
+    /// matching the same syntax as hook `if` conditions.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Tool names to always deny.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +42,10 @@ pub struct PikuConfig {
     pub model: Option<String>,
     /// Max turns per agent turn.
     pub max_turns: Option<u32>,
+    /// Tool names/patterns to auto-allow (global + project merged).
+    pub allow: Vec<String>,
+    /// Tool names to always deny (global + project merged).
+    pub deny: Vec<String>,
     /// Path to user-global config dir (`~/.config/piku/`).
     pub config_dir: PathBuf,
 }
@@ -71,6 +83,8 @@ impl PikuConfig {
             provider: settings.provider,
             model: settings.model,
             max_turns: settings.max_turns,
+            allow: settings.allow,
+            deny: settings.deny,
             config_dir,
         }
     }
@@ -85,6 +99,74 @@ impl PikuConfig {
     #[must_use]
     pub fn traces_dir(&self) -> PathBuf {
         self.config_dir.join("traces")
+    }
+
+    /// Check if a tool call is pre-allowed by the config allowlist.
+    /// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rule matches.
+    #[must_use]
+    pub fn check_permission_rule(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+    ) -> Option<bool> {
+        // Deny rules take precedence.
+        for pattern in &self.deny {
+            if matches_tool_pattern(pattern, tool_name, params) {
+                return Some(false);
+            }
+        }
+        for pattern in &self.allow {
+            if matches_tool_pattern(pattern, tool_name, params) {
+                return Some(true);
+            }
+        }
+        None
+    }
+}
+
+/// Match a tool permission pattern against a tool name and its params.
+/// Supports: exact tool name (`"bash"`), tool with arg glob (`"bash(git *)"`)
+/// using the same syntax as hook `if` conditions.
+#[must_use]
+pub fn matches_tool_pattern(pattern: &str, tool_name: &str, params: &serde_json::Value) -> bool {
+    // Parse `ToolName(glob)` syntax
+    if let Some(paren_start) = pattern.find('(') {
+        if let Some(paren_end) = pattern.rfind(')') {
+            let pat_tool = &pattern[..paren_start];
+            if pat_tool != tool_name {
+                return false;
+            }
+            let glob = &pattern[paren_start + 1..paren_end];
+            let primary_arg = match tool_name {
+                "bash" => params.get("command").and_then(|v| v.as_str()),
+                "read_file" | "write_file" | "edit_file" => {
+                    params.get("path").and_then(|v| v.as_str())
+                }
+                "glob" | "grep" => params.get("pattern").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            return primary_arg.is_some_and(|arg| glob_match(glob, arg));
+        }
+    }
+    // Exact tool name match
+    pattern == tool_name
+}
+
+/// Simple glob: `*` at start, end, or both. `*` alone matches all.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let starts = pattern.starts_with('*');
+    let ends = pattern.ends_with('*');
+    match (starts, ends) {
+        (true, true) => {
+            let inner = &pattern[1..pattern.len() - 1];
+            value.contains(inner)
+        }
+        (false, true) => value.starts_with(&pattern[..pattern.len() - 1]),
+        (true, false) => value.ends_with(&pattern[1..]),
+        (false, false) => value == pattern,
     }
 }
 
@@ -125,6 +207,9 @@ fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
     if overlay.max_turns.is_some() {
         base.max_turns = overlay.max_turns;
     }
+    // Allow/deny: append (project rules extend global rules).
+    base.allow.extend(overlay.allow.iter().cloned());
+    base.deny.extend(overlay.deny.iter().cloned());
 }
 
 // ---------------------------------------------------------------------------
@@ -181,5 +266,67 @@ mod tests {
         let cfg = PikuConfig::load(None, None, None);
         assert!(cfg.sessions_dir().ends_with("piku/sessions"));
         assert!(cfg.traces_dir().ends_with("piku/traces"));
+    }
+
+    #[test]
+    fn permission_allow_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let piku_dir = dir.path().join(".piku");
+        std::fs::create_dir_all(&piku_dir).unwrap();
+        std::fs::write(
+            piku_dir.join("settings.json"),
+            r#"{"allow": ["bash", "read_file"]}"#,
+        )
+        .unwrap();
+
+        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        assert_eq!(
+            cfg.check_permission_rule("bash", &serde_json::json!({})),
+            Some(true)
+        );
+        assert_eq!(
+            cfg.check_permission_rule("read_file", &serde_json::json!({})),
+            Some(true)
+        );
+        assert_eq!(
+            cfg.check_permission_rule("write_file", &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_allow_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let piku_dir = dir.path().join(".piku");
+        std::fs::create_dir_all(&piku_dir).unwrap();
+        std::fs::write(
+            piku_dir.join("settings.json"),
+            r#"{"allow": ["bash(git *)"]}"#,
+        )
+        .unwrap();
+
+        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let git_push = serde_json::json!({"command": "git push origin main"});
+        let rm_rf = serde_json::json!({"command": "rm -rf /"});
+        assert_eq!(cfg.check_permission_rule("bash", &git_push), Some(true));
+        assert_eq!(cfg.check_permission_rule("bash", &rm_rf), None);
+    }
+
+    #[test]
+    fn permission_deny_overrides_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let piku_dir = dir.path().join(".piku");
+        std::fs::create_dir_all(&piku_dir).unwrap();
+        std::fs::write(
+            piku_dir.join("settings.json"),
+            r#"{"allow": ["bash"], "deny": ["bash(rm *)"]}"#,
+        )
+        .unwrap();
+
+        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let git = serde_json::json!({"command": "git status"});
+        let rm = serde_json::json!({"command": "rm -rf /"});
+        assert_eq!(cfg.check_permission_rule("bash", &git), Some(true));
+        assert_eq!(cfg.check_permission_rule("bash", &rm), Some(false));
     }
 }

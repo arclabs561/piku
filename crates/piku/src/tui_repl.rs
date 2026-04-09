@@ -51,19 +51,24 @@ use piku_tools::{all_tool_definitions, Destructiveness};
 pub struct TuiPrompter {
     /// If true, skip all future prompts and allow everything.
     allow_all: std::sync::atomic::AtomicBool,
+    /// Pre-configured allow/deny rules from settings.json.
+    allow_rules: Vec<String>,
+    deny_rules: Vec<String>,
 }
 
 impl Default for TuiPrompter {
     fn default() -> Self {
-        Self::new()
+        Self::new(&[], &[])
     }
 }
 
 impl TuiPrompter {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(allow: &[String], deny: &[String]) -> Self {
         Self {
             allow_all: std::sync::atomic::AtomicBool::new(false),
+            allow_rules: allow.to_vec(),
+            deny_rules: deny.to_vec(),
         }
     }
 }
@@ -73,6 +78,20 @@ impl PermissionPrompter for TuiPrompter {
         // Fast path: user already said "allow all" earlier this turn.
         if self.allow_all.load(std::sync::atomic::Ordering::Relaxed) {
             return PermissionOutcome::Allow;
+        }
+
+        // Config-based rules: deny > allow > fall through to interactive.
+        for pattern in &self.deny_rules {
+            if crate::config::matches_tool_pattern(pattern, &req.tool_name, &req.params) {
+                return PermissionOutcome::Deny {
+                    reason: format!("denied by settings.json rule: {pattern}"),
+                };
+            }
+        }
+        for pattern in &self.allow_rules {
+            if crate::config::matches_tool_pattern(pattern, &req.tool_name, &req.params) {
+                return PermissionOutcome::Allow;
+            }
         }
 
         let (cols, rows) = term_size();
@@ -1011,7 +1030,7 @@ async fn run_tui_repl_core(
                     system_sections.push(format!("# Hook Context\n\n{ctx}"));
                 }
                 let tool_defs = all_tool_definitions();
-                let prompter = TuiPrompter::new();
+                let prompter = TuiPrompter::new(&config.allow, &config.deny);
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
 
                 // Show a ticking thinking indicator on the input row.
@@ -1078,7 +1097,7 @@ async fn run_tui_repl_core(
                     tool_defs,
                     &prompter,
                     &mut sink,
-                    None,
+                    config.max_turns,
                     Some(&mut notif_rx),
                     &task_registry,
                     0,
