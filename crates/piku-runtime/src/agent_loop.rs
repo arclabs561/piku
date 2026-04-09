@@ -28,6 +28,9 @@ use crate::task::{TaskRegistry, MAX_SPAWN_DEPTH};
 pub type InterjectionRx = mpsc::Receiver<String>;
 pub type InterjectionTx = mpsc::Sender<String>;
 
+/// Shared cancellation flag. Set to `true` to abort the current turn.
+pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
 const DEFAULT_MAX_TURNS: u32 = 20;
 
 /// Action the loop should take after a tool call completes.
@@ -64,6 +67,8 @@ pub struct TurnResult {
     pub stream_error: Option<String>,
     /// Set if the loop was interrupted for a self-update restart.
     pub replace_and_exec: Option<std::path::PathBuf>,
+    /// Set if the user cancelled the turn mid-execution.
+    pub cancelled: bool,
 }
 
 /// Run a full agentic turn: stream, collect tool calls, execute, loop.
@@ -104,6 +109,7 @@ pub async fn run_turn(
         0,
         &[],
         None,
+        None,
     )
     .await
 }
@@ -125,6 +131,7 @@ pub async fn run_turn_with_registry(
     depth: u32,
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
+    cancel_flag: Option<&CancelFlag>,
 ) -> TurnResult {
     run_turn_inner(
         input,
@@ -141,6 +148,7 @@ pub async fn run_turn_with_registry(
         depth,
         custom_agents,
         hook_registry,
+        cancel_flag,
     )
     .await
 }
@@ -160,9 +168,11 @@ async fn run_turn_inner(
     depth: u32,
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
+    cancel_flag: Option<&CancelFlag>,
 ) -> TurnResult {
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let mut interjections = interjections;
+    let mut cancelled = false;
 
     // push user message
     session.push(ConversationMessage::user(input));
@@ -190,6 +200,14 @@ async fn run_turn_inner(
     loop {
         if iterations >= max {
             break;
+        }
+        // Check cancellation flag before each iteration.
+        if let Some(flag) = cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                cancelled = true;
+                sink.on_text("\n\x1b[2m[cancelled by user]\x1b[0m\n");
+                break;
+            }
         }
         iterations += 1;
 
@@ -679,6 +697,8 @@ async fn run_turn_inner(
         let cwd = std::env::current_dir().unwrap_or_default();
         let reason = if replace_and_exec.is_some() {
             "replace_and_exec"
+        } else if cancelled {
+            "cancelled"
         } else if stream_error.is_some() {
             "error"
         } else if iterations >= max {
@@ -703,6 +723,7 @@ async fn run_turn_inner(
         usage: tracker.cumulative.clone(),
         stream_error,
         replace_and_exec,
+        cancelled,
     }
 }
 
@@ -1289,6 +1310,7 @@ async fn run_subagent_task(
         depth,
         &custom_agents,
         hook_registry.as_ref(),
+        None, // subagents don't support mid-turn cancel
     )
     .await;
 

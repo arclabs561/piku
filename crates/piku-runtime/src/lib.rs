@@ -12,8 +12,8 @@ pub mod task;
 mod tests;
 
 pub use agent_loop::{
-    run_turn, run_turn_with_registry, InterjectionRx, InterjectionTx, OutputSink, PostToolAction,
-    TurnResult,
+    run_turn, run_turn_with_registry, CancelFlag, InterjectionRx, InterjectionTx, OutputSink,
+    PostToolAction, TurnResult,
 };
 pub use agents::{
     agent_listing_prompt_with_custom, find_agent, find_built_in, load_custom_agents, AgentDef,
