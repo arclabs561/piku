@@ -319,6 +319,25 @@ fn render_inline(text: &str) -> String {
             }
         }
 
+        // Italic: _..._ (underscore variant, not inside words)
+        if chars[i] == '_' && (i == 0 || !chars[i - 1].is_alphanumeric()) {
+            if let Some(end) = find_underscore_close(&chars, i + 1) {
+                let inner: String = chars[i + 1..end].iter().collect();
+                let _ = write!(out, "{ITALIC}{MAGENTA}{inner}{RESET}");
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Links: [text](url)
+        if chars[i] == '[' {
+            if let Some((text, url, end)) = try_parse_link(&chars, i) {
+                let _ = write!(out, "\x1b[4m{text}\x1b[0m\x1b[2m({url})\x1b[0m");
+                i = end;
+                continue;
+            }
+        }
+
         out.push(chars[i]);
         i += 1;
     }
@@ -362,6 +381,38 @@ fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Find closing `_` that's not inside a word.
+fn find_underscore_close(chars: &[char], start: usize) -> Option<usize> {
+    for (i, &c) in chars.iter().enumerate().skip(start) {
+        if c == '_' && i > start {
+            // Don't close if followed by alphanumeric (mid-word underscore)
+            if chars.get(i + 1).is_some_and(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Try to parse `[text](url)` starting at `[`. Returns (text, url, `end_index`).
+fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    // Find closing ]
+    let close_bracket = find_char_from(chars, ']', start + 1)?;
+    // Must be followed by (
+    if chars.get(close_bracket + 1) != Some(&'(') {
+        return None;
+    }
+    // Find closing )
+    let close_paren = find_char_from(chars, ')', close_bracket + 2)?;
+    let text: String = chars[start + 1..close_bracket].iter().collect();
+    let url: String = chars[close_bracket + 2..close_paren].iter().collect();
+    if text.is_empty() {
+        return None;
+    }
+    Some((text, url, close_paren + 1))
 }
 
 // ── Line classification helpers ─────────────────────────────────────────────
@@ -506,8 +557,14 @@ mod tests {
         let flushed = md.flush();
         let all = format!("{pushed}{flushed}");
         let plain = strip_ansi(&all);
-        assert!(plain.contains("python"), "language tag should be in streamed output");
-        assert!(plain.contains("print"), "code line should be in streamed output");
+        assert!(
+            plain.contains("python"),
+            "language tag should be in streamed output"
+        );
+        assert!(
+            plain.contains("print"),
+            "code line should be in streamed output"
+        );
         assert!(plain.contains('╰'), "flush should close the frame");
     }
 
