@@ -1097,6 +1097,50 @@ async fn run_tui_repl_core(
                     }
                 });
 
+                // Spawn a concurrent keypress reader for mid-turn Ctrl-C.
+                let cancel_flag: piku_runtime::CancelFlag =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancel_clone = cancel_flag.clone();
+                let keypress_handle = tokio::task::spawn_local(async move {
+                    // Enable raw mode to read individual keypresses.
+                    let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
+                    if !was_raw {
+                        let _ = terminal::enable_raw_mode();
+                    }
+                    loop {
+                        // Poll with timeout so we don't block forever after the turn ends.
+                        match tokio::task::block_in_place(|| {
+                            cxevent::poll(std::time::Duration::from_millis(100))
+                        }) {
+                            Ok(true) => {
+                                if let Ok(Event::Key(KeyEvent {
+                                    code, modifiers, ..
+                                })) = cxevent::read()
+                                {
+                                    if (modifiers.contains(KeyModifiers::CONTROL)
+                                        && matches!(code, KeyCode::Char('c')))
+                                        || code == KeyCode::Esc
+                                    {
+                                        cancel_clone
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(false) => {
+                                // Check if cancel was set externally (turn ended)
+                                if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !was_raw {
+                        let _ = terminal::disable_raw_mode();
+                    }
+                });
+
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,
                     &mut session,
@@ -1112,8 +1156,13 @@ async fn run_tui_repl_core(
                     0,
                     &custom_agents,
                     Some(&hook_registry),
+                    Some(&cancel_flag),
                 )
                 .await;
+
+                // Stop the keypress reader.
+                cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                keypress_handle.abort();
 
                 total_usage.accumulate(&result.usage);
                 last_turn_error = result.stream_error.is_some();
