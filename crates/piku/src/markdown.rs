@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use syntect::util::as_24_bit_terminal_escaped;
 
 // ── ANSI constants ──────────────────────────────────────────────────────────
 
@@ -56,8 +56,8 @@ pub struct StreamingMarkdown {
     in_code_block: bool,
     /// Language tag from the opening fence.
     code_lang: String,
-    /// Accumulated code block content.
-    code_buf: String,
+    /// Whether we've emitted the opening frame for the current code block.
+    code_frame_open: bool,
     /// Line ending: `"\r\n"` for DECSTBM scroll regions, `"\n"` for normal stdout.
     eol: &'static str,
 }
@@ -76,7 +76,7 @@ impl StreamingMarkdown {
             line_buf: String::new(),
             in_code_block: false,
             code_lang: String::new(),
-            code_buf: String::new(),
+            code_frame_open: false,
             eol: "\r\n",
         }
     }
@@ -108,29 +108,34 @@ impl StreamingMarkdown {
     /// Flush any remaining buffered content (call at end of turn / before tool).
     pub fn flush(&mut self) -> String {
         let mut out = String::new();
+        let eol = self.eol;
 
         // Flush partial line
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             if self.in_code_block {
-                self.code_buf.push_str(&line);
-                self.code_buf.push('\n');
+                // Emit the partial line as a code line
+                let _ = write!(out, "{DIM}│{RESET} {line}{eol}");
             } else {
                 out.push_str(&render_inline(&line));
-                out.push_str(self.eol);
+                out.push_str(eol);
             }
         }
 
-        // If we're mid-code-block, render what we have
+        // If we're mid-code-block, close the frame
         if self.in_code_block {
-            out.push_str(&render_code_block(
-                &self.code_lang,
-                &self.code_buf,
-                self.eol,
-            ));
+            if !self.code_frame_open {
+                // Edge case: flush before any code line was emitted
+                if self.code_lang.is_empty() {
+                    let _ = write!(out, "{DIM}╭──{RESET}{eol}");
+                } else {
+                    let _ = write!(out, "{DIM}╭─ {CYAN}{}{RESET}{eol}", self.code_lang);
+                }
+            }
+            let _ = write!(out, "{DIM}╰──{RESET}{eol}");
             self.in_code_block = false;
+            self.code_frame_open = false;
             self.code_lang.clear();
-            self.code_buf.clear();
         }
 
         out
@@ -169,23 +174,47 @@ impl StreamingMarkdown {
         // ── Code fence detection ────────────────────────────────────────
         if let Some(rest) = trimmed.strip_prefix("```") {
             if self.in_code_block {
-                // Closing fence
-                out.push_str(&render_code_block(&self.code_lang, &self.code_buf, eol));
+                // Closing fence — emit bottom frame
+                let _ = write!(out, "{DIM}╰──{RESET}{eol}");
                 self.in_code_block = false;
+                self.code_frame_open = false;
                 self.code_lang.clear();
-                self.code_buf.clear();
                 return;
             }
-            // Opening fence
+            // Opening fence — emit top frame immediately
             self.in_code_block = true;
             self.code_lang = rest.trim().to_string();
-            self.code_buf.clear();
+            self.code_frame_open = true;
+            if self.code_lang.is_empty() {
+                let _ = write!(out, "{DIM}╭──{RESET}{eol}");
+            } else {
+                let _ = write!(out, "{DIM}╭─ {CYAN}{}{RESET}{eol}", self.code_lang);
+            }
             return;
         }
 
         if self.in_code_block {
-            self.code_buf.push_str(line);
-            self.code_buf.push('\n');
+            // Emit each code line immediately with syntax highlighting.
+            let _ = write!(out, "{DIM}│{RESET} ");
+            let ss = syntax_set();
+            let theme = syntax_theme();
+            let syntax = ss
+                .find_syntax_by_token(&self.code_lang)
+                .unwrap_or_else(|| ss.find_syntax_plain_text());
+            let mut hl = HighlightLines::new(syntax, theme);
+            let line_with_nl = format!("{line}\n");
+            match hl.highlight_line(&line_with_nl, ss) {
+                Ok(ranges) => {
+                    let escaped = as_24_bit_terminal_escaped(&ranges, false);
+                    let escaped = escaped.trim_end_matches('\n');
+                    out.push_str(escaped);
+                    out.push_str(RESET);
+                }
+                Err(_) => {
+                    out.push_str(line);
+                }
+            }
+            out.push_str(eol);
             return;
         }
 
@@ -248,53 +277,6 @@ impl StreamingMarkdown {
         out.push_str(&render_inline(trimmed));
         out.push_str(eol);
     }
-}
-
-// ── Block rendering ─────────────────────────────────────────────────────────
-
-fn render_code_block(lang: &str, code: &str, eol: &str) -> String {
-    let mut out = String::new();
-    let code = code.trim_end_matches('\n');
-
-    // Top frame
-    if lang.is_empty() {
-        let _ = write!(out, "{DIM}╭──{RESET}{eol}");
-    } else {
-        let _ = write!(out, "{DIM}╭─ {CYAN}{lang}{RESET}{eol}");
-    }
-
-    // Highlighted code lines
-    let ss = syntax_set();
-    let theme = syntax_theme();
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let mut hl = HighlightLines::new(syntax, theme);
-
-    for line in LinesWithEndings::from(code) {
-        let _ = write!(out, "{DIM}│{RESET} ");
-        match hl.highlight_line(line, ss) {
-            Ok(ranges) => {
-                let escaped = as_24_bit_terminal_escaped(&ranges, false);
-                let escaped = escaped.trim_end_matches('\n');
-                out.push_str(escaped);
-                out.push_str(RESET);
-            }
-            Err(_) => {
-                out.push_str(line.trim_end_matches('\n'));
-            }
-        }
-        out.push_str(eol);
-    }
-
-    // Handle empty code blocks
-    if code.is_empty() {
-        let _ = write!(out, "{DIM}│{RESET}{eol}");
-    }
-
-    // Bottom frame
-    let _ = write!(out, "{DIM}╰──{RESET}{eol}");
-    out
 }
 
 // ── Inline rendering ────────────────────────────────────────────────────────
@@ -520,11 +502,13 @@ mod tests {
     #[test]
     fn code_block_flush_mid_block() {
         let mut md = StreamingMarkdown::new();
-        let _ = md.push("```python\nprint('hi')\n");
-        let out = md.flush();
-        let plain = strip_ansi(&out);
-        assert!(plain.contains("python"));
-        assert!(plain.contains("print"));
+        let pushed = md.push("```python\nprint('hi')\n");
+        let flushed = md.flush();
+        let all = format!("{pushed}{flushed}");
+        let plain = strip_ansi(&all);
+        assert!(plain.contains("python"), "language tag should be in streamed output");
+        assert!(plain.contains("print"), "code line should be in streamed output");
+        assert!(plain.contains('╰'), "flush should close the frame");
     }
 
     #[test]
