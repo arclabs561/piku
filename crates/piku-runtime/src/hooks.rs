@@ -60,6 +60,8 @@ pub struct HookConfig {
     pub session_start: Vec<HookEntry>,
     #[serde(rename = "Stop", default)]
     pub stop: Vec<HookEntry>,
+    #[serde(rename = "PreCompact", default)]
+    pub pre_compact: Vec<HookEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +146,7 @@ impl HookRegistry {
             ("PostToolUse", &self.config.post_tool_use),
             ("SessionStart", &self.config.session_start),
             ("Stop", &self.config.stop),
+            ("PreCompact", &self.config.pre_compact),
         ];
         for (name, entries) in events {
             for entry in entries {
@@ -168,6 +171,7 @@ impl HookRegistry {
             || !self.config.post_tool_use.is_empty()
             || !self.config.session_start.is_empty()
             || !self.config.stop.is_empty()
+            || !self.config.pre_compact.is_empty()
     }
 
     /// Run `PreToolUse` hooks. Returns the decision (allow/deny).
@@ -377,6 +381,51 @@ impl HookRegistry {
                 }
             }
         }
+    }
+
+    /// Run `PreCompact` hooks before context compaction.
+    /// Returns `false` to veto compaction (any hook exits with code 2).
+    #[must_use]
+    pub fn run_pre_compact(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        message_count: usize,
+        method: &str,
+    ) -> bool {
+        let entries = &self.config.pre_compact;
+        if entries.is_empty() {
+            return true; // no hooks = proceed
+        }
+
+        let input = serde_json::json!({
+            "hook_event_name": "PreCompact",
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+            "message_count": message_count,
+            "method": method,
+        });
+
+        for entry in entries {
+            for handler in &entry.hooks {
+                match run_hook_command(
+                    &handler.command,
+                    &input,
+                    handler.timeout,
+                    self.project_dir.as_deref(),
+                ) {
+                    HookCommandResult::Blocked(reason) => {
+                        eprintln!("[piku] compaction vetoed by hook: {reason}");
+                        return false;
+                    }
+                    HookCommandResult::Error(msg) => {
+                        eprintln!("[piku] pre-compact hook error: {msg}");
+                    }
+                    HookCommandResult::Success(_) => {}
+                }
+            }
+        }
+        true
     }
 }
 

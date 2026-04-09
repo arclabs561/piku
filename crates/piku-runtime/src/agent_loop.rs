@@ -215,56 +215,66 @@ async fn run_turn_inner(
         // Tries LLM summarisation first (richer summaries); falls back to
         // structural (no-LLM) if the provider call fails or times out.
         if crate::compact::should_compact(session, compact_cfg) {
-            let (result, method) =
-                match try_llm_compact(session, provider, model, compact_cfg).await {
-                    Some(r) => (r, "llm"),
-                    None => (
-                        crate::compact::compact_session(session, compact_cfg),
-                        "structural",
-                    ),
-                };
-            if result.removed_message_count > 0 {
-                // Trigger memory extraction on the messages being compacted away.
-                // Guarded: skip if a previous extraction is still in flight (prevents
-                // race conditions on the store file).
-                let new_messages = &session.messages[last_extraction_idx..];
-                if !new_messages.is_empty()
-                    && !extraction_in_flight.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    let transcript = crate::embed_memory::build_extraction_transcript(new_messages);
-                    if !transcript.trim().is_empty() {
-                        let provider_clone = provider.boxed_clone();
-                        let model_owned = model.to_string();
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        let store_path = crate::embed_memory::default_store_path(&cwd);
-                        let embed_config = crate::embed_memory::EmbedConfig::from_env();
-                        let flag = extraction_in_flight.clone();
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        tokio::task::spawn_local(async move {
-                            let mut store = crate::embed_memory::MemoryStore::load(&store_path);
-                            let n = crate::embed_memory::extract_and_store(
-                                &transcript,
-                                provider_clone.as_ref(),
-                                &model_owned,
-                                &mut store,
-                                &embed_config,
-                            )
-                            .await;
-                            if n > 0 {
-                                let _ = store.save(&store_path);
-                            }
-                            flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                        });
+            // PreCompact hook: let hooks veto compaction (exit 2 = block).
+            let vetoed = hook_registry.is_some_and(|hooks| {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                !hooks.run_pre_compact(&session.id, &cwd, session.messages.len(), "auto")
+            });
+            if vetoed {
+                // Hook vetoed compaction -- skip this cycle.
+            } else {
+                let (result, method) =
+                    match try_llm_compact(session, provider, model, compact_cfg).await {
+                        Some(r) => (r, "llm"),
+                        None => (
+                            crate::compact::compact_session(session, compact_cfg),
+                            "structural",
+                        ),
+                    };
+                if result.removed_message_count > 0 {
+                    // Trigger memory extraction on the messages being compacted away.
+                    // Guarded: skip if a previous extraction is still in flight (prevents
+                    // race conditions on the store file).
+                    let new_messages = &session.messages[last_extraction_idx..];
+                    if !new_messages.is_empty()
+                        && !extraction_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let transcript =
+                            crate::embed_memory::build_extraction_transcript(new_messages);
+                        if !transcript.trim().is_empty() {
+                            let provider_clone = provider.boxed_clone();
+                            let model_owned = model.to_string();
+                            let cwd = std::env::current_dir().unwrap_or_default();
+                            let store_path = crate::embed_memory::default_store_path(&cwd);
+                            let embed_config = crate::embed_memory::EmbedConfig::from_env();
+                            let flag = extraction_in_flight.clone();
+                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            tokio::task::spawn_local(async move {
+                                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                                let n = crate::embed_memory::extract_and_store(
+                                    &transcript,
+                                    provider_clone.as_ref(),
+                                    &model_owned,
+                                    &mut store,
+                                    &embed_config,
+                                )
+                                .await;
+                                if n > 0 {
+                                    let _ = store.save(&store_path);
+                                }
+                                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            });
+                        }
                     }
-                }
 
-                *session = result.compacted_session;
-                last_extraction_idx = 0; // reset after compaction replaces messages
-                sink.on_text(&format!(
-                    "\x1b[2m[context compacted: {} messages summarised ({method})]\x1b[0m\n",
-                    result.removed_message_count
-                ));
-            }
+                    *session = result.compacted_session;
+                    last_extraction_idx = 0; // reset after compaction replaces messages
+                    sink.on_text(&format!(
+                        "\x1b[2m[context compacted: {} messages summarised ({method})]\x1b[0m\n",
+                        result.removed_message_count
+                    ));
+                }
+            } // else compact_allowed
         }
 
         let request = build_request(session, model, system_prompt, &tool_defs);
