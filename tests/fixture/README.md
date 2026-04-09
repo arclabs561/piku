@@ -1,26 +1,18 @@
-# piku-fixture
+# minigrep
 
-A small Rust library used as the stable dogfood target for piku integration tests.
+A simple grep clone for searching text files.
 
-## What it does
+## Usage
 
-- `stats`: sum, min, max, mean over integer slices
-- `parser`: key=value and CSV parsing, CLI flag extraction
-- `utils`: string formatting utilities
+```
+minigrep <query> <filename>
+```
 
-## process_batch
+Set `CASE_INSENSITIVE=1` for case-insensitive search.
 
-The `process_batch(values: &[i32]) -> String` function in `lib.rs` should:
+## TODO
 
-1. Compute the sum, min, and max of `values`
-2. Return a formatted string: `"sum={sum} min={min} max={max}"`
-3. Return `"empty"` if `values` is empty
-
-This function is currently stubbed with `unimplemented!()`.
-
-## Known issues
-
-- `stats::mean` panics on an empty slice
-- `parser::split_csv` drops empty fields between consecutive commas
-- `utils::format_output` is missing a doc comment
-- `process_batch` is not implemented
+- Add line number display (--line-numbers or -n flag)
+- Add support for searching multiple files
+- Add regex support
+- Add colorized output for matched terms

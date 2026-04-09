@@ -1562,6 +1562,64 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
         },
     );
 
+    // Realistic multi-turn feature implementation persona.
+    // Works on the minigrep fixture project with a genuine feature request.
+    m.insert(
+        "feature_implementer",
+        Persona {
+            name: "feature_implementer",
+            description:
+                "Developer implementing a real feature: add line numbers to search results. \
+                          Multi-turn: read code, plan, implement, test, iterate.",
+            phases: vec![
+                Phase {
+                    name: "orient",
+                    scripted: vec![Action::Submit(
+                        "Read src/lib.rs and README.md. What does this project do?".into(),
+                    )],
+                    focus: "Did piku read both files? Does it understand the project correctly?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "plan",
+                    scripted: vec![Action::Submit(
+                        "I want to add line numbers to search results. The search function should \
+                         return (line_number, line_text) pairs instead of just line text. \
+                         Plan the changes needed -- which functions to modify, what the new \
+                         signatures should be, and what tests to add."
+                            .into(),
+                    )],
+                    focus: "Did piku produce a concrete plan? Does it identify search() and \
+                            search_case_insensitive() as the functions to change? \
+                            Does it mention updating existing tests?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "implement",
+                    scripted: vec![Action::Submit(
+                        "Implement the plan. Modify search() and search_case_insensitive() \
+                         to return Vec<(usize, &str)> with 1-based line numbers. \
+                         Update the existing tests and add a new test for line numbers. \
+                         Update run() to format output as 'N:line'."
+                            .into(),
+                    )],
+                    focus: "Did piku modify src/lib.rs? Check workspace diff. \
+                            Are the function signatures changed? Are tests updated?",
+                    freeform_turns: 1,
+                },
+                Phase {
+                    name: "verify",
+                    scripted: vec![Action::Submit(
+                        "Run cargo test and show me the results.".into(),
+                    )],
+                    focus: "Did piku run the tests? Do they pass? \
+                            If they fail, does piku offer to fix them?",
+                    freeform_turns: 1,
+                },
+            ],
+        },
+    );
+
     m.insert(
         "input_explorer",
         Persona {
@@ -3190,6 +3248,16 @@ fn agentic_user_input_explorer() {
     }
     let ps = personas();
     run_agentic_session(ps.get("input_explorer").unwrap());
+}
+
+#[test]
+#[serial(agentic)]
+fn agentic_user_feature_implementer() {
+    if !is_enabled() {
+        return;
+    }
+    let ps = personas();
+    run_agentic_session(ps.get("feature_implementer").unwrap());
 }
 
 #[test]
