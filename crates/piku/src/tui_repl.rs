@@ -516,6 +516,8 @@ pub struct TuiSink {
     needs_indicator_clear: bool,
     /// Signal to stop the background thinking ticker.
     thinking_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Current activity label shown in the indicator (changes during the turn).
+    indicator_label: std::sync::Arc<std::sync::Mutex<String>>,
     /// Streaming markdown renderer for assistant text.
     md: StreamingMarkdown,
 }
@@ -528,6 +530,7 @@ impl TuiSink {
             build_candidate: self_update::default_build_output(),
             needs_indicator_clear: true,
             thinking_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indicator_label: std::sync::Arc::new(std::sync::Mutex::new("thinking".to_string())),
             md: StreamingMarkdown::new(),
         }
     }
@@ -591,6 +594,8 @@ impl OutputSink for TuiSink {
                 "\r\n\x1b[33m⏺\x1b[0m \x1b[1m{name}\x1b[0m\x1b[2m({args})\x1b[0m"
             ));
         }
+        // Update indicator label to show tool execution
+        *self.indicator_label.lock().unwrap() = format!("running {name}");
         let _ = self.stdout.flush();
     }
 
@@ -607,6 +612,8 @@ impl OutputSink for TuiSink {
             "\x1b[32m⏺\x1b[0m"
         };
         self.println(dot);
+        // Restore label for next iteration (model will think again)
+        *self.indicator_label.lock().unwrap() = "thinking".to_string();
         let _ = self.stdout.flush();
 
         if tool_name == "bash" {
@@ -638,6 +645,11 @@ impl OutputSink for TuiSink {
     }
 
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        // Stop the background spinner (prevents task leak).
+        self.thinking_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Clear any lingering indicator from the input row.
+        self.clear_thinking_indicator();
         // Flush any remaining markdown before the turn summary.
         let flushed = self.md.flush();
         if !flushed.is_empty() {
@@ -1038,20 +1050,17 @@ async fn run_tui_repl_core(
                 // Cleared by clear_thinking_indicator() on first output.
                 let stop_flag = sink.thinking_stop.clone();
                 stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                // Show dimmed prompt with animated thinking indicator on the
-                // input row. Cursor stays at the prompt position (like Claude Code
-                // dims the ❯ while loading). The spinner ticks on the input row
-                // using save/restore so streaming output in the scroll zone isn't
-                // disrupted.
+                let label_ref = sink.indicator_label.clone();
+                *label_ref.lock().unwrap() = "thinking".to_string();
+                // Show dimmed prompt with animated indicator on the input row.
                 goto(rows, 1);
-                print!("\x1b[2K\x1b[2m❯ · thinking…\x1b[0m\x1b[?25h");
-                goto(rows, 3); // cursor after "❯ "
+                print!("\x1b[2K\x1b[2m❯ · thinking\x1b[0m\x1b[?25h");
+                goto(rows, 3);
                 let _ = io::stdout().flush();
                 let indicator_row = rows;
                 tokio::task::spawn_local(async move {
                     const FRAMES: &[&str] = &["·", "✦", "✶", "✻", "✽", "✻", "✶", "✦"];
-                    const STALL_THRESHOLD_SECS: u64 = 30;
-                    const STALL_RAMP_SECS: u64 = 30; // 30-60s ramps to full red
+                    const STALL_SECS: u64 = 30;
                     let start = std::time::Instant::now();
                     let mut tick: usize = 0;
                     loop {
@@ -1063,24 +1072,22 @@ async fn run_tui_repl_core(
                         let frame = FRAMES[tick % FRAMES.len()];
                         tick += 1;
                         let time_str = crate::fmt_duration(elapsed);
+                        let label = label_ref.lock().unwrap().clone();
                         // Stalled state: after 30s, interpolate color toward red
-                        let color = if elapsed > STALL_THRESHOLD_SECS {
-                            let intensity = ((elapsed - STALL_THRESHOLD_SECS) as f32
-                                / STALL_RAMP_SECS as f32)
-                                .min(1.0);
-                            // Interpolate from gray (153,153,153) toward red (171,43,63)
-                            let r = (153.0 + (171.0 - 153.0) * intensity) as u8;
-                            let g = (153.0 + (43.0 - 153.0) * intensity) as u8;
-                            let b = (153.0 + (63.0 - 153.0) * intensity) as u8;
+                        let color = if elapsed > STALL_SECS {
+                            let t = ((elapsed - STALL_SECS) as f32 / 30.0).min(1.0);
+                            let r = (153.0 + 18.0 * t) as u8;
+                            let g = (153.0 - 110.0 * t) as u8;
+                            let b = (153.0 - 90.0 * t) as u8;
                             format!("\x1b[38;2;{r};{g};{b}m")
                         } else {
-                            "\x1b[2m".to_string() // dim
+                            "\x1b[2m".to_string()
                         };
                         let mut out = io::stdout();
                         let _ = out.write_all(b"\x1b[s");
                         goto(indicator_row, 1);
                         let _ = out.write_all(
-                            format!("\x1b[2K{color}❯ {frame} thinking… ({time_str})\x1b[0m")
+                            format!("\x1b[2K{color}❯ {frame} {label} ({time_str})\x1b[0m")
                                 .as_bytes(),
                         );
                         let _ = out.write_all(b"\x1b[u");
