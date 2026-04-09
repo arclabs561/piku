@@ -890,17 +890,9 @@ impl PtyHandle {
         }
     }
 
-    /// True if the PTY subprocess has exited.
-    fn is_dead(&mut self) -> bool {
-        if self.eof {
-            return true;
-        }
-        // Try a zero-byte write probe -- fails with EIO/EPIPE if PTY slave closed.
-        if self.writer.write_all(b"\x00").is_err() || self.writer.flush().is_err() {
-            self.eof = true;
-            return true;
-        }
-        false
+    /// True if the PTY subprocess has exited (detected via reader EOF/EIO).
+    fn is_dead(&self) -> bool {
+        self.eof
     }
 
     /// Send raw bytes to the PTY
@@ -2710,12 +2702,17 @@ fn run_agentic_session(persona: &Persona) {
             if total_turns >= turn_limit {
                 break;
             }
+            if pty.is_dead() {
+                eprintln!("[agentic_user] piku died before freeform turn {freeform_turn}");
+                break;
+            }
 
             // Get a freeform LLM provider (better model for exploration)
             let Some(freeform_spec) = user_agent_provider(true) else {
                 break;
             };
             let freeform_llm = LlmClient::new(freeform_spec);
+            eprintln!("[agentic_user] freeform critique starting (turn {freeform_turn})...");
 
             let snap_before_free = observer.snapshot();
 
@@ -2921,6 +2918,77 @@ fn check_attempt_store(workspace: &Path) -> (usize, usize, Vec<String>) {
     (entries, attempts, goals)
 }
 
+/// Run a single piku session: send a prompt, wait for response, capture output.
+/// Returns `(screen_text, workspace_changes)` for evidence.
+fn run_attempt_session(
+    workspace: &Path,
+    piku_spec: &ProviderSpec,
+    prompt: &str,
+    label: &str,
+) -> (String, String) {
+    let mut observer = TerminalObserver::new(40, 120);
+    let mut pty = PtyHandle::spawn(workspace, piku_spec);
+    let ws_observer = WorkspaceObserver::new(workspace.to_path_buf());
+
+    eprintln!("[attempt-tree] [{label}] waiting for startup...");
+    let startup = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
+    if !startup.is_ready() {
+        eprintln!("[attempt-tree] [{label}] piku did not start within 30s");
+        drop(pty);
+        return (String::new(), String::new());
+    }
+
+    eprintln!("[attempt-tree] [{label}] sending prompt...");
+    pty.execute_action(&Action::Submit(prompt.to_string()), &mut observer);
+
+    // Phase 1: wait until screen changes (response starts streaming)
+    let pre = observer.snapshot().contents.clone();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        pty.drain(&mut observer);
+        if observer.snapshot().contents != pre {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("[attempt-tree] [{label}] screen did not change within 20s");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Clear capture AFTER screen change detected -- strips the typing echo
+    pty.clear_capture();
+
+    // Phase 2: wait for response to complete (ready prompt returns)
+    let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(180));
+
+    // Collect response from both capture and screen snapshot
+    let captured = pty.captured_text();
+    let screen_text = snap.summary(50);
+    let response_text = if captured.len() > screen_text.len() {
+        captured
+    } else {
+        screen_text
+    };
+
+    eprintln!(
+        "[attempt-tree] [{label}] response: {} chars, ready={}",
+        response_text.len(),
+        snap.is_ready()
+    );
+
+    let ws_diff = ws_observer.diff_since_checkpoint();
+    let ws_summary = ws_diff.summary();
+    eprintln!("[attempt-tree] [{label}] workspace changes: {ws_summary}");
+
+    // Exit piku cleanly
+    pty.send_bytes(b"\x04");
+    std::thread::sleep(Duration::from_millis(500));
+    drop(pty);
+
+    (response_text, ws_summary)
+}
+
 /// Run two piku sessions against the same workspace to test attempt tree learning.
 ///
 /// Session 1: debug paginate.py -- piku should try approaches and record attempts.
@@ -2947,188 +3015,100 @@ fn run_attempt_tree_evaluation() {
     let ua_llm = LlmClient::new(ua_spec.clone());
 
     // =====================================================================
-    // SESSION 1: Debug paginate.py
+    // SESSION 1: Debug paginate.py -- record attempts
     // =====================================================================
     eprintln!("[attempt-tree] === SESSION 1: debug paginate.py ===");
-    let (s1_captured_len, s1_used_record_attempt) = {
-        let mut observer = TerminalObserver::new(40, 120);
-        let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
-        let ws_observer = WorkspaceObserver::new(workspace.clone());
+    let (s1_text, s1_ws) = run_attempt_session(
+        &workspace,
+        &piku_spec,
+        "Read src/paginate.py and src/test_paginate.py. The test fails -- \
+         page 1 returns [4, 5, 6] instead of [1, 2, 3]. \
+         First, call the record_attempt tool with goal='fix pagination off-by-one' \
+         and approach='examine index calculation in paginate()'. \
+         Then debug and fix the bug. After fixing, call record_attempt again with \
+         the same goal, your fix approach, and outcome='success' or 'failure'.",
+        "session-1",
+    );
 
-        eprintln!("[attempt-tree] waiting for piku startup...");
-        let startup = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
-        if !startup.is_ready() {
-            eprintln!("[attempt-tree] piku did not start within 30s");
-            drop(pty);
-            return;
-        }
-
-        // Ask piku to debug the pagination bug
-        let prompt = "Read src/paginate.py and src/test_paginate.py. The test fails -- \
-                      page 1 returns [4, 5, 6] instead of [1, 2, 3]. Debug this. \
-                      Try different approaches and use record_attempt to track what you try. \
-                      Fix the bug when you find the root cause.";
-
-        eprintln!("[attempt-tree] sending debug prompt...");
-        pty.execute_action(&Action::Submit(prompt.to_string()), &mut observer);
-
-        // Wait for screen change
-        let pre = observer.snapshot().contents.clone();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            pty.drain(&mut observer);
-            if observer.snapshot().contents != pre {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        pty.clear_capture();
-
-        // Wait for response to complete
-        let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(120));
-        let captured = pty.captured_text();
-        eprintln!(
-            "[attempt-tree] session 1 response: {} chars, ready={}",
-            captured.len(),
-            snap.is_ready()
-        );
-
-        // Check if record_attempt was called
-        let used_ra = captured.contains("record_attempt")
-            || captured.contains("attempt recorded")
-            || captured.contains("attempt");
-        eprintln!("[attempt-tree] session 1: record_attempt evidence: {used_ra}");
-
-        // Check workspace changes
-        let ws_diff = ws_observer.diff_since_checkpoint();
-        eprintln!(
-            "[attempt-tree] session 1: workspace changes: {}",
-            ws_diff.summary()
-        );
-
-        // Exit piku
-        pty.send_bytes(b"\x04");
-        std::thread::sleep(Duration::from_millis(500));
-        drop(pty);
-
-        (captured.len(), used_ra)
-    };
-
-    // Check the memory store after session 1
-    let (total_entries, attempt_count, goals) = check_attempt_store(&workspace);
+    let (s1_entries, s1_attempts, s1_goals) = check_attempt_store(&workspace);
     eprintln!(
-        "[attempt-tree] after session 1: {total_entries} entries, {attempt_count} attempts, goals: {goals:?}"
+        "[attempt-tree] after session 1: {s1_entries} entries, {s1_attempts} attempts, goals: {s1_goals:?}"
     );
 
     // =====================================================================
-    // SESSION 2: Debug chunker.py (similar bug pattern)
+    // SESSION 2: Debug chunker.py -- query prior attempts first
     // =====================================================================
     eprintln!("[attempt-tree] === SESSION 2: debug chunker.py ===");
-    {
-        let mut observer = TerminalObserver::new(40, 120);
-        let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
+    let (s2_text, s2_ws) = run_attempt_session(
+        &workspace,
+        &piku_spec,
+        "Read src/chunker.py. The chunk_text function has a bug: \
+         chunk_text('abcdefghij', 3, 1) returns 'def' instead of 'abc'. \
+         Before debugging, call the query_attempts tool with \
+         goal='fix off-by-one indexing bug' to check if similar bugs have been \
+         debugged before in this project. Then fix the bug in chunker.py.",
+        "session-2",
+    );
 
-        eprintln!("[attempt-tree] waiting for piku startup...");
-        let startup = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
-        if !startup.is_ready() {
-            eprintln!("[attempt-tree] piku did not start for session 2");
-            drop(pty);
-            return;
-        }
+    let (s2_entries, s2_attempts, s2_goals) = check_attempt_store(&workspace);
+    eprintln!(
+        "[attempt-tree] after session 2: {s2_entries} entries, {s2_attempts} attempts, goals: {s2_goals:?}"
+    );
 
-        // Ask piku to debug chunker.py -- similar bug
-        let prompt = "Read src/chunker.py. The chunk_text function has a bug: \
-                      chunk_text('abcdefghij', 3, 1) returns 'def' instead of 'abc'. \
-                      Before debugging, use query_attempts to check if similar bugs \
-                      have been debugged before. Then fix it.";
+    // =====================================================================
+    // META-JUDGE: evaluate the two-session interaction
+    // =====================================================================
+    let evidence = format!(
+        "SESSION 1 (debug paginate.py):\n\
+         Response ({} chars): {}\n\
+         Workspace changes: {}\n\
+         Memory store after: {} entries, {} attempts\n\
+         Goals recorded: {:?}\n\n\
+         SESSION 2 (debug chunker.py -- same off-by-one pattern):\n\
+         Response ({} chars): {}\n\
+         Workspace changes: {}\n\
+         Memory store after: {} entries, {} attempts\n\
+         Goals recorded: {:?}",
+        s1_text.len(),
+        safe_truncate(&s1_text, 2000),
+        s1_ws,
+        s1_entries,
+        s1_attempts,
+        s1_goals,
+        s2_text.len(),
+        safe_truncate(&s2_text, 2000),
+        s2_ws,
+        s2_entries,
+        s2_attempts,
+        s2_goals,
+    );
 
-        eprintln!("[attempt-tree] sending debug prompt (session 2)...");
-        pty.execute_action(&Action::Submit(prompt.to_string()), &mut observer);
-
-        let pre = observer.snapshot().contents.clone();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            pty.drain(&mut observer);
-            if observer.snapshot().contents != pre {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        pty.clear_capture();
-
-        let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(120));
-        let captured = pty.captured_text();
-        eprintln!(
-            "[attempt-tree] session 2 response: {} chars, ready={}",
-            captured.len(),
-            snap.is_ready()
-        );
-
-        // Check if query_attempts was called
-        let used_query = captured.contains("query_attempts")
-            || captured.contains("Prior Attempts")
-            || captured.contains("prior attempt");
-        eprintln!("[attempt-tree] session 2: query_attempts evidence: {used_query}");
-
-        // Exit piku
-        pty.send_bytes(b"\x04");
-        std::thread::sleep(Duration::from_millis(500));
-        drop(pty);
-
-        // Meta-judge: evaluate the two-session interaction
-        let (total_after, attempts_after, goals_after) = check_attempt_store(&workspace);
-        eprintln!(
-            "[attempt-tree] after session 2: {total_after} entries, {attempts_after} attempts, goals: {goals_after:?}"
-        );
-
-        let evidence = format!(
-            "SESSION 1 (debug paginate.py):\n\
-             Response length: {} chars\n\
-             record_attempt evidence in output: {}\n\
-             Memory store after: {} entries, {} attempts\n\
-             Goals recorded: {:?}\n\n\
-             SESSION 2 (debug chunker.py -- same bug pattern):\n\
-             Response length: {} chars\n\
-             query_attempts evidence in output: {}\n\
-             Memory store after: {} entries, {} attempts\n\
-             Goals recorded: {:?}",
-            s1_captured_len,
-            s1_used_record_attempt,
-            total_entries,
-            attempt_count,
-            goals,
-            captured.len(),
-            used_query,
-            total_after,
-            attempts_after,
-            goals_after,
-        );
-
-        let system = "\
+    let system = "\
 You are evaluating whether piku's attempt tree memory system works across sessions.
 
 Two sessions were run against the same workspace:
-- Session 1: piku debugged an off-by-one bug in paginate.py
-- Session 2: piku debugged an identical bug pattern in chunker.py
+- Session 1: piku was asked to debug an off-by-one bug in paginate.py and call record_attempt
+- Session 2: piku was asked to debug the same bug pattern in chunker.py and call query_attempts first
+
+The memory store is at .piku/embed-memory/memories.json. Attempt entries have entry_type='attempt'.
 
 Evaluate:
-1. RECORDING: Did session 1 create attempt entries in the memory store?
-2. RETRIEVAL: Did session 2 query prior attempts before debugging?
-3. LEARNING: Did session 2 benefit from session 1's experience? (faster fix, avoided failed approaches)
-4. TOOL_USAGE: Were record_attempt and query_attempts tools used?
+1. RECORDING: Did session 1 create attempt entries in the memory store? (check entries/attempts count)
+2. RETRIEVAL: Did session 2's response mention prior attempts or query_attempts?
+3. LEARNING: Did piku fix the bug correctly in both sessions?
+4. TOOL_USAGE: Look for evidence of record_attempt and query_attempts tool calls in the responses.
 
 Rate each dimension: PASS / PARTIAL / FAIL with one-line reason.
-End with VERDICT: one sentence on whether the attempt tree system is working.";
+End with VERDICT: one sentence overall assessment.";
 
-        let judge_response = ua_llm.call_raw(system, &[("user", &evidence)]);
-        eprintln!("\n[attempt-tree] === META-JUDGE ===\n{judge_response}\n");
-    }
+    eprintln!(
+        "[attempt-tree] running meta-judge ({} chars evidence)...",
+        evidence.len()
+    );
+    // Truncate evidence to avoid slow LLM calls on large context
+    let truncated_evidence: String = evidence.chars().take(3000).collect();
+    let judge_response = ua_llm.call_raw(system, &[("user", &truncated_evidence)]);
+    eprintln!("\n[attempt-tree] === META-JUDGE ===\n{judge_response}\n");
 }
 
 // ===========================================================================
