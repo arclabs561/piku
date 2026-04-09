@@ -1202,18 +1202,14 @@ async fn run_tui_repl_core(
         if !transcript.trim().is_empty() {
             let store_path = piku_runtime::default_store_path(&cwd);
             let mut store = piku_runtime::MemoryStore::load(&store_path);
-            let ollama_url = std::env::var("OLLAMA_HOST")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let embed_model = std::env::var("PIKU_EMBED_MODEL")
-                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            let embed_config = piku_runtime::embed_memory::EmbedConfig::from_env();
             // Use a short timeout — don't make the user wait forever on exit
             let extraction_future = piku_runtime::extract_and_store(
                 &transcript,
                 resolved.as_provider(),
                 &model,
                 &mut store,
-                &ollama_url,
-                &embed_model,
+                &embed_config,
             );
             match tokio::time::timeout(std::time::Duration::from_secs(15), extraction_future).await
             {

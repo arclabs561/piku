@@ -146,21 +146,142 @@ fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Embedding client (ollama /api/embed)
+// Embedding client (Ollama + OpenAI-compatible)
 // ---------------------------------------------------------------------------
 
-/// Embed text using ollama's /api/embed endpoint.
-/// Returns a normalized 768-dim vector.
-pub async fn embed_text(text: &str, ollama_url: &str, model: &str) -> Result<Vec<f32>, String> {
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "model": model,
-        "input": text,
-    });
+/// Embedding backend protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedBackend {
+    /// Ollama native: POST {url}/api/embed, response: `{"embeddings": [[...]]}`
+    Ollama,
+    /// OpenAI-compatible: POST `{url}/v1/embeddings`, response: `{"data": [{"embedding": [...]}]}`
+    /// Works with any provider that implements the OAI-compatible embeddings API.
+    OpenAiCompat,
+}
 
-    let resp = client
-        .post(format!("{ollama_url}/api/embed"))
-        .json(&body)
+/// Resolved embedding configuration.
+#[derive(Debug, Clone)]
+pub struct EmbedConfig {
+    pub backend: EmbedBackend,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+impl EmbedConfig {
+    /// Build from environment variables, with fallback chain:
+    /// 1. `PIKU_EMBED_URL` (explicit URL → auto-detect backend from URL shape)
+    /// 2. `OLLAMA_HOST` set (or default localhost) → Ollama native
+    /// 3. `OPENROUTER_API_KEY` set → `/v1/embeddings` via openrouter
+    ///
+    /// Model: `PIKU_EMBED_MODEL` overrides the default for any backend.
+    /// API key: `PIKU_EMBED_API_KEY` → `OPENROUTER_API_KEY` → none.
+    #[must_use]
+    pub fn from_env() -> Self {
+        // Explicit override: user set a custom embedding URL
+        if let Ok(url) = std::env::var("PIKU_EMBED_URL") {
+            let model = std::env::var("PIKU_EMBED_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+            let api_key = std::env::var("PIKU_EMBED_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+            let backend =
+                if url.contains("openrouter") || url.contains("openai") || url.contains("groq") {
+                    EmbedBackend::OpenAiCompat
+                } else if url.contains("11434") || url.contains("ollama") {
+                    EmbedBackend::Ollama
+                } else {
+                    // Default to OpenAI-compat for unknown URLs (most common)
+                    EmbedBackend::OpenAiCompat
+                };
+            return Self {
+                backend,
+                base_url: url.trim_end_matches('/').to_string(),
+                model,
+                api_key,
+            };
+        }
+
+        // Default: Ollama (local, no API key needed)
+        // OLLAMA_HOST is set by default in most piku environments.
+        let ollama_url =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let embed_model = std::env::var("PIKU_EMBED_MODEL");
+
+        // If OLLAMA_HOST was explicitly set, always use Ollama
+        if std::env::var("OLLAMA_HOST").is_ok() {
+            return Self {
+                backend: EmbedBackend::Ollama,
+                base_url: ollama_url,
+                model: embed_model.unwrap_or_else(|_| "nomic-embed-text".to_string()),
+                api_key: None,
+            };
+        }
+
+        // If OpenRouter API key is available, use it for embeddings too
+        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+            let base = std::env::var("OPENROUTER_BASE_URL")
+                .unwrap_or_else(|_| "https://openrouter.ai/api".to_string());
+            return Self {
+                backend: EmbedBackend::OpenAiCompat,
+                base_url: base.trim_end_matches('/').to_string(),
+                model: embed_model.unwrap_or_else(|_| "openai/text-embedding-3-small".to_string()),
+                api_key: Some(key),
+            };
+        }
+
+        // Last resort: Ollama at default host (will fail at call time if not running)
+        Self {
+            backend: EmbedBackend::Ollama,
+            base_url: ollama_url,
+            model: embed_model.unwrap_or_else(|_| "nomic-embed-text".to_string()),
+            api_key: None,
+        }
+    }
+}
+
+/// Embed text using the configured backend.
+/// Returns a normalized vector (dimension depends on model).
+pub async fn embed_text(text: &str, ollama_url: &str, model: &str) -> Result<Vec<f32>, String> {
+    // Legacy signature compat: build config from args
+    let config = EmbedConfig {
+        backend: EmbedBackend::Ollama,
+        base_url: ollama_url.to_string(),
+        model: model.to_string(),
+        api_key: None,
+    };
+    embed_text_with_config(text, &config).await
+}
+
+/// Embed text using an explicit config (supports both Ollama and OpenAI-compat).
+pub async fn embed_text_with_config(text: &str, config: &EmbedConfig) -> Result<Vec<f32>, String> {
+    let client = reqwest::Client::new();
+
+    let (url, body, auth) = match config.backend {
+        EmbedBackend::Ollama => (
+            format!("{}/api/embed", config.base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": config.model,
+                "input": text,
+            }),
+            None,
+        ),
+        EmbedBackend::OpenAiCompat => (
+            format!("{}/v1/embeddings", config.base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": config.model,
+                "input": text,
+            }),
+            config.api_key.as_deref(),
+        ),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if let Some(key) = auth {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("embed request failed: {e}"))?;
@@ -176,16 +297,23 @@ pub async fn embed_text(text: &str, ollama_url: &str, model: &str) -> Result<Vec
         .await
         .map_err(|e| format!("embed parse failed: {e}"))?;
 
-    let embedding = json
-        .get("embeddings")
-        .and_then(|e| e.get(0))
-        .ok_or_else(|| "no embeddings in response".to_string())?;
+    // Parse response: Ollama uses "embeddings[0]", OpenAI-compat uses "data[0].embedding"
+    let raw_embedding = match config.backend {
+        EmbedBackend::Ollama => json
+            .get("embeddings")
+            .and_then(|e| e.get(0))
+            .ok_or_else(|| "no embeddings in Ollama response".to_string())?,
+        EmbedBackend::OpenAiCompat => json
+            .get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("embedding"))
+            .ok_or_else(|| "no data[0].embedding in response".to_string())?,
+    };
 
-    let mut vec: Vec<f32> = serde_json::from_value(embedding.clone())
+    let mut vec: Vec<f32> = serde_json::from_value(raw_embedding.clone())
         .map_err(|e| format!("embedding parse failed: {e}"))?;
 
-    // Normalize to unit length — ollama usually returns normalized vectors,
-    // but normalize defensively so dot product = cosine similarity.
+    // Normalize to unit length so dot product = cosine similarity.
     normalize(&mut vec);
 
     Ok(vec)
@@ -994,8 +1122,7 @@ pub async fn extract_and_store(
     provider: &dyn piku_api::Provider,
     model: &str,
     store: &mut MemoryStore,
-    ollama_url: &str,
-    embed_model: &str,
+    embed_config: &EmbedConfig,
 ) -> usize {
     let Some(response) = extract_raw(conversation, provider, model).await else {
         return 0;
@@ -1012,7 +1139,7 @@ pub async fn extract_and_store(
 
     // Process facts (existing pipeline)
     for (fact, tags, importance) in facts {
-        let Ok(embedding) = embed_text(&fact, ollama_url, embed_model).await else {
+        let Ok(embedding) = embed_text_with_config(&fact, embed_config).await else {
             continue;
         };
 
@@ -1054,7 +1181,7 @@ pub async fn extract_and_store(
     let mut goal_roots: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for attempt in attempts {
         let embed_text_str = format!("{} | {}", attempt.goal, attempt.approach);
-        let Ok(embedding) = embed_text(&embed_text_str, ollama_url, embed_model).await else {
+        let Ok(embedding) = embed_text_with_config(&embed_text_str, embed_config).await else {
             continue;
         };
         // Dedup: check if a similar attempt already exists

@@ -165,21 +165,10 @@ impl PtyHandle {
         total
     }
 
-    /// True if the PTY subprocess has exited.
-    /// Checks both reader EOF and rexpect's waitpid(WNOHANG).
+    /// True if the PTY subprocess has exited (detected via reader EOF/EIO).
     #[must_use]
-    pub fn is_dead(&mut self) -> bool {
-        if self.eof {
-            return true;
-        }
-        // waitpid(WNOHANG) on the child -- if it returns an exit status, the process is gone.
-        match self._process.status() {
-            Some(rexpect::process::wait::WaitStatus::StillAlive) | None => false,
-            Some(_) => {
-                self.eof = true;
-                true
-            }
-        }
+    pub fn is_dead(&self) -> bool {
+        self.eof
     }
 
     /// Clear the raw capture buffer.
