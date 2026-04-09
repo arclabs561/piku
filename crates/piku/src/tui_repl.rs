@@ -605,13 +605,13 @@ impl OutputSink for TuiSink {
             self.println(&preview);
         }
 
-        // Status dot: green success, red error
-        let dot = if is_error {
-            "\x1b[31m⏺\x1b[0m"
+        // Closing connector: ⎿ with color (green success, red error)
+        let connector = if is_error {
+            "\x1b[31m⎿\x1b[0m"
         } else {
-            "\x1b[32m⏺\x1b[0m"
+            "\x1b[32m⎿\x1b[0m"
         };
-        self.println(dot);
+        self.println(connector);
         // Restore label for next iteration (model will think again)
         *self.indicator_label.lock().unwrap() = "thinking".to_string();
         let _ = self.stdout.flush();

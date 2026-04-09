@@ -372,6 +372,16 @@ impl InputBuffer {
         self.buffer.drain(self.cursor..old_cursor);
     }
 
+    /// Kill from cursor to end of next word (Alt+D).
+    pub fn kill_word_forward(&mut self) {
+        self.force_snapshot();
+        let old_cursor = self.cursor;
+        self.move_word_forward();
+        self.kill_buffer = self.buffer[old_cursor..self.cursor].to_string();
+        self.buffer.drain(old_cursor..self.cursor);
+        self.cursor = old_cursor;
+    }
+
     /// Yank (paste) the kill buffer at cursor (Ctrl+Y).
     pub fn yank(&mut self) {
         if self.kill_buffer.is_empty() {
@@ -467,6 +477,10 @@ pub struct LineEditor {
     history_index: Option<usize>,
     draft: Option<String>,
     preferred_col: Option<usize>,
+    /// Active reverse-search query (None = normal mode).
+    search_query: Option<String>,
+    /// Index into history of the current search match.
+    search_match_idx: Option<usize>,
     stash: Option<Stash>,
     /// Storage for large pastes collapsed to pills.
     /// Key: pill ID, Value: full pasted text.
@@ -486,6 +500,8 @@ impl LineEditor {
             preferred_col: None,
             stash: None,
             pasted_contents: Vec::new(),
+            search_query: None,
+            search_match_idx: None,
         }
     }
 
@@ -676,6 +692,11 @@ impl LineEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
+        // ── Reverse search mode ─────────────────────────────────────────
+        if self.search_query.is_some() {
+            return self.handle_search_key(key, input);
+        }
+
         // Clear sticky column on any key except Up/Down
         if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
             self.preferred_col = None;
@@ -851,6 +872,25 @@ impl LineEditor {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.history_down(input);
+                Action::Continue
+            }
+            // Ctrl+R = reverse history search
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query = Some(String::new());
+                self.search_match_idx = None;
+                Action::Continue
+            }
+            // Alt+D = kill word forward
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                input.kill_word_forward();
                 Action::Continue
             }
             // Alt+B = word back, Alt+F = word forward
@@ -1037,6 +1077,124 @@ impl LineEditor {
         }
     }
 
+    // ── Reverse search ──────────────────────────────────────────────────
+
+    fn handle_search_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> Action {
+        match key {
+            // Ctrl-R again = find next match (further back in history)
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_next_match(input);
+                Action::Continue
+            }
+            // Enter = accept the current match
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                self.search_query = None;
+                self.search_match_idx = None;
+                Action::Continue // stays in buffer, user can edit or submit
+            }
+            // Escape / Ctrl-C / Ctrl-G = cancel search, restore original input
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c' | 'g'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                // Restore the draft that was active before search
+                if let Some(draft) = self.draft.take() {
+                    input.replace(draft);
+                } else {
+                    input.clear();
+                }
+                self.search_query = None;
+                self.search_match_idx = None;
+                self.history_index = None;
+                Action::Continue
+            }
+            // Backspace = remove last char from search query
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                if let Some(ref mut q) = self.search_query {
+                    q.pop();
+                    self.search_update(input);
+                }
+                Action::Continue
+            }
+            // Regular character = append to search query
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(ref mut q) = self.search_query {
+                    q.push(c);
+                    self.search_update(input);
+                }
+                Action::Continue
+            }
+            // Any other key = accept match and replay the key
+            _ => {
+                self.search_query = None;
+                self.search_match_idx = None;
+                self.handle_key(key, input)
+            }
+        }
+    }
+
+    /// Search history for the current query and update the input buffer.
+    fn search_update(&mut self, input: &mut InputBuffer) {
+        let Some(ref query) = self.search_query else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        let query_lower = query.to_lowercase();
+        // Search backwards from the beginning (most recent first)
+        for (i, entry) in self.history.iter().enumerate() {
+            if entry.to_lowercase().contains(&query_lower) {
+                input.replace(entry.clone());
+                self.history_index = Some(i);
+                self.search_match_idx = Some(i);
+                return;
+            }
+        }
+        // No match found -- leave input as-is
+        self.search_match_idx = None;
+    }
+
+    /// Find the next match (further back in history from current).
+    fn search_next_match(&mut self, input: &mut InputBuffer) {
+        let Some(ref query) = self.search_query else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        let query_lower = query.to_lowercase();
+        let start = self.search_match_idx.map_or(0, |i| i + 1);
+        for (i, entry) in self.history.iter().enumerate().skip(start) {
+            if entry.to_lowercase().contains(&query_lower) {
+                input.replace(entry.clone());
+                self.history_index = Some(i);
+                self.search_match_idx = Some(i);
+                return;
+            }
+        }
+    }
+
     /// Find the most recent history entry that starts with `prefix` and
     /// return the suffix (the part after the prefix). Returns None if no match.
     fn history_ghost(&self, prefix: &str) -> Option<String> {
@@ -1056,6 +1214,26 @@ impl LineEditor {
     // ── Rendering ───────────────────────────────────────────────────────
 
     fn render(&self, input: &InputBuffer) -> Rendered {
+        // In search mode, show a single-line search prompt
+        if let Some(ref query) = self.search_query {
+            let match_indicator = if self.search_match_idx.is_some() {
+                ""
+            } else if !query.is_empty() {
+                " \x1b[31m(no match)\x1b[0m"
+            } else {
+                ""
+            };
+            let line = format!("\x1b[2m(reverse-search):\x1b[0m {query}{match_indicator}");
+            #[allow(clippy::cast_possible_truncation)]
+            let cursor_col = (19 + query.len()) as u16;
+            return Rendered {
+                lines: vec![line],
+                cursor_row: 0,
+                cursor_col,
+                line_count: 1,
+            };
+        }
+
         let text = input.as_str();
 
         // Cursor position within the text
