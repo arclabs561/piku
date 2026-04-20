@@ -202,7 +202,13 @@ async fn run_turn_inner(
 
     // Auto-compaction config — compact when session tokens exceed this threshold.
     // 10k tokens is ~40k chars, roughly 200 exchanges of average length.
-    let compact_cfg = crate::compact::CompactionConfig::default();
+    // Scale compaction trigger to the model's context window. For Claude
+    // (200k) compaction fires at ~100k tokens; for Gemini (1M) it fires
+    // much later. Step-2 curation handles normal-case budget pressure —
+    // compaction here is the emergency release valve that rewrites old
+    // content as a summary so curation has less to drop.
+    let compact_cfg =
+        crate::compact::CompactionConfig::for_window(piku_context_window_for_model(model));
 
     loop {
         if iterations >= max {
