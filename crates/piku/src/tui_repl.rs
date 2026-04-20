@@ -1115,9 +1115,13 @@ async fn run_tui_repl_core(
                     }
                     loop {
                         // Poll with timeout so we don't block forever after the turn ends.
-                        match tokio::task::block_in_place(|| {
+                        // spawn_blocking (not block_in_place) because this task is
+                        // inside a LocalSet, where block_in_place panics.
+                        let poll_res = tokio::task::spawn_blocking(|| {
                             cxevent::poll(std::time::Duration::from_millis(100))
-                        }) {
+                        })
+                        .await;
+                        match poll_res.unwrap_or(Ok(false)) {
                             Ok(true) => {
                                 if let Ok(Event::Key(KeyEvent {
                                     code, modifiers, ..
