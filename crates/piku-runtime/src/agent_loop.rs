@@ -729,21 +729,13 @@ async fn run_turn_inner(
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
 
-    // Context pressure: clamped input_tokens / model_window. Exposed as
-    // a separate callback so the TUI can surface it in the footer (and
-    // eventually step-3 summarization can gate on a threshold).
+    // Context pressure: clamped input_tokens / model_window. We only need
+    // ~2 significant figures for a 0-1 ratio, so u32→f32 precision loss
+    // is fine. `pressure` is always in [0, 1].
+    #[allow(clippy::cast_precision_loss)]
     let window = piku_context_window_for_model(model) as f32;
-    let pressure = (f32::from(tracker.cumulative.input_tokens.min(u16::MAX as u32) as u16)
-        / window)
-        .clamp(0.0, 1.0);
-    // For tokens > u16::MAX, use the full-precision path. The u16 clamp
-    // above is a min() — we lose no information, just avoid an f32/u32
-    // lossy cast on the fast path for tiny sessions.
-    let pressure = if tracker.cumulative.input_tokens > u16::MAX as u32 {
-        (tracker.cumulative.input_tokens as f32 / window).clamp(0.0, 1.0)
-    } else {
-        pressure
-    };
+    #[allow(clippy::cast_precision_loss)]
+    let pressure = (tracker.cumulative.input_tokens as f32 / window).clamp(0.0, 1.0);
     sink.on_context_pressure(pressure);
 
     // Stop hooks -- fire after turn completes (notifications, logging, cleanup).
@@ -917,14 +909,22 @@ const CONTEXT_USAGE_CAP: f32 = 0.70;
 /// message of a pair is selected.
 ///
 /// `model_window` is the provider's context window in tokens.
-pub(crate) fn curate_messages<'a>(
-    messages: &'a [crate::session::ConversationMessage],
+pub(crate) fn curate_messages(
+    messages: &[crate::session::ConversationMessage],
     model_window: usize,
-) -> Vec<&'a crate::session::ConversationMessage> {
+) -> Vec<&crate::session::ConversationMessage> {
     let total: usize = messages
         .iter()
         .map(crate::session::ConversationMessage::estimated_tokens)
         .sum();
+    // usize→f32→usize for a 0.7 scaling factor. Precision loss is immaterial
+    // at the token budgets we deal with (10k–1M); the usize cast rounds toward
+    // zero which is what we want (underestimate the budget, not overestimate).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let budget = ((model_window as f32) * CONTEXT_USAGE_CAP) as usize;
     if total <= budget || messages.len() <= CURATION_TAIL_SIZE {
         return messages.iter().collect();
