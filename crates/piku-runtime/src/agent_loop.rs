@@ -1271,6 +1271,20 @@ fn execute_spawn_agent(
 
     let custom_agents_owned = custom_agents.to_vec();
     let hooks_owned = hook_registry.cloned();
+
+    // SubagentStart hook: fire synchronously before the subagent task
+    // is spawned. The parent continues regardless of hook outcome —
+    // subagent hooks are observability, not policy.
+    if let Some(hr) = &hook_registry {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        hr.run_subagent_start(
+            &task_id.to_string(),
+            agent_def.as_ref().map(|d| d.agent_type.as_str()),
+            &p.task,
+            &cwd,
+        );
+    }
+
     let _handle = tokio::task::spawn_local(run_subagent_task(
         task_id_clone,
         prompt,
@@ -1379,8 +1393,9 @@ async fn run_subagent_task(
     // will still fire on function return.
     drop(worktree_guard);
 
-    if let Some(err) = result.stream_error {
+    let (status, iterations) = if let Some(err) = result.stream_error {
         registry.fail(&task_id, &err);
+        ("failed", result.iterations)
     } else {
         let mut output = extract_last_assistant_text(&session);
         if let Some(wt_kept) = worktree_result {
@@ -1389,6 +1404,14 @@ async fn run_subagent_task(
             output.push(']');
         }
         registry.complete(&task_id, &output, result.iterations);
+        ("done", result.iterations)
+    };
+
+    // SubagentStop hook. Observational; no veto. We don't have the
+    // agent_type here — it was consumed in execute_spawn_agent — so pass
+    // None. Could thread it through if needed later.
+    if let Some(hr) = &hook_registry {
+        hr.run_subagent_stop(&task_id.to_string(), None, status, iterations, &repo_root);
     }
 }
 
