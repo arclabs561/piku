@@ -62,6 +62,10 @@ pub struct HookConfig {
     pub stop: Vec<HookEntry>,
     #[serde(rename = "PreCompact", default)]
     pub pre_compact: Vec<HookEntry>,
+    #[serde(rename = "SubagentStart", default)]
+    pub subagent_start: Vec<HookEntry>,
+    #[serde(rename = "SubagentStop", default)]
+    pub subagent_stop: Vec<HookEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +201,8 @@ impl HookRegistry {
             ("SessionStart", &self.config.session_start),
             ("Stop", &self.config.stop),
             ("PreCompact", &self.config.pre_compact),
+            ("SubagentStart", &self.config.subagent_start),
+            ("SubagentStop", &self.config.subagent_stop),
         ];
         for (name, entries) in events {
             for entry in entries {
@@ -222,6 +228,8 @@ impl HookRegistry {
             || !self.config.session_start.is_empty()
             || !self.config.stop.is_empty()
             || !self.config.pre_compact.is_empty()
+            || !self.config.subagent_start.is_empty()
+            || !self.config.subagent_stop.is_empty()
     }
 
     /// Run `PreToolUse` hooks. Returns the decision (allow/deny).
@@ -483,6 +491,86 @@ impl HookRegistry {
         }
         true
     }
+
+    /// Run `SubagentStart` hooks before a subagent begins execution.
+    /// Fire-and-forget (errors logged). The parent continues regardless.
+    pub fn run_subagent_start(
+        &self,
+        task_id: &str,
+        agent_type: Option<&str>,
+        task: &str,
+        cwd: &Path,
+    ) {
+        let entries = &self.config.subagent_start;
+        if entries.is_empty() {
+            return;
+        }
+        let input = serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "task_id": task_id,
+            "agent_type": agent_type,
+            "task": task,
+            "cwd": cwd.display().to_string(),
+        });
+        for entry in entries {
+            for handler in &entry.hooks {
+                if let HookCommandResult::Error(msg) = run_hook_command(
+                    &handler.command,
+                    &input,
+                    handler.timeout,
+                    self.project_dir.as_deref(),
+                ) {
+                    eprintln!("[piku] subagent-start hook error: {msg}");
+                }
+            }
+        }
+    }
+
+    /// Run `SubagentStop` hooks after a subagent finishes.
+    pub fn run_subagent_stop(
+        &self,
+        task_id: &str,
+        agent_type: Option<&str>,
+        status: &str,
+        iterations: u32,
+        cwd: &Path,
+    ) {
+        let entries = &self.config.subagent_stop;
+        if entries.is_empty() {
+            return;
+        }
+        let input = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "task_id": task_id,
+            "agent_type": agent_type,
+            "status": status,
+            "iterations": iterations,
+            "cwd": cwd.display().to_string(),
+        });
+        for entry in entries {
+            for handler in &entry.hooks {
+                if handler.r#async {
+                    let cmd = handler.command.clone();
+                    let input_str = input.to_string();
+                    let project_dir = self.project_dir.clone();
+                    let h = std::thread::spawn(move || {
+                        let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
+                    });
+                    if let Ok(mut pending) = self.pending.lock() {
+                        pending.retain(|h| !h.is_finished());
+                        pending.push(h);
+                    }
+                } else if let HookCommandResult::Error(msg) = run_hook_command(
+                    &handler.command,
+                    &input,
+                    handler.timeout,
+                    self.project_dir.as_deref(),
+                ) {
+                    eprintln!("[piku] subagent-stop hook error: {msg}");
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +690,10 @@ fn merge_hook_config(base: &mut HookConfig, overlay: HookConfig) {
     base.post_tool_use.extend(overlay.post_tool_use);
     base.session_start.extend(overlay.session_start);
     base.stop.extend(overlay.stop);
+    // Previously missed: these events never got the global+project merge.
+    base.pre_compact.extend(overlay.pre_compact);
+    base.subagent_start.extend(overlay.subagent_start);
+    base.subagent_stop.extend(overlay.subagent_stop);
 }
 
 /// Check if a tool name matches a matcher pattern.

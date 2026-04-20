@@ -347,6 +347,14 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
         _ => String::new(),
     };
 
+    // Cost — computed from provider + model + token usage. Omitted when
+    // the model's pricing is unknown or when the estimate is $0 (local).
+    let cost_seg = match estimate_cost(s.provider, s.model, s.input_tokens, s.output_tokens) {
+        Some(c) if c >= 0.01 => format!(" ${c:.2} "),
+        Some(c) if c > 0.0 => format!(" ${c:.4} "),
+        _ => String::new(),
+    };
+
     // Running agents (amber, omitted when zero)
     let agents_seg = if s.running_agents > 0 {
         format!(" \x1b[33m{} bg\x1b[0m ", s.running_agents)
@@ -379,6 +387,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     let mut show_tok = false;
     let mut show_turns = false;
     let mut show_agents = false;
+    let mut show_cost = false;
     let mut show_sess = false;
 
     // agents always shown if there are any (highest priority optional)
@@ -390,6 +399,10 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     if !ctx_seg.is_empty() && budget >= vis(&ctx_seg) + sep_vis {
         budget -= vis(&ctx_seg) + sep_vis;
         show_ctx = true;
+    }
+    if !cost_seg.is_empty() && budget >= vis(&cost_seg) + sep_vis {
+        budget -= vis(&cost_seg) + sep_vis;
+        show_cost = true;
     }
     if !tok_seg.is_empty() && budget >= vis(&tok_seg) + sep_vis {
         budget -= vis(&tok_seg) + sep_vis;
@@ -421,6 +434,12 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     if show_ctx {
         line.push_str(&sep_s);
         line.push_str(&ctx_seg);
+    }
+    if show_cost {
+        line.push_str(&sep_s);
+        line.push_str(dim);
+        line.push_str(&cost_seg);
+        line.push_str(reset);
     }
     if show_tok {
         line.push_str(&sep_s);
@@ -482,17 +501,176 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     line
 }
 
+/// Look up approximate USD pricing for a model, returned as
+/// (input_$_per_million, output_$_per_million).
+///
+/// Local providers (Ollama) return (0, 0) so cost stays zero without
+/// polluting the table. Unknown models return None so the footer omits
+/// the $ segment entirely rather than showing a wrong number.
+pub(crate) fn model_pricing_per_million(provider: &str, model: &str) -> Option<(f32, f32)> {
+    // Local inference is always free (modulo electricity).
+    if provider.eq_ignore_ascii_case("ollama") {
+        return Some((0.0, 0.0));
+    }
+    let m = model.to_ascii_lowercase();
+    // Anthropic Claude family. Same prices on Anthropic direct and OpenRouter
+    // modulo OpenRouter's ~5% markup — we treat them equivalently here.
+    if m.contains("claude-haiku-4")
+        || m.contains("claude-3-5-haiku")
+        || m.contains("claude-3.5-haiku")
+    {
+        return Some((1.0, 5.0));
+    }
+    if m.contains("claude-sonnet-4")
+        || m.contains("claude-3-5-sonnet")
+        || m.contains("claude-3.5-sonnet")
+    {
+        return Some((3.0, 15.0));
+    }
+    if m.contains("claude-opus-4") || m.contains("claude-3-opus") {
+        return Some((15.0, 75.0));
+    }
+    // OpenAI / GPT-5 — approximations, real pricing varies by variant.
+    if m.contains("gpt-5") {
+        return Some((2.5, 10.0));
+    }
+    if m.contains("gpt-4o") {
+        return Some((2.5, 10.0));
+    }
+    if m.contains("gpt-4-turbo") || m.contains("gpt-4.1") {
+        return Some((10.0, 30.0));
+    }
+    // Gemini 2.x Pro. Gemini Flash is much cheaper; we err toward Pro
+    // pricing since Flash's real share of agentic workloads is small.
+    if m.contains("gemini-2") || m.contains("gemini-3") {
+        return Some((1.25, 5.0));
+    }
+    None
+}
+
+/// Compute estimated USD cost from token usage. Returns None when the
+/// model's pricing is unknown.
+pub(crate) fn estimate_cost(
+    provider: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> Option<f32> {
+    let (in_per_m, out_per_m) = model_pricing_per_million(provider, model)?;
+    let cost = (input_tokens as f32 / 1_000_000.0) * in_per_m
+        + (output_tokens as f32 / 1_000_000.0) * out_per_m;
+    Some(cost)
+}
+
+/// Format seconds-since-epoch into a short "Nh ago" / "Nd ago" label
+/// relative to now. Returns "?" for future or zero times.
+pub(crate) fn format_age_secs(file_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if file_unix == 0 || file_unix > now {
+        return "?".to_string();
+    }
+    let age = now - file_unix;
+    match age {
+        0..=59 => format!("{age}s"),
+        60..=3_599 => format!("{}m", age / 60),
+        3_600..=86_399 => format!("{}h", age / 3_600),
+        _ => format!("{}d", age / 86_400),
+    }
+}
+
+/// Read a session JSON and return the first user message, truncated to
+/// ~60 chars. Returns None if the file can't be parsed or has no user
+/// messages yet.
+pub(crate) fn first_user_message_preview(path: &std::path::Path) -> Option<String> {
+    let json = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let messages = v.get("messages")?.as_array()?;
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+            let blocks = msg.get("blocks")?.as_array()?;
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        return Some(truncate_preview(text, 60));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn truncate_preview(s: &str, max_chars: usize) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control() || *c == ' ').collect();
+    let trimmed = clean.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
 /// Format a token count compactly: 1234 → "1.2k", 123456 → "123k", 12 → "12".
-/// Estimate context window % from cumulative input tokens.
-/// Uses 200k as the default window size (accurate for claude-3.x/4.x).
-/// Returns None when tokens are zero (no usage yet).
-pub(crate) fn context_pct(input_tokens: u32) -> Option<u8> {
+/// Look up the context window size for a given model name.
+///
+/// Match strategy: case-insensitive substring check. Falls back to 200k
+/// (the Claude 4.x default and the most common choice) when the model
+/// is unfamiliar, so the percentage stays meaningful even for off-menu
+/// models. Override with `PIKU_CONTEXT_WINDOW=<tokens>` when the
+/// fallback is wrong.
+pub(crate) fn context_window_for(model: &str) -> u32 {
+    if let Ok(override_str) = std::env::var("PIKU_CONTEXT_WINDOW") {
+        if let Ok(n) = override_str.parse::<u32>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let m = model.to_ascii_lowercase();
+    // Gemini 2.x / Gemini 3.x — 1M tokens
+    if m.contains("gemini-2") || m.contains("gemini-3") || m.contains("gemini-1.5") {
+        return 1_000_000;
+    }
+    // Claude 4.x and 3.x — 200k (1M with the 1m-context flag, not supported here)
+    if m.contains("claude") {
+        return 200_000;
+    }
+    // GPT-5 / o3 / o1 — 200k
+    if m.contains("gpt-5") || m.contains("o1") || m.contains("o3") {
+        return 200_000;
+    }
+    // GPT-4o / GPT-4.x / GPT-3.5 Turbo 16k — 128k is the modern default
+    if m.contains("gpt-4") || m.contains("gpt-3.5-turbo") {
+        return 128_000;
+    }
+    // Ollama local models: small defaults. Users with long-context
+    // builds can set PIKU_CONTEXT_WINDOW=131072 or similar.
+    if m.contains("llama") || m.contains("qwen") || m.contains("mistral") || m.contains("gemma") {
+        return 8_192;
+    }
+    // Unknown — assume a large window rather than an alarmingly-low one.
+    200_000
+}
+
+/// Estimate context window % from cumulative input tokens against a
+/// model-specific window. Returns None when tokens are zero.
+pub(crate) fn context_pct_for(input_tokens: u32, model: &str) -> Option<u8> {
     if input_tokens == 0 {
         return None;
     }
-    const WINDOW: u32 = 200_000;
-    let pct = ((input_tokens as f32 / WINDOW as f32) * 100.0).round() as u8;
+    let window = context_window_for(model);
+    let pct = ((input_tokens as f32 / window as f32) * 100.0).round() as u8;
     Some(pct.min(100))
+}
+
+/// Backward-compatible shim. New call sites should use `context_pct_for`
+/// with the actual model name.
+pub(crate) fn context_pct(input_tokens: u32) -> Option<u8> {
+    context_pct_for(input_tokens, "claude")
 }
 
 pub(crate) fn fmt_tokens(n: u32) -> String {
@@ -1047,7 +1225,7 @@ async fn run_tui_repl_core(
                                 output_tokens: total_usage.output_tokens,
                                 turns: 0,
                                 running_agents: 0,
-                                context_pct: context_pct(total_usage.input_tokens),
+                                context_pct: context_pct_for(total_usage.input_tokens, &model),
                             },
                         );
                         let _ = io::stdout().flush();
@@ -1598,7 +1776,18 @@ fn handle_slash_cmd(
                                 let raw_name = f.file_name();
                                 let name = raw_name.to_string_lossy();
                                 let name = name.trim_end_matches(".json");
-                                println!("  {name}\r");
+                                let mtime = f
+                                    .metadata()
+                                    .and_then(|m| m.modified())
+                                    .ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| format_age_secs(d.as_secs()))
+                                    .unwrap_or_else(|| "?".to_string());
+                                let first = first_user_message_preview(&f.path());
+                                let preview = first.as_deref().unwrap_or("(empty)");
+                                println!(
+                                    "  \x1b[2m{mtime:>5}\x1b[0m  {name}  \x1b[2m{preview}\x1b[0m\r"
+                                );
                             }
                         }
                     }
@@ -2071,5 +2260,186 @@ mod tests {
     #[test]
     fn tool_result_empty() {
         assert!(format_tool_result("bash", "", false).is_empty());
+    }
+
+    #[test]
+    fn context_window_claude_200k() {
+        assert_eq!(context_window_for("anthropic/claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_window_for("anthropic/Claude-Opus-4-1"), 200_000);
+    }
+
+    #[test]
+    fn context_window_gpt4_128k() {
+        assert_eq!(context_window_for("openai/gpt-4o"), 128_000);
+        assert_eq!(context_window_for("gpt-4-turbo"), 128_000);
+    }
+
+    #[test]
+    fn context_window_gemini_1m() {
+        assert_eq!(context_window_for("google/gemini-2.5-pro"), 1_000_000);
+        assert_eq!(context_window_for("gemini-3-pro"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_ollama_8k_default() {
+        assert_eq!(context_window_for("llama3.2:latest"), 8_192);
+        assert_eq!(context_window_for("qwen2.5-coder"), 8_192);
+    }
+
+    #[test]
+    fn context_window_env_override() {
+        // Safety: env::set_var/remove_var are safe pre-thread-spawn but the
+        // test runner uses threads. Serial not available here — keep the
+        // race window tight. Not perfect but the lint allows it.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("PIKU_CONTEXT_WINDOW", "512000");
+        }
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 512_000);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("PIKU_CONTEXT_WINDOW");
+        }
+    }
+
+    #[test]
+    fn context_pct_honors_model() {
+        // 100k tokens, claude window 200k → 50%.
+        assert_eq!(context_pct_for(100_000, "claude-sonnet-4-6"), Some(50));
+        // Same 100k, gpt-4o window 128k → 78%.
+        assert_eq!(context_pct_for(100_000, "openai/gpt-4o"), Some(78));
+    }
+
+    #[test]
+    fn preview_truncates_with_ellipsis() {
+        let long = "a".repeat(100);
+        let out = truncate_preview(&long, 20);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 20);
+    }
+
+    #[test]
+    fn preview_strips_control_chars() {
+        let s = "  hello\x1bworld\x07  ";
+        assert_eq!(truncate_preview(s, 50), "helloworld");
+    }
+
+    #[test]
+    fn first_message_preview_reads_user_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.json");
+        let session = serde_json::json!({
+            "version": 1,
+            "id": "t",
+            "messages": [{
+                "role": "user",
+                "blocks": [{"type": "text", "text": "refactor the auth module"}]
+            }]
+        });
+        std::fs::write(&path, session.to_string()).unwrap();
+        let preview = first_user_message_preview(&path);
+        assert_eq!(preview.as_deref(), Some("refactor the auth module"));
+    }
+
+    #[test]
+    fn first_message_preview_none_when_no_user_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.json");
+        let session = serde_json::json!({
+            "version": 1,
+            "id": "t",
+            "messages": [{
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": "hello"}]
+            }]
+        });
+        std::fs::write(&path, session.to_string()).unwrap();
+        assert!(first_user_message_preview(&path).is_none());
+    }
+
+    #[test]
+    fn pricing_claude_sonnet() {
+        let (i, o) =
+            model_pricing_per_million("openrouter", "anthropic/claude-sonnet-4-6").unwrap();
+        assert_eq!(i, 3.0);
+        assert_eq!(o, 15.0);
+    }
+
+    #[test]
+    fn pricing_ollama_zero() {
+        assert_eq!(
+            model_pricing_per_million("ollama", "llama3.2"),
+            Some((0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn pricing_unknown_none() {
+        assert!(model_pricing_per_million("openrouter", "rando/unknown-model").is_none());
+    }
+
+    #[test]
+    fn estimate_cost_claude_sonnet_1m() {
+        // 1M input + 1M output → $3 + $15 = $18.
+        let c = estimate_cost("openrouter", "claude-sonnet-4-6", 1_000_000, 1_000_000).unwrap();
+        assert!((c - 18.0).abs() < 0.01, "got {c}");
+    }
+
+    #[test]
+    fn estimate_cost_ollama_always_zero() {
+        let c = estimate_cost("ollama", "llama3.2", 5_000_000, 5_000_000).unwrap();
+        assert_eq!(c, 0.0);
+    }
+
+    #[test]
+    fn footer_shows_cost_when_known() {
+        let line = render_footer(
+            200,
+            &FooterState {
+                provider: "openrouter",
+                model: "anthropic/claude-sonnet-4-6",
+                session_id: "sess-abc",
+                input_tokens: 1_000_000, // $3
+                output_tokens: 0,
+                turns: 1,
+                running_agents: 0,
+                context_pct: Some(50),
+            },
+        );
+        assert!(line.contains("$3.00"), "footer missing cost: {line}");
+    }
+
+    #[test]
+    fn footer_omits_cost_for_unknown_model() {
+        let line = render_footer(
+            200,
+            &FooterState {
+                provider: "openrouter",
+                model: "rando/unknown",
+                session_id: "sess-abc",
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                turns: 1,
+                running_agents: 0,
+                context_pct: None,
+            },
+        );
+        assert!(
+            !line.contains('$'),
+            "footer should omit $ for unknown: {line}"
+        );
+    }
+
+    #[test]
+    fn age_formats_compactly() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(format_age_secs(now - 5).ends_with('s'));
+        assert!(format_age_secs(now - 120).ends_with('m'));
+        assert!(format_age_secs(now - 7_200).ends_with('h'));
+        assert!(format_age_secs(now - 3 * 86_400).ends_with('d'));
     }
 }
