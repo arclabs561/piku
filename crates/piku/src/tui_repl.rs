@@ -237,54 +237,43 @@ fn term_size() -> (u16, u16) {
 /// only async-signal-safe syscalls are allowed inside a handler.
 const TERM_RESTORE_BYTES: &[u8] = b"\x1b[r\x1b[?25h\n";
 
-/// Async-signal-safe handler: write restore bytes to stdout, then re-raise
-/// the signal with the default disposition (SA_RESETHAND ensures re-raise
-/// gets default handling).
+/// Install signal handlers for SIGTERM / SIGHUP that write terminal-restore
+/// bytes before the process dies. Uses `signal_hook_registry::register`
+/// (not raw `sigaction`) so we chain with any previously-installed handler —
+/// notably crossterm's internal SIGWINCH handler, which uses the same
+/// registry. Replacing the slot via raw sigaction would silently break
+/// resize detection (helix, zellij, and the research on signal-hook #42
+/// document this failure mode).
 ///
-/// Uses `libc::write` (async-signal-safe per POSIX) — not std I/O, which
-/// may take locks.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
-    // Safety: write(2) and raise(3) are async-signal-safe per POSIX.
-    // Ignore short writes / errors; we're about to die anyway.
-    unsafe {
-        let _ = libc::write(
-            libc::STDOUT_FILENO,
-            TERM_RESTORE_BYTES.as_ptr().cast::<libc::c_void>(),
-            TERM_RESTORE_BYTES.len(),
-        );
-        // SA_RESETHAND restored the default disposition. Re-raise so the
-        // normal exit status / core dump behavior takes effect.
-        libc::raise(sig);
-    }
-}
-
-/// Install signal handlers for SIGTERM, SIGINT, SIGHUP, SIGQUIT that write
-/// a terminal-restore escape sequence before re-raising with the default
-/// disposition. Panic hook covers Rust panics; this covers POSIX signals.
+/// The handler writes restore bytes then `_exit(128+sig)`. We do not
+/// re-raise (which would require SA_RESETHAND + sigaction gymnastics that
+/// the registry deliberately abstracts) and we do not call `exit()` (not
+/// async-signal-safe — it runs atexit handlers that may take locks).
+/// `_exit` is the async-signal-safe POSIX call for prompt termination.
 ///
-/// SIGINT inside the TUI is normally consumed by crossterm's raw-mode
-/// keyboard reader and never reaches the process handler. This handler is
-/// a safety net for the narrow window before raw mode is enabled and for
-/// SIGTERM/SIGHUP which bypass raw mode entirely.
+/// SIGINT is deliberately NOT handled here. Inside raw mode, crossterm
+/// consumes Ctrl-C as a byte and never raises SIGINT. Outside raw mode
+/// (startup / after teardown) the default SIGINT disposition is fine.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn install_terminal_restoring_signal_handlers() {
-    // Safety: sigaction / sigemptyset are standard POSIX; we pass pointers
-    // to locally-owned memory with correct lifetimes.
-    unsafe {
-        let mut act: libc::sigaction = std::mem::zeroed();
-        act.sa_sigaction = terminal_restore_signal_handler as *const () as libc::sighandler_t;
-        // SA_RESETHAND: restore default handler after firing, so raise()
-        // re-enters the kernel's default behavior (core dump / exit).
-        // SA_RESTART: let interrupted system calls restart automatically
-        // instead of failing with EINTR. Without this, the crossterm poll
-        // loop can get wedged on EINTR after our handler fires.
-        act.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
-        libc::sigemptyset(&mut act.sa_mask);
-        for sig in [libc::SIGTERM] {
-            libc::sigaction(sig, &act, std::ptr::null_mut());
+    use signal_hook_registry::register;
+    for sig in [libc::SIGTERM, libc::SIGHUP] {
+        // Safety: the closure is async-signal-safe (only write(2) and _exit).
+        // register() chains this onto any existing handler — it does not
+        // replace — so crossterm's SIGWINCH registration is unaffected even
+        // if we ever registered for SIGWINCH here (we don't, but the
+        // chaining guarantee applies to all slots).
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = register(sig, move || {
+                let _ = libc::write(
+                    libc::STDOUT_FILENO,
+                    TERM_RESTORE_BYTES.as_ptr().cast::<libc::c_void>(),
+                    TERM_RESTORE_BYTES.len(),
+                );
+                // _exit is async-signal-safe; exit() is not.
+                libc::_exit(128 + sig);
+            });
         }
     }
 }
