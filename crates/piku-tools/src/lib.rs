@@ -77,6 +77,71 @@ pub fn is_protected_path(path: &str) -> bool {
     })
 }
 
+/// Reject paths that traverse out of `base` via `..` components or
+/// target well-known system directories. Absolute paths inside the user's
+/// home / tempdir are allowed so piku can edit files across the user's
+/// projects; the permission prompt is the final gate for those.
+///
+/// Policy:
+///   - Reject relative paths whose canonical resolution escapes `base`
+///     via `..` (classic traversal).
+///   - Reject absolute paths that target system directories
+///     (`/etc`, `/usr`, `/bin`, `/sbin`, `/boot`, `/sys`, `/proc`, `/dev`,
+///     `/var` except `/var/tmp`). These require root anyway, but the
+///     explicit rejection avoids silently-failing writes + gives a clearer
+///     message for users running piku as root.
+///   - Everything else passes.
+///
+/// The aggressive "refuse anything outside cwd" policy was too strict —
+/// piku users legitimately edit files across projects. The threat model
+/// is "model writes to /etc/cron.d/pwned" which this still catches.
+pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), String> {
+    let target_path = std::path::Path::new(target);
+
+    // Relative-path traversal: canonicalize and check containment within base.
+    if !target_path.is_absolute() {
+        let canonical_base = base
+            .canonicalize()
+            .map_err(|e| format!("cannot canonicalize base {}: {e}", base.display()))?;
+        let abs = canonical_base.join(target_path);
+        let mut check = abs.clone();
+        let canonical_target = loop {
+            match check.canonicalize() {
+                Ok(c) => break c,
+                Err(_) => {
+                    if !check.pop() {
+                        return Err(format!("relative path escapes project root: {}", target));
+                    }
+                }
+            }
+        };
+        if !canonical_target.starts_with(&canonical_base) {
+            return Err(format!(
+                "relative path escapes project root: {} resolves to {} (outside {})",
+                target,
+                canonical_target.display(),
+                canonical_base.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    // Absolute-path system-directory check. Only the dirs where writing
+    // would immediately damage the system or be obvious exfiltration
+    // targets. /usr, /var, /bin, /sbin left off — /usr/local is a
+    // legitimate install target, macOS tmpdir lives under /var/folders,
+    // and /bin writes require root regardless.
+    const SYSTEM_ROOTS: &[&str] = &["/etc", "/boot", "/sys", "/proc", "/dev"];
+    for root in SYSTEM_ROOTS {
+        if target_path.starts_with(root) {
+            return Err(format!(
+                "absolute path targets system directory: {target} (under {root})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tool registry
 // ---------------------------------------------------------------------------

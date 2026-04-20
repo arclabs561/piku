@@ -136,13 +136,22 @@ impl Provider for OpenAiCompatProvider {
                 }
             }
 
-            // flush remaining line
+            // Flush remaining line (no terminating newline).
             if !line_buf.is_empty() {
                 if let Some(sse) = parser.feed_line(&line_buf) {
                     let events = parse_openai_sse(&sse.data)?;
                     for event in events {
                         yield event;
                     }
+                }
+            }
+            // Flush any buffered data left pending a blank-line dispatch.
+            // Otherwise a stream that closes without a trailing blank line
+            // silently drops its final event (often `[DONE]`).
+            if let Some(sse) = parser.finish() {
+                let events = parse_openai_sse(&sse.data)?;
+                for event in events {
+                    yield event;
                 }
             }
         })

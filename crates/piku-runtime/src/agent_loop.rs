@@ -1308,6 +1308,20 @@ async fn run_subagent_task(
     let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
     let mut sink = crate::task::DevNullSink;
 
+    // Worktree guard: Drop will clean up worktree + branch if we exit via
+    // panic / abort before reaching the explicit cleanup below. Defused
+    // on the happy path so the existing `changed`-aware cleanup can decide
+    // whether to keep the worktree.
+    let repo_root_for_guard = std::env::current_dir().unwrap_or_default();
+    let mut worktree_guard = match (&worktree_cwd, &worktree_branch) {
+        (Some(wt), Some(branch)) => Some(crate::task::WorktreeGuard::new(
+            repo_root_for_guard,
+            wt.clone(),
+            branch.clone(),
+        )),
+        _ => None,
+    };
+
     // For worktree isolation: inject cwd as the first user message so the
     // agent knows to cd there. We do NOT call set_current_dir — that mutates
     // global process state and races with the parent's tool calls.
@@ -1344,10 +1358,16 @@ async fn run_subagent_task(
     )
     .await;
 
-    // Worktree cleanup
+    // Worktree cleanup. Happy path: defuse the guard so its Drop doesn't
+    // unconditionally remove the worktree; then delegate to the existing
+    // `changed`-aware cleanup (which keeps the worktree when the agent
+    // produced file changes).
     let worktree_result = if let (Some(ref wt_path), Some(ref branch)) =
         (&worktree_cwd, &worktree_branch)
     {
+        if let Some(g) = worktree_guard.as_mut() {
+            g.defuse();
+        }
         let changed = session.messages.iter().any(|m| {
             m.blocks.iter().any(|b| matches!(b, crate::session::ContentBlock::ToolUse { name, .. } if matches!(name.as_str(), "write_file" | "edit_file")))
         });
@@ -1355,6 +1375,9 @@ async fn run_subagent_task(
     } else {
         None
     };
+    // Drop order: if we somehow skipped the defuse branch above, the guard
+    // will still fire on function return.
+    drop(worktree_guard);
 
     if let Some(err) = result.stream_error {
         registry.fail(&task_id, &err);

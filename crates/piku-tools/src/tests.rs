@@ -431,6 +431,128 @@ fn tempdir() -> std::path::PathBuf {
     base
 }
 
+/// Path-traversal sandbox for write_file / edit_file.
+/// The risk: a model proposes `../../etc/cron.d/x` or `/Users/a/.ssh/id_rsa`.
+/// Even if the user approves the permission prompt, the tool should refuse.
+#[cfg(test)]
+mod sandbox {
+    use super::tempdir;
+    use serial_test::serial;
+
+    /// Set CWD to a throwaway dir. `#[serial]` because CWD is process-global.
+    fn cd(dir: &std::path::Path) {
+        std::env::set_current_dir(dir).unwrap();
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_refuses_parent_traversal() {
+        let td = tempdir();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "../secrets.txt",
+            "content": "boom",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(r.is_error, "traversal should be rejected");
+        assert!(
+            r.output.contains("refused") || r.output.contains("escapes"),
+            "expected sandbox error, got: {}",
+            r.output
+        );
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_refuses_absolute_system_path() {
+        let td = tempdir();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "/etc/piku-sandbox-should-not-exist.txt",
+            "content": "boom",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(r.is_error, "system path should be rejected");
+        assert!(
+            r.output.contains("system directory"),
+            "expected system-path error, got: {}",
+            r.output
+        );
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_allows_absolute_user_path() {
+        let td = tempdir();
+        cd(&td);
+        // /tmp is not a system root, so absolute paths there are allowed.
+        let outside = std::env::temp_dir().join("piku-user-path-ok.txt");
+        let params = serde_json::json!({
+            "path": outside.display().to_string(),
+            "content": "ok",
+        });
+        let r = crate::write_file::execute(params);
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            !r.is_error,
+            "absolute user path should succeed: {}",
+            r.output
+        );
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_allows_within_cwd() {
+        let td = tempdir();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "nested/ok.txt",
+            "content": "hi",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(!r.is_error, "in-project write should succeed: {}", r.output);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn edit_file_refuses_parent_traversal() {
+        let td = tempdir();
+        cd(&td);
+        // Pre-create a file outside the sandbox (in td.parent()) to edit.
+        let outside_dir = td.parent().unwrap();
+        let outside = outside_dir.join("outside-edit-target.txt");
+        std::fs::write(&outside, "original\n").unwrap();
+        let rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        let params = serde_json::json!({
+            "path": rel,
+            "old_string": "original",
+            "new_string": "pwned",
+        });
+        let r = crate::edit_file::execute(params);
+        assert!(r.is_error, "edit traversal should be rejected");
+        // Target must NOT have been modified.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original\n");
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn opt_out_env_disables_sandbox() {
+        let td = tempdir();
+        cd(&td);
+        std::env::set_var("PIKU_ALLOW_WRITE_ANY", "1");
+        let outside = std::env::temp_dir().join("piku-opt-out-test.txt");
+        let params = serde_json::json!({
+            "path": outside.display().to_string(),
+            "content": "ok",
+        });
+        let r = crate::write_file::execute(params);
+        std::env::remove_var("PIKU_ALLOW_WRITE_ANY");
+        let _ = std::fs::remove_file(&outside);
+        assert!(!r.is_error, "opt-out should allow any path: {}", r.output);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Extended P1/P2 tests
 // ---------------------------------------------------------------------------

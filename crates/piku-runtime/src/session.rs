@@ -41,13 +41,32 @@ impl Session {
             .sum()
     }
 
+    /// Save atomically: write to a sibling tmp file, then rename over the
+    /// destination. `std::fs::write` is O_TRUNC + write, so a crash between
+    /// the two syscalls leaves a zero-byte session file. `rename(2)` is
+    /// atomic on the same filesystem — readers either see the old file or
+    /// the new one, never a truncated partial.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, json)
+
+        // Tmp file sibling to the destination so rename is same-filesystem.
+        // Include pid to avoid collisions between concurrent saves.
+        let tmp_path = match path.file_name() {
+            Some(name) => {
+                let tmp_name = format!("{}.tmp.{}", name.to_string_lossy(), std::process::id());
+                path.with_file_name(tmp_name)
+            }
+            None => path.with_extension("tmp"),
+        };
+        std::fs::write(&tmp_path, &json)?;
+        // Rename is atomic. If this returns error the tmp file is left
+        // on disk; it'll be overwritten by the next save or cleaned on
+        // next startup scan.
+        std::fs::rename(&tmp_path, path)
     }
 
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
@@ -242,5 +261,78 @@ impl UsageTracker {
             }
         }
         tracker
+    }
+}
+
+#[cfg(test)]
+mod save_atomicity_tests {
+    use super::*;
+
+    #[test]
+    fn save_does_not_leave_tmp_files_in_place_on_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.json");
+        let session = Session::default();
+        session.save(&path).expect("save");
+
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "tmp files left after save: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn save_replaces_existing_file_atomically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.json");
+
+        // Pre-existing content simulates a previous successful save.
+        std::fs::write(&path, b"{\"old\":true}").unwrap();
+
+        // The atomic save should replace the file with valid new content.
+        let session = Session::default();
+        session.save(&path).expect("save");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        // New content must parse as a Session and not contain the old payload.
+        assert!(!content.contains("\"old\""), "old content survived save");
+        let _: Session = serde_json::from_str(&content).expect("reparse");
+    }
+
+    #[test]
+    fn readers_never_see_partial_file_during_concurrent_saves() {
+        // The atomic rename guarantees the destination file is always either
+        // old content or new content, never empty / partial. This test races
+        // a reader against many saves and checks the invariant holds.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.json");
+        let session = Session::default();
+        session.save(&path).unwrap();
+
+        let reader = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(b) = std::fs::read(&path) {
+                        assert!(!b.is_empty(), "zero-byte session observed");
+                        assert!(
+                            serde_json::from_slice::<Session>(&b).is_ok(),
+                            "session did not parse: {:?}",
+                            String::from_utf8_lossy(&b)
+                        );
+                    }
+                }
+            }
+        });
+        for _ in 0..50 {
+            session.save(&path).unwrap();
+        }
+        reader.join().unwrap();
     }
 }

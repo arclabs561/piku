@@ -56,6 +56,11 @@ impl Pty {
             // Fake key so piku enters TUI. No request will succeed; we
             // never wait for LLM output.
             .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
+            // Disable terminal-restoring signal handlers. Under nextest PTY
+            // the harness delivers spurious SIGTERM to piku during startup,
+            // and our handler would consume it and kill piku before tests
+            // can interact. The sigterm_restores_terminal test opts in.
+            .env("PIKU_NO_SIGNAL_HANDLERS", "1")
             .env("PIKU_RESTARTED", "1");
 
         let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
@@ -311,6 +316,78 @@ fn hooks_slash_command_renders() {
     assert!(!out.contains("panicked at"), "panic on /hooks:\n{out}");
 }
 
+/// SIGTERM should trigger the terminal-restore signal handler, which
+/// writes "\x1b[r\x1b[?25h\n" (reset scroll region + show cursor) to
+/// stdout before re-raising the signal with the default disposition.
+/// Without the handler, a kill(1) leaves DECSTBM set and the cursor
+/// hidden for the user's shell.
+///
+/// Must opt into signal handlers explicitly via PIKU_INSTALL_SIGNAL_HANDLERS=1.
+/// Production's main() sets this by default; tests leave it unset because
+/// the nextest/rexpect harness delivers spurious SIGTERM to the child
+/// during startup, tripping the handler before the test can interact.
+#[test]
+fn sigterm_restores_terminal_before_exit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cmd = Command::new(piku_binary());
+    cmd.current_dir(tmp.path())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
+        .env("PIKU_INSTALL_SIGNAL_HANDLERS", "1")
+        .env("PIKU_RESTARTED", "1");
+
+    let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
+    proc.set_kill_timeout(Some(3_000));
+    let writer = proc.get_file_handle().expect("pty writer");
+    let reader = proc.get_file_handle().expect("pty reader");
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
+    fcntl(
+        &reader,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .unwrap();
+
+    let mut pty = Pty {
+        _proc: proc,
+        writer,
+        reader,
+        buf: Vec::new(),
+        eof: false,
+    };
+
+    // Small wait for piku to install its handler + print setup.
+    pty.wait(Duration::from_millis(500));
+
+    let before_signal = pty.buf.len();
+
+    // Send SIGTERM to the child piku process.
+    pty._proc
+        .signal(nix::sys::signal::Signal::SIGTERM)
+        .expect("signal SIGTERM");
+
+    // Wait for exit.
+    let start = Instant::now();
+    while !pty.eof && start.elapsed() < Duration::from_secs(3) {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let after = &pty.buf[before_signal..];
+    // "\x1b[r" resets scroll region. "\x1b[?25h" shows cursor. Both must
+    // appear *after* the SIGTERM in the PTY stream.
+    let has_reset = after.windows(3).any(|w| w == b"\x1b[r" || w == b"\x1b[?");
+    assert!(pty.eof, "piku did not exit after SIGTERM within 3s");
+    assert!(
+        has_reset,
+        "SIGTERM handler did not emit terminal-restore bytes:\n{}",
+        String::from_utf8_lossy(after)
+    );
+}
+
 /// Ctrl-C mid-turn should cancel the turn and return to the prompt
 /// without panicking. This uses a test-local TCP listener that accepts
 /// the connection and then hangs, so the LLM call is in-flight long
@@ -342,6 +419,7 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
         .env("TERM", "xterm-256color")
         .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
         .env("PIKU_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("PIKU_NO_SIGNAL_HANDLERS", "1")
         .env("PIKU_RESTARTED", "1");
 
     let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
