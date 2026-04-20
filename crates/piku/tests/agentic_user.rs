@@ -29,15 +29,16 @@
 ///   - **Phase-based personas**: scripted keystroke sequences for reproducible coverage
 ///     + LLM freeform exploration for discovery.
 ///
-/// GATING: Requires `PIKU_AGENTIC_USER=1` AND an API key.
+/// GATING: Auto-runs when a provider is available (Ollama reachable,
+/// `OPENROUTER_API_KEY`, or `ANTHROPIC_API_KEY`). Auto-skips otherwise with
+/// a visible log line. Opt out with `PIKU_AGENTIC_USER=0`.
 ///
 /// QUICK RUN (`confident_dev` persona):
 ///   cargo build --release -p piku
-///   `PIKU_AGENTIC_USER=1` OPENROUTER_API_KEY=sk-or-... \
-///     cargo test --test `agentic_user` -- `agentic_user_confident_dev` --nocapture
+///   cargo test --test `agentic_user` -- `agentic_user_confident_dev` --nocapture
 ///
 /// ALL PERSONAS:
-///   `PIKU_AGENTIC_USER=1` cargo test --test `agentic_user` -- --nocapture
+///   cargo test --test `agentic_user` -- --nocapture
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -48,10 +49,34 @@ use std::time::{Duration, Instant, SystemTime};
 // Gate + binary discovery
 // ---------------------------------------------------------------------------
 
+/// Whether agentic tests should run.
+///
+/// Auto-runs when any usable provider is available (Ollama reachable, or
+/// OPENROUTER_API_KEY / ANTHROPIC_API_KEY set).
+/// Auto-skips with a visible log line when no provider is available — CI
+/// without secrets stays green, local runs with Ollama running will Just Work.
+/// Opt out explicitly with `PIKU_AGENTIC_USER=0`.
 fn is_enabled() -> bool {
-    std::env::var("PIKU_AGENTIC_USER")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    // Explicit opt-out wins.
+    if std::env::var("PIKU_AGENTIC_USER").as_deref() == Ok("0")
+        || std::env::var("PIKU_AGENTIC_USER").as_deref() == Ok("false")
+    {
+        eprintln!("[agentic_user] skipped: PIKU_AGENTIC_USER=0");
+        return false;
+    }
+    // Must have creds on both sides: one for the user-agent LLM, one for piku.
+    let ua = user_agent_provider(false);
+    let pk = piku_provider();
+    match (ua, pk) {
+        (Some(_), Some(_)) => true,
+        _ => {
+            eprintln!(
+                "[agentic_user] skipped: no provider available (need Ollama \
+                 running, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY)"
+            );
+            false
+        }
+    }
 }
 
 fn piku_binary() -> PathBuf {

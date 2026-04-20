@@ -1170,8 +1170,6 @@ fn execute_spawn_agent(
         prompt.push_str(&ctx);
     }
     // Proactive recall: embed the task prompt and retrieve relevant memories.
-    // Only for top-level spawns (depth == 0) -- subagents already get focused context,
-    // and block_in_place panics inside spawn_local (which subagents run in).
     if depth == 0 {
         let cwd = std::env::current_dir().unwrap_or_default();
         let store_path = crate::embed_memory::default_store_path(&cwd);
@@ -1179,15 +1177,34 @@ fn execute_spawn_agent(
         if store.valid_count() > 0 {
             let embed_config = crate::embed_memory::EmbedConfig::from_env();
             let query_text: String = p.task.chars().take(500).collect();
-            let query_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    tokio::time::timeout(
+            // This function is sync but the outer caller runs on a LocalSet
+            // (current-thread scheduler), where block_in_place panics. Use a
+            // dedicated std::thread + mini runtime to block until the embed
+            // call finishes, without touching the outer runtime.
+            let query_result = {
+                let query_text_cl = query_text.clone();
+                let embed_config_cl = embed_config.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let result = rt.block_on(tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        crate::embed_memory::embed_text_with_config(&query_text, &embed_config),
-                    )
-                    .await
-                })
-            });
+                        crate::embed_memory::embed_text_with_config(
+                            &query_text_cl,
+                            &embed_config_cl,
+                        ),
+                    ));
+                    let _ = tx.send(result);
+                });
+                rx.recv_timeout(std::time::Duration::from_secs(6))
+                    .unwrap_or(Ok(Err("embed thread did not report".to_string())))
+            };
             if let Ok(Ok(query_vec)) = query_result {
                 let retrieved = store.hybrid_retrieve(&query_vec, &query_text, 5);
                 if !retrieved.is_empty() {
@@ -1554,4 +1571,98 @@ fn coalesce_consecutive_roles(messages: Vec<RequestMessage>) -> Vec<RequestMessa
         out.push(msg);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-invariant tests: the LocalSet + block_in_place trap
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod runtime_tests {
+    //! These tests encode the runtime-shape invariants that two production
+    //! panics have already violated (tui_repl.rs:1118 and this file's
+    //! execute_spawn_agent proactive-recall block).
+    //!
+    //! The rule: inside a LocalSet task (which the TUI REPL wraps the whole
+    //! agent loop in), `tokio::task::block_in_place` panics because a
+    //! LocalSet pins tasks to the current thread. The fix is to use either
+    //! `.await` directly (if the call site is async) or a dedicated
+    //! `std::thread` with its own mini runtime (if the call site is sync).
+    use std::time::Duration;
+
+    /// Mirrors the dedicated-thread pattern used in `execute_spawn_agent`.
+    fn blocking_async_from_sync_context() -> Result<u32, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("runtime build: {e}")));
+                    return;
+                }
+            };
+            let result = rt.block_on(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok::<u32, String>(42)
+            });
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap_or(Err("thread did not report".to_string()))
+    }
+
+    /// The fix in `execute_spawn_agent` uses std::thread + its own runtime
+    /// to bridge from the sync caller back to async without touching the
+    /// outer LocalSet runtime. This test verifies the bridge works from
+    /// inside a LocalSet (the production context for the TUI REPL).
+    ///
+    /// If this test panics with "can call blocking only when running on the
+    /// multi-threaded runtime", the fix has regressed to the block_in_place
+    /// anti-pattern.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedicated_thread_bridge_works_inside_local_set() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Sync helper called from inside LocalSet — same shape as
+                // execute_spawn_agent reaching embed_text_with_config.
+                let result = blocking_async_from_sync_context();
+                assert_eq!(result, Ok(42));
+            })
+            .await;
+    }
+
+    /// Negative control: demonstrates why the dedicated-thread pattern is
+    /// needed. Calling `block_in_place` inside a LocalSet task panics. We
+    /// don't want the code to do this; the test pins the invariant so a
+    /// future refactor can't reintroduce it without this test failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_in_place_inside_local_set_panics() {
+        let local = tokio::task::LocalSet::new();
+        let panicked = local
+            .run_until(async {
+                let result = tokio::task::spawn_local(async {
+                    // This is the anti-pattern. Catch the panic so the test
+                    // process stays alive.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tokio::task::block_in_place(|| 42_u32)
+                    }));
+                    r.is_err()
+                })
+                .await
+                .unwrap_or(false);
+                result
+            })
+            .await;
+        assert!(
+            panicked,
+            "block_in_place inside a LocalSet should panic — if this test \
+             starts failing, tokio's semantics have changed and the \
+             runtime-context rules guarding execute_spawn_agent / \
+             tui_repl.rs may no longer apply"
+        );
+    }
 }

@@ -43,8 +43,13 @@ struct Pty {
 
 impl Pty {
     fn spawn() -> Self {
+        Self::spawn_in(std::env::temp_dir().as_path())
+    }
+
+    fn spawn_in(cwd: &std::path::Path) -> Self {
         let mut cmd = Command::new(piku_binary());
-        cmd.env_clear()
+        cmd.current_dir(cwd)
+            .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
             .env("TERM", "xterm-256color")
@@ -77,8 +82,9 @@ impl Pty {
     }
 
     fn send(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).unwrap();
-        self.writer.flush().unwrap();
+        // Tolerant of closed PTY — writes after child exit return EIO.
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
     }
 
     fn drain(&mut self) {
@@ -173,5 +179,208 @@ fn submit_does_not_panic_on_turn_start() {
     assert!(
         !out.contains("can call blocking only when running on the multi-threaded runtime"),
         "block_in_place panic regressed:\n{out}"
+    );
+}
+
+/// Ctrl-D on an empty prompt should exit cleanly — no panic, no hang.
+/// Startup/shutdown sanity.
+#[test]
+fn ctrl_d_on_empty_prompt_exits_cleanly() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    // Ctrl-D with no input — should exit.
+    pty.send(b"\x04");
+
+    // Wait for EOF or up to 3s.
+    let start = Instant::now();
+    while !pty.eof && start.elapsed() < Duration::from_secs(3) {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on Ctrl-D:\n{out}");
+    assert!(
+        pty.eof,
+        "piku did not exit within 3s on Ctrl-D; output was:\n{out}"
+    );
+}
+
+/// Regression guard for the raw-mode leak noted in the coverage audit:
+/// `keypress_handle.abort()` skips the task's raw-mode cleanup, so a
+/// second readline after a cancelled turn can receive raw input.
+///
+/// We submit two prompts back-to-back and check the second echoes as
+/// normal dim text. If raw mode leaked, the second `hi` would be
+/// interpreted as control bytes and wouldn't echo as characters.
+#[test]
+fn two_consecutive_prompts_echo_normally() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    // First prompt — kicks off a turn that will error out on fake API key.
+    pty.send(b"first\r");
+    // Wait for the error + return to prompt.
+    let back_to_prompt = pty.wait_for("HTTP error 401", Duration::from_secs(5));
+    assert!(
+        back_to_prompt,
+        "first turn did not produce expected error:\n{}",
+        pty.captured()
+    );
+    // Let piku finish re-rendering the idle prompt and restart its readline.
+    pty.wait(Duration::from_millis(500));
+
+    // Clear what we've seen; focus on the second turn's echo.
+    let before_second = pty.buf.len();
+    // Type character-by-character with small pauses so each echo has time
+    // to render — matches how a human types.
+    for ch in b"second" {
+        pty.send(&[*ch]);
+        std::thread::sleep(Duration::from_millis(30));
+        pty.drain();
+    }
+    pty.send(b"\r");
+    pty.wait(Duration::from_secs(2));
+
+    let second_segment = String::from_utf8_lossy(&pty.buf[before_second..]).into_owned();
+
+    // Echo of the second prompt: characters must appear in the segment.
+    // If raw mode leaked, each byte would be consumed by crossterm event
+    // handling instead of being echoed as typed characters.
+    assert!(
+        second_segment.contains("second"),
+        "second prompt did not echo (raw mode leak?):\n{second_segment}"
+    );
+    assert!(
+        !second_segment.contains("panicked at"),
+        "panic on second turn:\n{second_segment}"
+    );
+}
+
+/// The /help slash command should render without panicking. /help has
+/// zero prior test coverage per the audit.
+#[test]
+fn help_slash_command_renders() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    pty.send(b"/help\r");
+    pty.wait(Duration::from_secs(1));
+
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on /help:\n{out}");
+    // Help output should mention at least one known command.
+    assert!(
+        out.contains("/help") || out.contains("Commands") || out.contains("/permissions"),
+        "/help did not render recognizable output:\n{out}"
+    );
+}
+
+/// /permissions should render without panicking.
+#[test]
+fn permissions_slash_command_renders() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    pty.send(b"/permissions\r");
+    pty.wait(Duration::from_secs(1));
+
+    let out = pty.captured();
+    assert!(
+        !out.contains("panicked at"),
+        "panic on /permissions:\n{out}"
+    );
+}
+
+/// /hooks should render without panicking.
+#[test]
+fn hooks_slash_command_renders() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    pty.send(b"/hooks\r");
+    pty.wait(Duration::from_secs(1));
+
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on /hooks:\n{out}");
+}
+
+/// Ctrl-C mid-turn should cancel the turn and return to the prompt
+/// without panicking. This uses a test-local TCP listener that accepts
+/// the connection and then hangs, so the LLM call is in-flight long
+/// enough for the Ctrl-C to race it mid-turn.
+///
+/// Exercises the CancelFlag + keypress reader teardown path.
+#[test]
+fn ctrl_c_mid_turn_cancels_cleanly() {
+    use std::net::TcpListener;
+
+    // Bind a listener that accepts but never responds. Child piku process
+    // connects but hangs reading — the turn stays "in flight".
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    // Accept in the background; hold the socket so piku blocks on read.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            // Leak the socket — we want it to stay open and silent.
+            std::mem::forget(stream);
+        }
+    });
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cmd = Command::new(piku_binary());
+    cmd.current_dir(tmp.path())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
+        .env("PIKU_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("PIKU_RESTARTED", "1");
+
+    let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
+    proc.set_kill_timeout(Some(3_000));
+    let writer = proc.get_file_handle().expect("pty writer");
+    let reader = proc.get_file_handle().expect("pty reader");
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
+    fcntl(
+        &reader,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .unwrap();
+
+    let mut pty = Pty {
+        _proc: proc,
+        writer,
+        reader,
+        buf: Vec::new(),
+        eof: false,
+    };
+
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    pty.send(b"hello\r");
+    // Let the turn begin: spinner + in-flight HTTP request to our hanging
+    // server. The keypress reader is now live.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Send Ctrl-C.
+    pty.send(b"\x03");
+    pty.wait(Duration::from_secs(2));
+
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on Ctrl-C:\n{out}");
+    // Process should not have exited — Ctrl-C cancels the turn, not the app.
+    assert!(
+        !pty.eof,
+        "piku exited on Ctrl-C (should only cancel turn):\n{out}"
     );
 }
