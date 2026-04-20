@@ -1567,29 +1567,44 @@ fn handle_slash_cmd(
                 );
             }
         },
-        "sessions" => {
-            if let Ok(dir) = crate::sessions_dir() {
+        "sessions" => match crate::sessions_dir() {
+            Err(e) => {
+                println!("\x1b[31m/sessions:\x1b[0m could not resolve sessions dir: {e}\r");
+            }
+            Ok(dir) => {
                 println!("\x1b[1mSessions:\x1b[0m  {}\r", dir.display());
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    let mut files: Vec<_> = entries
-                        .filter_map(std::result::Result::ok)
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                        .collect();
-                    files.sort_by_key(|e| {
-                        e.metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::UNIX_EPOCH)
-                    });
-                    files.reverse();
-                    for f in files.iter().take(15) {
-                        let raw_name = f.file_name();
-                        let name = raw_name.to_string_lossy();
-                        let name = name.trim_end_matches(".json");
-                        println!("  {name}\r");
+                match std::fs::read_dir(&dir) {
+                    Err(e) => {
+                        println!(
+                            "\x1b[31m/sessions:\x1b[0m read_dir failed: {e}. \
+                             Directory may have been removed or is unreadable.\r"
+                        );
+                    }
+                    Ok(entries) => {
+                        let mut files: Vec<_> = entries
+                            .filter_map(std::result::Result::ok)
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                            .collect();
+                        files.sort_by_key(|e| {
+                            e.metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::UNIX_EPOCH)
+                        });
+                        files.reverse();
+                        if files.is_empty() {
+                            println!("\x1b[2m  (no sessions yet)\x1b[0m\r");
+                        } else {
+                            for f in files.iter().take(15) {
+                                let raw_name = f.file_name();
+                                let name = raw_name.to_string_lossy();
+                                let name = name.trim_end_matches(".json");
+                                println!("  {name}\r");
+                            }
+                        }
                     }
                 }
             }
-        }
+        },
         "tasks" | "agents" => {
             let tasks = task_registry.all();
             if tasks.is_empty() {
