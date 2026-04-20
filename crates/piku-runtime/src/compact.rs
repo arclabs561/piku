@@ -5,7 +5,7 @@
 /// so the model can continue without losing the thread.
 ///
 /// The compaction prompt structure mirrors Claude Code's
-/// `src/services/compact/prompt.ts` — 9 sections, <analysis> scratchpad
+/// `src/services/compact/prompt.ts` — 9 sections, `<analysis>` scratchpad
 /// stripped before returning the formatted summary.
 ///
 /// piku supports LLM-based compaction via `try_llm_compact` in the agent loop,
@@ -166,7 +166,7 @@ pub fn get_compact_continuation_message(
 
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
-    /// Raw summary text (may contain <analysis> tags — use `format_compact_summary`).
+    /// Raw summary text (may contain `<analysis>` tags — use `format_compact_summary`).
     pub summary: String,
     /// Pre-formatted summary (analysis stripped).
     pub formatted_summary: String,
