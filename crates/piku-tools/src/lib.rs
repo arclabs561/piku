@@ -96,6 +96,13 @@ pub fn is_protected_path(path: &str) -> bool {
 /// piku users legitimately edit files across projects. The threat model
 /// is "model writes to /etc/cron.d/pwned" which this still catches.
 pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), String> {
+    // Absolute-path system-directory deny-list. Writing to these is
+    // either immediately destructive or an obvious exfiltration target.
+    // /usr, /var, /bin, /sbin intentionally excluded — /usr/local is a
+    // legitimate install target, macOS tmpdir lives under /var/folders,
+    // and /bin writes require root regardless.
+    const SYSTEM_ROOTS: &[&str] = &["/etc", "/boot", "/sys", "/proc", "/dev"];
+
     let target_path = std::path::Path::new(target);
 
     // Relative-path traversal: canonicalize and check containment within base.
@@ -110,7 +117,7 @@ pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), St
                 Ok(c) => break c,
                 Err(_) => {
                     if !check.pop() {
-                        return Err(format!("relative path escapes project root: {}", target));
+                        return Err(format!("relative path escapes project root: {target}"));
                     }
                 }
             }
@@ -126,12 +133,6 @@ pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), St
         return Ok(());
     }
 
-    // Absolute-path system-directory check. Only the dirs where writing
-    // would immediately damage the system or be obvious exfiltration
-    // targets. /usr, /var, /bin, /sbin left off — /usr/local is a
-    // legitimate install target, macOS tmpdir lives under /var/folders,
-    // and /bin writes require root regardless.
-    const SYSTEM_ROOTS: &[&str] = &["/etc", "/boot", "/sys", "/proc", "/dev"];
     for root in SYSTEM_ROOTS {
         if target_path.starts_with(root) {
             return Err(format!(
