@@ -318,6 +318,98 @@ fn hooks_slash_command_renders() {
     assert!(!out.contains("panicked at"), "panic on /hooks:\n{out}");
 }
 
+/// /hooks should reflect a hooks.json that was written into `.piku/`.
+/// Tests the HookRegistry load path through the real binary — complements
+/// the in-process unit tests in hooks.rs.
+#[test]
+fn hooks_config_loads_from_project_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join(".piku")).unwrap();
+    let hooks_json = serde_json::json!({
+        "PreToolUse": [{
+            "matcher": "bash",
+            "hooks": [{
+                "command": "echo hook-loaded-ok",
+            }]
+        }]
+    });
+    std::fs::write(
+        tmp.path().join(".piku").join("hooks.json"),
+        serde_json::to_string_pretty(&hooks_json).unwrap(),
+    )
+    .unwrap();
+
+    let mut pty = Pty::spawn_in(tmp.path());
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    pty.send(b"/hooks\r");
+    pty.wait(Duration::from_secs(1));
+
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on /hooks:\n{out}");
+    // /hooks summary should mention PreToolUse or the registered event in some form.
+    assert!(
+        out.contains("PreToolUse") || out.contains("bash") || out.contains("pre_tool_use"),
+        "/hooks did not reflect the loaded config:\n{out}"
+    );
+}
+
+/// Set PTY window size via TIOCSWINSZ. Crossterm reads the terminal
+/// dimensions from the PTY ioctl (not $LINES / $COLUMNS), and sending
+/// the ioctl also delivers SIGWINCH to the foreground process group.
+#[allow(unsafe_code)]
+fn set_pty_winsize(fd: &std::fs::File, rows: u16, cols: u16) {
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "macos")]
+    const TIOCSWINSZ: libc::c_ulong = 0x80087467;
+    #[cfg(target_os = "linux")]
+    const TIOCSWINSZ: libc::c_ulong = 0x5414;
+
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(fd.as_raw_fd(), TIOCSWINSZ, &ws);
+    }
+}
+
+/// SIGWINCH (PTY resize) during a session should not panic piku. Does NOT
+/// verify piku correctly relayouts — that would need VT100 parsing. This
+/// is a regression guard for the crash class: crossterm's SIGWINCH handler
+/// interacting with our own signal-hook registration, or rows=0 edge
+/// cases in setup_layout when resize fires mid-startup.
+#[test]
+fn pty_resize_does_not_panic() {
+    let mut pty = Pty::spawn();
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    // Set initial size, then shrink, then grow. Each ioctl delivers SIGWINCH.
+    let fd = pty._proc.get_file_handle().expect("pty fd");
+    set_pty_winsize(&fd, 30, 100);
+    std::thread::sleep(Duration::from_millis(100));
+    set_pty_winsize(&fd, 15, 50);
+    std::thread::sleep(Duration::from_millis(100));
+    set_pty_winsize(&fd, 50, 200);
+    pty.wait(Duration::from_secs(1));
+
+    // Still alive and not panicked.
+    let out = pty.captured();
+    assert!(!out.contains("panicked at"), "panic on resize:\n{out}");
+    assert!(!pty.eof, "piku exited on SIGWINCH:\n{out}");
+}
+
 /// SIGTERM should trigger the terminal-restore signal handler, which
 /// writes "\x1b[r\x1b[?25h\n" (reset scroll region + show cursor) to
 /// stdout before re-raising the signal with the default disposition.
