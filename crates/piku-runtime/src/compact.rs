@@ -21,16 +21,32 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionConfig {
     /// Keep at least this many recent messages verbatim after the summary.
+    /// Step-2 curation already handles ordinary budget pressure, so
+    /// compaction should preserve enough recent history for continuity
+    /// (12 turns ≈ 3 user+assistant+tool cycles of context).
     pub preserve_recent_messages: usize,
     /// Trigger compaction when estimated tokens exceed this value.
+    /// Set to roughly 50% of the model's context window so compaction is
+    /// the emergency release valve, not the first line of defense.
     pub max_estimated_tokens: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
+        Self::for_window(200_000)
+    }
+}
+
+impl CompactionConfig {
+    /// Build a config scaled to a given context window. Trigger is 50%
+    /// of the window; below that, step-2 curation handles budget without
+    /// destroying history. At 50%+ we summarize so curation has less to
+    /// drop.
+    #[must_use]
+    pub fn for_window(window_tokens: usize) -> Self {
         Self {
-            preserve_recent_messages: 4,
-            max_estimated_tokens: 10_000,
+            preserve_recent_messages: 12,
+            max_estimated_tokens: window_tokens / 2,
         }
     }
 }
@@ -720,5 +736,29 @@ mod tests {
         // system msg + 2 recent
         assert_eq!(r.compacted_session.messages.len(), 3);
         assert_eq!(r.removed_message_count, 4);
+    }
+
+    #[test]
+    fn for_window_scales_threshold() {
+        // 200k window → trigger at 100k tokens.
+        let cfg = CompactionConfig::for_window(200_000);
+        assert_eq!(cfg.max_estimated_tokens, 100_000);
+        assert_eq!(cfg.preserve_recent_messages, 12);
+
+        // 1M window → trigger at 500k.
+        let cfg = CompactionConfig::for_window(1_000_000);
+        assert_eq!(cfg.max_estimated_tokens, 500_000);
+    }
+
+    #[test]
+    fn small_window_doesnt_starve_recent_messages() {
+        // Tiny Ollama window (8k) → trigger at 4k. Even then preserve
+        // enough recent messages for continuity.
+        let cfg = CompactionConfig::for_window(8_000);
+        assert_eq!(cfg.max_estimated_tokens, 4_000);
+        assert!(
+            cfg.preserve_recent_messages >= 12,
+            "recent preserve should not shrink with window"
+        );
     }
 }
