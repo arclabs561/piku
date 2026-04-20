@@ -56,10 +56,12 @@ impl Pty {
             // Fake key so piku enters TUI. No request will succeed; we
             // never wait for LLM output.
             .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
-            // Disable terminal-restoring signal handlers. Under nextest PTY
-            // the harness delivers spurious SIGTERM to piku during startup,
-            // and our handler would consume it and kill piku before tests
-            // can interact. The sigterm_restores_terminal test opts in.
+            // Disable terminal-restoring signal handlers. Under nextest,
+            // each test runs in its own process group, and nextest forwards
+            // SIGTERM to grandchildren on timeout/cancellation. Our handler
+            // honors the signal by exiting promptly, which from the test's
+            // POV looks like piku dying during startup. Production users
+            // keep the handler. See signal-hook research 2026-04-20.
             .env("PIKU_NO_SIGNAL_HANDLERS", "1")
             .env("PIKU_RESTARTED", "1");
 
@@ -377,13 +379,17 @@ fn sigterm_restores_terminal_before_exit() {
     }
 
     let after = &pty.buf[before_signal..];
-    // "\x1b[r" resets scroll region. "\x1b[?25h" shows cursor. Both must
-    // appear *after* the SIGTERM in the PTY stream.
-    let has_reset = after.windows(3).any(|w| w == b"\x1b[r" || w == b"\x1b[?");
+    // The handler writes exactly b"\x1b[r\x1b[?25h\n". Looking for the full
+    // sequence — `\x1b[?` alone matches many startup mode strings.
+    const HANDLER_BYTES: &[u8] = b"\x1b[r\x1b[?25h\n";
+    let has_handler_output = after
+        .windows(HANDLER_BYTES.len())
+        .any(|w| w == HANDLER_BYTES);
     assert!(pty.eof, "piku did not exit after SIGTERM within 3s");
     assert!(
-        has_reset,
-        "SIGTERM handler did not emit terminal-restore bytes:\n{}",
+        has_handler_output,
+        "SIGTERM handler did not emit terminal-restore bytes:\nlooking for: {:?}\nin: {}",
+        String::from_utf8_lossy(HANDLER_BYTES),
         String::from_utf8_lossy(after)
     );
 }

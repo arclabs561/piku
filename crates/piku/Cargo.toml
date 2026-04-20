@@ -29,6 +29,7 @@ syntect = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 libc = "0.2"
+signal-hook-registry = "1"
 
 [dev-dependencies]
 async-stream = "0.3"
