@@ -44,7 +44,7 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     let mut names: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let suffix = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let suffix = if entry.file_type().is_ok_and(|t| t.is_dir()) {
             "/"
         } else {
             ""
