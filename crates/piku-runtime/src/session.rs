@@ -36,8 +36,7 @@ impl Session {
     pub fn estimated_tokens(&self) -> usize {
         self.messages
             .iter()
-            .flat_map(|m| &m.blocks)
-            .map(|b| b.text_len() / 4 + 1)
+            .map(ConversationMessage::estimated_tokens)
             .sum()
     }
 
@@ -190,6 +189,17 @@ impl ConversationMessage {
             usage: None,
             importance: None,
         }
+    }
+
+    /// Estimated token cost of this message (4 chars/token heuristic,
+    /// plus 1 for role framing).
+    #[must_use]
+    pub fn estimated_tokens(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(|b| b.text_len() / 4 + 1)
+            .sum::<usize>()
+            + 1
     }
 }
 

@@ -178,25 +178,35 @@ impl PermissionPrompter for TuiPrompter {
         }
 
         // ── Restore input row ──────────────────────────────────────────────────
-        // Clear the prompt line and redraw the footer so the TUI looks tidy
-        // before the tool executes (or the denial message prints).
+        // Clear the prompt line, echo the decision into the scroll zone as a
+        // distinct line (so the decision stays in conversation history and
+        // can't be confused with a tool-execution announcement), then redraw
+        // the footer.
         goto(input_row, 1);
         print!("\x1b[2K"); // erase prompt
-                           // Echo decision into scroll zone
         let (_, scroll_bot_rows) = term_size();
         let scroll_bot = scroll_bot_rows.saturating_sub(2);
         goto(scroll_bot, 1);
+        let dim_m = "\x1b[2m";
+        let reset_m = "\x1b[0m";
         match &outcome {
             PermissionOutcome::Allow => {
                 let suffix = if self.allow_all.load(std::sync::atomic::Ordering::Relaxed) {
-                    " (all remaining)"
+                    format!("{dim_m} (all remaining auto-approved){reset_m}")
                 } else {
-                    ""
+                    String::new()
                 };
-                println!("  \x1b[32m{label}\x1b[0m\x1b[2m  {short_desc}{suffix}\x1b[0m\r");
+                // "  approved   bash   rm -rf build/   (all remaining auto)"
+                // Green verb marks this line as a permission decision.
+                println!(
+                    "  \x1b[32mapproved\x1b[0m  {color}{label}{reset}  {dim_m}{short_desc}{reset_m}{suffix}\r"
+                );
             }
             PermissionOutcome::Deny { .. } => {
-                println!("  \x1b[31m{label}\x1b[0m\x1b[2m  {short_desc}  denied\x1b[0m\r");
+                // "  denied     bash   rm -rf build/"
+                println!(
+                    "  \x1b[31mdenied\x1b[0m    {color}{label}{reset}  {dim_m}{short_desc}{reset_m}\r"
+                );
             }
         }
         goto(footer_row, 1);

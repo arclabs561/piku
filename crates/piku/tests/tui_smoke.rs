@@ -453,8 +453,15 @@ fn sigterm_restores_terminal_before_exit() {
         eof: false,
     };
 
-    // Small wait for piku to install its handler + print setup.
-    pty.wait(Duration::from_millis(500));
+    // Wait for piku to finish startup — prompt glyph is a reliable marker
+    // that the signal handler has been installed (install fires before the
+    // prompt renders).
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(
+        ready,
+        "piku never started:\n{}",
+        String::from_utf8_lossy(&pty.buf)
+    );
 
     let before_signal = pty.buf.len();
 
