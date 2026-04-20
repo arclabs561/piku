@@ -224,9 +224,22 @@ async fn run_turn_inner(
         }
         iterations += 1;
 
-        // Auto-compact: if the session is getting long, summarise old messages.
-        // Tries LLM summarisation first (richer summaries); falls back to
-        // structural (no-LLM) if the provider call fails or times out.
+        // Auto-compact: if the session is getting long, shed bulk.
+        //
+        // Strategy: observation-masking first, structural summary as fallback.
+        // Never call an LLM in the auto path. Research (JetBrains NeurIPS
+        // 2025, ACON Oct 2025, Anthropic engineering Sep 2025) converges on
+        // masking > LLM summarization for automatic compaction:
+        //   - LLM summarization causes 15% longer trajectories (smooths
+        //     stopping signals) and ~7% per-instance cost overhead with
+        //     near-zero cache reuse
+        //   - Summaries drop exactly the load-bearing details that only
+        //     matter later ("context rot")
+        //   - Observation masking keeps reasoning + tool calls verbatim,
+        //     sheds bulk from tool-output observations only
+        // The richer `try_llm_compact` path is still available for the
+        // manual `/compact` slash command, where the user has explicitly
+        // asked for a rewrite and tolerates the latency.
         if crate::compact::should_compact(session, compact_cfg) {
             // PreCompact hook: let hooks veto compaction (exit 2 = block).
             let vetoed = hook_registry.is_some_and(|hooks| {
@@ -236,14 +249,12 @@ async fn run_turn_inner(
             if vetoed {
                 // Hook vetoed compaction -- skip this cycle.
             } else {
-                let (result, method) =
-                    match try_llm_compact(session, provider, model, compact_cfg).await {
-                        Some(r) => (r, "llm"),
-                        None => (
-                            crate::compact::compact_session(session, compact_cfg),
-                            "structural",
-                        ),
-                    };
+                let result = crate::compact::compact_session(session, compact_cfg);
+                let method = if result.removed_message_count == 0 {
+                    "mask"
+                } else {
+                    "structural"
+                };
                 if result.removed_message_count > 0 {
                     // Trigger memory extraction on the messages being compacted away.
                     // Guarded: skip if a previous extraction is still in flight (prevents
@@ -1674,6 +1685,12 @@ async fn execute_agent_join(params: &serde_json::Value, registry: &TaskRegistry)
 /// fails (caller should fall back to structural compaction).
 ///
 /// Uses a 15-second timeout to avoid blocking the loop on slow models.
+///
+/// Currently unused from the auto-compact path (research on cliff-edge
+/// vs observation-masking moved the auto path to masking). Retained
+/// because the richer summary is still the right choice for manual
+/// `/compact` if that slash command is ever added.
+#[allow(dead_code)]
 async fn try_llm_compact(
     session: &Session,
     provider: &dyn Provider,
