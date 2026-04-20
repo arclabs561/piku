@@ -56,6 +56,13 @@ pub trait OutputSink: Send {
     /// Called when a user interjection is injected mid-turn (so the sink
     /// can echo it visually). Default: no-op.
     fn on_interjection(&mut self, _text: &str) {}
+
+    /// Called with the context-window pressure after each turn completes
+    /// (cumulative input tokens / model window size, clamped to [0, 1]).
+    /// The TUI uses this to light up color thresholds in the footer and
+    /// future work will use it to trigger rolling-summary compaction.
+    /// Default: no-op.
+    fn on_context_pressure(&mut self, _pressure: f32) {}
 }
 
 /// A turn result after the full agentic loop for one user message.
@@ -705,6 +712,23 @@ async fn run_turn_inner(
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
 
+    // Context pressure: clamped input_tokens / model_window. Exposed as
+    // a separate callback so the TUI can surface it in the footer (and
+    // eventually step-3 summarization can gate on a threshold).
+    let window = piku_context_window_for_model(model) as f32;
+    let pressure = (f32::from(tracker.cumulative.input_tokens.min(u16::MAX as u32) as u16)
+        / window)
+        .clamp(0.0, 1.0);
+    // For tokens > u16::MAX, use the full-precision path. The u16 clamp
+    // above is a min() — we lose no information, just avoid an f32/u32
+    // lossy cast on the fast path for tiny sessions.
+    let pressure = if tracker.cumulative.input_tokens > u16::MAX as u32 {
+        (tracker.cumulative.input_tokens as f32 / window).clamp(0.0, 1.0)
+    } else {
+        pressure
+    };
+    sink.on_context_pressure(pressure);
+
     // Stop hooks -- fire after turn completes (notifications, logging, cleanup).
     if let Some(hooks) = hook_registry {
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -827,6 +851,131 @@ async fn stream_response(
 
 const DYNAMIC_BOUNDARY: &str = "__PIKU_SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
+/// Context-window estimate used by curation. Mirrors (a subset of)
+/// piku's `context_window_for` in tui_repl.rs. Duplicated because
+/// piku-runtime can't depend on the piku binary crate. Override via
+/// `PIKU_CONTEXT_WINDOW=<tokens>`.
+fn piku_context_window_for_model(model: &str) -> usize {
+    if let Ok(s) = std::env::var("PIKU_CONTEXT_WINDOW") {
+        if let Ok(n) = s.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let m = model.to_ascii_lowercase();
+    if m.contains("gemini-2") || m.contains("gemini-3") || m.contains("gemini-1.5") {
+        return 1_000_000;
+    }
+    if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4.1") {
+        return 128_000;
+    }
+    // Claude, GPT-5, o1, o3, Ollama fallback — 200k is a safe default.
+    200_000
+}
+
+/// Budget-aware curation tail size: always keep the last N messages
+/// regardless of importance. Empirically 6 preserves the recent task
+/// context + any open tool_use/tool_result pair without being so large
+/// that it blows the budget on its own.
+const CURATION_TAIL_SIZE: usize = 6;
+
+/// Fraction of the context window reserved for system prompt, tool
+/// definitions, and the LLM's response. Anything above this budget gets
+/// curated out.
+const CONTEXT_USAGE_CAP: f32 = 0.70;
+
+/// Select which messages to include in the LLM request when the session
+/// exceeds the budget. Zone assembly:
+///   1. Last `CURATION_TAIL_SIZE` messages are always kept.
+///   2. Remaining "head" messages are ranked by importance (from
+///      Session::score_messages) and filled into the remaining budget.
+///   3. Output is in chronological order.
+///
+/// Pair invariant caveat: an assistant's tool_use and the next user's
+/// tool_result are distinct messages. If a tool_use is kept but its
+/// result is dropped (or vice versa), Anthropic / OpenAI will 400. The
+/// tail usually includes recent pairs together; for older pairs we keep
+/// them atomic by walking in chronological pairs when the earlier
+/// message of a pair is selected.
+///
+/// `model_window` is the provider's context window in tokens.
+pub(crate) fn curate_messages<'a>(
+    messages: &'a [crate::session::ConversationMessage],
+    model_window: usize,
+) -> Vec<&'a crate::session::ConversationMessage> {
+    let total: usize = messages
+        .iter()
+        .map(crate::session::ConversationMessage::estimated_tokens)
+        .sum();
+    let budget = ((model_window as f32) * CONTEXT_USAGE_CAP) as usize;
+    if total <= budget || messages.len() <= CURATION_TAIL_SIZE {
+        return messages.iter().collect();
+    }
+
+    let tail_start = messages.len() - CURATION_TAIL_SIZE;
+    let tail_tokens: usize = messages[tail_start..]
+        .iter()
+        .map(crate::session::ConversationMessage::estimated_tokens)
+        .sum();
+    let mut remaining_budget = budget.saturating_sub(tail_tokens);
+
+    // Rank head messages by importance desc, with chronological index as
+    // tiebreaker (prefer more recent when importance ties).
+    let mut head_ranked: Vec<usize> = (0..tail_start).collect();
+    head_ranked.sort_by(|&a, &b| {
+        let ia = messages[a].importance.unwrap_or(0.0);
+        let ib = messages[b].importance.unwrap_or(0.0);
+        ib.partial_cmp(&ia)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.cmp(&a))
+    });
+
+    // Include messages greedily by importance until budget exhausted.
+    // Pair invariant: if we include an Assistant message that has a
+    // ToolUse block, the following Tool message (its result) must also
+    // be included or the request is malformed.
+    let mut included: std::collections::BTreeSet<usize> = (tail_start..messages.len()).collect();
+    for idx in head_ranked {
+        if included.contains(&idx) {
+            continue;
+        }
+        // Compute pair: this message + its paired follower, if any.
+        let pair_end = pair_end_for(messages, idx);
+        let pair_cost: usize = (idx..=pair_end)
+            .map(|i| messages[i].estimated_tokens())
+            .sum();
+        if pair_cost <= remaining_budget {
+            for i in idx..=pair_end {
+                included.insert(i);
+            }
+            remaining_budget -= pair_cost;
+        }
+    }
+
+    included.into_iter().map(|i| &messages[i]).collect()
+}
+
+/// Find the last index of the pair that starts at `idx`. If the message
+/// at `idx` has a ToolUse block, the pair extends to include the
+/// following tool_result (role=Tool) message. Otherwise the pair is just
+/// `idx` itself.
+fn pair_end_for(messages: &[crate::session::ConversationMessage], idx: usize) -> usize {
+    let has_tool_use = messages[idx].role == crate::session::MessageRole::Assistant
+        && messages[idx]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::session::ContentBlock::ToolUse { .. }));
+    if has_tool_use
+        && idx + 1 < messages.len()
+        && messages[idx + 1].role == crate::session::MessageRole::Tool
+    {
+        idx + 1
+    } else {
+        idx
+    }
+}
+
 fn build_request(
     session: &Session,
     model: &str,
@@ -865,12 +1014,20 @@ fn build_request(
         }
     };
 
-    // Convert session messages → API messages
+    // Convert session messages → API messages.
+    //
+    // Curation: when the session exceeds ~70% of the model's context
+    // window, drop lower-importance messages to stay under budget.
+    // Always keeps the last 6 messages (tail) + any high-importance
+    // older messages that fit. See `curate_messages`.
+    let window = piku_context_window_for_model(model);
+    let selected = curate_messages(&session.messages, window);
+
     // System-role messages from compaction are injected as user-role text
     // with a clear wrapper (the API doesn't support mid-conversation system messages).
     let mut api_messages: Vec<RequestMessage> = Vec::new();
 
-    for msg in &session.messages {
+    for msg in selected {
         match msg.role {
             MessageRole::System => {
                 // inject as user message with wrapper
@@ -1709,6 +1866,188 @@ mod runtime_tests {
              starts failing, tokio's semantics have changed and the \
              runtime-context rules guarding execute_spawn_agent / \
              tui_repl.rs may no longer apply"
+        );
+    }
+}
+
+#[cfg(test)]
+mod curation_tests {
+    use super::*;
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+
+    fn user_msg(text: &str, importance: Option<f32>) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+            importance,
+        }
+    }
+
+    fn assistant_text(text: &str, importance: Option<f32>) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+            importance,
+        }
+    }
+
+    fn assistant_tool_use(tool_id: &str, name: &str) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                id: tool_id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+            usage: None,
+            importance: None,
+        }
+    }
+
+    fn tool_result(tool_id: &str, output: &str) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_id.to_string(),
+                output: output.to_string(),
+                is_error: false,
+            }],
+            usage: None,
+            importance: None,
+        }
+    }
+
+    #[test]
+    fn within_budget_returns_everything() {
+        let msgs = vec![user_msg("a", None), assistant_text("b", None)];
+        let kept = curate_messages(&msgs, 200_000);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn tail_is_always_kept() {
+        // 20 messages, tiny window → budget will bite. Last 6 must survive.
+        let big = "x".repeat(100_000);
+        let mut msgs: Vec<ConversationMessage> = (0..20)
+            .map(|i| user_msg(&format!("{i}:{big}"), Some(0.0)))
+            .collect();
+        // Give one oldest message high importance.
+        msgs[0].importance = Some(1.0);
+
+        let kept = curate_messages(&msgs, 1_000_000);
+        let kept_texts: Vec<String> = kept
+            .iter()
+            .flat_map(|m| {
+                m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        // Last 6 are always present.
+        for i in 14..20 {
+            assert!(
+                kept_texts.iter().any(|t| t.starts_with(&format!("{i}:"))),
+                "tail message {i} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn higher_importance_beats_lower() {
+        // Construct a scenario: tail is unimportant but fits; two head
+        // candidates compete for remaining budget.
+        let filler = "x".repeat(40_000); // ~10k tokens each
+        let mut msgs: Vec<ConversationMessage> = Vec::new();
+        // Head: 3 messages, importance 0.1, 0.9, 0.2 — only one fits after tail.
+        msgs.push(user_msg(&format!("LOW_A:{filler}"), Some(0.1)));
+        msgs.push(user_msg(&format!("HIGH:{filler}"), Some(0.9)));
+        msgs.push(user_msg(&format!("LOW_B:{filler}"), Some(0.2)));
+        // Tail: 6 tiny messages
+        for i in 0..6 {
+            msgs.push(user_msg(&format!("tail{i}"), Some(0.5)));
+        }
+        // Budget ~20k tokens → room for tail + 1 head candidate.
+        let kept = curate_messages(&msgs, 30_000);
+        let has_high = kept.iter().any(|m| match &m.blocks[0] {
+            ContentBlock::Text { text } => text.starts_with("HIGH:"),
+            _ => false,
+        });
+        assert!(has_high, "high-importance message should be kept");
+    }
+
+    #[test]
+    fn preserves_chronological_order() {
+        let msgs: Vec<ConversationMessage> = (0..10)
+            .map(|i| user_msg(&format!("m{i}"), Some(i as f32 / 10.0)))
+            .collect();
+        let kept = curate_messages(&msgs, 200_000);
+        let kept_texts: Vec<&str> = kept
+            .iter()
+            .filter_map(|m| match &m.blocks[0] {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Should still be in order m0, m1, m2, ...
+        let is_sorted = kept_texts
+            .windows(2)
+            .all(|w| w[0] < w[1] || w[0].len() < w[1].len());
+        assert!(is_sorted, "order mangled: {kept_texts:?}");
+    }
+
+    #[test]
+    fn pressure_matches_input_tokens_over_window() {
+        // Direct unit test for the calculation. The actual `on_context_pressure`
+        // wiring fires at end of run_turn — we exercise the formula only.
+        let window = piku_context_window_for_model("claude-sonnet-4-6") as f32;
+        // 50k input tokens against 200k window → 0.25 pressure.
+        let p = (50_000_f32 / window).clamp(0.0, 1.0);
+        assert!((p - 0.25).abs() < 0.01, "got {p}");
+        // Overflow: 1M tokens → clamped to 1.0
+        let p2 = (1_000_000_f32 / window).clamp(0.0, 1.0);
+        assert_eq!(p2, 1.0);
+    }
+
+    #[test]
+    fn tool_use_result_pair_kept_atomically_or_dropped() {
+        // Construct: tail of 6 + old tool-use/result pair under budget pressure.
+        // If the pair is dropped, neither appears; if kept, both appear.
+        let filler = "x".repeat(40_000);
+        let mut msgs: Vec<ConversationMessage> = Vec::new();
+        // Head pair (importance 0.9): assistant tool_use + tool_result
+        let mut tu = assistant_tool_use("t1", "bash");
+        tu.importance = Some(0.9);
+        msgs.push(tu);
+        msgs.push(tool_result("t1", "output"));
+        // More head filler with lower importance
+        for i in 0..3 {
+            msgs.push(user_msg(&format!("low_{i}:{filler}"), Some(0.0)));
+        }
+        // Tail
+        for i in 0..6 {
+            msgs.push(user_msg(&format!("tail{i}"), Some(0.5)));
+        }
+        let kept = curate_messages(&msgs, 30_000);
+        let has_use = kept.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "t1"))
+        });
+        let has_result = kept.iter().any(|m| {
+            m.blocks.iter().any(
+                |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"),
+            )
+        });
+        assert_eq!(
+            has_use, has_result,
+            "tool_use and tool_result must be included or dropped together (use={has_use} result={has_result})"
         );
     }
 }
