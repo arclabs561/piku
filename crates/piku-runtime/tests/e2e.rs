@@ -1569,6 +1569,89 @@ async fn auto_compact_triggers_at_threshold() {
     );
 }
 
+/// Research-backed invariant (2026-04-20): the auto-compaction path
+/// should prefer observation masking over LLM/structural summarization
+/// whenever masking alone sheds enough bulk. Masking preserves reasoning
+/// + tool-call structure; summarization discards load-bearing details.
+///
+/// This test builds a session dominated by a single large tool_result
+/// output. Masking that one output should be enough to drop under
+/// threshold, so compact_session should return removed_message_count=0
+/// (nothing was thrown away) while still visibly reducing size.
+#[tokio::test]
+async fn auto_compact_prefers_masking_over_summarization() {
+    use piku_runtime::compact::{compact_session, CompactionConfig};
+    use piku_runtime::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    let mut s = Session::new("mask-pref".to_string());
+    // Small user/assistant pair (~40 tokens total).
+    s.push(ConversationMessage::user("do X"));
+    s.push(ConversationMessage::assistant(
+        vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+        }],
+        None,
+    ));
+    // Large tool_result that dominates the token count. This is exactly
+    // what masking targets — it becomes "[masked: ...]".
+    let big = "x".repeat(20_000);
+    s.push(ConversationMessage::tool_result(
+        "t1".to_string(),
+        big,
+        false,
+    ));
+    // Recent tail (preserved verbatim).
+    s.push(ConversationMessage::user("tail1"));
+    s.push(ConversationMessage::assistant(
+        vec![ContentBlock::Text {
+            text: "tail2".to_string(),
+        }],
+        None,
+    ));
+
+    // Trigger threshold below total but above post-mask size.
+    let cfg = CompactionConfig {
+        preserve_recent_messages: 2,
+        max_estimated_tokens: 1_000,
+    };
+
+    let result = compact_session(&s, cfg);
+
+    // Masking should be enough — no messages removed, but the tool_result
+    // output is now masked.
+    assert_eq!(
+        result.removed_message_count, 0,
+        "masking alone should handle this session (no messages removed)"
+    );
+    // Session length unchanged (still have all 5 messages).
+    assert_eq!(result.compacted_session.messages.len(), 5);
+    // No system-continuation injected.
+    assert!(
+        !matches!(
+            result.compacted_session.messages[0].role,
+            MessageRole::System
+        ),
+        "masking-only path should not inject a system continuation"
+    );
+    // The tool_result must have been masked.
+    let tool_result_idx = 2;
+    let masked = match &result.compacted_session.messages[tool_result_idx].blocks[0] {
+        ContentBlock::ToolResult { output, .. } => output.clone(),
+        _ => panic!("expected tool_result"),
+    };
+    assert!(
+        masked.starts_with("[masked:"),
+        "tool_result output should be masked, got: {masked}"
+    );
+    // Recent tail must be untouched.
+    match &result.compacted_session.messages[4].blocks[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "tail2"),
+        _ => panic!("tail should be untouched"),
+    }
+}
+
 /// Verify `TaskRegistry.fail()` marks task and fires notification.
 #[tokio::test]
 async fn task_failure_notification_fires() {
