@@ -14,5 +14,8 @@ regex = { workspace = true }
 walkdir = { workspace = true }
 piku-api = { path = "../piku-api" }
 
+[dev-dependencies]
+serial_test = "3"
+
 [lints]
 workspace = true

@@ -101,13 +101,20 @@ impl Provider for AnthropicProvider {
                 }
             }
 
-            // flush any remaining line
+            // flush any remaining line (no trailing newline)
             if !line_buf.is_empty() {
                 if let Some(sse) = parser.feed_line(&line_buf) {
                     let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data)?;
                     for event in events {
                         yield event;
                     }
+                }
+            }
+            // Flush any buffered data pending blank-line dispatch.
+            if let Some(sse) = parser.finish() {
+                let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data)?;
+                for event in events {
+                    yield event;
                 }
             }
         })

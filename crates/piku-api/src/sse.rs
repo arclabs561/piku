@@ -50,4 +50,20 @@ impl SseParser {
 
         None
     }
+
+    /// Flush any buffered data as a final event. Call this after the stream
+    /// ends to handle the case where the last event lacks the trailing blank
+    /// line — common when TCP connections close mid-terminator (Cloudflare,
+    /// proxy truncation) and would otherwise silently drop `data: [DONE]`.
+    pub fn finish(&mut self) -> Option<SseEvent> {
+        if self.data_buf.is_empty() {
+            return None;
+        }
+        let data = std::mem::take(&mut self.data_buf);
+        let data = data.strip_suffix('\n').unwrap_or(&data).to_string();
+        Some(SseEvent {
+            event_type: self.event_type.take(),
+            data,
+        })
+    }
 }

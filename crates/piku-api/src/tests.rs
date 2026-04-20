@@ -48,6 +48,36 @@ mod sse_parser {
         assert_eq!(ev2.data, "second");
     }
 
+    /// Regression: TCP/Cloudflare can close a stream without the final
+    /// blank line. Without `finish`, the last event (typically `[DONE]`)
+    /// stays buffered and is silently dropped.
+    #[test]
+    fn finish_flushes_buffered_data_without_trailing_blank() {
+        let mut p = SseParser::new();
+        p.feed_line("data: [DONE]");
+        // No blank line — stream closed abruptly.
+        let ev = p.finish().expect("finish should emit buffered event");
+        assert_eq!(ev.data, "[DONE]");
+    }
+
+    #[test]
+    fn finish_returns_none_when_nothing_buffered() {
+        let mut p = SseParser::new();
+        p.feed_line("data: x");
+        let _ = p.feed_line(""); // dispatched
+        assert!(p.finish().is_none(), "finish should be idempotent");
+    }
+
+    #[test]
+    fn finish_preserves_event_type() {
+        let mut p = SseParser::new();
+        p.feed_line("event: message_stop");
+        p.feed_line("data: {}");
+        let ev = p.finish().unwrap();
+        assert_eq!(ev.event_type.as_deref(), Some("message_stop"));
+        assert_eq!(ev.data, "{}");
+    }
+
     #[test]
     fn event_type_resets_between_events() {
         let mut p = SseParser::new();

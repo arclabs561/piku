@@ -28,10 +28,10 @@ crossterm = { workspace = true }
 syntect = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 async-stream = "0.3"
-libc = "0.2"
 nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
 serial_test = "3"

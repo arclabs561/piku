@@ -74,6 +74,15 @@ pub fn cleanup_worktree(
         return Some(wt_path.to_path_buf());
     }
     // No changes — clean up silently
+    remove_worktree_and_branch(repo_root, wt_path, branch);
+    None
+}
+
+fn remove_worktree_and_branch(
+    repo_root: &std::path::Path,
+    wt_path: &std::path::Path,
+    branch: &str,
+) {
     let _ = std::process::Command::new("git")
         .args([
             "worktree",
@@ -87,7 +96,58 @@ pub fn cleanup_worktree(
         .args(["branch", "-D", branch])
         .current_dir(repo_root)
         .output();
-    None
+}
+
+/// Drop-based cleanup for worktrees. If the task panics or is aborted
+/// before it can call `cleanup_worktree`, the Drop impl removes the
+/// worktree and branch so they don't accumulate in /tmp and `git branch -a`.
+///
+/// The happy path calls [`WorktreeGuard::defuse`] to surrender ownership
+/// to the existing `cleanup_worktree` logic (which may keep the worktree
+/// when the agent made changes).
+pub struct WorktreeGuard {
+    repo_root: std::path::PathBuf,
+    wt_path: std::path::PathBuf,
+    branch: String,
+    armed: bool,
+}
+
+impl WorktreeGuard {
+    #[must_use]
+    pub fn new(repo_root: std::path::PathBuf, wt_path: std::path::PathBuf, branch: String) -> Self {
+        Self {
+            repo_root,
+            wt_path,
+            branch,
+            armed: true,
+        }
+    }
+
+    /// Surrender ownership — the caller will handle cleanup explicitly.
+    /// Drop will not run the git commands.
+    pub fn defuse(&mut self) {
+        self.armed = false;
+    }
+
+    pub fn wt_path(&self) -> &std::path::Path {
+        &self.wt_path
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Panic or abort path: unconditionally clean up. Any partial
+            // work inside the worktree is lost, but we avoid a permanent
+            // resource leak. Losing half-complete panicking-subagent work
+            // is a better outcome than accumulating zombie worktrees.
+            remove_worktree_and_branch(&self.repo_root, &self.wt_path, &self.branch);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,5 +408,89 @@ impl TaskRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod worktree_guard_tests {
+    use super::*;
+
+    /// Initialize a throwaway git repo for worktree tests. Returns the path.
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t.t"][..],
+            &["config", "user.name", "t"][..],
+            &["commit", "--allow-empty", "-q", "-m", "init"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo_root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        dir
+    }
+
+    /// A guard that panics inside a scope should still remove the worktree.
+    #[test]
+    fn guard_cleans_up_on_panic() {
+        let repo = init_repo();
+        let tid = AgentTaskId::new();
+        let (wt_path, branch) = create_worktree(repo.path(), &tid).expect("worktree");
+        assert!(wt_path.exists(), "worktree dir should exist after create");
+
+        let wt_clone = wt_path.clone();
+        let branch_clone = branch.clone();
+        let repo_clone = repo.path().to_path_buf();
+        // Simulate a panic inside the scope holding the guard.
+        let r = std::panic::catch_unwind(move || {
+            let _guard = WorktreeGuard::new(repo_clone, wt_clone, branch_clone);
+            panic!("simulated subagent panic");
+        });
+        assert!(r.is_err(), "panic should have propagated");
+
+        // Guard's Drop should have removed the worktree dir.
+        assert!(
+            !wt_path.exists(),
+            "worktree dir still exists after panic cleanup"
+        );
+
+        // Branch should also be gone.
+        let branches = std::process::Command::new("git")
+            .args(["branch", "-l"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git branch -l");
+        let out = String::from_utf8_lossy(&branches.stdout);
+        assert!(
+            !out.contains(&branch),
+            "branch {branch} still present after panic: {out}"
+        );
+    }
+
+    /// A defused guard should leave the worktree intact so the caller can
+    /// run its own `cleanup_worktree(changed=true)` logic.
+    #[test]
+    fn defused_guard_does_not_touch_worktree() {
+        let repo = init_repo();
+        let tid = AgentTaskId::new();
+        let (wt_path, branch) = create_worktree(repo.path(), &tid).expect("worktree");
+
+        {
+            let mut guard =
+                WorktreeGuard::new(repo.path().to_path_buf(), wt_path.clone(), branch.clone());
+            guard.defuse();
+        }
+
+        assert!(
+            wt_path.exists(),
+            "defused guard should have left worktree alone"
+        );
+        // Clean up by hand so we don't leak.
+        remove_worktree_and_branch(repo.path(), &wt_path, &branch);
     }
 }

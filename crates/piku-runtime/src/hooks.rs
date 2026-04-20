@@ -103,6 +103,54 @@ impl Default for HookResult {
 pub struct HookRegistry {
     config: HookConfig,
     project_dir: Option<PathBuf>,
+    /// Handles of async hooks currently running. Shared across clones so
+    /// `shutdown` sees every in-flight hook regardless of which clone
+    /// spawned it.
+    pending: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+impl HookRegistry {
+    /// Wait for all async hooks to finish, up to `timeout`. After that,
+    /// move on — blocking shutdown on a stuck hook is worse than losing
+    /// a hook's tail-end work. Returns the number of hooks that were
+    /// still running when we gave up.
+    ///
+    /// Call at process exit. Async hooks that write to logs / databases
+    /// otherwise get truncated mid-write when the process terminates.
+    pub fn shutdown(&self, timeout: std::time::Duration) -> usize {
+        // Take ownership of the handle list so other clones can still
+        // spawn new hooks without blocking; but those new spawns won't
+        // be awaited here (we're shutting down).
+        let handles: Vec<std::thread::JoinHandle<()>> = match self.pending.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => return 0,
+        };
+        if handles.is_empty() {
+            return 0;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut remaining: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for h in handles {
+            if std::time::Instant::now() >= deadline {
+                remaining.push(h);
+                continue;
+            }
+            // Poll until finished or deadline. std::thread::JoinHandle has
+            // no timed join, so we busy-wait-with-sleep on is_finished.
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                remaining.push(h);
+            }
+        }
+        // Detach the rest — they'll keep running until the process dies.
+        // We don't leak thread handles; dropping a JoinHandle detaches.
+        remaining.len()
+    }
 }
 
 impl HookRegistry {
@@ -121,6 +169,7 @@ impl HookRegistry {
         Self {
             config,
             project_dir: Some(project_dir.to_path_buf()),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -133,6 +182,7 @@ impl HookRegistry {
         Self {
             config,
             project_dir: Some(project_dir.to_path_buf()),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -275,13 +325,19 @@ impl HookRegistry {
                     continue;
                 }
                 if handler.r#async {
-                    // Fire and forget
                     let cmd = handler.command.clone();
                     let input_str = input.to_string();
                     let project_dir = self.project_dir.clone();
-                    std::thread::spawn(move || {
+                    let h = std::thread::spawn(move || {
                         let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
                     });
+                    if let Ok(mut pending) = self.pending.lock() {
+                        // Opportunistically drop any finished handles to
+                        // keep the vec from growing unboundedly across a
+                        // long session.
+                        pending.retain(|h| !h.is_finished());
+                        pending.push(h);
+                    }
                 } else if let HookCommandResult::Error(msg) = run_hook_command(
                     &handler.command,
                     &input,
@@ -973,5 +1029,80 @@ mod tests {
             "bash",
             &input
         ));
+    }
+
+    /// Regression: async PostToolUse hooks used to be fire-and-forget via
+    /// std::thread::spawn, so a hook writing to a log file got truncated
+    /// when the process exited. Now HookRegistry tracks async handles and
+    /// `shutdown` waits for them (bounded by a timeout).
+    ///
+    /// This test writes a marker file from an async hook and verifies the
+    /// marker is present after shutdown — even though the hook takes long
+    /// enough that a naive fire-and-forget would be killed mid-write.
+    #[test]
+    fn async_hook_completes_before_shutdown_returns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("hook-marker");
+        let marker_str = marker.display().to_string();
+
+        // Async hook: shell one-liner that sleeps then writes the marker.
+        // HookRegistry runs the command via `sh -c`, so a pure command
+        // string works without needing an executable file.
+        let hook_cmd = format!("sleep 0.3 && printf 'written' > '{marker_str}'");
+
+        // Wire up a PostToolUse async hook via project hooks.json.
+        let hooks_dir = tmp.path().join(".piku");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hooks_json = serde_json::json!({
+            "PostToolUse": [{
+                "hooks": [{
+                    "command": hook_cmd,
+                    "async": true,
+                }]
+            }]
+        });
+        std::fs::write(
+            hooks_dir.join("hooks.json"),
+            serde_json::to_string(&hooks_json).unwrap(),
+        )
+        .unwrap();
+
+        let registry = HookRegistry::load_project_only(tmp.path());
+        registry.run_post_tool_use(
+            "test_tool",
+            &serde_json::json!({}),
+            "ok",
+            false,
+            "session",
+            tmp.path(),
+        );
+
+        // At this point the async hook has been spawned but hasn't written
+        // the marker yet (sleep 0.3).
+        assert!(
+            !marker.exists(),
+            "marker should not exist immediately after spawn"
+        );
+
+        // Shutdown should block until the hook finishes. With sleep 0.3,
+        // shutdown must wait at least that long — this is the property we
+        // want, the opposite of fire-and-forget which would return instantly.
+        let start = std::time::Instant::now();
+        let still_running = registry.shutdown(std::time::Duration::from_secs(3));
+        let elapsed = start.elapsed();
+
+        assert_eq!(still_running, 0, "hook did not finish before timeout");
+        assert!(
+            marker.exists(),
+            "marker file was never written — hook truncated?"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "written");
+        // If fire-and-forget had returned (regression), elapsed would be
+        // near-zero. The hook sleeps 300ms, so shutdown must wait ≥ that.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "shutdown returned too fast ({elapsed:?}) — it's not actually \
+             waiting for async hooks"
+        );
     }
 }

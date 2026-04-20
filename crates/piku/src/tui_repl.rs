@@ -230,6 +230,68 @@ fn term_size() -> (u16, u16) {
     terminal::size().unwrap_or((80, 24))
 }
 
+// ── Signal-driven terminal restore ────────────────────────────────────────────
+
+/// Terminal restore bytes: reset scroll region, show cursor, newline.
+/// Kept as a byte slice so the signal handler can call write(2) directly —
+/// only async-signal-safe syscalls are allowed inside a handler.
+const TERM_RESTORE_BYTES: &[u8] = b"\x1b[r\x1b[?25h\n";
+
+/// Async-signal-safe handler: write restore bytes to stdout, then re-raise
+/// the signal with the default disposition (SA_RESETHAND ensures re-raise
+/// gets default handling).
+///
+/// Uses `libc::write` (async-signal-safe per POSIX) — not std I/O, which
+/// may take locks.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
+    // Safety: write(2) and raise(3) are async-signal-safe per POSIX.
+    // Ignore short writes / errors; we're about to die anyway.
+    unsafe {
+        let _ = libc::write(
+            libc::STDOUT_FILENO,
+            TERM_RESTORE_BYTES.as_ptr().cast::<libc::c_void>(),
+            TERM_RESTORE_BYTES.len(),
+        );
+        // SA_RESETHAND restored the default disposition. Re-raise so the
+        // normal exit status / core dump behavior takes effect.
+        libc::raise(sig);
+    }
+}
+
+/// Install signal handlers for SIGTERM, SIGINT, SIGHUP, SIGQUIT that write
+/// a terminal-restore escape sequence before re-raising with the default
+/// disposition. Panic hook covers Rust panics; this covers POSIX signals.
+///
+/// SIGINT inside the TUI is normally consumed by crossterm's raw-mode
+/// keyboard reader and never reaches the process handler. This handler is
+/// a safety net for the narrow window before raw mode is enabled and for
+/// SIGTERM/SIGHUP which bypass raw mode entirely.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn install_terminal_restoring_signal_handlers() {
+    // Safety: sigaction / sigemptyset are standard POSIX; we pass pointers
+    // to locally-owned memory with correct lifetimes.
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = terminal_restore_signal_handler as *const () as libc::sighandler_t;
+        // SA_RESETHAND: restore default handler after firing, so raise()
+        // re-enters the kernel's default behavior (core dump / exit).
+        // SA_RESTART: let interrupted system calls restart automatically
+        // instead of failing with EINTR. Without this, the crossterm poll
+        // loop can get wedged on EINTR after our handler fires.
+        act.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
+        libc::sigemptyset(&mut act.sa_mask);
+        for sig in [libc::SIGTERM] {
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_terminal_restoring_signal_handlers() {}
+
 // ── Divider ───────────────────────────────────────────────────────────────────
 
 // ── Footer ────────────────────────────────────────────────────────────────────
@@ -824,6 +886,17 @@ async fn run_tui_repl_core(
         let _ = io::stdout().flush();
         default_hook(info);
     }));
+    // Install signal handlers that restore the terminal before default
+    // signal handling kills the process. Panic hook only covers panics —
+    // SIGTERM/SIGINT/SIGHUP from `kill` or a disconnected parent would
+    // otherwise leave DECSTBM set and raw mode enabled.
+    // Default on; tests opt out via PIKU_NO_SIGNAL_HANDLERS=1. Under
+    // nextest/rexpect PTY, something in the test harness delivers spurious
+    // SIGTERM to piku during startup, which our handler would consume and
+    // terminate before the test can interact.
+    if std::env::var("PIKU_NO_SIGNAL_HANDLERS").as_deref() != Ok("1") {
+        install_terminal_restoring_signal_handlers();
+    }
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     let (cols, rows) = term_size();
@@ -1281,6 +1354,14 @@ async fn run_tui_repl_core(
         eprintln!("\x1b[33m[warn]\x1b[0m could not save session: {e}");
     } else if !session.messages.is_empty() {
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
+    }
+
+    // Wait for async hooks to finish writing (logs, etc) before the
+    // process exits and truncates their output mid-write. Bounded so a
+    // hung hook can't block shutdown — the user's exit should feel snappy.
+    let still_running = hook_registry.shutdown(std::time::Duration::from_secs(2));
+    if still_running > 0 {
+        eprintln!("\x1b[2m[{still_running} async hook(s) still running at exit — detached]\x1b[0m");
     }
 
     // Session-end memory extraction: distill atomic facts from the conversation.
