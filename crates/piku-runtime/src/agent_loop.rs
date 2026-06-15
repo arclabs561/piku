@@ -1360,12 +1360,11 @@ fn execute_spawn_agent(
                 let embed_config_cl = embed_config.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                    {
-                        Ok(r) => r,
-                        Err(_) => return,
+                    else {
+                        return;
                     };
                     let result = rt.block_on(tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -2006,6 +2005,7 @@ mod curation_tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // test indices 0..10, exact f32 value irrelevant
     fn preserves_chronological_order() {
         let msgs: Vec<ConversationMessage> = (0..10)
             .map(|i| user_msg(&format!("m{i}"), Some(i as f32 / 10.0)))
@@ -2026,6 +2026,7 @@ mod curation_tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::float_cmp)] // clamp(0,1) yields exact 1.0
     fn pressure_matches_input_tokens_over_window() {
         // Direct unit test for the calculation. The actual `on_context_pressure`
         // wiring fires at end of run_turn — we exercise the formula only.
