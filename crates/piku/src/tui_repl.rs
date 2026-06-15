@@ -117,8 +117,7 @@ impl PermissionPrompter for TuiPrompter {
             desc.clone()
         };
         // Format: "  bash  rm -rf build/   y/n/a? "
-        let prompt =
-            format!("\x1b[2K\r  {color}{label}{reset}  {short_desc}  {dim}y/n/a?{reset} ",);
+        let prompt = format!("\x1b[2K\r  {color}{label}{reset}  {short_desc}  {dim}y/n/a?{reset} ");
 
         // ── Show prompt on the input row ──────────────────────────────────────
         goto(input_row, 1);
@@ -256,7 +255,7 @@ const TERM_RESTORE_BYTES: &[u8] = b"\x1b[r\x1b[?25h\n";
 /// document this failure mode).
 ///
 /// The handler writes restore bytes then `_exit(128+sig)`. We do not
-/// re-raise (which would require SA_RESETHAND + sigaction gymnastics that
+/// re-raise (which would require `SA_RESETHAND` + sigaction gymnastics that
 /// the registry deliberately abstracts) and we do not call `exit()` (not
 /// async-signal-safe — it runs atexit handlers that may take locks).
 /// `_exit` is the async-signal-safe POSIX call for prompt termination.
@@ -512,7 +511,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 }
 
 /// Look up approximate USD pricing for a model, returned as
-/// (input_$_per_million, output_$_per_million).
+/// (input_$_`per_million`, output_$_`per_million`).
 ///
 /// Local providers (Ollama) return (0, 0) so cost stays zero without
 /// polluting the table. Unknown models return None so the footer omits
@@ -577,8 +576,7 @@ pub(crate) fn estimate_cost(
 pub(crate) fn format_age_secs(file_unix: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     if file_unix == 0 || file_unix > now {
         return "?".to_string();
     }
@@ -1791,8 +1789,10 @@ fn handle_slash_cmd(
                                     .and_then(|m| m.modified())
                                     .ok()
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| format_age_secs(d.as_secs()))
-                                    .unwrap_or_else(|| "?".to_string());
+                                    .map_or_else(
+                                        || "?".to_string(),
+                                        |d| format_age_secs(d.as_secs()),
+                                    );
                                 let first = first_user_message_preview(&f.path());
                                 let preview = first.as_deref().unwrap_or("(empty)");
                                 println!(
@@ -2040,6 +2040,10 @@ fn announce_self_update(new_binary: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    // Pricing tables are exact hardcoded constants; comparing them with
+    // `assert_eq!` is intentional, not the usual float-equality hazard.
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     fn strip_ansi(s: &str) -> String {

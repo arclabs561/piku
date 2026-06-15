@@ -34,10 +34,7 @@ impl TraceWriter {
     ///
     /// Returns a no-op writer if `PIKU_NO_TRACE=1` or the file can't be opened.
     pub fn open(traces_dir: &PathBuf, session_id: &str) -> Self {
-        if std::env::var("PIKU_NO_TRACE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
+        if std::env::var("PIKU_NO_TRACE").is_ok_and(|v| v == "1") {
             return Self { file: None };
         }
 
@@ -74,8 +71,7 @@ impl TraceWriter {
     fn now_secs() -> f64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
+            .map_or(0.0, |d| d.as_secs_f64())
     }
 
     // ---------------------------------------------------------------------------
