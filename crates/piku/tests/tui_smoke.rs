@@ -1,22 +1,38 @@
 //! Cheap PTY smoke tests for the interactive TUI path.
 //!
 //! These drive the real `piku` binary over a PTY to exercise code paths
-//! that pure unit tests can't reach — tokio runtime setup, LocalSet/
-//! spawn_local, the concurrent keypress reader that fires on every turn.
+//! that pure unit tests can't reach — tokio runtime setup, `LocalSet`/
+//! `spawn_local`, the concurrent keypress reader that fires on every turn.
 //!
 //! Contract: no LLM, no API calls, no external services. A fake API key
 //! lets piku enter the TUI; the LLM request will fail but we only care
 //! about what happens *before* that — the turn-start spawning that panicked
-//! in tui_repl.rs:1118 (block_in_place inside a LocalSet task).
+//! in `tui_repl.rs:1118` (`block_in_place` inside a `LocalSet` task).
+//!
+//! These are `#[ignore]`d + `#[serial]` and run isolated (`scripts/ci.sh pty`)
+//! so the main suite stays fast; under full-workspace concurrency their PTY
+//! teardown stalls.
 //!
 //! Run:
 //!   cargo build -p piku
-//!   cargo test --test tui_smoke
+//!   cargo test --test `tui_smoke` -- --ignored
+
+// Pedantic lints that are noise in this PTY harness, not in production:
+// `use` lives inside test fns to keep platform glue local; `Winsize`/`ws_*`
+// mirror C `struct winsize`; `_proc` is rexpect's own field we read to get the
+// PTY fd. Production code stays under full pedantic-deny.
+#![allow(
+    clippy::items_after_statements,
+    clippy::struct_field_names,
+    clippy::used_underscore_binding
+)]
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use serial_test::serial;
 
 fn piku_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -142,18 +158,20 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         // Detached drop — rexpect's kill loop can hang on zombies.
-        let _ = self.send(b"\x04"); // Ctrl-D
+        let () = self.send(b"\x04"); // Ctrl-D
     }
 }
 
-/// Regression: submitting any input used to panic at tui_repl.rs:1118
+/// Regression: submitting any input used to panic at `tui_repl.rs:1118`
 /// with "can call blocking only when running on the multi-threaded runtime"
-/// because `block_in_place` was called inside a spawn_local task.
+/// because `block_in_place` was called inside a `spawn_local` task.
 ///
 /// This test spawns piku, types a prompt, hits Enter, and verifies that
 /// the process does NOT emit a Rust panic header before the LLM call
 /// (which will legitimately fail with a fake API key).
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn submit_does_not_panic_on_turn_start() {
     let mut pty = Pty::spawn();
 
@@ -192,6 +210,8 @@ fn submit_does_not_panic_on_turn_start() {
 /// Ctrl-D on an empty prompt should exit cleanly — no panic, no hang.
 /// Startup/shutdown sanity.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn ctrl_d_on_empty_prompt_exits_cleanly() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -223,6 +243,8 @@ fn ctrl_d_on_empty_prompt_exits_cleanly() {
 /// normal dim text. If raw mode leaked, the second `hi` would be
 /// interpreted as control bytes and wouldn't echo as characters.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn two_consecutive_prompts_echo_normally() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -270,6 +292,8 @@ fn two_consecutive_prompts_echo_normally() {
 /// The /help slash command should render without panicking. /help has
 /// zero prior test coverage per the audit.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn help_slash_command_renders() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -289,6 +313,8 @@ fn help_slash_command_renders() {
 
 /// /permissions should render without panicking.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn permissions_slash_command_renders() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -306,6 +332,8 @@ fn permissions_slash_command_renders() {
 
 /// /hooks should render without panicking.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn hooks_slash_command_renders() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -319,9 +347,11 @@ fn hooks_slash_command_renders() {
 }
 
 /// /hooks should reflect a hooks.json that was written into `.piku/`.
-/// Tests the HookRegistry load path through the real binary — complements
+/// Tests the `HookRegistry` load path through the real binary — complements
 /// the in-process unit tests in hooks.rs.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn hooks_config_loads_from_project_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join(".piku")).unwrap();
@@ -362,7 +392,7 @@ fn hooks_config_loads_from_project_file() {
 fn set_pty_winsize(fd: &std::fs::File, rows: u16, cols: u16) {
     use std::os::unix::io::AsRawFd;
     #[cfg(target_os = "macos")]
-    const TIOCSWINSZ: libc::c_ulong = 0x80087467;
+    const TIOCSWINSZ: libc::c_ulong = 0x8008_7467;
     #[cfg(target_os = "linux")]
     const TIOCSWINSZ: libc::c_ulong = 0x5414;
 
@@ -388,8 +418,10 @@ fn set_pty_winsize(fd: &std::fs::File, rows: u16, cols: u16) {
 /// verify piku correctly relayouts — that would need VT100 parsing. This
 /// is a regression guard for the crash class: crossterm's SIGWINCH handler
 /// interacting with our own signal-hook registration, or rows=0 edge
-/// cases in setup_layout when resize fires mid-startup.
+/// cases in `setup_layout` when resize fires mid-startup.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn pty_resize_does_not_panic() {
     let mut pty = Pty::spawn();
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -416,11 +448,13 @@ fn pty_resize_does_not_panic() {
 /// Without the handler, a kill(1) leaves DECSTBM set and the cursor
 /// hidden for the user's shell.
 ///
-/// Must opt into signal handlers explicitly via PIKU_INSTALL_SIGNAL_HANDLERS=1.
-/// Production's main() sets this by default; tests leave it unset because
+/// Must opt into signal handlers explicitly via `PIKU_INSTALL_SIGNAL_HANDLERS=1`.
+/// Production's `main()` sets this by default; tests leave it unset because
 /// the nextest/rexpect harness delivers spurious SIGTERM to the child
 /// during startup, tripping the handler before the test can interact.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn sigterm_restores_terminal_before_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new(piku_binary());
@@ -498,8 +532,10 @@ fn sigterm_restores_terminal_before_exit() {
 /// the connection and then hangs, so the LLM call is in-flight long
 /// enough for the Ctrl-C to race it mid-turn.
 ///
-/// Exercises the CancelFlag + keypress reader teardown path.
+/// Exercises the `CancelFlag` + keypress reader teardown path.
 #[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn ctrl_c_mid_turn_cancels_cleanly() {
     use std::net::TcpListener;
 
