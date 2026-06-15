@@ -21,8 +21,7 @@ fn tempdir() -> PathBuf {
         "piku_e2e_su_{}_{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0),
+            .map_or(0, |d| d.subsec_nanos()),
         std::process::id(),
     ));
     std::fs::create_dir_all(&base).unwrap();
@@ -88,6 +87,7 @@ mod cli_parsing {
             prompt,
             model,
             provider_override,
+            ..
         } = action
         else {
             panic!("expected SingleShot");
@@ -163,6 +163,7 @@ mod cli_parsing {
             model,
             provider_override,
             prompt,
+            ..
         } = action
         else {
             panic!()
@@ -216,6 +217,7 @@ mod cli_parsing {
             prompt,
             model,
             provider_override,
+            ..
         } = action
         else {
             panic!()
@@ -239,6 +241,7 @@ mod cli_parsing {
             prompt,
             model,
             provider_override,
+            ..
         } = action
         else {
             panic!()
