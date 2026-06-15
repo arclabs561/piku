@@ -140,8 +140,7 @@ fn tempdir() -> PathBuf {
         "piku_e2e_{}_{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0),
+            .map_or(0, |d| d.subsec_nanos()),
         std::process::id(),
     ));
     std::fs::create_dir_all(&base).unwrap();
@@ -1574,9 +1573,9 @@ async fn auto_compact_triggers_at_threshold() {
 /// whenever masking alone sheds enough bulk. Masking preserves reasoning
 /// + tool-call structure; summarization discards load-bearing details.
 ///
-/// This test builds a session dominated by a single large tool_result
+/// This test builds a session dominated by a single large `tool_result`
 /// output. Masking that one output should be enough to drop under
-/// threshold, so compact_session should return removed_message_count=0
+/// threshold, so `compact_session` should return `removed_message_count=0`
 /// (nothing was thrown away) while still visibly reducing size.
 #[tokio::test]
 async fn auto_compact_prefers_masking_over_summarization() {

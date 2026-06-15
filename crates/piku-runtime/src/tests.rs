@@ -452,8 +452,7 @@ fn tempdir() -> std::path::PathBuf {
         "piku_rt_test_{}_{:?}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0),
+            .map_or(0, |d| d.subsec_nanos()),
         std::thread::current().id(),
     ));
     std::fs::create_dir_all(&base).unwrap();
