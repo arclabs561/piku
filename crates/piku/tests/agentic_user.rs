@@ -29,13 +29,15 @@
 ///   - **Phase-based personas**: scripted keystroke sequences for reproducible coverage
 ///     + LLM freeform exploration for discovery.
 ///
-/// GATING: Auto-runs when a provider is available (Ollama reachable,
-/// `OPENROUTER_API_KEY`, or `ANTHROPIC_API_KEY`). Auto-skips otherwise with
-/// a visible log line. Opt out with `PIKU_AGENTIC_USER=0`.
+/// GATING: The persona tests are `#[ignore]`, so default `cargo test` (and CI)
+/// reports them as *ignored* rather than passing silently. They are opt-in via
+/// `--ignored` and need a provider (Ollama reachable, `OPENROUTER_API_KEY`, or
+/// `ANTHROPIC_API_KEY`); with none they panic loudly instead of skipping. The
+/// harness unit tests below the personas are not ignored and run normally.
 ///
 /// QUICK RUN (`confident_dev` persona):
 ///   cargo build --release -p piku
-///   cargo test --test `agentic_user` -- `agentic_user_confident_dev` --nocapture
+///   cargo test --test `agentic_user` -- `agentic_user_confident_dev` --ignored --nocapture
 ///
 /// ALL PERSONAS:
 ///   cargo test --test `agentic_user` -- --nocapture
@@ -52,31 +54,13 @@ use std::time::{Duration, Instant, SystemTime};
 /// Whether agentic tests should run.
 ///
 /// Auto-runs when any usable provider is available (Ollama reachable, or
-/// OPENROUTER_API_KEY / ANTHROPIC_API_KEY set).
-/// Auto-skips with a visible log line when no provider is available — CI
-/// without secrets stays green, local runs with Ollama running will Just Work.
-/// Opt out explicitly with `PIKU_AGENTIC_USER=0`.
+/// `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` set).
+/// True when both sides have a provider available (one LLM for the simulated
+/// user, one for piku). The persona tests are `#[ignore]` and assert on this,
+/// so an opt-in `--ignored` run with no provider fails loudly rather than
+/// skipping silently.
 fn is_enabled() -> bool {
-    // Explicit opt-out wins.
-    if std::env::var("PIKU_AGENTIC_USER").as_deref() == Ok("0")
-        || std::env::var("PIKU_AGENTIC_USER").as_deref() == Ok("false")
-    {
-        eprintln!("[agentic_user] skipped: PIKU_AGENTIC_USER=0");
-        return false;
-    }
-    // Must have creds on both sides: one for the user-agent LLM, one for piku.
-    let ua = user_agent_provider(false);
-    let pk = piku_provider();
-    match (ua, pk) {
-        (Some(_), Some(_)) => true,
-        _ => {
-            eprintln!(
-                "[agentic_user] skipped: no provider available (need Ollama \
-                 running, OPENROUTER_API_KEY, or ANTHROPIC_API_KEY)"
-            );
-            false
-        }
-    }
+    user_agent_provider(false).is_some() && piku_provider().is_some()
 }
 
 fn piku_binary() -> PathBuf {
@@ -3059,7 +3043,7 @@ fn run_attempt_session(
     pty.clear_capture();
 
     // Phase 2: wait for response to complete (ready prompt returns)
-    let snap = pty.wait_for_ready(&mut observer, Duration::from_secs(180));
+    let snap = pty.wait_for_ready(&mut observer, Duration::from_mins(3));
 
     // Collect response from both capture and screen snapshot
     let captured = pty.captured_text();
@@ -3237,60 +3221,78 @@ use serial_test::serial;
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_confident_dev() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     let ps = personas();
     run_agentic_session(ps.get("confident_dev").unwrap());
 }
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_cautious_beginner() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     let ps = personas();
     run_agentic_session(ps.get("cautious_beginner").unwrap());
 }
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_adversarial() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     let ps = personas();
     run_agentic_session(ps.get("adversarial").unwrap());
 }
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_input_explorer() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     let ps = personas();
     run_agentic_session(ps.get("input_explorer").unwrap());
 }
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_feature_implementer() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     let ps = personas();
     run_agentic_session(ps.get("feature_implementer").unwrap());
 }
 
 #[test]
 #[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_attempt_tree_learning() {
-    if !is_enabled() {
-        return;
-    }
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
     run_attempt_tree_evaluation();
 }
 
