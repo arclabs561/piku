@@ -294,7 +294,7 @@ mod cli_parsing {
 // ---------------------------------------------------------------------------
 
 mod provider_resolution {
-    use piku::cli::ResolvedProvider;
+    use piku_runtime::ResolvedProvider;
 
     #[test]
     fn unknown_provider_name_errors_with_message() {

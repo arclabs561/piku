@@ -19,17 +19,15 @@
 /// a line. Submit by pressing Enter on an empty continuation line.
 use std::io::{self, Write};
 
-use crate::cli::ResolvedProvider;
 use crate::input_helper::{LineEditor, ReadOutcome};
 use crate::markdown::StreamingMarkdown;
 use crate::self_update;
 use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
-use piku_api::TokenUsage;
 use piku_runtime::{
     build_system_prompt, run_turn_with_registry, InterjectionRx, InterjectionTx, OutputSink,
-    PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, Session,
-    TaskRegistry, TaskStatus, TurnResult,
+    PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, ResolvedProvider,
+    Session, TaskRegistry, TaskStatus, TokenUsage, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 
