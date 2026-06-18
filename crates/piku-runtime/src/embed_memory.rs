@@ -170,30 +170,23 @@ pub struct EmbedConfig {
 
 impl EmbedConfig {
     /// Build from environment variables, with fallback chain:
-    /// 1. `PIKU_EMBED_URL` (explicit URL → auto-detect backend from URL shape)
-    /// 2. `OLLAMA_HOST` set (or default localhost) → Ollama native
-    /// 3. `OPENROUTER_API_KEY` set → `/v1/embeddings` via openrouter
+    /// 1. `PIKU_EMBED_URL` with optional `PIKU_EMBED_BACKEND`
+    /// 2. `OLLAMA_HOST` set (or default localhost) selects Ollama native
+    /// 3. `OPENROUTER_API_KEY` set selects `/v1/embeddings` via `OpenRouter`
     ///
+    /// Backend: `PIKU_EMBED_BACKEND=ollama|openai-compat` for custom URLs.
     /// Model: `PIKU_EMBED_MODEL` overrides the default for any backend.
     /// API key: `PIKU_EMBED_API_KEY` → `OPENROUTER_API_KEY` → none.
     #[must_use]
     pub fn from_env() -> Self {
-        // Explicit override: user set a custom embedding URL
+        // Explicit override: user set a custom embedding URL.
         if let Ok(url) = std::env::var("PIKU_EMBED_URL") {
             let model = std::env::var("PIKU_EMBED_MODEL")
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string());
             let api_key = std::env::var("PIKU_EMBED_API_KEY")
                 .ok()
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
-            let backend =
-                if url.contains("openrouter") || url.contains("openai") || url.contains("groq") {
-                    EmbedBackend::OpenAiCompat
-                } else if url.contains("11434") || url.contains("ollama") {
-                    EmbedBackend::Ollama
-                } else {
-                    // Default to OpenAI-compat for unknown URLs (most common)
-                    EmbedBackend::OpenAiCompat
-                };
+            let backend = embed_backend_from_env().unwrap_or(EmbedBackend::OpenAiCompat);
             return Self {
                 backend,
                 base_url: url.trim_end_matches('/').to_string(),
@@ -204,8 +197,8 @@ impl EmbedConfig {
 
         // Default: Ollama (local, no API key needed)
         // OLLAMA_HOST is set by default in most piku environments.
-        let ollama_url =
-            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let ollama_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| piku_api::ollama::DEFAULT_HOST.to_string());
         let embed_model = std::env::var("PIKU_EMBED_MODEL");
 
         // If OLLAMA_HOST was explicitly set, always use Ollama
@@ -237,6 +230,17 @@ impl EmbedConfig {
             model: embed_model.unwrap_or_else(|_| "nomic-embed-text".to_string()),
             api_key: None,
         }
+    }
+}
+
+fn embed_backend_from_env() -> Option<EmbedBackend> {
+    let value = std::env::var("PIKU_EMBED_BACKEND").ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ollama" => Some(EmbedBackend::Ollama),
+        "openai" | "openai-compat" | "openai_compat" | "openai-compatible" => {
+            Some(EmbedBackend::OpenAiCompat)
+        }
+        _ => None,
     }
 }
 
@@ -1578,6 +1582,54 @@ pub fn build_extraction_transcript(messages: &[crate::session::ConversationMessa
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const EMBED_ENV_KEYS: &[&str] = &[
+        "PIKU_EMBED_URL",
+        "PIKU_EMBED_BACKEND",
+        "PIKU_EMBED_MODEL",
+        "PIKU_EMBED_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OLLAMA_HOST",
+    ];
+
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+    impl EnvRestore {
+        fn new() -> Self {
+            let saved = EMBED_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect();
+            for key in EMBED_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn with_clean_embed_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvRestore::new();
+        f()
+    }
 
     /// Expose `parse_extraction_response` for cross-module tests.
     /// Returns (fact, tags, importance) tuples.
@@ -1608,6 +1660,48 @@ pub mod tests {
         let mut v: Vec<f32> = (0..768).map(|i| ((i as f32 + seed) * 0.01).sin()).collect();
         normalize(&mut v);
         v
+    }
+
+    #[test]
+    fn embed_config_custom_url_defaults_to_openai_compat() {
+        with_clean_embed_env(|| {
+            std::env::set_var("PIKU_EMBED_URL", "http://localhost:11434/");
+
+            let config = EmbedConfig::from_env();
+
+            assert_eq!(config.backend, EmbedBackend::OpenAiCompat);
+            assert_eq!(config.base_url, "http://localhost:11434");
+            assert_eq!(config.model, "text-embedding-3-small");
+            assert_eq!(config.api_key, None);
+        });
+    }
+
+    #[test]
+    fn embed_config_custom_url_respects_explicit_ollama_backend() {
+        with_clean_embed_env(|| {
+            std::env::set_var("PIKU_EMBED_URL", "http://localhost:11434/");
+            std::env::set_var("PIKU_EMBED_BACKEND", "ollama");
+            std::env::set_var("PIKU_EMBED_MODEL", "nomic-embed-text");
+
+            let config = EmbedConfig::from_env();
+
+            assert_eq!(config.backend, EmbedBackend::Ollama);
+            assert_eq!(config.base_url, "http://localhost:11434");
+            assert_eq!(config.model, "nomic-embed-text");
+            assert_eq!(config.api_key, None);
+        });
+    }
+
+    #[test]
+    fn embed_config_default_reuses_ollama_host() {
+        with_clean_embed_env(|| {
+            let config = EmbedConfig::from_env();
+
+            assert_eq!(config.backend, EmbedBackend::Ollama);
+            assert_eq!(config.base_url, piku_api::ollama::DEFAULT_HOST);
+            assert_eq!(config.model, "nomic-embed-text");
+            assert_eq!(config.api_key, None);
+        });
     }
 
     #[test]

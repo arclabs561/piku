@@ -1,6 +1,7 @@
 use crate::openai_compat::{Auth, OpenAiCompatProvider};
 
-const DEFAULT_HOST: &str = "http://localhost:11434";
+pub const DEFAULT_HOST: &str = "http://localhost:11434";
+pub const DEFAULT_PORT: u16 = 11434;
 pub const DEFAULT_MODEL: &str = "llama3.1";
 
 #[must_use]
@@ -22,12 +23,12 @@ pub fn is_available() -> bool {
     let addr = if addr.contains(':') {
         addr.to_string()
     } else {
-        format!("{addr}:11434")
+        format!("{addr}:{DEFAULT_PORT}")
     };
     std::net::TcpStream::connect_timeout(
         &addr
             .parse()
-            .unwrap_or_else(|_| "127.0.0.1:11434".parse().unwrap()),
+            .unwrap_or_else(|_| format!("127.0.0.1:{DEFAULT_PORT}").parse().unwrap()),
         std::time::Duration::from_millis(200),
     )
     .is_ok()
