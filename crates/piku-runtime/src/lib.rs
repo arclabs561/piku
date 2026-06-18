@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod memory;
 pub mod permission;
 pub mod prompt;
+pub mod provider;
 pub mod session;
 pub mod task;
 #[cfg(test)]
@@ -35,6 +36,10 @@ pub use permission::{AllowAll, PermissionOutcome, PermissionPrompter, Permission
 pub use piku_api::Provider;
 pub use piku_api::TokenUsage;
 pub use prompt::build_system_prompt;
+pub use provider::{
+    ResolvedProvider, DEFAULT_MODEL_ANTHROPIC, DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA,
+    DEFAULT_MODEL_OPENROUTER,
+};
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
     AgentTaskId, TaskEntry, TaskRegistry, TaskStatus, DEFAULT_SUBAGENT_MAX_TURNS, MAX_SPAWN_DEPTH,
