@@ -43,8 +43,7 @@ pub fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {
 pub fn new_session_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let pid = std::process::id();
     format!("session-{nanos}-{pid}")
 }
@@ -53,8 +52,7 @@ pub fn new_session_id() -> String {
 pub fn current_date() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let days = secs / 86400;
     let mut year = 1970u32;
