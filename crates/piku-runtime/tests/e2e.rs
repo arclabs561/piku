@@ -281,6 +281,54 @@ async fn e2e_reads_file_via_tool() {
     assert_eq!(session.messages.len(), 4);
 }
 
+#[tokio::test]
+async fn e2e_reads_file_and_answers_with_unique_value() {
+    let dir = tempdir();
+    let path = dir.join("config.toml");
+    let secret = "PIKU_SCRIPTED_SECRET_7f3a9b";
+    std::fs::write(
+        &path,
+        format!("[server]\nhost = \"localhost\"\nsecret_token = \"{secret}\"\n"),
+    )
+    .unwrap();
+
+    let input = serde_json::json!({ "path": path }).to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &input),
+        text_stop(&format!("The secret_token value is {secret}.")),
+    ]);
+
+    let mut session = Session::new("e2e-read-secret".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "read config.toml and tell me secret_token",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_starts.len(), 1);
+    assert_eq!(sink.tool_starts[0].0, "read_file");
+    assert!(!sink.tool_ends[0].2, "read_file should succeed");
+    assert!(
+        sink.tool_ends[0].1.contains(secret),
+        "tool output should include the seeded token"
+    );
+    assert!(
+        sink.text.contains(secret),
+        "assistant response should mention the seeded token"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E2E scenario 3: Write then read — multi-tool multi-turn
 // ---------------------------------------------------------------------------
@@ -378,6 +426,86 @@ async fn e2e_edit_file_surgical() {
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("new"), "file should have been edited");
     assert!(!content.contains("old"), "old string should be gone");
+}
+
+#[tokio::test]
+async fn e2e_adds_function_to_existing_rust_file() {
+    let dir = tempdir();
+    let path = dir.join("math.rs");
+    std::fs::write(
+        &path,
+        r"// Simple math utilities
+
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn subtract(a: i32, b: i32) -> i32 {
+    a - b
+}
+",
+    )
+    .unwrap();
+
+    let old = r"pub fn subtract(a: i32, b: i32) -> i32 {
+    a - b
+}
+";
+    let new = r"pub fn subtract(a: i32, b: i32) -> i32 {
+    a - b
+}
+
+pub fn multiply(a: i32, b: i32) -> i32 {
+    a * b
+}
+";
+
+    let edit_input = serde_json::json!({
+        "path": path,
+        "old_string": old,
+        "new_string": new,
+    })
+    .to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("e1", "edit_file", &edit_input),
+        text_stop("Added multiply after subtract."),
+    ]);
+
+    let mut session = Session::new("e2e-add-function".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "add multiply(a, b) after subtract",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_ends[0].0, "edit_file");
+    assert!(!sink.tool_ends[0].2, "edit_file should succeed");
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("pub fn add"), "add should be preserved");
+    assert!(
+        content.contains("pub fn subtract"),
+        "subtract should be preserved"
+    );
+    assert!(
+        content.contains("pub fn multiply"),
+        "multiply should be added"
+    );
+    assert!(
+        content.contains("a * b"),
+        "multiply should return the product"
+    );
 }
 
 // ---------------------------------------------------------------------------
