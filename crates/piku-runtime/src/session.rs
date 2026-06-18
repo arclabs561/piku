@@ -41,7 +41,7 @@ impl Session {
     }
 
     /// Save atomically: write to a sibling tmp file, then rename over the
-    /// destination. `std::fs::write` is O_TRUNC + write, so a crash between
+    /// destination. `std::fs::write` is `O_TRUNC` + write, so a crash between
     /// the two syscalls leaves a zero-byte session file. `rename(2)` is
     /// atomic on the same filesystem — readers either see the old file or
     /// the new one, never a truncated partial.

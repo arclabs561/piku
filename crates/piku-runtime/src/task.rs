@@ -129,10 +129,12 @@ impl WorktreeGuard {
         self.armed = false;
     }
 
+    #[must_use]
     pub fn wt_path(&self) -> &std::path::Path {
         &self.wt_path
     }
 
+    #[must_use]
     pub fn branch(&self) -> &str {
         &self.branch
     }
@@ -370,7 +372,7 @@ impl TaskRegistry {
     pub fn all(&self) -> Vec<TaskEntry> {
         let inner = self.inner.lock().unwrap();
         let mut tasks: Vec<_> = inner.tasks.values().cloned().collect();
-        tasks.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.started_at));
         tasks
     }
 

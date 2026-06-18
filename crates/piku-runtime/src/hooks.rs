@@ -121,6 +121,7 @@ impl HookRegistry {
     ///
     /// Call at process exit. Async hooks that write to logs / databases
     /// otherwise get truncated mid-write when the process terminates.
+    #[must_use]
     pub fn shutdown(&self, timeout: std::time::Duration) -> usize {
         // Take ownership of the handle list so other clones can still
         // spawn new hooks without blocking; but those new spawns won't
@@ -1123,9 +1124,9 @@ mod tests {
         ));
     }
 
-    /// Regression: async PostToolUse hooks used to be fire-and-forget via
-    /// std::thread::spawn, so a hook writing to a log file got truncated
-    /// when the process exited. Now HookRegistry tracks async handles and
+    /// Regression: async `PostToolUse` hooks used to be fire-and-forget via
+    /// `std::thread::spawn`, so a hook writing to a log file got truncated
+    /// when the process exited. Now `HookRegistry` tracks async handles and
     /// `shutdown` waits for them (bounded by a timeout).
     ///
     /// This test writes a marker file from an async hook and verifies the

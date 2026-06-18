@@ -7,15 +7,17 @@
 /// which tools it called, with what args, whether they succeeded, and what
 /// the final filesystem looks like.
 ///
-/// GATING: Requires `PIKU_DOGFOOD=1` (so CI stays fast by default).
+/// GATING: Every scenario is `#[ignore]`, so default `cargo test` (and CI)
+/// reports them as *ignored* rather than silently passing. They are opt-in and
+/// need a provider key; with none they panic loudly instead of skipping.
 ///
 /// SETUP:
-///   cargo build --release -p piku
+///   cargo build -p piku
 ///   export OPENROUTER_API_KEY=sk-or-...   # or `ANTHROPIC_API_KEY`
-///   `PIKU_DOGFOOD=1` cargo test --test dogfood -- --nocapture
+///   cargo test --test dogfood -- --ignored --nocapture
 ///
 /// TO RUN ONE SCENARIO:
-///   `PIKU_DOGFOOD=1` cargo test --test dogfood `scenario_name` -- --nocapture
+///   cargo test --test dogfood `dogfood_read_and_answer` -- --ignored --nocapture
 ///
 /// The test never fails on LLM output quality — it only fails on crashes,
 /// tool errors that shouldn't happen, or explicit structural assertions.
@@ -26,12 +28,6 @@ use std::process::{Command, Stdio};
 // ---------------------------------------------------------------------------
 // Gate + infrastructure
 // ---------------------------------------------------------------------------
-
-fn is_enabled() -> bool {
-    std::env::var("PIKU_DOGFOOD")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-}
 
 fn piku_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -48,7 +44,7 @@ fn piku_binary() -> PathBuf {
 }
 
 fn has_key(var: &str) -> bool {
-    std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false)
+    std::env::var(var).is_ok_and(|v| !v.is_empty())
 }
 
 fn detect_provider() -> Option<(&'static str, &'static str, &'static str)> {
@@ -68,8 +64,7 @@ fn detect_provider() -> Option<(&'static str, &'static str, &'static str)> {
 fn tempdir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.subsec_nanos());
     let base = std::env::temp_dir().join(format!("piku_dogfood_{label}_{nanos}"));
     std::fs::create_dir_all(&base).unwrap();
     base
@@ -293,6 +288,7 @@ fn run_scenario(
     std::fs::create_dir_all(&config_dir).unwrap();
 
     let output = Command::new(piku_binary())
+        .arg("--print") // headless: run the turn and exit, no REPL
         .arg("--provider")
         .arg(provider)
         .arg("--model")
@@ -326,13 +322,13 @@ fn run_scenario(
 /// Idea: does piku correctly identify where to add code, write it,
 /// and verify it compiles? Does it read first or just write blind?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_add_function_to_existing_file() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("add_fn");
@@ -398,13 +394,13 @@ pub fn subtract(a: i32, b: i32) -> i32 {
 /// Idea: verify the full `read_file` → response loop works, and that the
 /// answer actually reflects the file contents (not a hallucination).
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_read_and_answer() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("read_answer");
@@ -445,13 +441,13 @@ fn dogfood_read_and_answer() {
 /// Idea: does the multi-tool agentic loop work? Does it use glob to discover
 /// files then grep to find patterns, rather than reading everything blindly?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_explore_codebase() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("explore");
@@ -523,13 +519,13 @@ pub fn greet(name: &str) -> String {
 /// Idea: does `edit_file` correctly reject ambiguous matches and does the model
 /// recover by providing more context on a retry?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_edit_with_ambiguous_pattern() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("ambig_edit");
@@ -576,13 +572,13 @@ fn handle_post() -> &'static str {
 /// Idea: does piku correctly run bash and incorporate the output into its response?
 /// Uses a deterministic command (echo + wc) so output is predictable.
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_bash_and_use_output() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("bash_output");
@@ -615,13 +611,13 @@ fn dogfood_bash_and_use_output() {
 /// Idea: does piku create a file that's actually syntactically correct?
 /// We check the file exists and contains key structural elements.
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_write_new_file_from_scratch() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("write_new");
@@ -651,13 +647,13 @@ fn dogfood_write_new_file_from_scratch() {
 /// Idea: does piku verify its own work? Does it read → edit → read?
 /// The experience report shows the tool sequence clearly.
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_read_edit_verify_loop() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("edit_verify");
@@ -701,13 +697,13 @@ fn dogfood_read_edit_verify_loop() {
 /// Idea: does piku use grep to find all usages before editing?
 /// Does it update all call sites, not just the definition?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_multifile_rename() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("multifile_rename");
@@ -789,13 +785,13 @@ pub fn print_sum(values: &[i32]) {
 /// Idea: does piku actually read the code carefully before answering?
 /// Does it identify the specific line and explain why it's wrong?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_find_off_by_one_bug() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("find_bug");
@@ -852,13 +848,13 @@ pub fn sum(values: &[i32]) -> i32 {
 /// Idea: does piku read the function signature before writing tests?
 /// Does it produce tests that actually test the contract, not boilerplate?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_write_tests_for_function() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("write_tests");
@@ -917,13 +913,13 @@ pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
 /// Tests the full agentic loop: glob → read → synthesise.
 /// This is a confidence check — does piku understand codebases structurally?
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_self_describe_architecture() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     // Run from the actual piku workspace root
@@ -971,13 +967,13 @@ fn dogfood_self_describe_architecture() {
 /// Idea: pure infrastructure check — the JSONL trace must exist and contain
 /// at least the expected event types (prompt, `tool_start`, `turn_end`).
 #[test]
+#[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
 fn dogfood_trace_file_is_written() {
-    if !is_enabled() {
-        return;
-    }
     let Some((provider, key_var, model)) = detect_provider() else {
-        eprintln!("no API key — skipping");
-        return;
+        panic!(
+            "dogfood is opt-in (`--ignored`) and needs a provider key: set \
+             OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     };
 
     let workspace = tempdir("trace_check");

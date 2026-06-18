@@ -53,18 +53,21 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Run `piku --help` for usage.");
             std::process::exit(1);
         }
-        CliAction::SingleShot { prompt, .. } => {
-            if self_update::was_restarted() {
+        CliAction::SingleShot { prompt, print, .. } => {
+            if !print && self_update::was_restarted() {
                 if let Some(session) = try_load_restart_session(&config) {
                     return run_tui_repl_post_restart(session, &config).await;
                 }
             }
-            run_single_shot_then_repl(&prompt, None, &config).await?;
+            run_single_shot(&prompt, None, &config, print).await?;
         }
         CliAction::Resume {
-            session_id, prompt, ..
+            session_id,
+            prompt,
+            print,
+            ..
         } => {
-            run_resume(&session_id, prompt.as_deref(), &config).await?;
+            run_resume(&session_id, prompt.as_deref(), &config, print).await?;
         }
         CliAction::Repl { .. } => {
             if self_update::was_restarted() {
@@ -112,6 +115,7 @@ async fn run_resume(
     session_id: &str,
     prompt: Option<&str>,
     config: &PikuConfig,
+    print: bool,
 ) -> anyhow::Result<()> {
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
@@ -136,10 +140,11 @@ async fn run_resume(
                 eprintln!("[piku] resuming {}", matched_path.display());
                 let session = Session::load(&matched_path)
                     .map_err(|e| anyhow::anyhow!("failed to load session: {e}"))?;
-                return run_single_shot_then_repl(
+                return run_single_shot(
                     prompt.unwrap_or("Continue where we left off."),
                     Some(session),
                     config,
+                    print,
                 )
                 .await;
             }
@@ -162,22 +167,29 @@ async fn run_resume(
         session.messages.len()
     );
 
-    run_single_shot_then_repl(
+    run_single_shot(
         prompt.unwrap_or("Continue where we left off."),
         Some(session),
         config,
+        print,
     )
     .await
 }
 
 // ---------------------------------------------------------------------------
-// Single-shot mode → drops into TUI REPL for continued chat
+// Single-shot mode
+//
+// Runs one prompt to completion. In headless mode (`print = true`, set by
+// `-p`/`--print`) it exits afterward (aider `-m` / `claude -p` / `codex exec`
+// style). Otherwise it drops into the TUI REPL with the same session so the
+// conversation can continue interactively.
 // ---------------------------------------------------------------------------
 
-async fn run_single_shot_then_repl(
+async fn run_single_shot(
     prompt: &str,
     existing_session: Option<Session>,
     config: &PikuConfig,
+    print: bool,
 ) -> anyhow::Result<()> {
     let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let model = config
@@ -249,6 +261,13 @@ async fn run_single_shot_then_repl(
     // Check if this is a post-restart invocation
     if self_update::was_restarted() {
         eprintln!("[piku] restarted after self-rebuild ✓");
+    }
+
+    // Headless: stop here. The turn output has already streamed to stdout and
+    // the session is saved; entering the REPL would block on a (likely
+    // non-TTY) stdin, which is exactly what scripts and pipelines don't want.
+    if print {
+        return Ok(());
     }
 
     // Drop into TUI REPL with the same session for continued conversation
@@ -380,6 +399,8 @@ USAGE:
     piku [OPTIONS] [PROMPT]
 
 OPTIONS:
+    -p, --print          Headless: run the prompt, print the result, and exit
+                         (no interactive REPL). For scripts and pipelines.
     --model <name>       Override model (default: provider-dependent)
     --provider <name>    Force provider: openrouter | anthropic | groq | ollama | custom
     --resume <id>        Resume a previous session by ID (partial match ok)
@@ -395,6 +416,7 @@ PROVIDER SELECTION (opportunistic — first available wins):
 
 EXAMPLES:
     piku \"explain src/main.rs\"
+    piku -p \"explain src/main.rs\" > explanation.txt   # headless, exits after
     piku --model anthropic/claude-opus-4 \"refactor the permission system\"
     piku --provider anthropic \"what does the agentic loop do?\"
 
