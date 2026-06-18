@@ -160,8 +160,8 @@ fn read_git_status(cwd: &Path) -> Option<String> {
 /// Walk ancestors of `cwd` collecting PIKU.md files.
 /// Truncates at 4000 chars/file and 12000 chars total.
 fn load_piku_md(cwd: &Path) -> String {
-    const MAX_PER_FILE: usize = 4_000;
-    const MAX_TOTAL: usize = 12_000;
+    const MAX_PER_FILE_CHARS: usize = 4_000;
+    const MAX_TOTAL_CHARS: usize = 12_000;
 
     let mut total = String::new();
     let mut visited = std::collections::HashSet::new();
@@ -194,13 +194,13 @@ fn load_piku_md(cwd: &Path) -> String {
         if !visited.insert(key) {
             continue;
         }
-        let chunk = if content.chars().count() > MAX_PER_FILE {
-            let trunc: String = content.chars().take(MAX_PER_FILE).collect();
+        let chunk = if content.chars().count() > MAX_PER_FILE_CHARS {
+            let trunc: String = content.chars().take(MAX_PER_FILE_CHARS).collect();
             format!("{trunc}\n[truncated]")
         } else {
             content
         };
-        if total.len() + chunk.len() > MAX_TOTAL {
+        if total.len() + chunk.len() > MAX_TOTAL_CHARS {
             break;
         }
         if !total.is_empty() {
