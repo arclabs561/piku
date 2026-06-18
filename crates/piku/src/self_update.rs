@@ -287,15 +287,19 @@ pub fn was_restarted() -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn tempdir() -> PathBuf {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
         let base = std::env::temp_dir().join(format!(
-            "piku_su_{}_{}",
+            "piku_su_{}_{}_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0),
             std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
