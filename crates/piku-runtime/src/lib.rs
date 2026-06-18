@@ -1,3 +1,9 @@
+//! Runtime orchestration for piku.
+//!
+//! This crate owns the agent loop, sessions, memory, hooks, permissions,
+//! provider resolution, and subagent task tracking. Protocol clients live in
+//! `piku-api`; executable tools live in `piku-tools`.
+
 pub mod agent_loop;
 pub mod agents;
 pub mod compact;
