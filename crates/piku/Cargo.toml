@@ -21,7 +21,6 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-piku-api = { path = "../piku-api" }
 piku-tools = { path = "../piku-tools" }
 piku-runtime = { path = "../piku-runtime" }
 crossterm = { workspace = true }
@@ -33,6 +32,7 @@ signal-hook-registry = "1"
 
 [dev-dependencies]
 async-stream = "0.3"
+piku-api = { path = "../piku-api" }
 nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
 serial_test = "3"

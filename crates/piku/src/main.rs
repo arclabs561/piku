@@ -1,4 +1,4 @@
-use piku::cli::{parse_args, CliAction, ResolvedProvider};
+use piku::cli::{parse_args, CliAction};
 use piku::config::PikuConfig;
 use piku::self_update;
 use piku::trace::TraceWriter;
@@ -7,9 +7,8 @@ use piku::tui_repl;
 use std::env;
 use std::io::{self, Write};
 
-use piku_api::TokenUsage;
-use piku_runtime::PostToolAction;
 use piku_runtime::{build_system_prompt, run_turn, AllowAll, OutputSink, Session, TurnResult};
+use piku_runtime::{PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION"); // self-update demo
@@ -389,7 +388,7 @@ impl OutputSink for StdoutSink {
 // ---------------------------------------------------------------------------
 
 fn print_help() {
-    use piku::cli::{
+    use piku_runtime::{
         DEFAULT_MODEL_ANTHROPIC, DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA, DEFAULT_MODEL_OPENROUTER,
     };
     println!(
