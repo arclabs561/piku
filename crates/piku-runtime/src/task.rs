@@ -15,7 +15,10 @@
 /// `TaskRegistry` is `Clone + Send + Sync` — it wraps an `Arc<Mutex<_>>`
 /// so it can be handed to the TUI, the agent loop, and tool executors.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -195,19 +198,38 @@ impl Default for AgentTaskId {
 impl AgentTaskId {
     #[must_use]
     pub fn new() -> Self {
-        // short unique id: timestamp-nanos + random suffix
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        // Put the process-local counter before the timestamp because
+        // worktree branch names use a truncated task id prefix.
+        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .subsec_nanos();
+            .as_nanos();
         let pid = std::process::id();
-        Self(format!("agent-{pid}-{nanos:08x}"))
+        Self(format!("agent-{pid}-{sequence:x}-{nanos:x}"))
     }
 }
 
 impl std::fmt::Display for AgentTaskId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod task_id_tests {
+    use super::*;
+
+    #[test]
+    fn task_ids_are_unique_in_tight_loop() {
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..1024 {
+            let id = AgentTaskId::new();
+            assert!(seen.insert(id), "duplicate task id generated");
+        }
     }
 }
 
