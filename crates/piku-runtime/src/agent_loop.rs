@@ -667,6 +667,9 @@ async fn run_turn_inner(
             };
 
             let action = sink.on_tool_end(tool_name, &output, is_error);
+            if !is_error && matches!(tool_name.as_str(), "write_file" | "edit_file" | "bash") {
+                seen_tool_calls.clear();
+            }
 
             // PostToolUse hooks -- params is still available since we borrow tool_calls.
             if let Some(hooks) = hook_registry {

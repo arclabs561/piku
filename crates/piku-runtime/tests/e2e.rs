@@ -429,6 +429,66 @@ async fn e2e_edit_file_surgical() {
 }
 
 #[tokio::test]
+async fn e2e_read_edit_verify_loop() {
+    let dir = tempdir();
+    let path = dir.join("version.txt");
+    std::fs::write(&path, "version = 1.0.0\n").unwrap();
+
+    let read_input = serde_json::json!({ "path": path }).to_string();
+    let edit_input = serde_json::json!({
+        "path": path,
+        "old_string": "version = 1.0.0",
+        "new_string": "version = 2.0.0",
+    })
+    .to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &read_input),
+        tool_call_events("e1", "edit_file", &edit_input),
+        tool_call_events("r2", "read_file", &read_input),
+        text_stop("Confirmed version.txt now says version = 2.0.0."),
+    ]);
+
+    let mut session = Session::new("e2e-read-edit-verify".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "read version.txt, change 1.0.0 to 2.0.0, then read it again",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    let tool_names: Vec<&str> = sink
+        .tool_starts
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(tool_names, ["read_file", "edit_file", "read_file"]);
+    assert!(
+        sink.tool_ends.iter().all(|(_, _, is_error)| !is_error),
+        "all tools should succeed: {:?}",
+        sink.tool_ends
+    );
+    assert!(
+        sink.tool_ends[2].1.contains("version = 2.0.0"),
+        "verification read should see the new version"
+    );
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("version = 2.0.0"));
+    assert!(!content.contains("version = 1.0.0"));
+    assert!(sink.text.contains("2.0.0"));
+}
+
+#[tokio::test]
 async fn e2e_adds_function_to_existing_rust_file() {
     let dir = tempdir();
     let path = dir.join("math.rs");
