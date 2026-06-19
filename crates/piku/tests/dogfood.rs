@@ -778,6 +778,14 @@ pub fn print_sum(values: &[i32]) {
         !lib_content.contains("compute_total"),
         "lib.rs should not have old name.\ncontent:\n{lib_content}"
     );
+    assert!(
+        !main_content.contains("compute_total"),
+        "main.rs should not have old name.\ncontent:\n{main_content}"
+    );
+    assert!(
+        !utils_content.contains("compute_total"),
+        "utils.rs should not have old name.\ncontent:\n{utils_content}"
+    );
 }
 
 /// Scenario: piku finds an intentional off-by-one bug in a loop.
@@ -832,10 +840,18 @@ pub fn sum(values: &[i32]) -> i32 {
 
     // After the fix, the file should use `i < n` not `i < n - 1`
     let content = std::fs::read_to_string(workspace.join("stats.rs")).unwrap();
-    // Either fixed the while condition or rewrote using iter().sum()
-    let fixed = content.contains("i < n")
-        || content.contains("i <= n")
+    assert!(
+        !content.contains("i < n - 1"),
+        "the original off-by-one condition should be gone. content:\n{content}"
+    );
+    assert!(
+        !content.contains("i <= n"),
+        "`i <= n` would read past the end of the slice. content:\n{content}"
+    );
+    // Either fixed the while condition or rewrote using iteration.
+    let fixed = content.contains("while i < n {")
         || content.contains(".sum()")
+        || content.contains("for ")
         || content.contains("iter()");
     assert!(
         fixed,
