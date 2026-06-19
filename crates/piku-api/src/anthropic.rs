@@ -142,7 +142,6 @@ pub fn parse_anthropic_sse_pub(
     parse_anthropic_sse(event_type, data)
 }
 
-#[allow(clippy::too_many_lines)]
 fn parse_anthropic_sse(event_type: Option<&str>, data: &str) -> Result<Vec<Event>, ApiError> {
     if data == "[DONE]" {
         return Ok(vec![]);
@@ -154,110 +153,115 @@ fn parse_anthropic_sse(event_type: Option<&str>, data: &str) -> Result<Vec<Event
     let et = event_type.unwrap_or(&raw.event_type);
 
     match et {
-        "content_block_start" => {
-            let Some(block) = raw.rest.get("content_block") else {
-                return Ok(vec![]);
-            };
-            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                let id = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = block
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(vec![Event::ToolUseStart { id, name }]);
-            }
-            Ok(vec![])
-        }
-
-        "content_block_delta" => {
-            let Some(delta) = raw.rest.get("delta") else {
-                return Ok(vec![]);
-            };
-            let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            match delta_type {
-                "text_delta" => {
-                    let text = delta
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if text.is_empty() {
-                        Ok(vec![])
-                    } else {
-                        Ok(vec![Event::TextDelta { text }])
-                    }
-                }
-                "input_json_delta" => {
-                    let partial_json = delta
-                        .get("partial_json")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    // We need the tool use id — it's in the outer index, not the delta.
-                    // We use a placeholder; the runtime correlates by stream position.
-                    let id = raw
-                        .rest
-                        .get("index")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|i| format!("__idx_{i}"))
-                        .unwrap_or_default();
-                    Ok(vec![Event::ToolUseDelta { id, partial_json }])
-                }
-                _ => Ok(vec![]),
-            }
-        }
-
-        "content_block_stop" => {
-            let id = raw
-                .rest
-                .get("index")
-                .and_then(serde_json::Value::as_u64)
-                .map(|i| format!("__idx_{i}"))
-                .unwrap_or_default();
-            Ok(vec![Event::ToolUseEnd { id }])
-        }
-
-        "message_delta" => {
-            let Some(delta) = raw.rest.get("delta") else {
-                return Ok(vec![Event::MessageStop {
-                    stop_reason: StopReason::EndTurn,
-                }]);
-            };
-            let stop_reason = delta
-                .get("stop_reason")
-                .and_then(|v| v.as_str())
-                .map_or(StopReason::EndTurn, StopReason::from_wire_str);
-
-            let mut events = vec![Event::MessageStop { stop_reason }];
-
-            // usage may also be in message_delta
-            if let Some(usage_val) = raw.rest.get("usage") {
-                if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
-                    events.push(Event::UsageDelta { usage });
-                }
-            }
-
-            Ok(events)
-        }
-
-        "message_start" => {
-            // usage is in message.usage
-            if let Some(msg) = raw.rest.get("message") {
-                if let Some(usage_val) = msg.get("usage") {
-                    if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
-                        return Ok(vec![Event::UsageDelta { usage }]);
-                    }
-                }
-            }
-            Ok(vec![])
-        }
-
+        "content_block_start" => Ok(anthropic_content_block_start(&raw)),
+        "content_block_delta" => Ok(anthropic_content_block_delta(&raw)),
+        "content_block_stop" => Ok(vec![Event::ToolUseEnd {
+            id: anthropic_index_id(&raw),
+        }]),
+        "message_delta" => Ok(anthropic_message_delta(&raw)),
+        "message_start" => Ok(anthropic_message_start(&raw)),
         _ => Ok(vec![]),
     }
+}
+
+fn anthropic_content_block_start(raw: &RawStreamEvent) -> Vec<Event> {
+    let Some(block) = raw.rest.get("content_block") else {
+        return vec![];
+    };
+    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+        return vec![];
+    }
+
+    let id = block
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = block
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    vec![Event::ToolUseStart { id, name }]
+}
+
+fn anthropic_content_block_delta(raw: &RawStreamEvent) -> Vec<Event> {
+    let Some(delta) = raw.rest.get("delta") else {
+        return vec![];
+    };
+    let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match delta_type {
+        "text_delta" => anthropic_text_delta(delta),
+        "input_json_delta" => anthropic_input_json_delta(raw, delta),
+        _ => vec![],
+    }
+}
+
+fn anthropic_text_delta(delta: &serde_json::Value) -> Vec<Event> {
+    let text = delta
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if text.is_empty() {
+        vec![]
+    } else {
+        vec![Event::TextDelta { text }]
+    }
+}
+
+fn anthropic_input_json_delta(raw: &RawStreamEvent, delta: &serde_json::Value) -> Vec<Event> {
+    let partial_json = delta
+        .get("partial_json")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // We need the tool use id — it's in the outer index, not the delta.
+    // We use a placeholder; the runtime correlates by stream position.
+    let id = anthropic_index_id(raw);
+    vec![Event::ToolUseDelta { id, partial_json }]
+}
+
+fn anthropic_message_delta(raw: &RawStreamEvent) -> Vec<Event> {
+    let Some(delta) = raw.rest.get("delta") else {
+        return vec![Event::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        }];
+    };
+    let stop_reason = delta
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map_or(StopReason::EndTurn, StopReason::from_wire_str);
+
+    let mut events = vec![Event::MessageStop { stop_reason }];
+
+    // usage may also be in message_delta
+    if let Some(usage_val) = raw.rest.get("usage") {
+        if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
+            events.push(Event::UsageDelta { usage });
+        }
+    }
+
+    events
+}
+
+fn anthropic_message_start(raw: &RawStreamEvent) -> Vec<Event> {
+    // usage is in message.usage
+    if let Some(msg) = raw.rest.get("message") {
+        if let Some(usage_val) = msg.get("usage") {
+            if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
+                return vec![Event::UsageDelta { usage }];
+            }
+        }
+    }
+    vec![]
+}
+
+fn anthropic_index_id(raw: &RawStreamEvent) -> String {
+    raw.rest
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .map(|i| format!("__idx_{i}"))
+        .unwrap_or_default()
 }
