@@ -18,6 +18,7 @@
 /// Multiline: paste text with newlines, or press Enter mid-input to add
 /// a line. Submit by pressing Enter on an empty continuation line.
 use std::io::{self, Write};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::input_helper::{LineEditor, ReadOutcome};
 use crate::markdown::StreamingMarkdown;
@@ -759,6 +760,12 @@ pub struct TuiSink {
     md: StreamingMarkdown,
 }
 
+fn lock_indicator_label(label: &Mutex<String>) -> MutexGuard<'_, String> {
+    label
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl TuiSink {
     fn new(_model: &str, binary_mtime_baseline: Option<std::time::SystemTime>) -> Self {
         Self {
@@ -833,7 +840,7 @@ impl OutputSink for TuiSink {
             ));
         }
         // Update indicator label to show tool execution
-        *self.indicator_label.lock().unwrap() = format!("running {name}");
+        *lock_indicator_label(&self.indicator_label) = format!("running {name}");
         let _ = self.stdout.flush();
     }
 
@@ -851,7 +858,7 @@ impl OutputSink for TuiSink {
         };
         self.println(connector);
         // Restore label for next iteration (model will think again)
-        *self.indicator_label.lock().unwrap() = "thinking".to_string();
+        *lock_indicator_label(&self.indicator_label) = "thinking".to_string();
         let _ = self.stdout.flush();
 
         if tool_name == "bash" {
@@ -1305,7 +1312,7 @@ async fn run_tui_repl_core(
                 let stop_flag = sink.thinking_stop.clone();
                 stop_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 let label_ref = sink.indicator_label.clone();
-                *label_ref.lock().unwrap() = "thinking".to_string();
+                *lock_indicator_label(&label_ref) = "thinking".to_string();
                 // Show dimmed prompt with animated indicator on the input row.
                 goto(rows, 1);
                 print!("\x1b[2K\x1b[2m❯ · thinking\x1b[0m\x1b[?25h");
@@ -1326,7 +1333,7 @@ async fn run_tui_repl_core(
                         let frame = FRAMES[tick % FRAMES.len()];
                         tick += 1;
                         let time_str = crate::fmt_duration(elapsed);
-                        let label = label_ref.lock().unwrap().clone();
+                        let label = lock_indicator_label(&label_ref).clone();
                         // Stalled state: after 30s, interpolate color toward red
                         let color = if elapsed > STALL_SECS {
                             let t = ((elapsed - STALL_SECS) as f32 / 30.0).min(1.0);
@@ -2044,6 +2051,42 @@ mod tests {
 
     use super::*;
 
+    static CONTEXT_WINDOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ContextWindowEnvRestore(Option<String>);
+
+    impl ContextWindowEnvRestore {
+        fn new() -> Self {
+            let saved = std::env::var("PIKU_CONTEXT_WINDOW").ok();
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::remove_var("PIKU_CONTEXT_WINDOW");
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for ContextWindowEnvRestore {
+        fn drop(&mut self) {
+            #[allow(unsafe_code)]
+            unsafe {
+                if let Some(value) = &self.0 {
+                    std::env::set_var("PIKU_CONTEXT_WINDOW", value);
+                } else {
+                    std::env::remove_var("PIKU_CONTEXT_WINDOW");
+                }
+            }
+        }
+    }
+
+    fn with_clean_context_window_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = CONTEXT_WINDOW_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = ContextWindowEnvRestore::new();
+        f()
+    }
+
     fn strip_ansi(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars().peekable();
@@ -2199,17 +2242,23 @@ mod tests {
 
     #[test]
     fn context_pct_zero_is_none() {
-        assert_eq!(context_pct(0), None);
+        with_clean_context_window_env(|| {
+            assert_eq!(context_pct(0), None);
+        });
     }
 
     #[test]
     fn context_pct_half() {
-        assert_eq!(context_pct(100_000), Some(50));
+        with_clean_context_window_env(|| {
+            assert_eq!(context_pct(100_000), Some(50));
+        });
     }
 
     #[test]
     fn context_pct_caps() {
-        assert_eq!(context_pct(300_000), Some(100));
+        with_clean_context_window_env(|| {
+            assert_eq!(context_pct(300_000), Some(100));
+        });
     }
 
     // ── format_result_lines ─────────────────────────────────────────
@@ -2276,51 +2325,56 @@ mod tests {
 
     #[test]
     fn context_window_claude_200k() {
-        assert_eq!(context_window_for("anthropic/claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
-        assert_eq!(context_window_for("anthropic/Claude-Opus-4-1"), 200_000);
+        with_clean_context_window_env(|| {
+            assert_eq!(context_window_for("anthropic/claude-sonnet-4-6"), 200_000);
+            assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
+            assert_eq!(context_window_for("anthropic/Claude-Opus-4-1"), 200_000);
+        });
     }
 
     #[test]
     fn context_window_gpt4_128k() {
-        assert_eq!(context_window_for("openai/gpt-4o"), 128_000);
-        assert_eq!(context_window_for("gpt-4-turbo"), 128_000);
+        with_clean_context_window_env(|| {
+            assert_eq!(context_window_for("openai/gpt-4o"), 128_000);
+            assert_eq!(context_window_for("gpt-4-turbo"), 128_000);
+        });
     }
 
     #[test]
     fn context_window_gemini_1m() {
-        assert_eq!(context_window_for("google/gemini-2.5-pro"), 1_000_000);
-        assert_eq!(context_window_for("gemini-3-pro"), 1_000_000);
+        with_clean_context_window_env(|| {
+            assert_eq!(context_window_for("google/gemini-2.5-pro"), 1_000_000);
+            assert_eq!(context_window_for("gemini-3-pro"), 1_000_000);
+        });
     }
 
     #[test]
     fn context_window_ollama_8k_default() {
-        assert_eq!(context_window_for("llama3.2:latest"), 8_192);
-        assert_eq!(context_window_for("qwen2.5-coder"), 8_192);
+        with_clean_context_window_env(|| {
+            assert_eq!(context_window_for("llama3.2:latest"), 8_192);
+            assert_eq!(context_window_for("qwen2.5-coder"), 8_192);
+        });
     }
 
     #[test]
     fn context_window_env_override() {
-        // Safety: env::set_var/remove_var are safe pre-thread-spawn but the
-        // test runner uses threads. Serial not available here — keep the
-        // race window tight. Not perfect but the lint allows it.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("PIKU_CONTEXT_WINDOW", "512000");
-        }
-        assert_eq!(context_window_for("claude-sonnet-4-6"), 512_000);
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::remove_var("PIKU_CONTEXT_WINDOW");
-        }
+        with_clean_context_window_env(|| {
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("PIKU_CONTEXT_WINDOW", "512000");
+            }
+            assert_eq!(context_window_for("claude-sonnet-4-6"), 512_000);
+        });
     }
 
     #[test]
     fn context_pct_honors_model() {
-        // 100k tokens, claude window 200k → 50%.
-        assert_eq!(context_pct_for(100_000, "claude-sonnet-4-6"), Some(50));
-        // Same 100k, gpt-4o window 128k → 78%.
-        assert_eq!(context_pct_for(100_000, "openai/gpt-4o"), Some(78));
+        with_clean_context_window_env(|| {
+            // 100k tokens, claude window 200k → 50%.
+            assert_eq!(context_pct_for(100_000, "claude-sonnet-4-6"), Some(50));
+            // Same 100k, gpt-4o window 128k → 78%.
+            assert_eq!(context_pct_for(100_000, "openai/gpt-4o"), Some(78));
+        });
     }
 
     #[test]

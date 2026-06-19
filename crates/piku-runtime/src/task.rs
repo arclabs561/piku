@@ -15,7 +15,7 @@
 /// `TaskRegistry` is `Clone + Send + Sync` — it wraps an `Arc<Mutex<_>>`
 /// so it can be handed to the TUI, the agent loop, and tool executors.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -291,10 +291,16 @@ impl TaskRegistry {
         }
     }
 
+    fn inner(&self) -> MutexGuard<'_, RegistryInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Register an interjection channel so background task completions
     /// auto-inject a notification into the parent's agent loop.
     pub fn set_notification_channel(&self, tx: mpsc::Sender<String>) {
-        self.inner.lock().unwrap().notification_tx = Some(tx);
+        self.inner().notification_tx = Some(tx);
     }
 
     /// Register a new running task. Returns the id.
@@ -318,13 +324,13 @@ impl TaskRegistry {
             turns_used: 0,
             worktree_path,
         };
-        self.inner.lock().unwrap().tasks.insert(id.clone(), entry);
+        self.inner().tasks.insert(id.clone(), entry);
         id
     }
 
     /// Mark a task as complete with its final output.
     pub fn complete(&self, id: &AgentTaskId, output: &str, turns_used: u32) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let notification = if let Some(entry) = inner.tasks.get_mut(id) {
             entry.status = TaskStatus::Done;
             entry.output = Some(output.to_string());
@@ -344,7 +350,7 @@ impl TaskRegistry {
 
     /// Mark a task as failed.
     pub fn fail(&self, id: &AgentTaskId, reason: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let notification = if let Some(entry) = inner.tasks.get_mut(id) {
             entry.status = TaskStatus::Failed;
             entry.output = Some(reason.to_string());
@@ -364,13 +370,13 @@ impl TaskRegistry {
     /// Poll the status of a task without blocking.
     #[must_use]
     pub fn status(&self, id: &AgentTaskId) -> Option<TaskEntry> {
-        self.inner.lock().unwrap().tasks.get(id).cloned()
+        self.inner().tasks.get(id).cloned()
     }
 
     /// All tasks, sorted by start time (most recent first).
     #[must_use]
     pub fn all(&self) -> Vec<TaskEntry> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         let mut tasks: Vec<_> = inner.tasks.values().cloned().collect();
         tasks.sort_by_key(|t| std::cmp::Reverse(t.started_at));
         tasks
@@ -390,7 +396,7 @@ impl TaskRegistry {
     #[must_use]
     pub fn wait_for(&self, id: &AgentTaskId) -> oneshot::Receiver<TaskEntry> {
         let (tx, rx) = oneshot::channel();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         // If already done, notify immediately
         if let Some(entry) = inner.tasks.get(id) {
             if entry.status != TaskStatus::Running {
