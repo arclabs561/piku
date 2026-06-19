@@ -162,135 +162,16 @@ impl Provider for OpenAiCompatProvider {
 // Build `OpenAI` chat completions request body
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
+#[must_use]
 pub fn build_openai_body(request: &MessageRequest) -> serde_json::Value {
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
-    if let Some(system_blocks) = &request.system {
-        // OpenAI takes system as a plain string message — flatten all blocks.
-        let content: String = system_blocks
-            .iter()
-            .map(|b| b.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !content.is_empty() {
-            messages.push(serde_json::json!({ "role": "system", "content": content }));
-        }
+    if let Some(system_message) = openai_system_message(request) {
+        messages.push(system_message);
     }
 
     for msg in &request.messages {
-        // For tool results (role=user with ToolResult blocks) we need the
-        // OpenAI tool message format.
-        let has_tool_results = msg
-            .content
-            .iter()
-            .any(|c| matches!(c, RequestContent::ToolResult { .. }));
-
-        if has_tool_results {
-            // Emit one "tool" role message per ToolResult block.
-            // Any accompanying Text blocks (from coalesced messages after a
-            // ReplaceAndExec restart) are emitted separately as a "user" message
-            // AFTER the tool results, so the model sees the follow-up prompt.
-            for block in &msg.content {
-                if let RequestContent::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                {
-                    let content_str = if is_error.unwrap_or(false) {
-                        format!("Error: {content}")
-                    } else {
-                        content.clone()
-                    };
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": content_str,
-                    }));
-                }
-            }
-            // Emit any Text blocks as a follow-up user message
-            let text_blocks: Vec<&str> = msg
-                .content
-                .iter()
-                .filter_map(|c| {
-                    if let RequestContent::Text { text } = c {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !text_blocks.is_empty() {
-                let combined = text_blocks.join("\n");
-                messages.push(serde_json::json!({ "role": "user", "content": combined }));
-            }
-            continue;
-        }
-
-        // Check for tool use blocks (assistant tool calls)
-        let has_tool_use = msg
-            .content
-            .iter()
-            .any(|c| matches!(c, RequestContent::ToolUse { .. }));
-
-        if has_tool_use {
-            let text: String = msg
-                .content
-                .iter()
-                .filter_map(|c| {
-                    if let RequestContent::Text { text } = c {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("");
-
-            let tool_calls: Vec<serde_json::Value> = msg
-                .content
-                .iter()
-                .filter_map(|c| {
-                    if let RequestContent::ToolUse { id, name, input } = c {
-                        Some(serde_json::json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": input.to_string(),
-                            }
-                        }))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let mut obj = serde_json::json!({
-                "role": "assistant",
-                "tool_calls": tool_calls,
-            });
-            if !text.is_empty() {
-                obj["content"] = serde_json::Value::String(text);
-            }
-            messages.push(obj);
-            continue;
-        }
-
-        // Regular user/assistant text message
-        let content: serde_json::Value = if msg.content.len() == 1 {
-            if let RequestContent::Text { text } = &msg.content[0] {
-                serde_json::Value::String(text.clone())
-            } else {
-                serde_json::Value::Array(msg.content.iter().map(request_content_to_oai).collect())
-            }
-        } else {
-            serde_json::Value::Array(msg.content.iter().map(request_content_to_oai).collect())
-        };
-
-        messages.push(serde_json::json!({ "role": msg.role, "content": content }));
+        messages.extend(openai_messages_for_request(msg));
     }
 
     let mut body = serde_json::json!({
@@ -308,6 +189,143 @@ pub fn build_openai_body(request: &MessageRequest) -> serde_json::Value {
     }
 
     body
+}
+
+fn openai_system_message(request: &MessageRequest) -> Option<serde_json::Value> {
+    let system_blocks = request.system.as_ref()?;
+    // OpenAI takes system as a plain string message: flatten all blocks.
+    let content: String = system_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if content.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "role": "system", "content": content }))
+    }
+}
+
+fn openai_messages_for_request(msg: &crate::types::RequestMessage) -> Vec<serde_json::Value> {
+    if msg
+        .content
+        .iter()
+        .any(|c| matches!(c, RequestContent::ToolResult { .. }))
+    {
+        return openai_tool_result_messages(msg);
+    }
+
+    if msg
+        .content
+        .iter()
+        .any(|c| matches!(c, RequestContent::ToolUse { .. }))
+    {
+        return vec![openai_tool_use_message(msg)];
+    }
+
+    vec![openai_regular_message(msg)]
+}
+
+fn openai_tool_result_messages(msg: &crate::types::RequestMessage) -> Vec<serde_json::Value> {
+    // Emit one "tool" role message per ToolResult block.
+    // Any accompanying Text blocks (from coalesced messages after a
+    // ReplaceAndExec restart) are emitted separately as a "user" message
+    // AFTER the tool results, so the model sees the follow-up prompt.
+    let mut messages: Vec<serde_json::Value> = msg
+        .content
+        .iter()
+        .filter_map(openai_tool_result_message)
+        .collect();
+
+    let text_blocks: Vec<&str> = msg.content.iter().filter_map(request_text).collect();
+    if !text_blocks.is_empty() {
+        let combined = text_blocks.join("\n");
+        messages.push(serde_json::json!({ "role": "user", "content": combined }));
+    }
+
+    messages
+}
+
+fn openai_tool_result_message(block: &RequestContent) -> Option<serde_json::Value> {
+    let RequestContent::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+    } = block
+    else {
+        return None;
+    };
+    let content_str = if is_error.unwrap_or(false) {
+        format!("Error: {content}")
+    } else {
+        content.clone()
+    };
+    Some(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": tool_use_id,
+        "content": content_str,
+    }))
+}
+
+fn openai_tool_use_message(msg: &crate::types::RequestMessage) -> serde_json::Value {
+    let text: String = msg
+        .content
+        .iter()
+        .filter_map(request_text)
+        .collect::<Vec<_>>()
+        .join("");
+
+    let tool_calls: Vec<serde_json::Value> =
+        msg.content.iter().filter_map(openai_tool_call).collect();
+
+    let mut obj = serde_json::json!({
+        "role": "assistant",
+        "tool_calls": tool_calls,
+    });
+    if !text.is_empty() {
+        obj["content"] = serde_json::Value::String(text);
+    }
+    obj
+}
+
+fn openai_tool_call(block: &RequestContent) -> Option<serde_json::Value> {
+    let RequestContent::ToolUse { id, name, input } = block else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": input.to_string(),
+        }
+    }))
+}
+
+fn openai_regular_message(msg: &crate::types::RequestMessage) -> serde_json::Value {
+    let content = if msg.content.len() == 1 {
+        if let RequestContent::Text { text } = &msg.content[0] {
+            serde_json::Value::String(text.clone())
+        } else {
+            openai_content_array(&msg.content)
+        }
+    } else {
+        openai_content_array(&msg.content)
+    };
+
+    serde_json::json!({ "role": msg.role, "content": content })
+}
+
+fn openai_content_array(content: &[RequestContent]) -> serde_json::Value {
+    serde_json::Value::Array(content.iter().map(request_content_to_oai).collect())
+}
+
+fn request_text(block: &RequestContent) -> Option<&str> {
+    if let RequestContent::Text { text } = block {
+        Some(text.as_str())
+    } else {
+        None
+    }
 }
 
 fn request_content_to_oai(block: &RequestContent) -> serde_json::Value {
