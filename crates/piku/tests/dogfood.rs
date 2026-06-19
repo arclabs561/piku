@@ -90,6 +90,7 @@ struct Experience {
     stderr: String,
     exit_ok: bool,
     tool_calls: Vec<ToolCall>,
+    trace_events: Vec<serde_json::Value>,
     /// Files in the workspace that were created or modified.
     touched_files: Vec<PathBuf>,
     /// The assistant's final text response (everything not inside tool lines).
@@ -131,15 +132,41 @@ impl Experience {
     }
 
     fn tool_names(&self) -> Vec<&str> {
-        self.tool_calls.iter().map(|t| t.name.as_str()).collect()
+        let trace_names: Vec<&str> = self
+            .trace_events
+            .iter()
+            .filter(|e| e["event"] == "tool_start")
+            .filter_map(|e| e["tool"].as_str())
+            .collect();
+        if trace_names.is_empty() {
+            self.tool_calls.iter().map(|t| t.name.as_str()).collect()
+        } else {
+            trace_names
+        }
     }
 
     fn all_tools_ok(&self) -> bool {
-        self.tool_calls.iter().all(|t| t.ok)
+        let trace_tool_ends: Vec<&serde_json::Value> = self
+            .trace_events
+            .iter()
+            .filter(|e| e["event"] == "tool_end")
+            .collect();
+        if trace_tool_ends.is_empty() {
+            self.tool_calls.iter().all(|t| t.ok)
+        } else {
+            trace_tool_ends
+                .iter()
+                .all(|e| e["ok"].as_bool() == Some(true))
+        }
     }
 
     fn tool_called(&self, name: &str) -> bool {
-        self.tool_calls.iter().any(|t| t.name == name)
+        let trace_names = self.tool_names();
+        if trace_names.is_empty() {
+            self.tool_calls.iter().any(|t| t.name == name)
+        } else {
+            trace_names.contains(&name)
+        }
     }
 }
 
@@ -178,7 +205,13 @@ fn strip_ansi(s: &str) -> String {
 /// Tool start line:  `[tool_name args …]`  (after ANSI strip)
 /// Tool end line:    `[tool_name → ok]` or `[tool_name → err]`
 /// Everything else: response text
-fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> Experience {
+fn parse_output(
+    stdout: &str,
+    stderr: &str,
+    exit_ok: bool,
+    workspace: &Path,
+    trace_events: Vec<serde_json::Value>,
+) -> Experience {
     let clean = strip_ansi(stdout);
 
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -247,9 +280,44 @@ fn parse_output(stdout: &str, stderr: &str, exit_ok: bool, workspace: &Path) -> 
         stderr: stderr.to_string(),
         exit_ok,
         tool_calls,
+        trace_events,
         touched_files,
         response_text: response_lines.join("\n"),
     }
+}
+
+fn read_trace_events(config_dir: &Path) -> Vec<serde_json::Value> {
+    let traces_dir = config_dir.join("piku").join("traces");
+    let Ok(entries) = std::fs::read_dir(traces_dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    paths.sort();
+
+    let Some(trace_path) = paths.last() else {
+        return Vec::new();
+    };
+    parse_trace_file(trace_path)
+}
+
+fn parse_trace_file(trace_path: &Path) -> Vec<serde_json::Value> {
+    let trace_content = std::fs::read_to_string(trace_path)
+        .unwrap_or_else(|e| panic!("failed to read trace file {}: {e}", trace_path.display()));
+    trace_content
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|_| {
+                panic!(
+                    "trace line in {} should be valid JSON: {line}",
+                    trace_path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 fn collect_workspace_files(dir: &Path) -> Vec<PathBuf> {
@@ -310,7 +378,8 @@ fn run_scenario(
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_ok = output.status.success();
 
-    parse_output(&stdout, &stderr, exit_ok, workspace)
+    let trace_events = read_trace_events(&config_dir);
+    parse_output(&stdout, &stderr, exit_ok, workspace, trace_events)
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +741,7 @@ fn dogfood_read_edit_verify_loop() {
 
     // Should have used at least 2 file tool calls (read, edit/write, maybe read again)
     assert!(
-        exp.tool_calls.len() >= 2,
+        exp.tool_names().len() >= 2,
         "should use at least 2 tool calls. got: {:?}",
         exp.tool_names()
     );
@@ -1019,7 +1088,14 @@ fn dogfood_trace_file_is_written() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exp = parse_output(&stdout, &stderr, output.status.success(), &workspace);
+    let trace_events = read_trace_events(&config_dir);
+    let exp = parse_output(
+        &stdout,
+        &stderr,
+        output.status.success(),
+        &workspace,
+        trace_events,
+    );
     exp.report("trace_file_is_written");
 
     // Traces dir should exist under config_dir
@@ -1044,15 +1120,8 @@ fn dogfood_trace_file_is_written() {
 
     // Read the trace and verify it has expected event types
     let trace_path = trace_files[0].path();
-    let trace_content = std::fs::read_to_string(&trace_path).unwrap();
-
     // Each line should be valid JSON
-    let mut events: Vec<serde_json::Value> = Vec::new();
-    for line in trace_content.lines() {
-        let v: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|_| panic!("trace line should be valid JSON: {line}"));
-        events.push(v);
-    }
+    let events = parse_trace_file(&trace_path);
 
     assert!(!events.is_empty(), "trace file should have events");
 
