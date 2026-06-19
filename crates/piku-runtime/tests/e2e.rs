@@ -791,6 +791,164 @@ async fn e2e_glob_and_grep_codebase() {
     assert!(grep_result.1.contains("fn "));
 }
 
+#[tokio::test]
+async fn e2e_multifile_rename_updates_all_call_sites() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let lib_path = dir.join("src/lib.rs");
+    let main_path = dir.join("src/main.rs");
+    let utils_path = dir.join("src/utils.rs");
+
+    std::fs::write(
+        &lib_path,
+        r"pub fn compute_total(items: &[i32]) -> i32 {
+    items.iter().sum()
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_path,
+        r#"mod lib;
+fn main() {
+    let items = vec![1, 2, 3];
+    let total = lib::compute_total(&items);
+    println!("total: {total}");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &utils_path,
+        r#"use crate::lib;
+pub fn print_sum(values: &[i32]) {
+    let result = lib::compute_total(values);
+    println!("sum = {result}");
+}
+"#,
+    )
+    .unwrap();
+
+    let glob_input =
+        serde_json::json!({ "pattern": "**/*.rs", "path": dir.join("src") }).to_string();
+    let grep_old_input = serde_json::json!({
+        "pattern": "compute_total",
+        "path": dir.join("src"),
+        "include": "*.rs"
+    })
+    .to_string();
+    let edit_lib_input = serde_json::json!({
+        "path": lib_path,
+        "old_string": "pub fn compute_total(items: &[i32]) -> i32",
+        "new_string": "pub fn sum_items(items: &[i32]) -> i32",
+    })
+    .to_string();
+    let edit_main_input = serde_json::json!({
+        "path": main_path,
+        "old_string": "lib::compute_total(&items)",
+        "new_string": "lib::sum_items(&items)",
+    })
+    .to_string();
+    let edit_utils_input = serde_json::json!({
+        "path": utils_path,
+        "old_string": "lib::compute_total(values)",
+        "new_string": "lib::sum_items(values)",
+    })
+    .to_string();
+    let grep_new_input = serde_json::json!({
+        "pattern": "sum_items",
+        "path": dir.join("src"),
+        "include": "*.rs"
+    })
+    .to_string();
+    let grep_verify_input = serde_json::json!({
+        "pattern": "compute_total",
+        "path": dir.join("src"),
+        "include": "*.rs"
+    })
+    .to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("g1", "glob", &glob_input),
+        tool_call_events("s1", "grep", &grep_old_input),
+        tool_call_events("e1", "edit_file", &edit_lib_input),
+        tool_call_events("e2", "edit_file", &edit_main_input),
+        tool_call_events("e3", "edit_file", &edit_utils_input),
+        tool_call_events("s2", "grep", &grep_new_input),
+        tool_call_events("s3", "grep", &grep_verify_input),
+        text_stop("Renamed compute_total to sum_items in the definition and call sites."),
+    ]);
+
+    let mut session = Session::new("e2e-multifile-rename".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "rename compute_total to sum_items everywhere in src",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    let tool_names: Vec<&str> = sink
+        .tool_starts
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        tool_names,
+        [
+            "glob",
+            "grep",
+            "edit_file",
+            "edit_file",
+            "edit_file",
+            "grep",
+            "grep"
+        ]
+    );
+    assert!(
+        sink.tool_ends.iter().all(|(_, _, is_error)| !is_error),
+        "all tools should succeed: {:?}",
+        sink.tool_ends
+    );
+    assert!(
+        sink.tool_ends[1].1.matches("compute_total").count() >= 3,
+        "initial grep should find definition and call sites: {}",
+        sink.tool_ends[1].1
+    );
+    assert!(
+        sink.tool_ends[5].1.matches("sum_items").count() >= 3,
+        "new-name grep should find definition and call sites: {}",
+        sink.tool_ends[5].1
+    );
+    assert!(
+        sink.tool_ends[6].1.contains("(no matches)"),
+        "old-name verification grep should find no matches: {}",
+        sink.tool_ends[6].1
+    );
+
+    for path in [&lib_path, &main_path, &utils_path] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.contains("sum_items"),
+            "{} should use sum_items",
+            path.display()
+        );
+        assert!(
+            !content.contains("compute_total"),
+            "{} should not use compute_total",
+            path.display()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // E2E scenario 8: Bash tool executes and captures output
 // ---------------------------------------------------------------------------
