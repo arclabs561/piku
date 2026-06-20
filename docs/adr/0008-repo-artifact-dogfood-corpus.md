@@ -38,6 +38,11 @@ row into a local Markdown prompt seed. `scripts/github-corpus-run.sh` runs the
 seed against a temp repo copy and appends a JSONL ledger row. The output is
 ignored generated data.
 
+Corpus prompt success requires more than process exit 0. The runner validates
+the trace: only read-only tools may run, all tools must succeed, the model must
+read local files including changed files, and the output must mention changed
+files plus a test or doc check.
+
 Piku runtime stays GitHub-agnostic. Normal PR CI does not fetch repo artifacts.
 
 ## Consequences

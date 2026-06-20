@@ -81,6 +81,10 @@ body="$(jq -r '.body // ""' <<<"$row")"
   printf -- '- Name the files most likely to matter.\n'
   printf -- '- Say what deterministic test or doc check this history suggests.\n'
   printf -- '- Call out any stale claim, missing verification, or follow-up risk.\n\n'
+  printf 'Evidence requirements:\n'
+  printf -- '- Read local files before answering. Do not rely on the PR body alone.\n'
+  printf -- '- Cite exact repo paths for each concrete claim.\n'
+  printf -- '- Separate observed facts from recommendations.\n\n'
   printf '## PR\n\n'
   printf -- '- title: `%s`\n' "$title"
   printf -- '- url: `%s`\n' "$url"

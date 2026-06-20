@@ -18,7 +18,12 @@ exporter fetches PR and issue lists, optional PR and issue detail JSONL, a
 combined bundle, and a short summary. The prompt script turns one PR detail row
 into a read-only Markdown seed for local dogfood. The runner executes that seed
 against a temp repo copy and writes the same kind of JSONL ledger row as other
-live dogfood. The output is ignored build data, not committed fixture data.
+live dogfood.
+
+The runner also validates the trace before calling a run successful. It rejects
+mutating tools, failed tools, missing traces, weak file-reading evidence, and
+responses that do not mention changed files or a test/doc check. The output is
+ignored build data, not committed fixture data.
 
 ## Non-goals
 
@@ -27,6 +32,7 @@ live dogfood. The output is ignored build data, not committed fixture data.
 - Do not file issues or comments automatically.
 - Do not treat issue labels, PR titles, or model prose as ground truth.
 - Do not add a hosted control plane.
+- Do not treat corpus prompt success as a product guarantee.
 
 ## Options considered
 

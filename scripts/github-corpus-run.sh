@@ -12,6 +12,7 @@
 #   PIKU_LIVE_KEY_VAR=OPENROUTER_API_KEY           optional key env override
 #   PIKU_LIVE_LEDGER=/abs/path/runs.jsonl          optional ledger override
 #   PIKU_BIN=/path/to/piku                         optional piku binary override
+#   PIKU_GITHUB_CORPUS_VALIDATE=0                  skip validation for harness dry runs
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,6 +113,116 @@ trace_last_number() {
   jq -s -r "[.[] | select(.event == \"turn_end\")][-1].${field} // 0" "$trace"
 }
 
+changed_files_from_prompt() {
+  awk '/^- `[^`]+` \(/ { sub(/^- `/, ""); sub(/`.*/, ""); print }' "$prompt_path"
+}
+
+changed_files_total() {
+  changed_files_from_prompt | wc -l | tr -d ' '
+}
+
+changed_files_read_count() {
+  local trace="$1"
+  local changed_file read_path count=0
+  while IFS= read -r changed_file; do
+    [[ -n "$changed_file" ]] || continue
+    while IFS= read -r read_path; do
+      if [[ "$read_path" == "$changed_file" || "$read_path" == "./$changed_file" || "$read_path" == */"$changed_file" ]]; then
+        count=$((count + 1))
+        break
+      fi
+    done < <(jq -r 'select(.event == "tool_start" and .tool == "read_file") | .input.path // empty' "$trace")
+  done < <(changed_files_from_prompt)
+  printf '%s\n' "$count"
+}
+
+changed_files_mentioned_count() {
+  local output_file="$1"
+  local changed_file count=0
+  while IFS= read -r changed_file; do
+    [[ -n "$changed_file" ]] || continue
+    if grep -Fq "$changed_file" "$output_file"; then
+      count=$((count + 1))
+    fi
+  done < <(changed_files_from_prompt)
+  printf '%s\n' "$count"
+}
+
+validate_run() {
+  local trace="$1"
+  local output_file="$2"
+  local min_reads="${PIKU_GITHUB_CORPUS_MIN_READS:-3}"
+  local min_changed_reads="${PIKU_GITHUB_CORPUS_MIN_CHANGED_READS:-2}"
+  local min_changed_mentions="${PIKU_GITHUB_CORPUS_MIN_CHANGED_MENTIONS:-2}"
+  local read_count changed_file_total changed_read_count changed_mention_count bad_tools failed_tools
+
+  if [[ "${PIKU_GITHUB_CORPUS_VALIDATE:-1}" == "0" ]]; then
+    validation_error=""
+    validation_changed_files_read=0
+    validation_changed_files_mentioned=0
+    return 0
+  fi
+
+  if [[ -z "$trace" || ! -f "$trace" ]]; then
+    validation_error="missing_trace"
+    return 1
+  fi
+
+  changed_file_total="$(changed_files_total)"
+  if (( changed_file_total < min_changed_reads )); then
+    min_changed_reads="$changed_file_total"
+  fi
+  if (( changed_file_total < min_changed_mentions )); then
+    min_changed_mentions="$changed_file_total"
+  fi
+
+  bad_tools="$(
+    jq -r '
+      select(.event == "tool_start")
+      | select((.tool == "read_file" or .tool == "grep" or .tool == "glob" or .tool == "list_dir") | not)
+      | .tool
+    ' "$trace" | sort -u | paste -sd ','
+  )"
+  if [[ -n "$bad_tools" ]]; then
+    validation_error="read_only_violation:${bad_tools}"
+    return 1
+  fi
+
+  failed_tools="$(trace_count "$trace" 'select(.event == "tool_end" and .ok != true)')"
+  if (( failed_tools > 0 )); then
+    validation_error="tool_failure"
+    return 1
+  fi
+
+  read_count="$(trace_count "$trace" 'select(.event == "tool_start" and .tool == "read_file")')"
+  if (( read_count < min_reads )); then
+    validation_error="weak_evidence:read_file_count=${read_count}"
+    return 1
+  fi
+
+  changed_read_count="$(changed_files_read_count "$trace")"
+  validation_changed_files_read="$changed_read_count"
+  if (( changed_read_count < min_changed_reads )); then
+    validation_error="weak_evidence:changed_files_read=${changed_read_count}"
+    return 1
+  fi
+
+  changed_mention_count="$(changed_files_mentioned_count "$output_file")"
+  validation_changed_files_mentioned="$changed_mention_count"
+  if (( changed_mention_count < min_changed_mentions )); then
+    validation_error="weak_response:changed_files_mentioned=${changed_mention_count}"
+    return 1
+  fi
+
+  if ! grep -Eiq 'deterministic|test|check|verification|doc' "$output_file"; then
+    validation_error="weak_response:missing_test_or_check"
+    return 1
+  fi
+
+  validation_error=""
+  return 0
+}
+
 append_ledger() {
   local result="$1"
   local failure_class="$2"
@@ -124,6 +235,9 @@ append_ledger() {
   local tool_ends=0
   local failed_tools=0
   local permission_denied=0
+  local changed_files_read="${validation_changed_files_read:-0}"
+  local changed_files_mentioned="${validation_changed_files_mentioned:-0}"
+  local validation="${validation_error:-}"
 
   if [[ -n "$trace_path" && -f "$trace_path" ]]; then
     input_tokens="$(trace_last_number "$trace_path" input_tokens)"
@@ -153,7 +267,9 @@ append_ledger() {
     --arg failure_class "$failure_class" \
     --arg trace_path "$trace_path" \
     --arg prompt_path "$prompt_path" \
+    --arg output_path "${output_path:-}" \
     --arg run_dir "$run_dir" \
+    --arg validation_error "$validation" \
     --argjson input_tokens "$input_tokens" \
     --argjson output_tokens "$output_tokens" \
     --argjson iterations "$iterations" \
@@ -161,6 +277,8 @@ append_ledger() {
     --argjson tool_ends "$tool_ends" \
     --argjson failed_tools "$failed_tools" \
     --argjson permission_denied "$permission_denied" \
+    --argjson changed_files_read "$changed_files_read" \
+    --argjson changed_files_mentioned "$changed_files_mentioned" \
     --argjson duration_ms "$duration_ms" \
     '{
       suite: $suite,
@@ -171,7 +289,9 @@ append_ledger() {
       failure_class: $failure_class,
       trace_path: (if $trace_path == "" then null else $trace_path end),
       prompt_path: $prompt_path,
+      output_path: (if $output_path == "" then null else $output_path end),
       run_dir: $run_dir,
+      validation_error: (if $validation_error == "" then null else $validation_error end),
       input_tokens: $input_tokens,
       output_tokens: $output_tokens,
       iterations: $iterations,
@@ -179,6 +299,8 @@ append_ledger() {
       tool_ends: $tool_ends,
       failed_tools: $failed_tools,
       permission_denied: $permission_denied,
+      changed_files_read: $changed_files_read,
+      changed_files_mentioned: $changed_files_mentioned,
       duration_ms: $duration_ms
     }' >>"$ledger"
 }
@@ -228,6 +350,10 @@ fi
 run_dir="$(mktemp -d)"
 config_dir="$run_dir/config"
 repo_copy="$run_dir/repo"
+output_path="$run_dir/output.txt"
+validation_error=""
+validation_changed_files_read=0
+validation_changed_files_mentioned=0
 mkdir -p "$config_dir"
 rsync -a --delete --exclude target --exclude .git "$REPO_ROOT/" "$repo_copy/"
 
@@ -243,19 +369,38 @@ set +e
 (
   cd "$repo_copy"
   XDG_CONFIG_HOME="$config_dir" "$bin" --print --provider "$provider" --model "$model" "$prompt"
-)
+) | tee "$output_path"
 status=$?
 set -e
 end_seconds="$(date +%s)"
 duration_ms=$(( (end_seconds - start_seconds) * 1000 ))
 
 trace_path="$(latest_trace_path "$config_dir" || true)"
-if (( status == 0 )); then
+if (( status == 0 )) && validate_run "$trace_path" "$output_path"; then
   append_ledger "success" "none" "$duration_ms" "$trace_path"
 else
-  append_ledger "failure" "unknown_failure" "$duration_ms" "$trace_path"
+  if (( status == 0 )); then
+    status=1
+  fi
+  if [[ "$validation_error" == read_only_violation:* ]]; then
+    append_ledger "failure" "read_only_violation" "$duration_ms" "$trace_path"
+  elif [[ "$validation_error" == weak_evidence:* ]]; then
+    append_ledger "failure" "weak_evidence" "$duration_ms" "$trace_path"
+  elif [[ "$validation_error" == weak_response:* ]]; then
+    append_ledger "failure" "weak_response" "$duration_ms" "$trace_path"
+  elif [[ "$validation_error" == "tool_failure" ]]; then
+    append_ledger "failure" "tool_failure" "$duration_ms" "$trace_path"
+  elif [[ "$validation_error" == "missing_trace" ]]; then
+    append_ledger "failure" "missing_trace" "$duration_ms" "$trace_path"
+  else
+    append_ledger "failure" "unknown_failure" "$duration_ms" "$trace_path"
+  fi
 fi
 
 printf 'trace: %s\n' "${trace_path:-}"
+printf 'output: %s\n' "$output_path"
+if [[ -n "$validation_error" ]]; then
+  printf 'validation: %s\n' "$validation_error"
+fi
 printf 'exit: %s\n' "$status"
 exit "$status"

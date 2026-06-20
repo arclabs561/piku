@@ -35,6 +35,7 @@ Already done:
 - `just github-corpus` exports PR and issue artifacts.
 - `just github-prompt` turns one PR row into a dogfood prompt seed.
 - `just github-dogfood` runs one prompt seed against a temp repo copy and writes a ledger row.
+- Corpus dogfood now rejects mutating tools, failed tools, weak evidence gathering, and weak responses.
 - One local `llm_e2e` run produced and reviewed a ledger row for `openrouter/openai/gpt-4o-mini`.
 - One corpus-backed ledger row for PR #15 ran against a temp repo copy with `openrouter/openai/gpt-4o-mini`: 10 `read_file` calls, zero failed tools, two iterations.
 
