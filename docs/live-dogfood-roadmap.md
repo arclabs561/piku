@@ -27,17 +27,20 @@ Already done:
 - The generated-tests dogfood now compiles and runs the generated test binary.
 - A manual live matrix is committed in `d94cddd` with an owner gate and GitHub environment approval.
 - ADR-0005 is tracked even though new ADR files are hidden by the global gitignore.
+- Local live runs can write timestamped ledgers by default through `just live`, `just live-random`, and `just live-dogfood`.
+- ADR-0006 records the live ledger decision.
+- ADR-0007 records the promotion policy for repeated live failures.
+- `.gitignore` now unignores `docs/adr/*.md`, so future ADRs are not hidden by the global gitignore.
 
 Not done yet:
 
-- The live matrix has not run through GitHub with real environment secrets.
-- There is no dogfood result ledger yet.
-- There is no formal path from repeated live failures to deterministic PR-blocking tests.
+- The GitHub live matrix has not run through real environment secrets, by choice.
+- No local live ledger rows have been reviewed yet.
+- No real live finding has been promoted into a deterministic test yet.
 
 Current drift:
 
 - `.claude/reports/status.md` has stale findings. For example, clippy `-D warnings` is now wired into `scripts/ci.sh`.
-- New ADR files under `docs/adr/` are hidden by `/Users/arc/.gitignore_global`.
 
 ## Phase 0: checkpoint the live-matrix branch
 
@@ -61,6 +64,8 @@ Gate:
 - `git status --ignored` confirms the ADR is not silently lost.
 
 ## Phase 1: land the protected manual live matrix
+
+Status: available but deferred by the local-first decision.
 
 Goal: get live dogfood without automatic spend or public-trigger risk.
 
@@ -160,4 +165,4 @@ Recommendation:
 
 ## Next action
 
-Do Phase 1 next: push the protected live matrix and verify the manual workflow can only run through the intended owner and environment gates.
+Do local dev first: run `just live-random` or `just live-dogfood`, inspect the JSONL row in `target/live-ledger/`, then promote any repeated issue through `docs/live-failure-promotions.md`.
