@@ -10,14 +10,20 @@
 ///   export OPENROUTER_API_KEY=sk-or-...   # or `ANTHROPIC_API_KEY` / `GROQ_API_KEY`
 ///   cargo test --test `llm_e2e` -- --ignored --nocapture
 ///
+/// CI/manual matrix runs may set `PIKU_LIVE_PROVIDER`, `PIKU_LIVE_MODEL`, and
+/// `PIKU_LIVE_KEY_VAR` to pin a specific provider/model row.
+///
 /// DESIGN PRINCIPLES:
 ///   1. Assert on filesystem side-effects, not LLM prose (deterministic)
 ///   2. Use cheap/fast models (gpt-4o-mini, haiku, llama-8b) — <10s per test
 ///   3. One tool call per test where possible (no multi-turn complexity)
 ///   4. Prompt is unambiguous — the task either succeeded or it didn't
 ///   5. 90s wall-clock timeout in the assertion, but fast models finish <15s
+mod test_helpers;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,21 +53,53 @@ fn has_key(var: &str) -> bool {
     std::env::var(var).is_ok_and(|v| !v.is_empty())
 }
 
+fn detect_provider_override() -> Option<(String, String, String)> {
+    let provider = std::env::var("PIKU_LIVE_PROVIDER").ok()?;
+    let model = std::env::var("PIKU_LIVE_MODEL").ok()?;
+    let key_var = std::env::var("PIKU_LIVE_KEY_VAR").unwrap_or_else(|_| match provider.as_str() {
+        "anthropic" => "ANTHROPIC_API_KEY".to_string(),
+        "groq" => "GROQ_API_KEY".to_string(),
+        _ => "OPENROUTER_API_KEY".to_string(),
+    });
+
+    if has_key(&key_var) {
+        Some((provider, key_var, model))
+    } else {
+        None
+    }
+}
+
 /// Choose the cheapest/fastest available provider and model for tool-use tests.
 ///
 /// Priority: `OpenRouter` (gpt-4o-mini has reliable tool use), then Anthropic, then Groq.
 /// Groq's llama models sometimes generate malformed tool calls — de-prioritized.
-fn detect_provider() -> Option<(&'static str, &'static str, &'static str)> {
+fn detect_provider() -> Option<(String, String, String)> {
+    if let Some(provider) = detect_provider_override() {
+        return Some(provider);
+    }
+
     // Returns (provider_name, env_var, model)
     if has_key("OPENROUTER_API_KEY") {
-        return Some(("openrouter", "OPENROUTER_API_KEY", "openai/gpt-4o-mini"));
+        return Some((
+            "openrouter".to_string(),
+            "OPENROUTER_API_KEY".to_string(),
+            "openai/gpt-4o-mini".to_string(),
+        ));
     }
     if has_key("ANTHROPIC_API_KEY") {
-        return Some(("anthropic", "ANTHROPIC_API_KEY", "claude-haiku-4-5"));
+        return Some((
+            "anthropic".to_string(),
+            "ANTHROPIC_API_KEY".to_string(),
+            "claude-haiku-4-5".to_string(),
+        ));
     }
     if has_key("GROQ_API_KEY") {
         // moonshotai/kimi-k2-instruct has better tool use than llama-8b
-        return Some(("groq", "GROQ_API_KEY", "moonshotai/kimi-k2-instruct"));
+        return Some((
+            "groq".to_string(),
+            "GROQ_API_KEY".to_string(),
+            "moonshotai/kimi-k2-instruct".to_string(),
+        ));
     }
     None
 }
@@ -78,6 +116,52 @@ fn tempdir() -> PathBuf {
     base
 }
 
+#[test]
+fn live_ledger_summarizes_trace_file() {
+    let dir = tempdir();
+    let config_dir = dir.join("config");
+    let traces_dir = config_dir.join("piku").join("traces");
+    std::fs::create_dir_all(&traces_dir).unwrap();
+    std::fs::write(
+        traces_dir.join("session.jsonl"),
+        r#"{"event":"tool_start","tool":"read_file"}
+{"event":"tool_end","tool":"read_file","ok":false}
+{"event":"turn_end","iterations":2,"input_tokens":123,"output_tokens":45}
+"#,
+    )
+    .unwrap();
+
+    let ledger_path = dir.join("ledger").join("runs.jsonl");
+    std::env::set_var("PIKU_LIVE_LEDGER", &ledger_path);
+    test_helpers::append_live_ledger(
+        "llm_e2e",
+        "openrouter",
+        "test-model",
+        &config_dir,
+        false,
+        Duration::from_millis(12),
+    );
+    std::env::remove_var("PIKU_LIVE_LEDGER");
+
+    let ledger = std::fs::read_to_string(&ledger_path).unwrap();
+    let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+    assert_eq!(row["suite"], "llm_e2e");
+    assert_eq!(row["provider"], "openrouter");
+    assert_eq!(row["model"], "test-model");
+    assert_eq!(row["result"], "failure");
+    assert_eq!(row["failure_class"], "tool_failure");
+    assert_eq!(row["input_tokens"], 123);
+    assert_eq!(row["output_tokens"], 45);
+    assert_eq!(row["iterations"], 2);
+    assert_eq!(row["tool_starts"], 1);
+    assert_eq!(row["tool_ends"], 1);
+    assert_eq!(row["failed_tools"], 1);
+    assert_eq!(row["duration_ms"], 12);
+    assert!(row["trace_path"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("session.jsonl")));
+}
+
 /// Run piku with a prompt against a controlled directory.
 /// Returns (stdout, stderr, `exit_success`).
 fn run_piku(
@@ -89,6 +173,7 @@ fn run_piku(
     config_dir: &std::path::Path,
 ) -> (String, String, bool) {
     let api_key = std::env::var(key_var).unwrap();
+    let start = std::time::Instant::now();
 
     let output = Command::new(piku_binary())
         .arg("--print") // headless: run the turn and exit, no REPL
@@ -107,13 +192,17 @@ fn run_piku(
         .stderr(Stdio::piped())
         .output()
         .expect("failed to spawn piku");
+    let duration = start.elapsed();
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     eprintln!("=== piku stdout ===\n{stdout}");
     eprintln!("=== piku stderr ===\n{stderr}");
 
-    (stdout, stderr, output.status.success())
+    let success = output.status.success();
+    test_helpers::append_live_ledger("llm_e2e", provider, model, config_dir, success, duration);
+
+    (stdout, stderr, success)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +245,7 @@ pub fn add(a: i32, b: i32) -> i32 {
         path = target.display()
     );
 
-    let (stdout, stderr, success) = run_piku(&prompt, provider, model, key_var, &dir, &config);
+    let (stdout, stderr, success) = run_piku(&prompt, &provider, &model, &key_var, &dir, &config);
 
     assert!(success, "piku should exit 0. stderr: {stderr}");
 
@@ -229,7 +318,7 @@ fn piku_creates_new_file_with_content() {
         path = target.display()
     );
 
-    let (_, stderr, success) = run_piku(&prompt, provider, model, key_var, &dir, &config);
+    let (_, stderr, success) = run_piku(&prompt, &provider, &model, &key_var, &dir, &config);
     assert!(success, "piku should exit 0. stderr: {stderr}");
 
     assert!(target.exists(), "piku should have created the file");
@@ -275,7 +364,7 @@ fn piku_reads_file_and_references_content() {
         path = target.display()
     );
 
-    let (stdout, stderr, success) = run_piku(&prompt, provider, model, key_var, &dir, &config);
+    let (stdout, stderr, success) = run_piku(&prompt, &provider, &model, &key_var, &dir, &config);
     assert!(success, "piku should exit 0. stderr: {stderr}");
 
     // The response must mention the unique token
@@ -310,7 +399,7 @@ fn piku_runs_bash_and_reports_output() {
         path = sentinel_file.display()
     );
 
-    let (_, stderr, success) = run_piku(&prompt, provider, model, key_var, &dir, &config);
+    let (_, stderr, success) = run_piku(&prompt, &provider, &model, &key_var, &dir, &config);
     assert!(success, "piku should exit 0. stderr: {stderr}");
 
     // The file should exist and have the sentinel
@@ -352,8 +441,14 @@ fn piku_explores_own_codebase_with_glob_and_read() {
                   (pattern: crates/**/*.rs, path: .). \
                   Then read crates/piku/src/lib.rs and tell me what modules it exports.";
 
-    let (stdout, stderr, success) =
-        run_piku(prompt, provider, model, key_var, &workspace_root, &config);
+    let (stdout, stderr, success) = run_piku(
+        prompt,
+        &provider,
+        &model,
+        &key_var,
+        &workspace_root,
+        &config,
+    );
 
     let _ = std::fs::remove_dir_all(&config);
 

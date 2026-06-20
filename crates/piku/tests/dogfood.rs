@@ -16,12 +16,17 @@
 ///   export OPENROUTER_API_KEY=sk-or-...   # or `ANTHROPIC_API_KEY`
 ///   cargo test --test dogfood -- --ignored --nocapture
 ///
+/// Matrix/random dogfood runs may set `PIKU_LIVE_PROVIDER`, `PIKU_LIVE_MODEL`,
+/// and `PIKU_LIVE_KEY_VAR` to pin a specific provider/model row.
+///
 /// TO RUN ONE SCENARIO:
 ///   cargo test --test dogfood `dogfood_read_and_answer` -- --ignored --nocapture
 ///
 /// The test never fails on LLM output quality — it only fails on crashes,
 /// tool errors that shouldn't happen, or explicit structural assertions.
 /// The experience report is always printed so you can read what happened.
+mod test_helpers;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -47,16 +52,40 @@ fn has_key(var: &str) -> bool {
     std::env::var(var).is_ok_and(|v| !v.is_empty())
 }
 
-fn detect_provider() -> Option<(&'static str, &'static str, &'static str)> {
+fn detect_provider_override() -> Option<(String, String, String)> {
+    let provider = std::env::var("PIKU_LIVE_PROVIDER").ok()?;
+    let model = std::env::var("PIKU_LIVE_MODEL").ok()?;
+    let key_var = std::env::var("PIKU_LIVE_KEY_VAR").unwrap_or_else(|_| match provider.as_str() {
+        "anthropic" => "ANTHROPIC_API_KEY".to_string(),
+        "groq" => "GROQ_API_KEY".to_string(),
+        _ => "OPENROUTER_API_KEY".to_string(),
+    });
+
+    if has_key(&key_var) {
+        Some((provider, key_var, model))
+    } else {
+        None
+    }
+}
+
+fn detect_provider() -> Option<(String, String, String)> {
+    if let Some(provider) = detect_provider_override() {
+        return Some(provider);
+    }
+
     if has_key("OPENROUTER_API_KEY") {
         return Some((
-            "openrouter",
-            "OPENROUTER_API_KEY",
-            "anthropic/claude-sonnet-4-5",
+            "openrouter".to_string(),
+            "OPENROUTER_API_KEY".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
         ));
     }
     if has_key("ANTHROPIC_API_KEY") {
-        return Some(("anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-4-5"));
+        return Some((
+            "anthropic".to_string(),
+            "ANTHROPIC_API_KEY".to_string(),
+            "claude-sonnet-4-5".to_string(),
+        ));
     }
     None
 }
@@ -287,21 +316,10 @@ fn parse_output(
 }
 
 fn read_trace_events(config_dir: &Path) -> Vec<serde_json::Value> {
-    let traces_dir = config_dir.join("piku").join("traces");
-    let Ok(entries) = std::fs::read_dir(traces_dir) else {
+    let Some(trace_path) = test_helpers::latest_trace_path(config_dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .collect();
-    paths.sort();
-
-    let Some(trace_path) = paths.last() else {
-        return Vec::new();
-    };
-    parse_trace_file(trace_path)
+    parse_trace_file(&trace_path)
 }
 
 fn parse_trace_file(trace_path: &Path) -> Vec<serde_json::Value> {
@@ -380,6 +398,7 @@ fn run_scenario(
     let api_key = std::env::var(key_var).unwrap();
     let config_dir = workspace.join(".piku-config");
     std::fs::create_dir_all(&config_dir).unwrap();
+    let start = std::time::Instant::now();
 
     let output = Command::new(piku_binary())
         .arg("--print") // headless: run the turn and exit, no REPL
@@ -399,12 +418,14 @@ fn run_scenario(
         .stderr(Stdio::piped())
         .output()
         .expect("failed to spawn piku");
+    let duration = start.elapsed();
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_ok = output.status.success();
 
     let trace_events = read_trace_events(&config_dir);
+    test_helpers::append_live_ledger("dogfood", provider, model, &config_dir, exit_ok, duration);
     parse_output(&stdout, &stderr, exit_ok, workspace, trace_events)
 }
 
@@ -448,9 +469,9 @@ pub fn subtract(a: i32, b: i32) -> i32 {
         "In math.rs, add a `multiply(a: i32, b: i32) -> i32` function that returns a * b. \
          Add it after the subtract function.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("add_function_to_existing_file");
 
@@ -511,9 +532,9 @@ fn dogfood_read_and_answer() {
     let exp = run_scenario(
         "Read config.toml and tell me the value of secret_token.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("read_and_answer");
 
@@ -585,9 +606,9 @@ pub fn greet(name: &str) -> String {
          then grep for functions (pattern: `pub fn`). \
          List what public functions exist.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("explore_codebase");
 
@@ -643,9 +664,9 @@ fn handle_post() -> &'static str {
         r#"In handlers.rs, change the return value of handle_post to "POST accepted". \
          Do not change handle_get."#,
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("targeted_edit_preserves_neighbor");
 
@@ -686,9 +707,9 @@ fn dogfood_bash_and_use_output() {
     let exp = run_scenario(
         "Run `wc -l data.txt` and tell me how many lines the file has.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("bash_and_use_output");
 
@@ -723,9 +744,9 @@ fn dogfood_write_new_file_from_scratch() {
          `greet(name: &str) -> String` that returns `format!(\"Hello, {}!\", name)`. \
          No tests needed, just the function.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("write_new_file_from_scratch");
 
@@ -760,9 +781,9 @@ fn dogfood_read_edit_verify_loop() {
         "Read version.txt, change the version from 1.0.0 to 2.0.0, \
          then read the file again to confirm the change was made.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("read_edit_verify_loop");
 
@@ -845,9 +866,9 @@ pub fn print_sum(values: &[i32]) {
          Update the definition in lib.rs and all call sites in main.rs and utils.rs. \
          Do not change any logic.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("multifile_rename");
 
@@ -923,9 +944,9 @@ pub fn sum(values: &[i32]) -> i32 {
         "Read stats.rs. There is a bug in the `sum` function — it does not return \
          the correct sum. Identify the bug, explain it, and fix it.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("find_off_by_one_bug");
 
@@ -987,9 +1008,9 @@ pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
         "Read parser.rs and write a Rust #[cfg(test)] module inside the same file with \
          at least 3 unit tests for `parse_kv`. Cover: normal case, missing =, empty string.",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("write_tests_for_function");
 
@@ -1050,9 +1071,9 @@ fn dogfood_self_describe_architecture() {
          Then read crates/piku-runtime/src/agent_loop.rs line 1 to 30. \
          Describe in one sentence: what is piku, and what does the agentic loop do?",
         &workspace,
-        provider,
-        model,
-        key_var,
+        &provider,
+        &model,
+        &key_var,
     );
     exp.report("self_describe_architecture");
 
@@ -1097,15 +1118,15 @@ fn dogfood_trace_file_is_written() {
 
     std::fs::write(workspace.join("hello.txt"), "hello world\n").unwrap();
 
-    let api_key = std::env::var(key_var).unwrap();
+    let api_key = std::env::var(&key_var).unwrap();
     let output = std::process::Command::new(piku_binary())
         .arg("--provider")
-        .arg(provider)
+        .arg(&provider)
         .arg("--model")
-        .arg(model)
+        .arg(&model)
         .arg("Read hello.txt and tell me what it says.")
         .env_clear()
-        .env(key_var, &api_key)
+        .env(&key_var, &api_key)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("XDG_CONFIG_HOME", &config_dir)

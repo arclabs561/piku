@@ -1,0 +1,77 @@
+name: Live LLM
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Test suite to run
+        required: true
+        default: llm_e2e
+        type: choice
+        options:
+          - llm_e2e
+          - dogfood
+env:
+  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+jobs:
+  live:
+    if: github.actor == 'arclabs561'
+    runs-on: ubuntu-latest
+    environment: live-llm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: openrouter
+            model: openai/gpt-4o-mini
+            key_var: OPENROUTER_API_KEY
+            label: openrouter-gpt-4o-mini
+          - provider: openrouter
+            model: anthropic/claude-sonnet-4-5
+            key_var: OPENROUTER_API_KEY
+            label: openrouter-claude-sonnet-4-5
+          - provider: openrouter
+            model: google/gemini-2.5-flash
+            key_var: OPENROUTER_API_KEY
+            label: openrouter-gemini-2-5-flash
+          - provider: anthropic
+            model: claude-haiku-4-5
+            key_var: ANTHROPIC_API_KEY
+            label: anthropic-claude-haiku-4-5
+          - provider: groq
+            model: moonshotai/kimi-k2-instruct
+            key_var: GROQ_API_KEY
+            label: groq-kimi-k2-instruct
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build piku
+        run: ./scripts/ci.sh build
+      - name: Run live LLM suite
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PIKU_LIVE_PROVIDER: ${{ matrix.provider }}
+          PIKU_LIVE_MODEL: ${{ matrix.model }}
+          PIKU_LIVE_KEY_VAR: ${{ matrix.key_var }}
+          PIKU_LIVE_SUITE: ${{ inputs.suite || 'llm_e2e' }}
+        run: |
+          if [[ -z "${!PIKU_LIVE_KEY_VAR:-}" ]]; then
+            echo "skipping ${PIKU_LIVE_PROVIDER}/${PIKU_LIVE_MODEL}: ${PIKU_LIVE_KEY_VAR} is not set"
+            exit 0
+          fi
+          mkdir -p target/live-ledger
+          safe_model="${PIKU_LIVE_MODEL//\//_}"
+          export PIKU_LIVE_LEDGER="target/live-ledger/${PIKU_LIVE_SUITE}-${PIKU_LIVE_PROVIDER}-${safe_model}.jsonl"
+          ./scripts/ci.sh live
+      - name: Upload live ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-ledger-${{ inputs.suite || 'llm_e2e' }}-${{ matrix.label }}
+          path: target/live-ledger/*.jsonl
+          if-no-files-found: ignore
