@@ -64,9 +64,9 @@ jobs:
             echo "skipping ${PIKU_LIVE_PROVIDER}/${PIKU_LIVE_MODEL}: ${PIKU_LIVE_KEY_VAR} is not set"
             exit 0
           fi
-          mkdir -p target/live-ledger
+          mkdir -p "$GITHUB_WORKSPACE/target/live-ledger"
           safe_model="${PIKU_LIVE_MODEL//\//_}"
-          export PIKU_LIVE_LEDGER="target/live-ledger/${PIKU_LIVE_SUITE}-${PIKU_LIVE_PROVIDER}-${safe_model}.jsonl"
+          export PIKU_LIVE_LEDGER="$GITHUB_WORKSPACE/target/live-ledger/${PIKU_LIVE_SUITE}-${PIKU_LIVE_PROVIDER}-${safe_model}.jsonl"
           ./scripts/ci.sh live
       - name: Upload live ledger
         if: always()

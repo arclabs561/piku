@@ -70,11 +70,11 @@ PIKU_LIVE_MODEL=anthropic/claude-sonnet-4-5 \
 PIKU_LIVE_KEY_VAR=OPENROUTER_API_KEY \
 ./scripts/ci.sh live
 
-PIKU_LIVE_LEDGER=target/live-ledger/local.jsonl ./scripts/ci.sh live-random
+PIKU_LIVE_LEDGER="$PWD/target/live-ledger/local.jsonl" ./scripts/ci.sh live-random
 ```
 
 Local live runs write a JSONL ledger under `target/live-ledger/` unless
-`PIKU_LIVE_LEDGER` is set.
+`PIKU_LIVE_LEDGER` is set. Use an absolute path when overriding it.
 
 ## Run
 

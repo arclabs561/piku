@@ -65,8 +65,8 @@ default_live_ledger() {
   safe="${safe//:/_}"
   safe="${safe// /_}"
 
-  mkdir -p target/live-ledger
-  export PIKU_LIVE_LEDGER="target/live-ledger/${safe}.jsonl"
+  mkdir -p "$REPO_ROOT/target/live-ledger"
+  export PIKU_LIVE_LEDGER="$REPO_ROOT/target/live-ledger/${safe}.jsonl"
 }
 
 live() {
