@@ -25,6 +25,8 @@
 /// The test never fails on LLM output quality — it only fails on crashes,
 /// tool errors that shouldn't happen, or explicit structural assertions.
 /// The experience report is always printed so you can read what happened.
+mod test_helpers;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -314,21 +316,10 @@ fn parse_output(
 }
 
 fn read_trace_events(config_dir: &Path) -> Vec<serde_json::Value> {
-    let traces_dir = config_dir.join("piku").join("traces");
-    let Ok(entries) = std::fs::read_dir(traces_dir) else {
+    let Some(trace_path) = test_helpers::latest_trace_path(config_dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .collect();
-    paths.sort();
-
-    let Some(trace_path) = paths.last() else {
-        return Vec::new();
-    };
-    parse_trace_file(trace_path)
+    parse_trace_file(&trace_path)
 }
 
 fn parse_trace_file(trace_path: &Path) -> Vec<serde_json::Value> {
@@ -407,6 +398,7 @@ fn run_scenario(
     let api_key = std::env::var(key_var).unwrap();
     let config_dir = workspace.join(".piku-config");
     std::fs::create_dir_all(&config_dir).unwrap();
+    let start = std::time::Instant::now();
 
     let output = Command::new(piku_binary())
         .arg("--print") // headless: run the turn and exit, no REPL
@@ -426,12 +418,14 @@ fn run_scenario(
         .stderr(Stdio::piped())
         .output()
         .expect("failed to spawn piku");
+    let duration = start.elapsed();
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_ok = output.status.success();
 
     let trace_events = read_trace_events(&config_dir);
+    test_helpers::append_live_ledger("dogfood", provider, model, &config_dir, exit_ok, duration);
     parse_output(&stdout, &stderr, exit_ok, workspace, trace_events)
 }
 

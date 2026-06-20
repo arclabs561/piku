@@ -68,6 +68,7 @@ PIKU_LIVE_KEY_VAR=OPENROUTER_API_KEY \
 
 ./scripts/ci.sh live-random
 PIKU_LIVE_SUITE=dogfood ./scripts/ci.sh live-random
+PIKU_LIVE_LEDGER=target/live-ledger/local.jsonl ./scripts/ci.sh live-random
 ```
 
 ## Run

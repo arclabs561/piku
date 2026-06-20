@@ -19,8 +19,11 @@
 ///   3. One tool call per test where possible (no multi-turn complexity)
 ///   4. Prompt is unambiguous — the task either succeeded or it didn't
 ///   5. 90s wall-clock timeout in the assertion, but fast models finish <15s
+mod test_helpers;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -113,6 +116,52 @@ fn tempdir() -> PathBuf {
     base
 }
 
+#[test]
+fn live_ledger_summarizes_trace_file() {
+    let dir = tempdir();
+    let config_dir = dir.join("config");
+    let traces_dir = config_dir.join("piku").join("traces");
+    std::fs::create_dir_all(&traces_dir).unwrap();
+    std::fs::write(
+        traces_dir.join("session.jsonl"),
+        r#"{"event":"tool_start","tool":"read_file"}
+{"event":"tool_end","tool":"read_file","ok":false}
+{"event":"turn_end","iterations":2,"input_tokens":123,"output_tokens":45}
+"#,
+    )
+    .unwrap();
+
+    let ledger_path = dir.join("ledger").join("runs.jsonl");
+    std::env::set_var("PIKU_LIVE_LEDGER", &ledger_path);
+    test_helpers::append_live_ledger(
+        "llm_e2e",
+        "openrouter",
+        "test-model",
+        &config_dir,
+        false,
+        Duration::from_millis(12),
+    );
+    std::env::remove_var("PIKU_LIVE_LEDGER");
+
+    let ledger = std::fs::read_to_string(&ledger_path).unwrap();
+    let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+    assert_eq!(row["suite"], "llm_e2e");
+    assert_eq!(row["provider"], "openrouter");
+    assert_eq!(row["model"], "test-model");
+    assert_eq!(row["result"], "failure");
+    assert_eq!(row["failure_class"], "tool_failure");
+    assert_eq!(row["input_tokens"], 123);
+    assert_eq!(row["output_tokens"], 45);
+    assert_eq!(row["iterations"], 2);
+    assert_eq!(row["tool_starts"], 1);
+    assert_eq!(row["tool_ends"], 1);
+    assert_eq!(row["failed_tools"], 1);
+    assert_eq!(row["duration_ms"], 12);
+    assert!(row["trace_path"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("session.jsonl")));
+}
+
 /// Run piku with a prompt against a controlled directory.
 /// Returns (stdout, stderr, `exit_success`).
 fn run_piku(
@@ -124,6 +173,7 @@ fn run_piku(
     config_dir: &std::path::Path,
 ) -> (String, String, bool) {
     let api_key = std::env::var(key_var).unwrap();
+    let start = std::time::Instant::now();
 
     let output = Command::new(piku_binary())
         .arg("--print") // headless: run the turn and exit, no REPL
@@ -142,13 +192,17 @@ fn run_piku(
         .stderr(Stdio::piped())
         .output()
         .expect("failed to spawn piku");
+    let duration = start.elapsed();
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     eprintln!("=== piku stdout ===\n{stdout}");
     eprintln!("=== piku stderr ===\n{stderr}");
 
-    (stdout, stderr, output.status.success())
+    let success = output.status.success();
+    test_helpers::append_live_ledger("llm_e2e", provider, model, config_dir, success, duration);
+
+    (stdout, stderr, success)
 }
 
 // ---------------------------------------------------------------------------

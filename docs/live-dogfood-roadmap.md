@@ -80,23 +80,25 @@ Gate:
 
 ## Phase 2: add a dogfood ledger
 
+Status: implemented after ADR-0006.
+
 Goal: make model quality differences visible over time.
 
 Smallest useful version:
 
-- A local script that summarizes test output plus trace metadata into one row per model run.
+- Live test helpers append one JSONL row per completed scenario when `PIKU_LIVE_LEDGER` is set.
 - Fields: date, suite, provider, model, result, failure class, trace path, input tokens, output tokens, duration if available.
 - No pricing table yet. Token counts are enough for the first version.
 
-Recommended ADR fork:
+Decision:
 
-- ADR-0006: dogfood result ledger.
+- ADR-0006: live dogfood ledger.
 
 Options:
 
-- Trace plus test-output summary script. Recommended first because it uses data piku already writes.
-- Test harness writes ledger rows directly. Richer, but couples tests to reporting.
-- GitHub artifact-only reporting. Useful in CI, weak for local dogfood.
+- Post-run trace discovery script. Rejected because traces live under per-test temp config dirs.
+- Test harness writes ledger rows directly. Chosen because the helper knows the trace path.
+- GitHub artifact-only reporting. Rejected because local dogfood should produce the same rows.
 
 Gate:
 
