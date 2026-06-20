@@ -23,6 +23,11 @@ Thumbs.db
 # Test fixtures
 tests/fixture/tmp/
 
+# Project docs
+!docs/
+!docs/adr/
+!docs/adr/*.md
+
 # Legacy dirs — explicitly excluded so they can never creep back in
 /src/
 assets/
