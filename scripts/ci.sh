@@ -28,6 +28,7 @@ scripts() {
   for script in scripts/*.sh; do
     bash -n "$script"
   done
+  ./scripts/github-corpus-prompt-selftest.sh
   ./scripts/github-corpus-run-selftest.sh
 }
 
