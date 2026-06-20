@@ -61,15 +61,20 @@ just agentic-user                          # one persona; see justfile for more
 Live model matrix runs are separate from PR CI. Local examples:
 
 ```bash
+just live
+just live-random
+just live-dogfood
+
 PIKU_LIVE_PROVIDER=openrouter \
 PIKU_LIVE_MODEL=anthropic/claude-sonnet-4-5 \
 PIKU_LIVE_KEY_VAR=OPENROUTER_API_KEY \
 ./scripts/ci.sh live
 
-./scripts/ci.sh live-random
-PIKU_LIVE_SUITE=dogfood ./scripts/ci.sh live-random
 PIKU_LIVE_LEDGER=target/live-ledger/local.jsonl ./scripts/ci.sh live-random
 ```
+
+Local live runs write a JSONL ledger under `target/live-ledger/` unless
+`PIKU_LIVE_LEDGER` is set.
 
 ## Run
 

@@ -50,8 +50,29 @@ build() {
   cargo build --release -p piku
 }
 
+default_live_ledger() {
+  if [[ -n "${PIKU_LIVE_LEDGER:-}" ]]; then
+    return
+  fi
+
+  local suite="${PIKU_LIVE_SUITE:-llm_e2e}"
+  local provider="${PIKU_LIVE_PROVIDER:-auto}"
+  local model="${PIKU_LIVE_MODEL:-auto}"
+  local stamp safe
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  safe="${suite}-${provider}-${model}-${stamp}"
+  safe="${safe//\//_}"
+  safe="${safe//:/_}"
+  safe="${safe// /_}"
+
+  mkdir -p target/live-ledger
+  export PIKU_LIVE_LEDGER="target/live-ledger/${safe}.jsonl"
+}
+
 live() {
   local suite="${PIKU_LIVE_SUITE:-llm_e2e}"
+  default_live_ledger
+  printf 'live-ledger: %s\n' "$PIKU_LIVE_LEDGER"
   cargo test -p piku --test "$suite" -- --ignored --nocapture --test-threads=1
 }
 

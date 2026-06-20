@@ -11,6 +11,18 @@ fmt:
 clippy:
     ./scripts/ci.sh clippy
 
+# Run local live LLM smoke tests and write a ledger under target/live-ledger.
+live:
+    ./scripts/ci.sh live
+
+# Pick one available local provider/model row and write a ledger.
+live-random:
+    ./scripts/ci.sh live-random
+
+# Run the report-first live dogfood suite through one random available row.
+live-dogfood:
+    PIKU_LIVE_SUITE=dogfood ./scripts/ci.sh live-random
+
 # Quick, executable agentic-user smoke test.
 #
 # Usage:
