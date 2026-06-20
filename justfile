@@ -1,13 +1,15 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-# Run the full check gate — the exact commands CI runs (fmt, clippy -D warnings,
-# test, build). Defined in scripts/ci.sh so local and CI can't drift.
+# Run the full check gate: the exact commands CI runs. Defined in scripts/ci.sh
+# so local and CI can't drift.
 check:
     ./scripts/ci.sh all
 
 # Individual gate stages (same source as `just check` and CI).
 fmt:
     ./scripts/ci.sh fmt
+scripts:
+    ./scripts/ci.sh scripts
 clippy:
     ./scripts/ci.sh clippy
 

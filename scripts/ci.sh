@@ -7,7 +7,7 @@
 # locally. Either way the underlying commands are defined HERE and only here, so
 # local-green and CI-green can't drift apart.
 #
-# Usage: scripts/ci.sh {fmt|clippy|test|pty|build|live|live-random|all}   (default: all)
+# Usage: scripts/ci.sh {fmt|scripts|clippy|test|pty|build|live|live-random|all}   (default: all)
 set -euo pipefail
 
 # Resolve repo root from this script's location so it works from any cwd.
@@ -21,6 +21,13 @@ fi
 
 fmt() {
   cargo fmt --all -- --check
+}
+
+scripts() {
+  local script
+  for script in scripts/*.sh; do
+    bash -n "$script"
+  done
 }
 
 # `-D warnings` makes clippy a real gate, not advisory. The workspace opts into
@@ -113,6 +120,7 @@ live_random() {
 stage="${1:-all}"
 case "$stage" in
   fmt) fmt ;;
+  scripts) scripts ;;
   clippy) clippy ;;
   test) test_ ;;
   pty) pty ;;
@@ -121,6 +129,7 @@ case "$stage" in
   live-random) live_random ;;
   all)
     fmt
+    scripts
     clippy
     test_
     pty
@@ -128,7 +137,7 @@ case "$stage" in
     echo "all checks passed"
     ;;
   *)
-    echo "usage: $0 {fmt|clippy|test|pty|build|live|live-random|all}" >&2
+    echo "usage: $0 {fmt|scripts|clippy|test|pty|build|live|live-random|all}" >&2
     exit 2
     ;;
 esac

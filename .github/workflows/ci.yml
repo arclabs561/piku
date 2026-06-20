@@ -20,6 +20,8 @@ jobs:
       # separate step purely for failure-locating in the Actions UI.
       - name: Format
         run: ./scripts/ci.sh fmt
+      - name: Scripts
+        run: ./scripts/ci.sh scripts
       - name: Clippy
         run: ./scripts/ci.sh clippy
       - name: Test
