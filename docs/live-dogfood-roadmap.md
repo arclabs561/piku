@@ -107,11 +107,14 @@ Gate:
 
 ## Phase 3: promote repeated live failures into deterministic tests
 
+Status: policy accepted in ADR-0007.
+
 Goal: live dogfood should improve the normal PR gate, not become a parallel universe.
 
 Work:
 
-- Add a simple failure taxonomy: provider outage, provider behavior, piku parsing, piku tool loop, prompt weakness, test harness bug.
+- Use `docs/live-failure-promotions.md` as the promotion ledger.
+- Classify failures as provider outage, provider behavior, piku parsing, piku tool loop, prompt weakness, test harness bug, or product decision.
 - For each repeated live failure, either:
   - add a scripted-provider runtime e2e test,
   - add a parser or trace test,
@@ -133,7 +136,7 @@ Recommendation for now:
 
 Recommended ADR fork:
 
-- ADR-0007: user-facing model selection.
+- ADR-0008: user-facing model selection.
 
 Options:
 
