@@ -35,12 +35,14 @@ Already done:
 - `just github-corpus` exports PR and issue artifacts.
 - `just github-prompt` turns one PR row into a dogfood prompt seed.
 - One local `llm_e2e` run produced and reviewed a ledger row for `openrouter/openai/gpt-4o-mini`.
+- One corpus-backed prompt seed for PR #15 ran against a temp repo copy with `openrouter/openai/gpt-4o-mini`: 14 `read_file` calls, zero failed tools, two iterations.
 
 Not done yet:
 
 - The GitHub live matrix has not run through real environment secrets, by choice.
 - No local `dogfood` ledger row has been reviewed yet.
 - No real live finding has been promoted into a deterministic test yet.
+- Corpus-backed ad-hoc prompt runs do not write the live ledger yet.
 
 Current drift:
 
