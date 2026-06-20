@@ -25,6 +25,10 @@ mutating tools, failed tools, missing traces, weak file-reading evidence, and
 responses that do not mention changed files or a test/doc check. The output is
 ignored build data, not committed fixture data.
 
+CI runs a deterministic selftest for the runner with fake traces. That covers
+success, missing trace, mutating tool, failed tool, weak evidence, and weak
+response cases without calling a live provider.
+
 ## Non-goals
 
 - Do not make piku a GitHub client yet. The corpus is harness input.

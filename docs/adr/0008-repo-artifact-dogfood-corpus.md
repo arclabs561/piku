@@ -43,6 +43,9 @@ the trace: only read-only tools may run, all tools must succeed, the model must
 read local files including changed files, and the output must mention changed
 files plus a test or doc check.
 
+The CI scripts stage runs a deterministic fake-trace selftest for those
+validation branches. Live provider runs stay local and opt-in.
+
 Piku runtime stays GitHub-agnostic. Normal PR CI does not fetch repo artifacts.
 
 ## Consequences

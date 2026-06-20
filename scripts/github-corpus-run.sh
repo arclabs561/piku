@@ -177,11 +177,16 @@ validate_run() {
   fi
 
   bad_tools="$(
-    jq -r '
-      select(.event == "tool_start")
-      | select((.tool == "read_file" or .tool == "grep" or .tool == "glob" or .tool == "list_dir") | not)
-      | .tool
-    ' "$trace" | sort -u | paste -sd ','
+    jq -s -r '
+      [
+        .[]
+        | select(.event == "tool_start")
+        | .tool
+        | select(. != "read_file" and . != "grep" and . != "glob" and . != "list_dir")
+      ]
+      | unique
+      | join(",")
+    ' "$trace"
   )"
   if [[ -n "$bad_tools" ]]; then
     validation_error="read_only_violation:${bad_tools}"
@@ -195,20 +200,21 @@ validate_run() {
   fi
 
   read_count="$(trace_count "$trace" 'select(.event == "tool_start" and .tool == "read_file")')"
+  changed_read_count="$(changed_files_read_count "$trace")"
+  validation_changed_files_read="$changed_read_count"
+  changed_mention_count="$(changed_files_mentioned_count "$output_file")"
+  validation_changed_files_mentioned="$changed_mention_count"
+
   if (( read_count < min_reads )); then
     validation_error="weak_evidence:read_file_count=${read_count}"
     return 1
   fi
 
-  changed_read_count="$(changed_files_read_count "$trace")"
-  validation_changed_files_read="$changed_read_count"
   if (( changed_read_count < min_changed_reads )); then
     validation_error="weak_evidence:changed_files_read=${changed_read_count}"
     return 1
   fi
 
-  changed_mention_count="$(changed_files_mentioned_count "$output_file")"
-  validation_changed_files_mentioned="$changed_mention_count"
   if (( changed_mention_count < min_changed_mentions )); then
     validation_error="weak_response:changed_files_mentioned=${changed_mention_count}"
     return 1

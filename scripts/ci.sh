@@ -28,6 +28,7 @@ scripts() {
   for script in scripts/*.sh; do
     bash -n "$script"
   done
+  ./scripts/github-corpus-run-selftest.sh
 }
 
 # `-D warnings` makes clippy a real gate, not advisory. The workspace opts into
