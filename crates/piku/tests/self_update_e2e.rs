@@ -58,6 +58,15 @@ mod cli_parsing {
     }
 
     #[test]
+    fn bare_read_only_enters_read_only_repl() {
+        let action = parse_args(&args(&["--read-only"]));
+        let CliAction::Repl { read_only, .. } = action else {
+            panic!("expected read-only Repl")
+        };
+        assert!(read_only);
+    }
+
+    #[test]
     fn version_flag_long() {
         assert!(matches!(
             parse_args(&args(&["--version"])),

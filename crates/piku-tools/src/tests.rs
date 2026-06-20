@@ -1,4 +1,17 @@
 #[cfg(test)]
+mod registry {
+    #[test]
+    fn read_only_tool_definitions_only_include_file_inspection_tools() {
+        let names: Vec<String> = crate::read_only_tool_definitions()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+
+        assert_eq!(names, ["read_file", "glob", "grep", "list_dir"]);
+    }
+}
+
+#[cfg(test)]
 mod read_file {
     use super::tempdir;
     use crate::read_file;

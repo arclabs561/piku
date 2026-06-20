@@ -178,6 +178,14 @@ fn no_args_starts_tui_repl_and_exits_zero() {
     // the important property is no crash.)
 }
 
+#[test]
+fn read_only_no_prompt_starts_tui_repl_and_does_not_crash() {
+    let out = piku_clean_env().arg("--read-only").output().unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    assert_ne!(code, 139, "should not segfault");
+    assert_ne!(code, 134, "should not abort");
+}
+
 // ---------------------------------------------------------------------------
 // Provider errors (no API key)
 // ---------------------------------------------------------------------------

@@ -914,7 +914,14 @@ impl OutputSink for TuiSink {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run_tui_repl(config: &crate::config::PikuConfig) -> anyhow::Result<()> {
-    run_tui_repl_with_session(config, None, TokenUsage::default()).await
+    run_tui_repl_with_mode(config, false).await
+}
+
+pub async fn run_tui_repl_with_mode(
+    config: &crate::config::PikuConfig,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    run_tui_repl_with_session_mode(config, None, TokenUsage::default(), read_only).await
 }
 
 /// Like `run_tui_repl` but resumes from an existing session (e.g. after a
@@ -925,7 +932,16 @@ pub async fn run_tui_repl_with_session(
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(config, existing_session, initial_usage, false).await
+    run_tui_repl_with_session_mode(config, existing_session, initial_usage, false).await
+}
+
+pub async fn run_tui_repl_with_session_mode(
+    config: &crate::config::PikuConfig,
+    existing_session: Option<Session>,
+    initial_usage: TokenUsage,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    run_tui_repl_inner(config, existing_session, initial_usage, false, read_only).await
 }
 
 /// Like `run_tui_repl_with_session` but shows a "restarted" banner --
@@ -933,8 +949,16 @@ pub async fn run_tui_repl_with_session(
 pub async fn run_tui_repl_post_restart(
     config: &crate::config::PikuConfig,
     existing_session: Option<Session>,
+    read_only: bool,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(config, existing_session, TokenUsage::default(), true).await
+    run_tui_repl_inner(
+        config,
+        existing_session,
+        TokenUsage::default(),
+        true,
+        read_only,
+    )
+    .await
 }
 
 async fn run_tui_repl_inner(
@@ -942,6 +966,7 @@ async fn run_tui_repl_inner(
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
     post_restart: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     // Wrap the entire REPL in a LocalSet so `tokio::task::spawn_local` works
     // for background subagents. Without this, spawn_local panics at runtime
@@ -953,6 +978,7 @@ async fn run_tui_repl_inner(
             existing_session,
             initial_usage,
             post_restart,
+            read_only,
         ))
         .await
 }
@@ -962,6 +988,7 @@ async fn run_tui_repl_core(
     existing_session: Option<Session>,
     initial_usage: TokenUsage,
     post_restart: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let mut model = config
@@ -973,13 +1000,17 @@ async fn run_tui_repl_core(
     let cwd = std::env::current_dir()?;
     let date = crate::current_date();
     let custom_agents = piku_runtime::load_custom_agents(&cwd);
-    let hook_registry = piku_runtime::HookRegistry::load(&cwd);
+    let hook_registry = if read_only {
+        piku_runtime::HookRegistry::default()
+    } else {
+        piku_runtime::HookRegistry::load(&cwd)
+    };
     if hook_registry.has_hooks() {
         eprintln!("\x1b[2m[hooks loaded from .piku/hooks.json]\x1b[0m");
     }
 
     // Session-start maintenance: evict stale/weak memories from embedding store.
-    {
+    if !read_only {
         let store_path = piku_runtime::default_store_path(&cwd);
         let mut store = piku_runtime::MemoryStore::load(&store_path);
         if store.valid_count() > 0 {
@@ -1034,7 +1065,7 @@ async fn run_tui_repl_core(
     // If a newer binary exists at the default cargo output path, replace and
     // exec before drawing any UI. The session (possibly empty) is persisted
     // first so the restarted process can resume it via PIKU_SESSION_ID.
-    if !post_restart {
+    if !read_only && !post_restart {
         let newer = binary_mtime_baseline.map_or_else(
             || self_update::is_newer_than_running(&build_candidate),
             |b| self_update::is_newer_than_mtime(&build_candidate, b),
@@ -1092,9 +1123,12 @@ async fn run_tui_repl_core(
                 "\x1b[1;32m↺ restarted with new binary\x1b[0m  \x1b[2msession: {session_id}\x1b[0m\r"
             );
         } else {
+            let mode = if read_only { " · read-only" } else { "" };
             println!(
-                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}\x1b[0m\r\n\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r",
-                resolved.name(), model,
+                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}{}\x1b[0m\r\n\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r",
+                resolved.name(),
+                model,
+                mode,
             );
         }
 
@@ -1118,10 +1152,14 @@ async fn run_tui_repl_core(
         // Check for a newer binary on every iteration — catches the case where
         // `cargo build` was run externally while the REPL was already running.
         {
-            let newer = binary_mtime_baseline.map_or_else(
-                || self_update::is_newer_than_running(&build_candidate),
-                |b| self_update::is_newer_than_mtime(&build_candidate, b),
-            );
+            let newer = if read_only {
+                false
+            } else {
+                binary_mtime_baseline.map_or_else(
+                    || self_update::is_newer_than_running(&build_candidate),
+                    |b| self_update::is_newer_than_mtime(&build_candidate, b),
+                )
+            };
             if newer {
                 let _ = session.save(&session_path);
                 let (_, rows) = term_size();
@@ -1193,6 +1231,28 @@ async fn run_tui_repl_core(
                         goto(rows, 1);
                         print!("\x1b[2K");
                         goto(scroll_bot, 1);
+                        if read_only {
+                            println!(
+                                "\r\n\x1b[33m[read-only]\x1b[0m shell commands are disabled\r"
+                            );
+                            let (cols, rows) = term_size();
+                            draw_footer(
+                                rows.saturating_sub(1),
+                                cols,
+                                &FooterState {
+                                    provider: resolved.name(),
+                                    model: &model,
+                                    session_id: &session_id,
+                                    input_tokens: total_usage.input_tokens,
+                                    output_tokens: total_usage.output_tokens,
+                                    turns: 0,
+                                    running_agents: 0,
+                                    context_pct: context_pct_for(total_usage.input_tokens, &model),
+                                },
+                            );
+                            let _ = io::stdout().flush();
+                            continue;
+                        }
                         // Echo command
                         println!("\r\n\x1b[2;35m!\x1b[0m \x1b[2m{cmd}\x1b[0m\r");
                         // Run it
@@ -1264,6 +1324,7 @@ async fn run_tui_repl_core(
                         &task_registry,
                         config,
                         &hook_registry,
+                        read_only,
                     );
                     if should_exit {
                         break;
@@ -1299,10 +1360,17 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 let mut system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                if read_only {
+                    system_sections.push(crate::read_only_system_prompt_section());
+                }
                 if let Some(ref ctx) = hook_session_context {
                     system_sections.push(format!("# Hook Context\n\n{ctx}"));
                 }
-                let tool_defs = all_tool_definitions();
+                let tool_defs = if read_only {
+                    piku_tools::read_only_tool_definitions()
+                } else {
+                    all_tool_definitions()
+                };
                 let prompter = TuiPrompter::new(&config.allow, &config.deny);
                 let mut sink = TuiSink::new(&model, binary_mtime_baseline);
 
@@ -1545,7 +1613,7 @@ async fn run_tui_repl_core(
     }
 
     // Session-end memory extraction: distill atomic facts from the conversation.
-    if session.messages.len() > 2 {
+    if !read_only && session.messages.len() > 2 {
         let transcript = piku_runtime::build_extraction_transcript(&session.messages);
         if !transcript.trim().is_empty() {
             let store_path = piku_runtime::default_store_path(&cwd);
@@ -1686,6 +1754,7 @@ fn handle_slash_cmd(
     task_registry: &TaskRegistry,
     config: &crate::config::PikuConfig,
     hook_registry: &piku_runtime::HookRegistry,
+    read_only: bool,
 ) -> bool {
     let mut parts = input.trim()[1..].splitn(2, ' ');
     let cmd = parts.next().unwrap_or("").to_lowercase();
@@ -1699,10 +1768,22 @@ fn handle_slash_cmd(
 
     match cmd.as_str() {
         "help" | "h" => {
+            let shell_help = if read_only {
+                "  !command       Disabled in read-only mode\r"
+            } else {
+                "  !command       Run shell command directly\r"
+            };
+            let read_only_note = if read_only {
+                "\r
+\x1b[1mRead-only:\x1b[0m\r
+  Shell commands, /clear, and /model changes are disabled.\r"
+            } else {
+                ""
+            };
             println!(
                 "\x1b[1mCommands:\x1b[0m\r
   /help          This message\r
-  !command       Run shell command directly\r
+{shell_help}
   /status        Session info\r
   /cost          Token usage\r
   /model [name]  Show or switch model\r
@@ -1719,7 +1800,7 @@ fn handle_slash_cmd(
   Ctrl+W         Kill previous word\r
   Ctrl+Y         Yank (paste killed text)\r
   Right          Accept history suggestion\r
-  Esc            Clear input\r"
+  Esc            Clear input\r{read_only_note}"
             );
         }
         "status" => {
@@ -1738,6 +1819,9 @@ fn handle_slash_cmd(
         }
         "model" => match arg {
             None => println!("model: {current_model}\r"),
+            Some(_) if read_only => {
+                println!("\x1b[33m[read-only]\x1b[0m model changes are disabled\r");
+            }
             Some(m) => {
                 m.clone_into(model);
                 println!("\x1b[2m[model → {m}]\x1b[0m\r");
@@ -1834,8 +1918,12 @@ fn handle_slash_cmd(
             }
         }
         "clear" => {
-            session.messages.clear();
-            println!("\x1b[2m[session cleared]\x1b[0m\r");
+            if read_only {
+                println!("\x1b[33m[read-only]\x1b[0m /clear is disabled\r");
+            } else {
+                session.messages.clear();
+                println!("\x1b[2m[session cleared]\x1b[0m\r");
+            }
         }
         "permissions" | "perms" => {
             if config.allow.is_empty() && config.deny.is_empty() {

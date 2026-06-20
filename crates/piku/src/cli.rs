@@ -13,6 +13,8 @@ pub enum CliAction {
     Repl {
         model: Option<String>,
         provider_override: Option<String>,
+        /// Run the REPL with file-inspection tools only.
+        read_only: bool,
     },
     /// Prompt without a prior session.
     SingleShot {
@@ -153,14 +155,13 @@ pub fn parse_args(args: &[String]) -> CliAction {
             read_only,
             print,
         }
-    } else if read_only {
-        CliAction::ArgError("--read-only requires a prompt or --resume".to_string())
     } else {
         // No prompt given → interactive REPL (`-p` is meaningless without a
         // prompt, so it is silently ignored here).
         CliAction::Repl {
             model,
             provider_override,
+            read_only,
         }
     }
 }
@@ -232,11 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn bare_read_only_with_no_prompt_is_an_error() {
-        assert!(matches!(
-            parse_args(&args(&["--read-only"])),
-            CliAction::ArgError(_)
-        ));
+    fn bare_read_only_with_no_prompt_enters_read_only_repl() {
+        match parse_args(&args(&["--read-only"])) {
+            CliAction::Repl { read_only, .. } => assert!(read_only),
+            _ => panic!("expected Repl"),
+        }
     }
 
     #[test]

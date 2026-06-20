@@ -92,6 +92,7 @@ Interactive (TUI REPL):
 ```bash
 cargo run -p piku -- --help
 piku "explain src/main.rs"
+piku --read-only
 ```
 
 Headless (run once, print, exit — for scripts and pipelines, like `aider -m` or

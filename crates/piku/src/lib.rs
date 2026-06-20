@@ -24,6 +24,15 @@ use std::env;
 // Shared utilities
 // ---------------------------------------------------------------------------
 
+#[must_use]
+pub fn read_only_system_prompt_section() -> String {
+    "# Read-only mode\n\n\
+- Inspect files only. Do not edit files, write files, run shell commands, spawn agents, or change memory.\n\
+- If a requested task requires changes, describe the exact change instead of making it.\n\
+- Do not claim that you changed, fixed, wrote, or ran anything."
+        .to_string()
+}
+
 pub fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {
     let base = env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {

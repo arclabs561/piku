@@ -63,8 +63,17 @@ impl Pty {
     }
 
     fn spawn_in(cwd: &std::path::Path) -> Self {
+        Self::spawn_with_args(cwd, std::iter::empty::<&str>())
+    }
+
+    fn spawn_with_args<I, S>(cwd: &std::path::Path, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let mut cmd = Command::new(piku_binary());
-        cmd.current_dir(cwd)
+        cmd.args(args)
+            .current_dir(cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -232,6 +241,45 @@ fn ctrl_d_on_empty_prompt_exits_cleanly() {
     assert!(
         pty.eof,
         "piku did not exit within 3s on Ctrl-D; output was:\n{out}"
+    );
+}
+
+/// Bare --read-only should start the interactive TUI in read-only mode,
+/// not fail as a headless-only flag.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn read_only_flag_starts_read_only_tui() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocked_path = tmp.path().join("should-not-exist");
+    let mut pty = Pty::spawn_with_args(tmp.path(), ["--read-only"]);
+    let banner = pty.wait_for("read-only", Duration::from_secs(5));
+    assert!(banner, "read-only banner not reached:\n{}", pty.captured());
+
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(
+        ready,
+        "read-only TUI prompt not reached:\n{}",
+        pty.captured()
+    );
+
+    let out = pty.captured();
+    assert!(
+        !out.contains("panicked at"),
+        "panic on read-only TUI:\n{out}"
+    );
+
+    pty.send(b"!touch should-not-exist\r");
+    let blocked = pty.wait_for("shell commands are disabled", Duration::from_secs(2));
+    assert!(
+        blocked,
+        "read-only shell command was not blocked:\n{}",
+        pty.captured()
+    );
+    assert!(
+        !blocked_path.exists(),
+        "read-only shell escape created {}",
+        blocked_path.display()
     );
 }
 

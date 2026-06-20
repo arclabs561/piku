@@ -168,6 +168,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Return file-inspection tools for read-only agent runs.
+#[must_use]
+pub fn read_only_tool_definitions() -> Vec<ToolDefinition> {
+    all_tool_definitions()
+        .into_iter()
+        .filter(|t| matches!(t.name.as_str(), "read_file" | "glob" | "grep" | "list_dir"))
+        .collect()
+}
+
 /// Get the `Destructiveness` for a named tool call.
 #[must_use]
 pub fn tool_destructiveness(name: &str, params: &serde_json::Value) -> Destructiveness {
