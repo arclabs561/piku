@@ -340,6 +340,32 @@ fn collect_workspace_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn assert_rust_tests_pass(source: &Path, output_binary: &Path) {
+    let compile = Command::new("rustc")
+        .arg("--test")
+        .arg(source)
+        .arg("-o")
+        .arg(output_binary)
+        .output()
+        .expect("failed to run rustc");
+    assert!(
+        compile.status.success(),
+        "generated tests should compile.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(output_binary)
+        .output()
+        .expect("failed to run generated test binary");
+    assert!(
+        run.status.success(),
+        "generated tests should pass.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Run piku and collect experience
 // ---------------------------------------------------------------------------
@@ -975,7 +1001,8 @@ pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
         "piku should write to the file"
     );
 
-    let content = std::fs::read_to_string(workspace.join("parser.rs")).unwrap();
+    let parser_path = workspace.join("parser.rs");
+    let content = std::fs::read_to_string(&parser_path).unwrap();
     assert!(
         content.contains("#[cfg(test)]"),
         "file should contain a test module.\ncontent:\n{content}"
@@ -990,6 +1017,8 @@ pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
         test_count >= 3,
         "should have at least 3 tests, found {test_count}.\ncontent:\n{content}"
     );
+
+    assert_rust_tests_pass(&parser_path, &workspace.join("parser_tests"));
 }
 
 /// Scenario: piku explores its own source and summarises the architecture.
