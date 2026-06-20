@@ -52,7 +52,7 @@ build() {
 
 live() {
   local suite="${PIKU_LIVE_SUITE:-llm_e2e}"
-  cargo test -p piku --test "$suite" -- --ignored --nocapture
+  cargo test -p piku --test "$suite" -- --ignored --nocapture --test-threads=1
 }
 
 live_random() {

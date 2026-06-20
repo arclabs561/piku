@@ -27,18 +27,23 @@ jobs:
           - provider: openrouter
             model: openai/gpt-4o-mini
             key_var: OPENROUTER_API_KEY
+            label: openrouter-gpt-4o-mini
           - provider: openrouter
             model: anthropic/claude-sonnet-4-5
             key_var: OPENROUTER_API_KEY
+            label: openrouter-claude-sonnet-4-5
           - provider: openrouter
             model: google/gemini-2.5-flash
             key_var: OPENROUTER_API_KEY
+            label: openrouter-gemini-2-5-flash
           - provider: anthropic
             model: claude-haiku-4-5
             key_var: ANTHROPIC_API_KEY
+            label: anthropic-claude-haiku-4-5
           - provider: groq
             model: moonshotai/kimi-k2-instruct
             key_var: GROQ_API_KEY
+            label: groq-kimi-k2-instruct
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -59,4 +64,14 @@ jobs:
             echo "skipping ${PIKU_LIVE_PROVIDER}/${PIKU_LIVE_MODEL}: ${PIKU_LIVE_KEY_VAR} is not set"
             exit 0
           fi
+          mkdir -p target/live-ledger
+          safe_model="${PIKU_LIVE_MODEL//\//_}"
+          export PIKU_LIVE_LEDGER="target/live-ledger/${PIKU_LIVE_SUITE}-${PIKU_LIVE_PROVIDER}-${safe_model}.jsonl"
           ./scripts/ci.sh live
+      - name: Upload live ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-ledger-${{ inputs.suite || 'llm_e2e' }}-${{ matrix.label }}
+          path: target/live-ledger/*.jsonl
+          if-no-files-found: ignore
