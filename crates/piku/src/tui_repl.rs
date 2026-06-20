@@ -1787,6 +1787,8 @@ fn handle_slash_cmd(
   /status        Session info\r
   /cost          Token usage\r
   /model [name]  Show or switch model\r
+  /provider [n]  Show provider or switch hint\r
+  /providers     Show provider status\r
   /tasks         List background agents\r
   /sessions      List saved sessions\r
   /clear         Clear session context\r
@@ -1842,6 +1844,37 @@ fn handle_slash_cmd(
                 );
             }
         },
+        "provider" => match arg {
+            None => println!("provider: {provider_name}\r"),
+            Some(name) => {
+                println!(
+                    "\x1b[33m[provider]\x1b[0m restart with `piku --provider {name}` to switch\r"
+                );
+            }
+        },
+        "providers" => {
+            println!("\x1b[1mProviders:\x1b[0m\r");
+            for provider in piku_runtime::provider_availability() {
+                let marker = if provider.name == provider_name {
+                    "current"
+                } else if provider.available {
+                    "available"
+                } else {
+                    "missing"
+                };
+                let color = if provider.name == provider_name {
+                    "\x1b[36m"
+                } else if provider.available {
+                    "\x1b[32m"
+                } else {
+                    "\x1b[2m"
+                };
+                println!(
+                    "  {color}{:<10}\x1b[0m {:<9} \x1b[2mdefault={} ({})\x1b[0m\r",
+                    provider.name, marker, provider.default_model, provider.note
+                );
+            }
+        }
         "sessions" => match crate::sessions_dir() {
             Err(e) => {
                 println!("\x1b[31m/sessions:\x1b[0m could not resolve sessions dir: {e}\r");

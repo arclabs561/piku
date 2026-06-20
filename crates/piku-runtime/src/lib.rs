@@ -43,8 +43,8 @@ pub use piku_api::Provider;
 pub use piku_api::TokenUsage;
 pub use prompt::build_system_prompt;
 pub use provider::{
-    ResolvedProvider, DEFAULT_MODEL_ANTHROPIC, DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA,
-    DEFAULT_MODEL_OPENROUTER,
+    provider_availability, ProviderAvailability, ResolvedProvider, DEFAULT_MODEL_ANTHROPIC,
+    DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA, DEFAULT_MODEL_OPENROUTER,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
