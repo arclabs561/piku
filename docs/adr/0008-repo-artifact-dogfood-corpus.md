@@ -5,6 +5,7 @@ status: accepted
 date: 2026-06-20
 governs:
   - scripts/github-corpus.sh
+  - scripts/github-corpus-prompt.sh
   - justfile
   - docs/repo-artifact-dogfood-design.md
   - docs/live-dogfood-roadmap.md
@@ -31,7 +32,8 @@ auth, rate limits, permission scope, and prompt-injection concerns.
 
 Use GitHub repo artifacts as local dogfood corpus input. `scripts/github-corpus.sh`
 exports PR and issue JSON under `target/github-corpus/`; `just github-corpus`
-is the local entrypoint. The output is ignored generated data.
+is the local entrypoint. `scripts/github-corpus-prompt.sh` turns one PR detail
+row into a local Markdown prompt seed. The output is ignored generated data.
 
 Piku runtime stays GitHub-agnostic. Normal PR CI does not fetch repo artifacts.
 

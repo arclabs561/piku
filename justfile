@@ -27,6 +27,10 @@ live-dogfood:
 github-corpus repo="":
     if [ -n "{{repo}}" ]; then ./scripts/github-corpus.sh "{{repo}}"; else ./scripts/github-corpus.sh; fi
 
+# Build a dogfood prompt seed from the latest exported GitHub corpus.
+github-prompt pr="":
+    if [ -n "{{pr}}" ]; then ./scripts/github-corpus-prompt.sh "" "{{pr}}"; else ./scripts/github-corpus-prompt.sh; fi
+
 # Quick, executable agentic-user smoke test.
 #
 # Usage:

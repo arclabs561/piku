@@ -32,6 +32,8 @@ Already done:
 - ADR-0007 records the promotion policy for repeated live failures.
 - `.gitignore` now unignores `docs/adr/*.md`, so future ADRs are not hidden by the global gitignore.
 - ADR-0008 records the repo artifact corpus boundary.
+- `just github-corpus` exports PR and issue artifacts.
+- `just github-prompt` turns one PR row into a dogfood prompt seed.
 - One local `llm_e2e` run produced and reviewed a ledger row for `openrouter/openai/gpt-4o-mini`.
 
 Not done yet:
@@ -164,7 +166,7 @@ Goal: move beyond synthetic prompts without making piku runtime a GitHub client.
 Work:
 
 - Run `just github-corpus` to export PR and issue artifacts under `target/github-corpus/`.
-- Pick one PR detail row and turn it into a local dogfood prompt.
+- Run `just github-prompt` to turn one PR detail row into a local dogfood prompt.
 - Compare the model's behavior against the PR's changed files and commit message.
 - Promote repeated failures through `docs/live-failure-promotions.md`.
 
@@ -186,4 +188,4 @@ Recommendation:
 
 ## Next action
 
-Do local dev first: run `just github-corpus`, then run one corpus-backed dogfood prompt through `just live-dogfood` or a focused local scenario.
+Do local dev first: run `just github-corpus`, then `just github-prompt`, then run that corpus-backed prompt through a focused local dogfood scenario.
