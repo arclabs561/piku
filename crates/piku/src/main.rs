@@ -12,6 +12,7 @@ use piku_runtime::{PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION"); // self-update demo
+const READ_ONLY_TOOLS: &[&str] = &["read_file", "glob", "grep", "list_dir"];
 
 // ---------------------------------------------------------------------------
 // Entry point — fast-path dispatch
@@ -52,21 +53,27 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Run `piku --help` for usage.");
             std::process::exit(1);
         }
-        CliAction::SingleShot { prompt, print, .. } => {
-            if !print && self_update::was_restarted() {
+        CliAction::SingleShot {
+            prompt,
+            print,
+            read_only,
+            ..
+        } => {
+            if !print && !read_only && self_update::was_restarted() {
                 if let Some(session) = try_load_restart_session(&config) {
                     return run_tui_repl_post_restart(session, &config).await;
                 }
             }
-            run_single_shot(&prompt, None, &config, print).await?;
+            run_single_shot(&prompt, None, &config, print, read_only).await?;
         }
         CliAction::Resume {
             session_id,
             prompt,
             print,
+            read_only,
             ..
         } => {
-            run_resume(&session_id, prompt.as_deref(), &config, print).await?;
+            run_resume(&session_id, prompt.as_deref(), &config, print, read_only).await?;
         }
         CliAction::Repl { .. } => {
             if self_update::was_restarted() {
@@ -115,6 +122,7 @@ async fn run_resume(
     prompt: Option<&str>,
     config: &PikuConfig,
     print: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
@@ -144,6 +152,7 @@ async fn run_resume(
                     Some(session),
                     config,
                     print,
+                    read_only,
                 )
                 .await;
             }
@@ -171,6 +180,7 @@ async fn run_resume(
         Some(session),
         config,
         print,
+        read_only,
     )
     .await
 }
@@ -189,6 +199,7 @@ async fn run_single_shot(
     existing_session: Option<Session>,
     config: &PikuConfig,
     print: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let model = config
@@ -201,7 +212,16 @@ async fn run_single_shot(
 
     let cwd = env::current_dir()?;
     let date = current_date();
-    let system_sections = build_system_prompt(&cwd, &date, &model, &[]);
+    let mut system_sections = build_system_prompt(&cwd, &date, &model, &[]);
+    if read_only {
+        system_sections.push(
+            "# Read-only mode\n\n\
+- Inspect files only. Do not edit files, write files, run shell commands, spawn agents, or change memory.\n\
+- If a requested task requires changes, describe the exact change instead of making it.\n\
+- Do not claim that you changed, fixed, wrote, or ran anything."
+                .to_string(),
+        );
+    }
 
     let (session_id, mut session) = if let Some(s) = existing_session {
         eprintln!("[piku] continuing session {}", s.id);
@@ -211,7 +231,11 @@ async fn run_single_shot(
         (id.clone(), Session::new(id))
     };
 
-    let tool_defs = all_tool_definitions();
+    let mut tool_defs = all_tool_definitions();
+    if read_only {
+        tool_defs.retain(|t| READ_ONLY_TOOLS.contains(&t.name.as_str()));
+        eprintln!("[piku] read-only mode: file-inspection tools only");
+    }
     let prompter = AllowAll;
     let traces_dir = config.traces_dir();
     std::fs::create_dir_all(&traces_dir).ok();
@@ -265,7 +289,7 @@ async fn run_single_shot(
     // Headless: stop here. The turn output has already streamed to stdout and
     // the session is saved; entering the REPL would block on a (likely
     // non-TTY) stdin, which is exactly what scripts and pipelines don't want.
-    if print {
+    if print || read_only {
         return Ok(());
     }
 
@@ -400,6 +424,7 @@ USAGE:
 OPTIONS:
     -p, --print          Headless: run the prompt, print the result, and exit
                          (no interactive REPL). For scripts and pipelines.
+    --read-only          Headless: only read_file, glob, grep, and list_dir may run
     --model <name>       Override model (default: provider-dependent)
     --provider <name>    Force provider: openrouter | anthropic | groq | ollama | custom
     --resume <id>        Resume a previous session by ID (partial match ok)

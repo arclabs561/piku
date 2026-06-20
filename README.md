@@ -99,6 +99,7 @@ Headless (run once, print, exit — for scripts and pipelines, like `aider -m` o
 
 ```bash
 piku -p "explain src/main.rs" > explanation.txt
+piku --read-only "inspect this repo and suggest the next fix"
 ```
 
 ## Dogfood

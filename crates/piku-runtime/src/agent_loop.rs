@@ -6,7 +6,7 @@
     clippy::too_many_lines
 )]
 
-use std::fmt::Write;
+use std::{collections::HashSet, fmt::Write};
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -193,6 +193,7 @@ async fn run_turn_inner(
     // Dedup detection: canonical string key (tool_name + args JSON) for exact match.
     // Uses String keys instead of hashing to avoid collision risk on safety-critical dedup.
     let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let advertised_tool_names: HashSet<String> = tool_defs.iter().map(|t| t.name.clone()).collect();
 
     // Track where we last extracted memories (message index).
     // Periodic extraction happens after compaction events.
@@ -343,6 +344,18 @@ async fn run_turn_inner(
         let session_id_for_hooks = session.id.clone();
 
         for (tool_use_id, tool_name, params) in &tool_calls {
+            if !advertised_tool_names.contains(tool_name) {
+                let msg = format!("{tool_name} is not available in this mode");
+                sink.on_tool_start(tool_name, tool_use_id, params);
+                sink.on_tool_end(tool_name, &msg, true);
+                session.push(ConversationMessage::tool_result(
+                    tool_use_id.clone(),
+                    msg,
+                    true,
+                ));
+                continue;
+            }
+
             // PreToolUse hooks (can block before permission check)
             let mut hook_context: Option<String> = None;
             if let Some(hooks) = hook_registry {

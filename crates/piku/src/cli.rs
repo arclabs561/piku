@@ -19,6 +19,8 @@ pub enum CliAction {
         prompt: String,
         model: Option<String>,
         provider_override: Option<String>,
+        /// Run with file-inspection tools only, then exit.
+        read_only: bool,
         /// Headless: run the prompt to completion and exit instead of
         /// dropping into the interactive REPL (`-p` / `--print`).
         print: bool,
@@ -29,6 +31,8 @@ pub enum CliAction {
         prompt: Option<String>,
         model: Option<String>,
         provider_override: Option<String>,
+        /// Run with file-inspection tools only, then exit.
+        read_only: bool,
         /// Headless: run-and-exit, no REPL (`-p` / `--print`).
         print: bool,
     },
@@ -42,6 +46,7 @@ pub fn parse_args(args: &[String]) -> CliAction {
     let mut provider_override: Option<String> = None;
     let mut resume_session: Option<String> = None;
     let mut print = false;
+    let mut read_only = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
 
@@ -51,6 +56,10 @@ pub fn parse_args(args: &[String]) -> CliAction {
             "--help" | "-h" => return CliAction::Help,
             "--print" | "-p" => {
                 print = true;
+                i += 1;
+            }
+            "--read-only" => {
+                read_only = true;
                 i += 1;
             }
             "--model" => match args.get(i + 1) {
@@ -133,6 +142,7 @@ pub fn parse_args(args: &[String]) -> CliAction {
             prompt: prompt_str,
             model,
             provider_override,
+            read_only,
             print,
         }
     } else if let Some(prompt) = prompt_str {
@@ -140,8 +150,11 @@ pub fn parse_args(args: &[String]) -> CliAction {
             prompt,
             model,
             provider_override,
+            read_only,
             print,
         }
+    } else if read_only {
+        CliAction::ArgError("--read-only requires a prompt or --resume".to_string())
     } else {
         // No prompt given → interactive REPL (`-p` is meaningless without a
         // prompt, so it is silently ignored here).
@@ -193,6 +206,37 @@ mod tests {
             }
             _ => panic!("expected Resume"),
         }
+    }
+
+    #[test]
+    fn read_only_flag_threads_through_single_shot() {
+        match parse_args(&args(&["--read-only", "explain", "main.rs"])) {
+            CliAction::SingleShot {
+                prompt, read_only, ..
+            } => {
+                assert_eq!(prompt, "explain main.rs");
+                assert!(read_only);
+            }
+            _ => panic!("expected SingleShot"),
+        }
+    }
+
+    #[test]
+    fn read_only_flag_threads_through_resume() {
+        match parse_args(&args(&["--resume", "sess-1", "--read-only"])) {
+            CliAction::Resume { read_only, .. } => {
+                assert!(read_only);
+            }
+            _ => panic!("expected Resume"),
+        }
+    }
+
+    #[test]
+    fn bare_read_only_with_no_prompt_is_an_error() {
+        assert!(matches!(
+            parse_args(&args(&["--read-only"])),
+            CliAction::ArgError(_)
+        ));
     }
 
     #[test]

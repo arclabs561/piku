@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
-use piku_api::{ApiError, Event, MessageRequest, Provider, StopReason, TokenUsage};
+use piku_api::{ApiError, Event, MessageRequest, Provider, StopReason, TokenUsage, ToolDefinition};
 use piku_runtime::{build_system_prompt, run_turn, AllowAll, OutputSink, PostToolAction, Session};
 use piku_tools::all_tool_definitions;
 
@@ -655,6 +655,51 @@ async fn e2e_permission_denied_stops_tool_not_loop() {
 
     // final response produced
     assert!(sink.text.contains("bash was denied"));
+}
+
+#[tokio::test]
+async fn e2e_unadvertised_tool_call_is_not_executed() {
+    let dir = tempdir();
+    let target = dir.join("created.txt");
+    let write_input = serde_json::json!({
+        "path": target,
+        "content": "should not be written"
+    })
+    .to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("w1", "write_file", &write_input),
+        text_stop("write_file was blocked."),
+    ]);
+    let mut session = Session::new("e2e-unadvertised".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "try to write a file",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }],
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !target.exists(),
+        "unadvertised write_file must not create files"
+    );
+    assert!(sink.tool_ends.iter().any(|(name, output, is_error)| {
+        name == "write_file" && *is_error && output.contains("not available")
+    }));
+    assert!(sink.text.contains("write_file was blocked"));
 }
 
 // ---------------------------------------------------------------------------

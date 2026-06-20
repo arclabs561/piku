@@ -141,6 +141,10 @@ fn help_exits_zero_and_contains_usage() {
         text.contains("--provider"),
         "help should document --provider"
     );
+    assert!(
+        text.contains("--read-only"),
+        "help should document --read-only"
+    );
     assert!(text.contains("--version"), "help should document --version");
     assert!(text.contains("--resume"), "help should document --resume");
 }
