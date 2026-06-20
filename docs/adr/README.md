@@ -9,3 +9,4 @@
 | [0005](0005-live-llm-matrix.md) | Accepted | Live LLM coverage runs outside PR CI across a small model matrix. |
 | [0006](0006-live-dogfood-ledger.md) | Accepted | Live dogfood writes comparable JSONL run records when requested. |
 | [0007](0007-live-failure-promotion.md) | Accepted | Repeated live failures are promoted into deterministic tests or explicit provider notes. |
+| [0008](0008-repo-artifact-dogfood-corpus.md) | Accepted | GitHub repo artifacts are local dogfood corpus input, not piku runtime behavior. |

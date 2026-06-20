@@ -23,6 +23,10 @@ live-random:
 live-dogfood:
     PIKU_LIVE_SUITE=dogfood ./scripts/ci.sh live-random
 
+# Export GitHub PR and issue artifacts for local dogfood.
+github-corpus repo="":
+    if [ -n "{{repo}}" ]; then ./scripts/github-corpus.sh "{{repo}}"; else ./scripts/github-corpus.sh; fi
+
 # Quick, executable agentic-user smoke test.
 #
 # Usage:

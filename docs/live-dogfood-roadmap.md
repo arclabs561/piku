@@ -31,11 +31,13 @@ Already done:
 - ADR-0006 records the live ledger decision.
 - ADR-0007 records the promotion policy for repeated live failures.
 - `.gitignore` now unignores `docs/adr/*.md`, so future ADRs are not hidden by the global gitignore.
+- ADR-0008 records the repo artifact corpus boundary.
+- One local `llm_e2e` run produced and reviewed a ledger row for `openrouter/openai/gpt-4o-mini`.
 
 Not done yet:
 
 - The GitHub live matrix has not run through real environment secrets, by choice.
-- No local live ledger rows have been reviewed yet.
+- No local `dogfood` ledger row has been reviewed yet.
 - No real live finding has been promoted into a deterministic test yet.
 
 Current drift:
@@ -153,6 +155,25 @@ Gate:
 
 - At least 3 manual matrix runs show a stable pattern that product behavior could help.
 
+## Phase 5: use repo artifacts as dogfood material
+
+Status: first exporter implemented after ADR-0008.
+
+Goal: move beyond synthetic prompts without making piku runtime a GitHub client.
+
+Work:
+
+- Run `just github-corpus` to export PR and issue artifacts under `target/github-corpus/`.
+- Pick one PR detail row and turn it into a local dogfood prompt.
+- Compare the model's behavior against the PR's changed files and commit message.
+- Promote repeated failures through `docs/live-failure-promotions.md`.
+
+Gate:
+
+- One corpus-backed prompt produces a ledger row.
+- Any finding is classified as provider behavior, prompt weakness, harness bug,
+  product decision, or deterministic-test candidate.
+
 ## Later: hosted control plane
 
 Codex Online's useful shape is hosted execution, GitHub review, worktrees, setup automation, and background tasks. That is not piku's best next lane.
@@ -165,4 +186,4 @@ Recommendation:
 
 ## Next action
 
-Do local dev first: run `just live-random` or `just live-dogfood`, inspect the JSONL row in `target/live-ledger/`, then promote any repeated issue through `docs/live-failure-promotions.md`.
+Do local dev first: run `just github-corpus`, then run one corpus-backed dogfood prompt through `just live-dogfood` or a focused local scenario.

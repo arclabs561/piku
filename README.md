@@ -76,6 +76,13 @@ PIKU_LIVE_LEDGER="$PWD/target/live-ledger/local.jsonl" ./scripts/ci.sh live-rand
 Local live runs write a JSONL ledger under `target/live-ledger/` unless
 `PIKU_LIVE_LEDGER` is set. Use an absolute path when overriding it.
 
+To export local PR and issue data for dogfood prompts:
+
+```bash
+just github-corpus
+PIKU_GITHUB_CORPUS_LIMIT=100 just github-corpus owner/repo
+```
+
 ## Run
 
 Interactive (TUI REPL):
