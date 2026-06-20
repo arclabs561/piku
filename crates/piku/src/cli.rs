@@ -9,6 +9,7 @@
 pub enum CliAction {
     Version,
     Help,
+    Providers,
     /// Interactive REPL — no prompt given.
     Repl {
         model: Option<String>,
@@ -56,6 +57,7 @@ pub fn parse_args(args: &[String]) -> CliAction {
         match args[i].as_str() {
             "--version" | "-V" => return CliAction::Version,
             "--help" | "-h" => return CliAction::Help,
+            "--providers" => return CliAction::Providers,
             "--print" | "-p" => {
                 print = true;
                 i += 1;
@@ -244,5 +246,13 @@ mod tests {
     fn bare_print_with_no_prompt_is_interactive_repl() {
         // `-p` alone has no prompt → REPL (headless flag has nothing to run).
         assert!(matches!(parse_args(&args(&["-p"])), CliAction::Repl { .. }));
+    }
+
+    #[test]
+    fn providers_flag_is_standalone() {
+        assert!(matches!(
+            parse_args(&args(&["--providers"])),
+            CliAction::Providers
+        ));
     }
 }

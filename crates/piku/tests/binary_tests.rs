@@ -142,6 +142,10 @@ fn help_exits_zero_and_contains_usage() {
         "help should document --provider"
     );
     assert!(
+        text.contains("--providers"),
+        "help should document --providers"
+    );
+    assert!(
         text.contains("--read-only"),
         "help should document --read-only"
     );
@@ -157,6 +161,22 @@ fn help_short_flag_identical_to_long() {
         stdout(&long),
         stdout(&short),
         "-h and --help should be identical"
+    );
+}
+
+#[test]
+fn providers_flag_exits_zero_without_provider_key() {
+    let out = piku_clean_env().arg("--providers").output().unwrap();
+    assert!(
+        out.status.success(),
+        "--providers should not require a configured provider. stderr: {}",
+        stderr(&out)
+    );
+
+    let text = stdout(&out);
+    assert!(
+        text.contains("PROVIDERS") && text.contains("openrouter") && text.contains("missing"),
+        "--providers should print provider status. stdout: {text}"
     );
 }
 

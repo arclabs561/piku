@@ -8,7 +8,7 @@ use std::env;
 use std::io::{self, Write};
 
 use piku_runtime::{build_system_prompt, run_turn, AllowAll, OutputSink, Session, TurnResult};
-use piku_runtime::{PostToolAction, ResolvedProvider, TokenUsage};
+use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION"); // self-update demo
@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     match action {
         CliAction::Version => println!("piku {VERSION}"),
         CliAction::Help => print_help(),
+        CliAction::Providers => print_providers(),
         CliAction::ArgError(msg) => {
             eprintln!("error: {msg}");
             eprintln!("Run `piku --help` for usage.");
@@ -426,6 +427,7 @@ OPTIONS:
     --read-only          Only read_file, glob, grep, and list_dir may run
     --model <name>       Override model (default: provider-dependent)
     --provider <name>    Force provider: openrouter | anthropic | groq | ollama | custom
+    --providers          Show provider status and exit
     --resume <id>        Resume a previous session by ID (partial match ok)
     --version            Print version
     --help               Print this help
@@ -447,6 +449,21 @@ NOTES:
     Sessions are auto-saved to ~/.config/piku/sessions/
     Per-project context: add a PIKU.md file in your project root"
     );
+}
+
+fn print_providers() {
+    println!("PROVIDERS:");
+    for provider in provider_availability() {
+        let marker = if provider.available {
+            "available"
+        } else {
+            "missing"
+        };
+        println!(
+            "    {:<10} {:<9} default={} ({})",
+            provider.name, marker, provider.default_model, provider.note
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
