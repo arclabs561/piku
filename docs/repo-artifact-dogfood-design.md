@@ -12,11 +12,13 @@ Treat GitHub repo artifacts as a local dogfood corpus. A script exports PR and
 issue data into `target/github-corpus/`; dogfood and agentic prompts can consume
 that data later without adding GitHub auth or network access to piku runtime.
 
-The first slice is `scripts/github-corpus.sh` plus
-`scripts/github-corpus-prompt.sh`. The exporter fetches PR and issue lists,
-optional PR and issue detail JSONL, a combined bundle, and a short summary. The
-prompt script turns one PR detail row into a read-only Markdown seed for local
-dogfood. The output is ignored build data, not committed fixture data.
+The first slice is `scripts/github-corpus.sh`,
+`scripts/github-corpus-prompt.sh`, and `scripts/github-corpus-run.sh`. The
+exporter fetches PR and issue lists, optional PR and issue detail JSONL, a
+combined bundle, and a short summary. The prompt script turns one PR detail row
+into a read-only Markdown seed for local dogfood. The runner executes that seed
+against a temp repo copy and writes the same kind of JSONL ledger row as other
+live dogfood. The output is ignored build data, not committed fixture data.
 
 ## Non-goals
 
@@ -55,8 +57,8 @@ handling, and a threat model. The local harness can learn from the data first.
 
 ## Next step
 
-Run `just github-corpus`, then `just github-prompt`. Use the prompt under
-`target/github-corpus/prompts/` as a local dogfood seed.
+Run `just github-corpus`, then `just github-dogfood`. Inspect the new row under
+`target/live-ledger/`.
 
 ---
 Decided: 2026-06-20

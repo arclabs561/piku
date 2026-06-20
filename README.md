@@ -81,6 +81,7 @@ To export local PR and issue data for dogfood prompts:
 ```bash
 just github-corpus
 just github-prompt
+just github-dogfood
 PIKU_GITHUB_CORPUS_LIMIT=100 just github-corpus owner/repo
 ```
 

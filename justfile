@@ -31,6 +31,10 @@ github-corpus repo="":
 github-prompt pr="":
     if [ -n "{{pr}}" ]; then ./scripts/github-corpus-prompt.sh "" "{{pr}}"; else ./scripts/github-corpus-prompt.sh; fi
 
+# Run a corpus prompt against a temp repo copy and append a live ledger row.
+github-dogfood pr="":
+    if [ -n "{{pr}}" ]; then ./scripts/github-corpus-run.sh "{{pr}}"; else ./scripts/github-corpus-run.sh; fi
+
 # Quick, executable agentic-user smoke test.
 #
 # Usage:
