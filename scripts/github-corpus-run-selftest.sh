@@ -53,6 +53,25 @@ set -euo pipefail
 
 trace_dir="$XDG_CONFIG_HOME/piku/traces"
 trace="$trace_dir/fake.jsonl"
+saw_read_only=0
+saw_print=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --read-only) saw_read_only=1 ;;
+    --print|-p) saw_print=1 ;;
+  esac
+done
+
+if (( ! saw_read_only )); then
+  printf 'fake piku expected --read-only\n' >&2
+  exit 2
+fi
+
+if (( saw_print )); then
+  printf 'fake piku should not receive --print in corpus mode\n' >&2
+  exit 2
+fi
 
 write_success_trace() {
   mkdir -p "$trace_dir"

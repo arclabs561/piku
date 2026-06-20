@@ -374,7 +374,7 @@ start_seconds="$(date +%s)"
 set +e
 (
   cd "$repo_copy"
-  XDG_CONFIG_HOME="$config_dir" "$bin" --print --provider "$provider" --model "$model" "$prompt"
+  XDG_CONFIG_HOME="$config_dir" "$bin" --read-only --provider "$provider" --model "$model" "$prompt"
 ) | tee "$output_path"
 status=$?
 set -e
