@@ -609,13 +609,14 @@ pub fn greet(name: &str) -> String {
     );
 }
 
-/// Scenario: piku surgically edits a file with an ambiguous pattern, then retries.
+/// Scenario: piku edits the requested function without touching its neighbor.
 ///
-/// Idea: does `edit_file` correctly reject ambiguous matches and does the model
-/// recover by providing more context on a retry?
+/// Idea: does piku target `handle_post` precisely and preserve `handle_get`?
+/// Ambiguous `edit_file` retry recovery is covered deterministically in
+/// `crates/piku-runtime/tests/e2e.rs`.
 #[test]
 #[ignore = "live LLM dogfood; run with `cargo test --test dogfood -- --ignored` and a provider key"]
-fn dogfood_edit_with_ambiguous_pattern() {
+fn dogfood_targeted_edit_preserves_neighbor() {
     let Some((provider, key_var, model)) = detect_provider() else {
         panic!(
             "dogfood is opt-in (`--ignored`) and needs a provider key: set \
@@ -623,7 +624,7 @@ fn dogfood_edit_with_ambiguous_pattern() {
         );
     };
 
-    let workspace = tempdir("ambig_edit");
+    let workspace = tempdir("targeted_edit");
 
     std::fs::write(
         workspace.join("handlers.rs"),
@@ -646,7 +647,7 @@ fn handle_post() -> &'static str {
         model,
         key_var,
     );
-    exp.report("edit_with_ambiguous_pattern");
+    exp.report("targeted_edit_preserves_neighbor");
 
     let content = std::fs::read_to_string(workspace.join("handlers.rs")).unwrap();
 
