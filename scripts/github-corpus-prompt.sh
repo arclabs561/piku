@@ -76,6 +76,7 @@ body="$(jq -r '.body // ""' <<<"$row")"
   printf '# Dogfood prompt seed: PR #%s\n\n' "$pr_number"
   printf 'Use piku on this repository. Answer from the PR artifact and local files.\n\n'
   printf 'Task:\n'
+  printf -- '- Do not edit files. This is a read-only analysis prompt.\n'
   printf -- '- Summarize what changed in plain terms.\n'
   printf -- '- Name the files most likely to matter.\n'
   printf -- '- Say what deterministic test or doc check this history suggests.\n'

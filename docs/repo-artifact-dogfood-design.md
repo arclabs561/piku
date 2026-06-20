@@ -15,8 +15,8 @@ that data later without adding GitHub auth or network access to piku runtime.
 The first slice is `scripts/github-corpus.sh` plus
 `scripts/github-corpus-prompt.sh`. The exporter fetches PR and issue lists,
 optional PR and issue detail JSONL, a combined bundle, and a short summary. The
-prompt script turns one PR detail row into a Markdown seed for local dogfood.
-The output is ignored build data, not committed fixture data.
+prompt script turns one PR detail row into a read-only Markdown seed for local
+dogfood. The output is ignored build data, not committed fixture data.
 
 ## Non-goals
 
