@@ -23,10 +23,10 @@ Thumbs.db
 # Test fixtures
 tests/fixture/tmp/
 
-# Project docs
+# Project docs (docs/ tracked; design + adr are working/personal, kept local-only)
 !docs/
-!docs/adr/
-!docs/adr/*.md
+docs/adr/
+docs/design/
 
 # Legacy dirs — explicitly excluded so they can never creep back in
 /src/
