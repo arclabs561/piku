@@ -25,13 +25,13 @@ cargo build --workspace
 ## Test
 
 `just check` runs the full gate (fmt, clippy with `-D warnings`, tests, release
-build) — the exact commands CI runs, defined once in `scripts/ci.sh`:
+build), the exact commands CI runs, defined once in `scripts/ci.sh`:
 
 ```bash
 just check
 ```
 
-Just the default test suite (fast, deterministic — no live LLM, no PTY):
+Just the default test suite (fast, deterministic, no live LLM, no PTY):
 
 ```bash
 cargo test --workspace
@@ -95,7 +95,7 @@ piku "explain src/main.rs"
 piku --read-only
 ```
 
-Headless (run once, print, exit — for scripts and pipelines, like `aider -m` or
+Headless (run once, print, exit; for scripts and pipelines, like `aider -m` or
 `claude -p`):
 
 ```bash
