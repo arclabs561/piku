@@ -38,7 +38,7 @@ pub fn create_worktree(
     task_id: &AgentTaskId,
 ) -> Result<(std::path::PathBuf, String), String> {
     let branch = format!("piku-agent-{}", &task_id.0[..16.min(task_id.0.len())]);
-    let wt_path = std::env::temp_dir().join(format!("piku-wt-{}", &task_id.0));
+    let wt_path = std::env::temp_dir().join(format!("piku-wt-{}", task_id.0));
 
     let out = std::process::Command::new("git")
         .args([
