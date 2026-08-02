@@ -59,7 +59,7 @@ mod scenario;
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
     now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord, ObserverRecord,
-    PlaygroundLedger, ReviewRecord, ScenarioContractRecord, TurnRecord,
+    PlaygroundLedger, ReviewRecord, ScenarioContractRecord, SpendRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -912,13 +912,12 @@ fn strip_ansi_bytes(bytes: &[u8]) -> String {
         }
     }
 
-    // Post-process: remove thinking indicator frames and prompt redraws,
-    // collapse blank lines
+    // Post-process: reduce carriage-return redraws to their final state and
+    // collapse blank lines.
     let mut result = String::new();
     let mut nl_count = 0;
     for line in out.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             nl_count += 1;
             if nl_count <= 1 {
                 result.push('\n');
@@ -926,19 +925,47 @@ fn strip_ansi_bytes(bytes: &[u8]) -> String {
             continue;
         }
         nl_count = 0;
-        // Skip thinking indicator lines (❯ · thinking… / ❯ ✶ thinking… etc)
-        if trimmed.contains("thinking\u{2026}") || trimmed.contains("thinking...") {
+        let visible = final_redraw_state(line);
+        if visible.is_empty() {
             continue;
         }
-        // Skip progressive prompt redraws (❯ W❯ Wh❯ Wha... pattern)
-        // These have multiple ❯ on a single line from rapid redraws
-        if trimmed.matches('\u{276F}').count() > 1 {
-            continue;
-        }
-        result.push_str(trimmed);
+        result.push_str(&visible);
         result.push('\n');
     }
     result
+}
+
+/// What a physical line finally showed, after carriage-return redraws.
+///
+/// The prompt and the thinking spinner both redraw in place, so one physical
+/// line can hold dozens of frames, and piku appends the assistant's reply
+/// after the last one. Dropping any line with several prompt glyphs, or any
+/// line mentioning "thinking", therefore deleted real replies along with the
+/// noise, which is what made completed turns look empty.
+fn final_redraw_state(line: &str) -> String {
+    let line = line.trim();
+    // Only the last redraw is on screen; earlier frames were overwritten.
+    let last_frame = match line.rsplit_once('\u{276F}') {
+        Some((_, tail)) => format!("\u{276F}{tail}"),
+        None => line.to_string(),
+    };
+    strip_thinking_indicator(&last_frame).trim().to_string()
+}
+
+/// Remove a `❯ <spinner> thinking (Ns)` prefix, keeping anything written after
+/// it on the same line.
+fn strip_thinking_indicator(frame: &str) -> &str {
+    let Some(position) = frame.rfind("thinking") else {
+        return frame;
+    };
+    let rest = &frame[position + "thinking".len()..];
+    // An elapsed-time suffix closes the indicator; text after it is content.
+    match rest.find(')') {
+        Some(end) => &rest[end + 1..],
+        // No timer yet on the first frames, so the indicator is the whole
+        // token and anything following it is content.
+        None => rest.trim_start_matches(['\u{2026}', '.', ' ']),
+    }
 }
 
 // ===========================================================================
@@ -1575,6 +1602,90 @@ fn is_terminal_chrome(line: &str) -> bool {
         || line.contains("❯ Send a message or /help")
 }
 
+/// What this harness has spent, process-wide.
+///
+/// The playground drives three paid roles plus piku itself, so a run that
+/// looks cheap per call is not obviously cheap in aggregate. Cost comes from
+/// the provider's own accounting rather than a local price table, which would
+/// go stale silently.
+mod spend {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
+    pub static COMPLETION_TOKENS: AtomicU64 = AtomicU64::new(0);
+    /// Millionths of a dollar, so the running total stays exact.
+    pub static COST_MICROS: AtomicU64 = AtomicU64::new(0);
+    pub static PIKU_INPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
+    pub static PIKU_OUTPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one provider response. Absent fields count as zero rather than
+    /// dropping the call, so the call count never understates activity.
+    pub fn record_call(response: &serde_json::Value) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let usage = &response["usage"];
+        let prompt = usage["prompt_tokens"]
+            .as_u64()
+            .or_else(|| usage["input_tokens"].as_u64())
+            .unwrap_or(0);
+        let completion = usage["completion_tokens"]
+            .as_u64()
+            .or_else(|| usage["output_tokens"].as_u64())
+            .unwrap_or(0);
+        PROMPT_TOKENS.fetch_add(prompt, Ordering::Relaxed);
+        COMPLETION_TOKENS.fetch_add(completion, Ordering::Relaxed);
+        if let Some(cost) = usage["cost"].as_f64() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            COST_MICROS.fetch_add(
+                (cost * 1_000_000.0).round().max(0.0) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub fn record_piku_turn(input: u64, output: u64) {
+        PIKU_INPUT_TOKENS.fetch_add(input, Ordering::Relaxed);
+        PIKU_OUTPUT_TOKENS.fetch_add(output, Ordering::Relaxed);
+    }
+
+    pub fn usd() -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            COST_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        }
+    }
+
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
+/// Read piku's own per-turn token counts out of its status footer.
+///
+/// The footer is the only place piku reports usage to an observer, so this is
+/// how a run accounts for the subject's spend as well as the harness's.
+fn parse_footer_tokens(captured: &str) -> Option<(u64, u64)> {
+    let line = captured
+        .lines()
+        .rev()
+        .find(|line| line.contains(" iter") && line.contains("tokens"))?;
+    let input = line
+        .split('\u{2191}')
+        .next()?
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .find(|token| !token.is_empty())?
+        .parse()
+        .ok()?;
+    let output = line
+        .split('\u{2193}')
+        .next()?
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .find(|token| !token.is_empty())?
+        .parse()
+        .ok()?;
+    Some((input, output))
+}
+
 /// The text an action put on the input row, if any.
 fn submitted_text(action: &Action) -> &str {
     match action {
@@ -2155,6 +2266,9 @@ impl LlmClient {
                     "max_tokens": self.max_tokens,
                     "messages": all,
                     "response_format": {"type": "json_object"},
+                    // Ask the provider for its own cost accounting. A local
+                    // price table would go stale without anyone noticing.
+                    "usage": {"include": true},
                 })
             }
             Backend::Ollama => {
@@ -2232,6 +2346,7 @@ impl LlmClient {
         }
 
         let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        spend::record_call(&resp);
 
         Ok(resp
             .pointer("/message/content")
@@ -3391,6 +3506,9 @@ fn run_agentic_session(persona: &Persona) {
         {
             findings.push(blank_reply_finding(&captured));
         }
+        if let Some((input, output)) = parse_footer_tokens(&captured) {
+            spend::record_piku_turn(input, output);
+        }
         eprintln!(
             "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
             pty.raw_capture.len(),
@@ -3562,6 +3680,9 @@ fn run_agentic_session(persona: &Persona) {
                         && !has_visible_turn_output(&free_captured, submitted_text(&action))
                     {
                         findings_free.push(blank_reply_finding(&free_captured));
+                    }
+                    if let Some((input, output)) = parse_footer_tokens(&free_captured) {
+                        spend::record_piku_turn(input, output);
                     }
                     let mut free_screen = if free_captured.lines().count() > 2 {
                         format!(
@@ -3779,6 +3900,37 @@ fn run_agentic_session(persona: &Persona) {
 
     let (verified_findings, hypotheses, next_action) =
         improvement_handoff(&entries, harness_findings, &scenario_failures);
+    let harness_cost = spend::usd();
+    eprintln!("\n=== RUN SPEND ===");
+    eprintln!(
+        "harness: {} calls, {}↑ {}↓ tokens, ${harness_cost:.4} reported by provider",
+        spend::get(&spend::CALLS),
+        spend::get(&spend::PROMPT_TOKENS),
+        spend::get(&spend::COMPLETION_TOKENS),
+    );
+    eprintln!(
+        "piku:    {}↑ {}↓ tokens (from its status footer; cost not reported)",
+        spend::get(&spend::PIKU_INPUT_TOKENS),
+        spend::get(&spend::PIKU_OUTPUT_TOKENS),
+    );
+    eprintln!("=== END RUN SPEND ===");
+    if let Some(ledger) = &ledger {
+        if let Err(error) = ledger.append_spend(&SpendRecord {
+            schema_version: 1,
+            kind: "spend",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            harness_calls: spend::get(&spend::CALLS),
+            harness_prompt_tokens: spend::get(&spend::PROMPT_TOKENS),
+            harness_completion_tokens: spend::get(&spend::COMPLETION_TOKENS),
+            harness_cost_usd: harness_cost,
+            piku_input_tokens: spend::get(&spend::PIKU_INPUT_TOKENS),
+            piku_output_tokens: spend::get(&spend::PIKU_OUTPUT_TOKENS),
+        }) {
+            eprintln!("[playground] could not append spend record: {error}");
+        }
+    }
+
     eprintln!("\n=== PIKU IMPROVEMENT HANDOFF ===");
     if !scenario_results.is_empty() {
         eprintln!("scenario goal: {scenario_goal}");
@@ -4223,6 +4375,77 @@ fn the_echoed_submission_is_not_counted_as_a_reply() {
     assert!(!is_submission_echo("❯ goodbye", "hello world"));
     assert!(!is_submission_echo("⏺ Read(x)", "hello world"));
     assert!(!is_submission_echo("❯ anything", ""));
+}
+
+#[test]
+fn a_reply_appended_to_the_spinner_line_survives_stripping() {
+    // Captured from a real PTY run: the spinner redraws with a carriage
+    // return, so every frame and then the reply land on one physical line.
+    // The previous filter dropped this line for having several prompt glyphs
+    // and the word "thinking", which is what made the turn look empty.
+    let line = "\u{276F} · thinking\u{276F} · thinking (0s)\u{276F} ✶ thinking (1s)\u{276F} ✽ thinking (2s)How can I help?";
+    assert_eq!(final_redraw_state(line), "How can I help?");
+
+    // A spinner line with no reply still contributes nothing.
+    assert_eq!(
+        final_redraw_state("\u{276F} · thinking\u{276F} ✶ thinking (1s)"),
+        ""
+    );
+    // A progressive prompt redraw reduces to what was actually typed.
+    assert_eq!(
+        final_redraw_state("\u{276F} /\u{276F} /e\u{276F} /ex\u{276F} /exit"),
+        "\u{276F} /exit"
+    );
+    // Ordinary output is untouched.
+    assert_eq!(
+        final_redraw_state("⏺ Read(src/lib.rs:1-20)"),
+        "⏺ Read(src/lib.rs:1-20)"
+    );
+}
+
+#[test]
+fn stripping_keeps_a_reply_that_follows_the_spinner_end_to_end() {
+    let raw = "\u{1b}[2m\u{276F} · thinking\u{1b}[0m\r\u{276F} ✽ thinking (2s)How can I help?\r\n[1 iter · +2571 tokens]\r\n";
+    let stripped = strip_ansi_bytes(raw.as_bytes());
+    assert!(
+        stripped.contains("How can I help?"),
+        "reply was lost by stripping: {stripped:?}"
+    );
+    assert!(!stripped.contains("thinking"));
+    assert!(has_visible_turn_output(&stripped, "x"));
+}
+
+#[test]
+fn footer_tokens_are_read_for_piku_spend() {
+    assert_eq!(
+        parse_footer_tokens("⏺ Read(x)\n[1 iter · +2983 tokens · 2957↑ 26↓ total]\n"),
+        Some((2957, 26))
+    );
+    // The last footer wins when several turns share a capture.
+    assert_eq!(
+        parse_footer_tokens(
+            "[1 iter · +11 tokens · 10↑ 1↓ total]\n[2 iter · +22 tokens · 20↑ 2↓ total]\n"
+        ),
+        Some((20, 2))
+    );
+    assert_eq!(parse_footer_tokens("no footer here\n"), None);
+}
+
+#[test]
+fn provider_reported_cost_is_accumulated_not_estimated() {
+    let before = spend::get(&spend::CALLS);
+    let before_micros = spend::get(&spend::COST_MICROS);
+    spend::record_call(&serde_json::json!({
+        "usage": {"prompt_tokens": 100, "completion_tokens": 7, "cost": 0.000_25}
+    }));
+    assert_eq!(spend::get(&spend::CALLS), before + 1);
+    assert_eq!(spend::get(&spend::COST_MICROS), before_micros + 250);
+
+    // A response without usage still counts as a call, so the call count
+    // never understates what was sent.
+    let before_calls = spend::get(&spend::CALLS);
+    spend::record_call(&serde_json::json!({"choices": []}));
+    assert_eq!(spend::get(&spend::CALLS), before_calls + 1);
 }
 
 #[test]

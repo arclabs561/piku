@@ -83,6 +83,24 @@ pub struct ScenarioContractRecord<'a> {
     pub verifications: &'a [String],
 }
 
+/// What the run cost. Harness figures come from the provider's own accounting;
+/// piku's are the token counts it printed in its status footer, which is the
+/// only usage it reports to an observer.
+#[derive(Serialize)]
+pub struct SpendRecord<'a> {
+    pub schema_version: u8,
+    pub kind: &'static str,
+    pub run_id: &'a str,
+    pub timestamp_secs: u64,
+    pub harness_calls: u64,
+    pub harness_prompt_tokens: u64,
+    pub harness_completion_tokens: u64,
+    /// Reported by the provider. Zero means it reported no cost, not free.
+    pub harness_cost_usd: f64,
+    pub piku_input_tokens: u64,
+    pub piku_output_tokens: u64,
+}
+
 /// A bounded second-order review of the judge and the observed piku behavior.
 #[derive(Serialize)]
 pub struct ObserverRecord<'a> {
@@ -190,6 +208,10 @@ impl PlaygroundLedger {
     }
 
     pub fn append_observer(&self, record: &ObserverRecord<'_>) -> std::io::Result<()> {
+        self.append(record)
+    }
+
+    pub fn append_spend(&self, record: &SpendRecord<'_>) -> std::io::Result<()> {
         self.append(record)
     }
 

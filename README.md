@@ -207,3 +207,9 @@ builds is a real before-and-after. `just playground-sample` randomizes to
 reach failure shapes a fixed pair never hits. `just playground-paired` runs
 one of each: comparing two randomized runs measures the sample, not the
 change.
+
+Each run ends with a spend summary and appends a `spend` ledger record: the
+harness's call count, tokens, and the dollar cost the provider itself reported,
+plus piku's own token counts read from its status footer. A local price table
+would go stale without anyone noticing, so the cost figure is the provider's,
+and a zero means it reported none rather than that the run was free.
