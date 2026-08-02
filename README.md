@@ -175,3 +175,14 @@ ledger (`target/agentic-findings/development-context/`): use that packet, not
 free-form judge prose, to select the next piku change and its validation run.
 The packet carries a bounded history of prior deterministic findings (including
 recurrence), never unverified historical model allegations.
+
+A persona with a filesystem task also carries a scenario contract: a stated
+goal plus executable acceptance checks run against the workspace piku edited
+(file contents, and a bounded `cargo test`). The contract and its per-check
+results are ledgered as `scenario_contract` and in the development-context
+packet. A failed acceptance check outranks every screen-level finding and sets
+the next action to `fix_piku_for_failed_scenario_acceptance`, because it is
+measured against the workspace rather than inferred from the terminal.
+Readiness checks say the terminal behaved; acceptance checks say the work
+succeeded, and a run that produced plausible prose with a failing workspace is
+a failed run.

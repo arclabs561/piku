@@ -53,11 +53,13 @@ mod playground;
 mod playground_ledger;
 #[path = "agentic/recursive_observer.rs"]
 mod recursive_observer;
+#[path = "agentic/scenario.rs"]
+mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
     now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord, ObserverRecord,
-    PlaygroundLedger, ReviewRecord, TurnRecord,
+    PlaygroundLedger, ReviewRecord, ScenarioContractRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -950,6 +952,10 @@ struct PtyHandle {
     /// Raw bytes captured since last clear — used to extract response text
     /// by running through a plain VT100 parser (no DECSTBM interference).
     raw_capture: Vec<u8>,
+    /// Bytes discarded by the most recent `clear_capture`. Retained so a
+    /// "no visible reply" finding can distinguish piku producing nothing from
+    /// the harness clearing the buffer after the reply had already arrived.
+    discarded_capture: Vec<u8>,
     eof: bool,
     ready_wait_timed_out: bool,
     permission_response: PermissionResponse,
@@ -1057,6 +1063,7 @@ impl PtyHandle {
             writer,
             reader,
             raw_capture: Vec::new(),
+            discarded_capture: Vec::new(),
             eof: false,
             ready_wait_timed_out: false,
             permission_response: PermissionResponse::from_env(),
@@ -1156,9 +1163,19 @@ impl PtyHandle {
         total
     }
 
-    /// Clear the raw capture buffer.
+    /// Clear the raw capture buffer, keeping what was discarded.
+    ///
+    /// The capture is cleared once the screen changes after a submit, so that
+    /// only response bytes remain. If the reply lands in the same drain that
+    /// produced the screen change, the reply is in the discarded segment, not
+    /// missing. Evidence for a blank-reply finding must say which happened.
     fn clear_capture(&mut self) {
-        self.raw_capture.clear();
+        self.discarded_capture = std::mem::take(&mut self.raw_capture);
+    }
+
+    /// Text discarded by the most recent `clear_capture`.
+    fn discarded_text(&self) -> String {
+        strip_ansi_bytes(&self.discarded_capture)
     }
 
     /// Extract text content from captured raw bytes by stripping ANSI escape
@@ -1554,12 +1571,52 @@ fn deterministic_checks(
 /// either a tool/result line or visible assistant text; the final prompt and
 /// token footer alone are not a reply.
 fn has_visible_turn_output(captured: &str) -> bool {
-    captured.lines().map(str::trim).any(|line| {
-        !line.is_empty()
-            && !(line.starts_with('[') && line.contains(" iter") && line.contains("tokens"))
-            && !line.starts_with("openrouter ")
-            && !line.contains("❯ Send a message or /help")
-    })
+    captured
+        .lines()
+        .map(str::trim)
+        .any(|line| !(line.is_empty() || is_terminal_chrome(line)))
+}
+
+/// UI piku prints every turn whatever the model said: the token footer, the
+/// provider status line, and the input hint.
+fn is_terminal_chrome(line: &str) -> bool {
+    (line.starts_with('[') && line.contains(" iter") && line.contains("tokens"))
+        || line.starts_with("openrouter ")
+        || line.contains("❯ Send a message or /help")
+}
+
+/// Classify a turn that captured no assistant reply.
+///
+/// The response capture is cleared once the screen changes after a submit. If
+/// the reply is present in the discarded segment, the capture window closed
+/// too late and the blank turn is a harness artifact, not a piku defect.
+/// Reporting the two as one finding is what previously sent a repair at the
+/// runtime while the real cause was unidentified, so the severity and the
+/// evidence have to distinguish them.
+fn blank_reply_finding(discarded: &str) -> Finding {
+    if has_visible_turn_output(discarded) {
+        Finding {
+            severity: Severity::Info,
+            description: "harness cleared the response capture after the reply had already arrived"
+                .to_string(),
+            expected: "the capture window opens before any assistant output".to_string(),
+            actual: format!(
+                "reply text was found in the discarded pre-response segment: {}",
+                evidence_excerpt(discarded, 600)
+            ),
+        }
+    } else {
+        Finding {
+            severity: Severity::Major,
+            description: "completed user turn produced no visible agent reply".to_string(),
+            expected: "a tool/result line or assistant text before the input prompt".to_string(),
+            actual: format!(
+                "only token/footer UI and the next input prompt were captured; the discarded \
+                 pre-response segment carried no reply either ({} chars)",
+                discarded.trim().len()
+            ),
+        }
+    }
 }
 
 // ===========================================================================
@@ -2619,6 +2676,7 @@ fn append_playground_turn(
 fn improvement_handoff(
     entries: &[CritiqueEntry],
     harness_findings: Vec<String>,
+    scenario_failures: &[String],
 ) -> (Vec<String>, Vec<String>, &'static str) {
     let mut verified_findings = entries
         .iter()
@@ -2636,6 +2694,7 @@ fn improvement_handoff(
         })
         .collect::<Vec<_>>();
     verified_findings.extend(harness_findings);
+    verified_findings.extend(scenario_failures.iter().cloned());
     let hypotheses = entries
         .iter()
         .flat_map(|entry| {
@@ -2647,7 +2706,12 @@ fn improvement_handoff(
             })
         })
         .collect::<Vec<_>>();
-    let next_action = if !verified_findings.is_empty() {
+    // A failed acceptance check is the one outcome that names piku as the thing
+    // to change, because it was measured against the workspace rather than
+    // inferred from the screen.
+    let next_action = if !scenario_failures.is_empty() {
+        "fix_piku_for_failed_scenario_acceptance"
+    } else if !verified_findings.is_empty() {
         "fix_harness_or_reproduce_verified_findings"
     } else if !hypotheses.is_empty() {
         "reproduce_hypotheses_before_changing_piku"
@@ -2990,6 +3054,34 @@ fn run_agentic_session(persona: &Persona) {
         }
     }
 
+    // The scenario contract is the run's product oracle: a goal the persona is
+    // driving piku toward plus executable acceptance checks over the workspace.
+    // Screen-readiness checks say the terminal behaved; only these say the work
+    // succeeded.
+    let contract = scenario::for_persona(persona.name);
+    if let Some(contract) = contract {
+        eprintln!("[scenario] {} — {}", contract.id, contract.goal);
+        if let Some(ledger) = &ledger {
+            let verifications: Vec<String> = contract
+                .verifications
+                .iter()
+                .map(|verification| verification.label())
+                .collect();
+            if let Err(error) = ledger.append_scenario_contract(&ScenarioContractRecord {
+                schema_version: 1,
+                kind: "scenario_contract",
+                run_id: ledger.run_id(),
+                timestamp_secs: now_secs(),
+                scenario_id: contract.id,
+                contexts: contract.contexts,
+                goal: contract.goal,
+                verifications: &verifications,
+            }) {
+                eprintln!("[playground] could not append scenario contract: {error}");
+            }
+        }
+    }
+
     // Wait for piku to be ready
     eprintln!("[agentic_user] waiting for piku startup...");
     let startup_snap = pty.wait_for_ready(&mut observer, Duration::from_secs(30));
@@ -3149,13 +3241,7 @@ fn run_agentic_session(persona: &Persona) {
             Action::Submit(_) | Action::Key(SpecialKey::Enter)
         ) && !has_visible_turn_output(&captured)
         {
-            findings.push(Finding {
-                severity: Severity::Major,
-                description: "completed user turn produced no visible agent reply".to_string(),
-                expected: "a tool/result line or assistant text before the input prompt"
-                    .to_string(),
-                actual: "only token/footer UI and the next input prompt were captured".to_string(),
-            });
+            findings.push(blank_reply_finding(&pty.discarded_text()));
         }
         eprintln!(
             "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
@@ -3318,16 +3404,7 @@ fn run_agentic_session(persona: &Persona) {
 
                     let free_captured = pty.captured_text();
                     if waits_for_response && !has_visible_turn_output(&free_captured) {
-                        findings_free.push(Finding {
-                            severity: Severity::Major,
-                            description: "completed user turn produced no visible agent reply"
-                                .to_string(),
-                            expected:
-                                "a tool/result line or assistant text before the input prompt"
-                                    .to_string(),
-                            actual: "only token/footer UI and the next input prompt were captured"
-                                .to_string(),
-                        });
+                        findings_free.push(blank_reply_finding(&pty.discarded_text()));
                     }
                     let mut free_screen = if free_captured.lines().count() > 2 {
                         format!(
@@ -3493,9 +3570,45 @@ fn run_agentic_session(persona: &Persona) {
                 .to_string(),
         );
     }
+    // Run the executable acceptance checks against the workspace piku actually
+    // edited. A run where piku produced fluent prose but no passing workspace
+    // is a failed run, whatever the judges concluded.
+    let mut scenario_results: Vec<String> = Vec::new();
+    let mut scenario_failures: Vec<String> = Vec::new();
+    let mut scenario_goal = "";
+    if let Some(contract) = contract {
+        scenario_goal = contract.goal;
+        for result in scenario::verify(contract, &workspace) {
+            eprintln!(
+                "[scenario] {} {}",
+                if result.passed { "pass" } else { "FAIL" },
+                result.label
+            );
+            scenario_results.push(format!(
+                "{}: {}",
+                if result.passed { "pass" } else { "fail" },
+                result.label
+            ));
+            if !result.passed {
+                scenario_failures.push(format!(
+                    "[scenario:{}] acceptance check failed: {} — {}",
+                    contract.id,
+                    result.label,
+                    safe_truncate(result.evidence.trim(), 400)
+                ));
+            }
+        }
+    }
+
     let (verified_findings, hypotheses, next_action) =
-        improvement_handoff(&entries, harness_findings);
+        improvement_handoff(&entries, harness_findings, &scenario_failures);
     eprintln!("\n=== PIKU IMPROVEMENT HANDOFF ===");
+    if !scenario_results.is_empty() {
+        eprintln!("scenario goal: {scenario_goal}");
+        for result in &scenario_results {
+            eprintln!("scenario check: {result}");
+        }
+    }
     eprintln!("verified findings: {}", verified_findings.len());
     eprintln!("hypotheses to reproduce: {}", hypotheses.len());
     eprintln!("next action: {next_action}");
@@ -3507,6 +3620,8 @@ fn run_agentic_session(persona: &Persona) {
                 run_id: ledger.run_id(),
                 persona: persona.name,
                 prior_verified_history: &prior_findings,
+                scenario_goal,
+                scenario_results: &scenario_results,
                 verified_findings: &verified_findings,
                 hypotheses: &hypotheses,
                 next_action,
@@ -3876,6 +3991,51 @@ fn visible_turn_output_excludes_footer_only_capture() {
     assert!(has_visible_turn_output(
         "[permission denied: bash] user denied\n[2 iter · +12 tokens]\n"
     ));
+}
+
+#[test]
+fn blank_reply_is_attributed_to_the_harness_when_the_reply_was_discarded() {
+    let harness_artifact = blank_reply_finding("Here is the summary you asked for.\n");
+    assert_eq!(harness_artifact.severity, Severity::Info);
+    assert!(harness_artifact.description.contains("harness cleared"));
+    assert!(harness_artifact.actual.contains("summary you asked for"));
+
+    let piku_defect = blank_reply_finding("[1 iter · +12 tokens]\n");
+    assert_eq!(piku_defect.severity, Severity::Major);
+    assert!(piku_defect.description.contains("no visible agent reply"));
+}
+
+#[test]
+fn failed_acceptance_check_outranks_screen_findings_in_the_handoff() {
+    let entries = vec![CritiqueEntry {
+        phase: "startup".to_string(),
+        action_desc: "Observe".to_string(),
+        screen_text: String::new(),
+        observations: Vec::new(),
+        bugs: Vec::new(),
+        deterministic_findings: vec![Finding {
+            severity: Severity::Major,
+            description: "cursor was hidden at the prompt".to_string(),
+            expected: "a visible cursor".to_string(),
+            actual: "hidden".to_string(),
+        }],
+        workspace_diff: "no changes".to_string(),
+        permission_events: Vec::new(),
+        next_action: NextAction::Quit,
+    }];
+    let failures = vec!["[scenario:x] acceptance check failed: cargo test --quiet".to_string()];
+
+    let (verified, _, next_action) = improvement_handoff(&entries, Vec::new(), &failures);
+    assert!(verified
+        .iter()
+        .any(|finding| finding.contains("scenario:x")));
+    assert_eq!(next_action, "fix_piku_for_failed_scenario_acceptance");
+
+    let (_, _, without_scenario) = improvement_handoff(&entries, Vec::new(), &[]);
+    assert_eq!(
+        without_scenario,
+        "fix_harness_or_reproduce_verified_findings"
+    );
 }
 
 #[test]

@@ -62,6 +62,19 @@ pub struct ConfigRecord<'a> {
     pub judge_client: &'static str,
 }
 
+/// The filesystem-backed task contract selected for a run.
+#[derive(Serialize)]
+pub struct ScenarioContractRecord<'a> {
+    pub schema_version: u8,
+    pub kind: &'static str,
+    pub run_id: &'a str,
+    pub timestamp_secs: u64,
+    pub scenario_id: &'a str,
+    pub contexts: &'a [&'a str],
+    pub goal: &'a str,
+    pub verifications: &'a [String],
+}
+
 /// A bounded second-order review of the judge and the observed piku behavior.
 #[derive(Serialize)]
 pub struct ObserverRecord<'a> {
@@ -100,6 +113,12 @@ pub struct DevelopmentContextRecord<'a> {
     pub run_id: &'a str,
     pub persona: &'a str,
     pub prior_verified_history: &'a str,
+    /// The scenario goal the run was working toward, empty when the persona
+    /// has no filesystem contract.
+    pub scenario_goal: &'a str,
+    /// One line per executable acceptance check, pass or fail. These are the
+    /// authoritative product outcomes; LLM review only annotates them.
+    pub scenario_results: &'a [String],
     pub verified_findings: &'a [String],
     pub hypotheses: &'a [String],
     pub next_action: &'a str,
@@ -149,6 +168,13 @@ impl PlaygroundLedger {
     }
 
     pub fn append_config(&self, record: &ConfigRecord<'_>) -> std::io::Result<()> {
+        self.append(record)
+    }
+
+    pub fn append_scenario_contract(
+        &self,
+        record: &ScenarioContractRecord<'_>,
+    ) -> std::io::Result<()> {
         self.append(record)
     }
 
@@ -267,6 +293,19 @@ mod tests {
                 primary_review_grounded: true,
             })
             .unwrap();
+        let contract_verifications = vec!["cargo test --quiet".to_string()];
+        ledger
+            .append_scenario_contract(&ScenarioContractRecord {
+                schema_version: 1,
+                kind: "scenario_contract",
+                run_id: ledger.run_id(),
+                timestamp_secs: 1,
+                scenario_id: "feature-line-numbers",
+                contexts: &["feature-development"],
+                goal: "return 1-based line numbers",
+                verifications: &contract_verifications,
+            })
+            .unwrap();
         let verified = vec!["a deterministic check failed".to_string()];
         let hypotheses = vec!["the agent may have missed a regression".to_string()];
         ledger
@@ -288,14 +327,16 @@ mod tests {
                 run_id: ledger.run_id(),
                 persona: "tester",
                 prior_verified_history: "[MAJOR] previous deterministic failure",
+                scenario_goal: "return 1-based line numbers",
+                scenario_results: &["fail: cargo test --quiet".to_string()],
                 verified_findings: &verified,
                 hypotheses: &hypotheses,
-                next_action: "reproduce_verified_findings_then_fix",
+                next_action: "fix_piku_for_failed_scenario_acceptance",
             })
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = content.lines().collect();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(record["kind"], "turn");
         assert_eq!(record["observations"][0], "response is readable");
@@ -306,7 +347,11 @@ mod tests {
         let observer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(observer["kind"], "recursive_observer");
         assert_eq!(observer["verdict"], "keep");
-        let handoff: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+        let contract: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(contract["kind"], "scenario_contract");
+        assert_eq!(contract["scenario_id"], "feature-line-numbers");
+        assert_eq!(contract["verifications"][0], "cargo test --quiet");
+        let handoff: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
         assert_eq!(handoff["kind"], "improvement_handoff");
         assert_eq!(
             handoff["next_action"],
@@ -322,6 +367,18 @@ mod tests {
         assert_eq!(
             context_packet["verified_findings"][0],
             "a deterministic check failed"
+        );
+        assert_eq!(
+            context_packet["scenario_goal"],
+            "return 1-based line numbers"
+        );
+        assert_eq!(
+            context_packet["scenario_results"][0],
+            "fail: cargo test --quiet"
+        );
+        assert_eq!(
+            context_packet["next_action"],
+            "fix_piku_for_failed_scenario_acceptance"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
