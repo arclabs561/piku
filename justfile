@@ -76,6 +76,13 @@ agentic-user-full persona="confident_dev":
 playground persona="confident_dev" turns="6" piku_model="openai/gpt-5.6-sol" user_model="openai/gpt-5.6-terra" judge_model="anthropic/claude-opus-5":
     PIKU_AGENTIC_PIKU_PROVIDER=openrouter PIKU_AGENTIC_PIKU_MODEL={{piku_model}} PIKU_AGENTIC_USER_PROVIDER=openrouter PIKU_AGENTIC_USER_MODEL={{user_model}} PIKU_AGENTIC_JUDGE_PROVIDER=openrouter PIKU_AGENTIC_JUDGE_MODEL={{judge_model}} PIKU_AGENTIC_MAX_TURNS={{turns}} cargo test --test agentic_user -p piku -- agentic_user_{{persona}} --ignored --nocapture
 
+# Sample a reproducible OpenRouter subject/user assignment. The judge stays on
+# Claude Opus 5 as a calibration anchor; selected models and seed are recorded
+# in the config ledger, so a finding can be replayed exactly.
+# Usage: just playground-sample adversarial 8 42
+playground-sample persona="adversarial" turns="6" seed="":
+    bash -eu -o pipefail -c 'seed="$1"; if [ -z "$seed" ]; then seed="$(date +%s)"; fi; case "$seed" in *[!0-9]*) printf "seed must be decimal: %s\\n" "$seed" >&2; exit 2;; esac; RANDOM="$seed"; piku_models=(openai/gpt-5.6-sol openai/gpt-5.6-terra deepseek/deepseek-v4-flash deepseek/deepseek-v4-pro xiaomi/mimo-v2.5 tencent/hy3); user_models=(openai/gpt-5.6-terra openai/gpt-5.6-luna deepseek/deepseek-v4-flash xiaomi/mimo-v2.5 tencent/hy3); piku_model="${piku_models[RANDOM % ${#piku_models[@]}]}"; user_model="${user_models[RANDOM % ${#user_models[@]}]}"; judge_model="anthropic/claude-opus-5"; printf "playground sample seed=%s piku=%s user=%s judge=%s\\n" "$seed" "$piku_model" "$user_model" "$judge_model"; PIKU_AGENTIC_MODEL_SELECTION_SEED="$seed" PIKU_AGENTIC_PIKU_PROVIDER=openrouter PIKU_AGENTIC_PIKU_MODEL="$piku_model" PIKU_AGENTIC_USER_PROVIDER=openrouter PIKU_AGENTIC_USER_MODEL="$user_model" PIKU_AGENTIC_JUDGE_PROVIDER=openrouter PIKU_AGENTIC_JUDGE_MODEL="$judge_model" PIKU_AGENTIC_MAX_TURNS="$2" cargo test --test agentic_user -p piku -- "agentic_user_$3" --ignored --nocapture' -- '{{seed}}' '{{turns}}' '{{persona}}'
+
 # Run the report-first dogfood suite.
 dogfood:
     cargo test --test dogfood -p piku -- --ignored --nocapture

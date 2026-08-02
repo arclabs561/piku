@@ -56,8 +56,8 @@ mod recursive_observer;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    now_secs, ConfigRecord, ImprovementHandoffRecord, ObserverRecord, PlaygroundLedger,
-    ReviewRecord, TurnRecord,
+    now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord, ObserverRecord,
+    PlaygroundLedger, ReviewRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -952,6 +952,57 @@ struct PtyHandle {
     raw_capture: Vec<u8>,
     eof: bool,
     ready_wait_timed_out: bool,
+    permission_response: PermissionResponse,
+    permission_events: Vec<String>,
+}
+
+/// The explicit response used when the observed terminal asks for permission.
+/// A one-time approval is deliberately the default: one completed action must
+/// not silently grant a later action a broader capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionResponse {
+    AllowOnce,
+    AllowAll,
+    Deny,
+}
+
+impl PermissionResponse {
+    fn from_env() -> Self {
+        match std::env::var("PIKU_AGENTIC_PERMISSION_RESPONSE") {
+            Ok(value) if value.eq_ignore_ascii_case("y") || value.eq_ignore_ascii_case("once") => {
+                Self::AllowOnce
+            }
+            Ok(value) if value.eq_ignore_ascii_case("a") || value.eq_ignore_ascii_case("all") => {
+                Self::AllowAll
+            }
+            Ok(value) if value.eq_ignore_ascii_case("n") || value.eq_ignore_ascii_case("deny") => {
+                Self::Deny
+            }
+            Ok(value) => {
+                eprintln!(
+                    "[playground] unknown PIKU_AGENTIC_PERMISSION_RESPONSE={value:?}; using one-time approval"
+                );
+                Self::AllowOnce
+            }
+            Err(_) => Self::AllowOnce,
+        }
+    }
+
+    const fn key(self) -> &'static [u8] {
+        match self {
+            Self::AllowOnce => b"y",
+            Self::AllowAll => b"a",
+            Self::Deny => b"n",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "y (allow once)",
+            Self::AllowAll => "a (allow all)",
+            Self::Deny => "n (deny)",
+        }
+    }
 }
 
 impl PtyHandle {
@@ -1008,6 +1059,8 @@ impl PtyHandle {
             raw_capture: Vec::new(),
             eof: false,
             ready_wait_timed_out: false,
+            permission_response: PermissionResponse::from_env(),
+            permission_events: Vec::new(),
         }
     }
 
@@ -1130,7 +1183,8 @@ impl PtyHandle {
     }
 
     /// Wait until the screen shows piku is ready (prompt visible, cursor on input row).
-    /// Auto-accepts permission prompts (`y/n/a?`) by sending `a` (allow-all).
+    /// Permission responses are explicit, one-time by default, and retained
+    /// as turn evidence.
     /// Returns the final snapshot.
     fn wait_for_ready(
         &mut self,
@@ -1149,10 +1203,15 @@ impl PtyHandle {
                 eprintln!("[pty] process died during ready-wait");
                 return snap;
             }
-            // Auto-accept permission prompts so the turn can complete.
+            // Answer permission prompts using the configured bounded policy.
             if snap.has_permission_prompt() {
-                eprintln!("[pty] detected permission prompt, sending 'a' (allow-all)");
-                self.send_bytes(b"a");
+                let event = format!(
+                    "permission prompt detected; harness responded {}",
+                    self.permission_response.label()
+                );
+                eprintln!("[pty] {event}");
+                self.permission_events.push(event);
+                self.send_bytes(self.permission_response.key());
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -1175,6 +1234,10 @@ impl PtyHandle {
 
     fn take_ready_wait_timeout(&mut self) -> bool {
         std::mem::take(&mut self.ready_wait_timed_out)
+    }
+
+    fn take_permission_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.permission_events)
     }
 }
 
@@ -1485,6 +1548,18 @@ fn deterministic_checks(
     }
 
     findings
+}
+
+/// Raw capture starts after the typing echo. A completed user turn must leave
+/// either a tool/result line or visible assistant text; the final prompt and
+/// token footer alone are not a reply.
+fn has_visible_turn_output(captured: &str) -> bool {
+    captured.lines().map(str::trim).any(|line| {
+        !line.is_empty()
+            && !(line.starts_with('[') && line.contains(" iter") && line.contains("tokens"))
+            && !line.starts_with("openrouter ")
+            && !line.contains("❯ Send a message or /help")
+    })
 }
 
 // ===========================================================================
@@ -1976,6 +2051,7 @@ struct CritiqueEntry {
     bugs: Vec<Bug>,
     deterministic_findings: Vec<Finding>,
     workspace_diff: String,
+    permission_events: Vec<String>,
     next_action: NextAction,
 }
 
@@ -2530,6 +2606,7 @@ fn append_playground_turn(
         action: &entry.action_desc,
         viewport: safe_truncate(&entry.screen_text, 4_000),
         workspace_diff: &entry.workspace_diff,
+        permission_events: &entry.permission_events,
         observations: &entry.observations,
         bugs: &bugs,
         deterministic_findings: &deterministic_findings,
@@ -2903,6 +2980,9 @@ fn run_agentic_session(persona: &Persona) {
             judge_model: &judge_llm.spec.model,
             piku_provider: piku_spec.label,
             piku_model: &piku_spec.model,
+            model_selection_seed: std::env::var("PIKU_AGENTIC_MODEL_SELECTION_SEED")
+                .ok()
+                .as_deref(),
             user_agent_client: "direct-https/reqwest",
             judge_client: "direct-https/reqwest",
         }) {
@@ -2923,6 +3003,13 @@ fn run_agentic_session(persona: &Persona) {
         eprintln!(
             "[agentic_user] screen contents: {:?}",
             safe_truncate(&startup_snap.contents, 200)
+        );
+    }
+    let startup_permission_events = pty.take_permission_events();
+    if !startup_permission_events.is_empty() {
+        eprintln!(
+            "[agentic_user] startup permission events: {}",
+            startup_permission_events.join("; ")
         );
     }
 
@@ -3029,6 +3116,7 @@ fn run_agentic_session(persona: &Persona) {
             });
         }
         let ws_diff = ws_observer.diff_since_checkpoint();
+        let permission_events = pty.take_permission_events();
 
         // Log deterministic findings
         for f in &findings {
@@ -3056,13 +3144,26 @@ fn run_agentic_session(persona: &Persona) {
 
         // Get full response content from raw byte capture (bypasses DECSTBM clipping)
         let captured = pty.captured_text();
+        if matches!(
+            last_action,
+            Action::Submit(_) | Action::Key(SpecialKey::Enter)
+        ) && !has_visible_turn_output(&captured)
+        {
+            findings.push(Finding {
+                severity: Severity::Major,
+                description: "completed user turn produced no visible agent reply".to_string(),
+                expected: "a tool/result line or assistant text before the input prompt"
+                    .to_string(),
+                actual: "only token/footer UI and the next input prompt were captured".to_string(),
+            });
+        }
         eprintln!(
             "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
             pty.raw_capture.len(),
             captured.len(),
             captured.lines().count()
         );
-        let screen_for_llm = if captured.lines().count() > 2 {
+        let mut screen_for_llm = if captured.lines().count() > 2 {
             format!(
                 "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
                 evidence_excerpt(&captured, 8_000),
@@ -3071,6 +3172,15 @@ fn run_agentic_session(persona: &Persona) {
         } else {
             snap_after.summary(30)
         };
+        if permission_events.is_empty() {
+            screen_for_llm
+                .push_str("\nPERMISSION EVENTS: none detected by the terminal observer.\n");
+        } else {
+            screen_for_llm.push_str(&format!(
+                "\nPERMISSION EVENTS:\n{}\n",
+                permission_events.join("\n")
+            ));
+        }
         eprintln!(
             "[agentic_user] screen_for_llm: {} chars, {} lines",
             screen_for_llm.len(),
@@ -3112,6 +3222,7 @@ fn run_agentic_session(persona: &Persona) {
             bugs,
             deterministic_findings: findings,
             workspace_diff: ws_diff.summary(),
+            permission_events,
             next_action: NextAction::Quit, // scripted phase, no next
         });
         if let Some(entry) = entries.last() {
@@ -3194,9 +3305,10 @@ fn run_agentic_session(persona: &Persona) {
                         pty.settle(&mut observer, Duration::from_millis(100));
                         observer.snapshot()
                     };
-                    let findings_free =
+                    let mut findings_free =
                         deterministic_checks(&snap_before_free, &snap_after_free, &action);
                     let ws_diff_free = ws_observer.diff_since_checkpoint();
+                    let permission_events = pty.take_permission_events();
 
                     let det_report_free: String = findings_free
                         .iter()
@@ -3205,7 +3317,19 @@ fn run_agentic_session(persona: &Persona) {
                         .join("\n");
 
                     let free_captured = pty.captured_text();
-                    let free_screen = if free_captured.lines().count() > 2 {
+                    if waits_for_response && !has_visible_turn_output(&free_captured) {
+                        findings_free.push(Finding {
+                            severity: Severity::Major,
+                            description: "completed user turn produced no visible agent reply"
+                                .to_string(),
+                            expected:
+                                "a tool/result line or assistant text before the input prompt"
+                                    .to_string(),
+                            actual: "only token/footer UI and the next input prompt were captured"
+                                .to_string(),
+                        });
+                    }
+                    let mut free_screen = if free_captured.lines().count() > 2 {
                         format!(
                             "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
                             evidence_excerpt(&free_captured, 8_000),
@@ -3214,6 +3338,16 @@ fn run_agentic_session(persona: &Persona) {
                     } else {
                         snap_after_free.summary(30)
                     };
+                    if permission_events.is_empty() {
+                        free_screen.push_str(
+                            "\nPERMISSION EVENTS: none detected by the terminal observer.\n",
+                        );
+                    } else {
+                        free_screen.push_str(&format!(
+                            "\nPERMISSION EVENTS:\n{}\n",
+                            permission_events.join("\n")
+                        ));
+                    }
                     let (obs2, bugs2, _) = user_agent_critique(
                         &ua_llm,
                         persona,
@@ -3249,6 +3383,7 @@ fn run_agentic_session(persona: &Persona) {
                         bugs: bugs2,
                         deterministic_findings: findings_free,
                         workspace_diff: ws_diff_free.summary(),
+                        permission_events,
                         next_action: NextAction::Quit,
                     });
                     if let Some(entry) = entries.last() {
@@ -3366,6 +3501,24 @@ fn run_agentic_session(persona: &Persona) {
     eprintln!("next action: {next_action}");
     eprintln!("=== END PIKU IMPROVEMENT HANDOFF ===\n");
     if let Some(ledger) = &ledger {
+        let development_context_path = ledger
+            .write_development_context(&DevelopmentContextRecord {
+                schema_version: 1,
+                run_id: ledger.run_id(),
+                persona: persona.name,
+                prior_verified_history: &prior_findings,
+                verified_findings: &verified_findings,
+                hypotheses: &hypotheses,
+                next_action,
+            })
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| {
+                eprintln!("[playground] could not write development context: {error}");
+                String::new()
+            });
+        if !development_context_path.is_empty() {
+            eprintln!("[playground] development context: {development_context_path}");
+        }
         if let Err(error) = ledger.append_improvement_handoff(&ImprovementHandoffRecord {
             schema_version: 1,
             kind: "improvement_handoff",
@@ -3375,6 +3528,7 @@ fn run_agentic_session(persona: &Persona) {
             verified_findings: &verified_findings,
             hypotheses: &hypotheses,
             next_action,
+            development_context_path: &development_context_path,
         }) {
             eprintln!("[playground] could not append improvement handoff: {error}");
         }
@@ -3706,6 +3860,22 @@ fn review_grounding_rejects_unknown_turns() {
         1
     ));
     assert!(!review_is_grounded(&serde_json::json!({}), 1));
+}
+
+#[test]
+fn visible_turn_output_excludes_footer_only_capture() {
+    assert!(!has_visible_turn_output(
+        "[1 iter · +2965 tokens]\nopenrouter · model │ /help ❯ Send a message or /help\n"
+    ));
+    assert!(has_visible_turn_output(
+        "⏺ Read(src/lib.rs:1-20)\n⎿ contents\nopenrouter · model │ /help ❯ Send a message or /help\n"
+    ));
+    assert!(has_visible_turn_output(
+        "The requested operation was denied.\nopenrouter · model │ /help ❯ Send a message or /help\n"
+    ));
+    assert!(has_visible_turn_output(
+        "[permission denied: bash] user denied\n[2 iter · +12 tokens]\n"
+    ));
 }
 
 #[test]

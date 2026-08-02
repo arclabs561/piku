@@ -473,7 +473,7 @@ mod agent_loop_extended {
     use super::tempdir;
     use crate::agent_loop::{run_turn, OutputSink};
     use crate::permission::AllowAll;
-    use crate::session::Session;
+    use crate::session::{ContentBlock, MessageRole, Session};
     use piku_tools::all_tool_definitions;
 
     #[derive(Default)]
@@ -607,6 +607,52 @@ mod agent_loop_extended {
         .await;
 
         assert_eq!(*captured.lock().unwrap(), "claude-sonnet-4.6");
+    }
+
+    #[tokio::test]
+    async fn empty_provider_response_is_visible_and_persisted() {
+        struct EmptyProvider;
+        impl Provider for EmptyProvider {
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+
+            fn stream_message(
+                &self,
+                _request: MessageRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
+                Box::pin(async_stream::stream! {
+                    yield Ok(Event::MessageStop { stop_reason: StopReason::EndTurn });
+                })
+            }
+        }
+
+        let provider = EmptyProvider;
+        let mut session = Session::new("empty".to_string());
+        let mut sink = CaptureSink::default();
+
+        run_turn(
+            "hi",
+            &mut session,
+            &provider,
+            "test-model",
+            &[],
+            vec![],
+            &AllowAll,
+            &mut sink,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(sink.text.contains("model returned an empty response"));
+        assert!(session.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.blocks.iter().any(|block| match block {
+                    ContentBlock::Text { text } => text.contains("empty response"),
+                    _ => false,
+                })
+        }));
     }
 
     #[tokio::test]

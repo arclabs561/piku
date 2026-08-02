@@ -136,6 +136,7 @@ reviews become ledger records:
 
 ```bash
 just playground confident_dev 6
+just playground-sample adversarial 8 42
 ```
 
 Each opt-in run appends turn evidence and its final meta-review to
@@ -153,6 +154,14 @@ credential-free `config` entry. The harness reads an optional local `.env` as
 dotenv data; it never shell-sources that file or places credentials in a child
 process command line.
 
+`just playground-sample` rotates piku and simulated-user models from a small
+OpenRouter pool: GPT-5.6 Sol/Terra/Luna, DeepSeek V4 Flash/Pro, MiMo-V2.5, and
+Hy3. Claude Opus 5 remains the judge anchor so role variation does not confound
+review quality. Its decimal seed and resolved assignment are ledgered, so an
+interesting run can be replayed. Permission prompts are also ledgered with the
+harness response; the default is one-time approval (`y`). Set
+`PIKU_AGENTIC_PERMISSION_RESPONSE=n` for an explicit-denial replay.
+
 The point of the playground is to improve piku, not accumulate model prose.
 Every completed run ends with an `improvement_handoff`: deterministic failures
 and ungrounded-review detections are **verified findings** to reproduce and
@@ -161,3 +170,8 @@ changing piku. Judge records cite observed turns, and the recursive observer
 can invalidate an ungrounded primary review. The terminal output states the
 next action, and the handoff is append-only evidence for the next engineering
 session.
+It also writes a deterministic JSON development-context packet next to the
+ledger (`target/agentic-findings/development-context/`): use that packet, not
+free-form judge prose, to select the next piku change and its validation run.
+The packet carries a bounded history of prior deterministic findings (including
+recurrence), never unverified historical model allegations.

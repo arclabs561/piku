@@ -25,6 +25,9 @@ pub struct TurnRecord<'a> {
     pub action: &'a str,
     pub viewport: &'a str,
     pub workspace_diff: &'a str,
+    /// Permission prompts observed in this turn and the harness response. This
+    /// distinguishes an explicit approval from a silently unguarded tool call.
+    pub permission_events: &'a [String],
     pub observations: &'a [String],
     pub bugs: &'a [String],
     pub deterministic_findings: &'a [String],
@@ -54,6 +57,7 @@ pub struct ConfigRecord<'a> {
     pub judge_model: &'a str,
     pub piku_provider: &'a str,
     pub piku_model: &'a str,
+    pub model_selection_seed: Option<&'a str>,
     pub user_agent_client: &'static str,
     pub judge_client: &'static str,
 }
@@ -84,6 +88,21 @@ pub struct ImprovementHandoffRecord<'a> {
     pub verified_findings: &'a [String],
     pub hypotheses: &'a [String],
     pub next_action: &'static str,
+    pub development_context_path: &'a str,
+}
+
+/// Deterministic context for the engineer who closes the evaluation loop.
+/// It deliberately excludes free-form judge prose: only reproducible evidence
+/// and the selected next action belong in a product-development handoff.
+#[derive(Serialize)]
+pub struct DevelopmentContextRecord<'a> {
+    pub schema_version: u8,
+    pub run_id: &'a str,
+    pub persona: &'a str,
+    pub prior_verified_history: &'a str,
+    pub verified_findings: &'a [String],
+    pub hypotheses: &'a [String],
+    pub next_action: &'a str,
 }
 
 pub struct PlaygroundLedger {
@@ -144,6 +163,26 @@ impl PlaygroundLedger {
         self.append(record)
     }
 
+    pub fn write_development_context(
+        &self,
+        record: &DevelopmentContextRecord<'_>,
+    ) -> std::io::Result<PathBuf> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("development-context");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.json", self.run_id));
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        serde_json::to_writer_pretty(file, record)?;
+        Ok(path)
+    }
+
     fn append<T: Serialize>(&self, record: &T) -> std::io::Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -190,6 +229,7 @@ mod tests {
                 action: "Observe",
                 viewport: "❯",
                 workspace_diff: "no changes",
+                permission_events: &[],
                 observations: &observations,
                 bugs: &[],
                 deterministic_findings: &[],
@@ -207,6 +247,7 @@ mod tests {
                 judge_model: "test-judge",
                 piku_provider: "ollama",
                 piku_model: "test",
+                model_selection_seed: Some("42"),
                 user_agent_client: "direct-https/reqwest",
                 judge_client: "direct-https/reqwest",
             })
@@ -238,6 +279,18 @@ mod tests {
                 verified_findings: &verified,
                 hypotheses: &hypotheses,
                 next_action: "reproduce_verified_findings_then_fix",
+                development_context_path: "development-context/example.json",
+            })
+            .unwrap();
+        let context_path = ledger
+            .write_development_context(&DevelopmentContextRecord {
+                schema_version: 1,
+                run_id: ledger.run_id(),
+                persona: "tester",
+                prior_verified_history: "[MAJOR] previous deterministic failure",
+                verified_findings: &verified,
+                hypotheses: &hypotheses,
+                next_action: "reproduce_verified_findings_then_fix",
             })
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -249,6 +302,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(config["kind"], "config");
         assert_eq!(config["judge_model"], "test-judge");
+        assert_eq!(config["model_selection_seed"], "42");
         let observer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(observer["kind"], "recursive_observer");
         assert_eq!(observer["verdict"], "keep");
@@ -257,6 +311,17 @@ mod tests {
         assert_eq!(
             handoff["next_action"],
             "reproduce_verified_findings_then_fix"
+        );
+        let context_packet: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(context_path).unwrap()).unwrap();
+        assert_eq!(context_packet["persona"], "tester");
+        assert_eq!(
+            context_packet["prior_verified_history"],
+            "[MAJOR] previous deterministic failure"
+        );
+        assert_eq!(
+            context_packet["verified_findings"][0],
+            "a deterministic check failed"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

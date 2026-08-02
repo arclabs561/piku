@@ -305,7 +305,7 @@ async fn run_turn_inner(
         let request = build_request(session, model, system_prompt, &tool_defs);
 
         // stream the response
-        let (assistant_blocks, usage, mut stop_reason, maybe_err) =
+        let (mut assistant_blocks, usage, mut stop_reason, maybe_err) =
             stream_response(provider, request, sink).await;
 
         if let Some(err) = maybe_err {
@@ -316,6 +316,19 @@ async fn run_turn_inner(
         }
 
         tracker.record(usage.clone());
+
+        // A provider can legally end an SSE stream without text or a tool
+        // call. Do not turn that into a silent user-visible no-op: preserve a
+        // clear, retryable assistant message in both the sink and session.
+        if assistant_blocks.is_empty() {
+            const EMPTY_RESPONSE: &str =
+                "The model returned an empty response. Please retry your request.";
+            sink.on_text(EMPTY_RESPONSE);
+            sink.on_text("\n");
+            assistant_blocks.push(ContentBlock::Text {
+                text: EMPTY_RESPONSE.to_string(),
+            });
+        }
 
         // extract tool calls from this assistant message
         let tool_calls: Vec<(String, String, serde_json::Value)> = assistant_blocks
