@@ -944,10 +944,17 @@ fn strip_ansi_bytes(bytes: &[u8]) -> String {
 /// noise, which is what made completed turns look empty.
 fn final_redraw_state(line: &str) -> String {
     let line = line.trim();
-    // Only the last redraw is on screen; earlier frames were overwritten.
-    let last_frame = match line.rsplit_once('\u{276F}') {
-        Some((_, tail)) => format!("\u{276F}{tail}"),
-        None => line.to_string(),
+    // Several prompt glyphs mean several frames landed here and only the last
+    // is on screen. One glyph is an ordinary line: the status row carries the
+    // provider and model before the prompt, and reducing it would throw that
+    // away.
+    let last_frame = if line.matches('\u{276F}').count() > 1 {
+        match line.rsplit_once('\u{276F}') {
+            Some((_, tail)) => format!("\u{276F}{tail}"),
+            None => line.to_string(),
+        }
+    } else {
+        line.to_string()
     };
     strip_thinking_indicator(&last_frame).trim().to_string()
 }
@@ -1658,6 +1665,22 @@ mod spend {
     pub fn get(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
     }
+}
+
+/// Pull piku's session-file path out of the line it prints on exit.
+///
+/// Matched on the arrow rather than the whole sentence so a reworded status
+/// line does not silently stop the run from keeping its own subject's history.
+fn parse_session_path(captured: &str) -> Option<String> {
+    captured
+        .lines()
+        .rev()
+        .filter(|line| line.contains("session saved"))
+        .find_map(|line| {
+            let (_, path) = line.split_once('\u{2192}')?;
+            let path = path.trim().trim_end_matches(']').trim();
+            (!path.is_empty()).then(|| path.to_string())
+        })
 }
 
 /// Read piku's own per-turn token counts out of its status footer.
@@ -3307,6 +3330,13 @@ fn run_agentic_session(persona: &Persona) {
             judge_client: "direct-https/reqwest",
             run_role: &run_role,
             piku_revision: &revision,
+            review_max_tokens: ua_llm.max_tokens,
+            turn_limit: phase_turn_limit(),
+            terminal_rows: 40,
+            terminal_cols: 120,
+            permission_response: PermissionResponse::from_env().label(),
+            fast_mode: std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1"),
+            scenario_id: scenario::for_persona(persona.name).map_or("none", |contract| contract.id),
         }) {
             eprintln!("[playground] could not append config record: {error}");
         }
@@ -3775,11 +3805,32 @@ fn run_agentic_session(persona: &Persona) {
     // piku. rexpect can still block while reaping an already-zombie child, so
     // never make the evaluator's evidence and review depend on that reap.
     eprintln!("[agentic_user] sending /exit to piku...");
+    pty.clear_capture();
     pty.send_line("/exit");
     std::thread::sleep(Duration::from_millis(500));
+    // piku names its session file on the way out. That file is the only
+    // complete record of the run's other half: the messages it actually sent,
+    // the tools it called with their arguments and results, and per-turn
+    // usage. The viewport shows what a user would have seen; this shows what
+    // piku did.
+    pty.settle(&mut observer, Duration::from_millis(500));
+    let piku_session_source = parse_session_path(&pty.captured_text());
     eprintln!("[agentic_user] dropping PTY handle (detached)...");
     std::thread::spawn(move || drop(pty));
     eprintln!("[agentic_user] generating report...");
+
+    let mut piku_session_copy = String::new();
+    if let (Some(source), Some(ledger)) = (&piku_session_source, &ledger) {
+        match ledger.copy_piku_session(Path::new(source)) {
+            Ok(path) => {
+                eprintln!("[playground] piku session: {}", path.display());
+                piku_session_copy = path.display().to_string();
+            }
+            Err(error) => eprintln!("[playground] could not copy piku session: {error}"),
+        }
+    } else {
+        eprintln!("[playground] piku did not report a session file on exit");
+    }
 
     print_report(persona, &entries);
     persist_findings(persona.name, &entries);
@@ -3951,6 +4002,7 @@ fn run_agentic_session(persona: &Persona) {
                 prior_verified_history: &prior_findings,
                 scenario_goal,
                 scenario_results: &scenario_results,
+                piku_session_path: &piku_session_copy,
                 verified_findings: &verified_findings,
                 hypotheses: &hypotheses,
                 next_action,
@@ -3973,6 +4025,7 @@ fn run_agentic_session(persona: &Persona) {
             hypotheses: &hypotheses,
             next_action,
             development_context_path: &development_context_path,
+            piku_session_path: &piku_session_copy,
         }) {
             eprintln!("[playground] could not append improvement handoff: {error}");
         }
@@ -4401,6 +4454,13 @@ fn a_reply_appended_to_the_spinner_line_survives_stripping() {
         final_redraw_state("⏺ Read(src/lib.rs:1-20)"),
         "⏺ Read(src/lib.rs:1-20)"
     );
+    // The status row carries the provider and model before the prompt glyph.
+    // Reducing a single-frame line to its tail dropped that from every run's
+    // evidence.
+    assert_eq!(
+        final_redraw_state("openrouter · openai/gpt-5.6-terra │ /help ❯ Send a message or /help"),
+        "openrouter · openai/gpt-5.6-terra │ /help ❯ Send a message or /help"
+    );
 }
 
 #[test]
@@ -4413,6 +4473,26 @@ fn stripping_keeps_a_reply_that_follows_the_spinner_end_to_end() {
     );
     assert!(!stripped.contains("thinking"));
     assert!(has_visible_turn_output(&stripped, "x"));
+}
+
+#[test]
+fn the_session_path_is_read_from_pikus_exit_line() {
+    assert_eq!(
+        parse_session_path(
+            "[1 iter · +12 tokens]\n[session saved → /tmp/sessions/session-42.json]\n"
+        )
+        .as_deref(),
+        Some("/tmp/sessions/session-42.json")
+    );
+    // The last session wins if a capture spans a restart.
+    assert_eq!(
+        parse_session_path("[session saved → /tmp/a.json]\n[session saved → /tmp/b.json]\n")
+            .as_deref(),
+        Some("/tmp/b.json")
+    );
+    assert_eq!(parse_session_path("no session line here\n"), None);
+    // A status line without a path is not a path.
+    assert_eq!(parse_session_path("[session saved → ]\n"), None);
 }
 
 #[test]

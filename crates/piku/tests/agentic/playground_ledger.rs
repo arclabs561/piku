@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -68,6 +68,19 @@ pub struct ConfigRecord<'a> {
     /// The piku revision under test, so a control run can be compared to the
     /// same control on another build.
     pub piku_revision: &'a str,
+    /// Request and environment parameters. Two runs of the same models can
+    /// still differ on these, so a comparison that ignores them is comparing
+    /// two different experiments.
+    pub review_max_tokens: u32,
+    pub turn_limit: usize,
+    pub terminal_rows: u16,
+    pub terminal_cols: u16,
+    /// How the harness answers a permission prompt, which decides whether a
+    /// run exercises the allow path or the deny path at all.
+    pub permission_response: &'a str,
+    /// True when both LLM review layers were skipped.
+    pub fast_mode: bool,
+    pub scenario_id: &'a str,
 }
 
 /// The filesystem-backed task contract selected for a run.
@@ -131,6 +144,10 @@ pub struct ImprovementHandoffRecord<'a> {
     pub hypotheses: &'a [String],
     pub next_action: &'static str,
     pub development_context_path: &'a str,
+    /// Copy of piku's own session file: the messages it sent, the tools it
+    /// called with arguments and results, and per-turn usage. Empty when piku
+    /// reported no session on exit.
+    pub piku_session_path: &'a str,
 }
 
 /// Deterministic context for the engineer who closes the evaluation loop.
@@ -148,6 +165,9 @@ pub struct DevelopmentContextRecord<'a> {
     /// One line per executable acceptance check, pass or fail. These are the
     /// authoritative product outcomes; LLM review only annotates them.
     pub scenario_results: &'a [String],
+    /// Copy of piku's own session file, so the engineer can read what piku
+    /// sent and called rather than only what the terminal showed.
+    pub piku_session_path: &'a str,
     pub verified_findings: &'a [String],
     pub hypotheses: &'a [String],
     pub next_action: &'a str,
@@ -213,6 +233,24 @@ impl PlaygroundLedger {
 
     pub fn append_spend(&self, record: &SpendRecord<'_>) -> std::io::Result<()> {
         self.append(record)
+    }
+
+    /// Keep piku's own session file with the run that produced it.
+    ///
+    /// piku writes into a shared sessions directory that later runs add to and
+    /// a user may prune, so a path recorded now can point at nothing later. A
+    /// copy beside the ledger keeps the messages, tool calls, and usage
+    /// readable for as long as the evidence is.
+    pub fn copy_piku_session(&self, source: &Path) -> std::io::Result<PathBuf> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("piku-sessions");
+        fs::create_dir_all(&directory)?;
+        let destination = directory.join(format!("{}.json", self.run_id));
+        fs::copy(source, &destination)?;
+        Ok(destination)
     }
 
     pub fn append_improvement_handoff(
@@ -311,6 +349,13 @@ mod tests {
                 judge_client: "direct-https/reqwest",
                 run_role: "control",
                 piku_revision: "abc1234",
+                review_max_tokens: 2048,
+                turn_limit: 6,
+                terminal_rows: 40,
+                terminal_cols: 120,
+                permission_response: "n (deny)",
+                fast_mode: false,
+                scenario_id: "feature-line-numbers",
             })
             .unwrap();
         let judge_observations = vec!["the primary review is grounded".to_string()];
@@ -355,6 +400,7 @@ mod tests {
                 hypotheses: &hypotheses,
                 next_action: "reproduce_verified_findings_then_fix",
                 development_context_path: "development-context/example.json",
+                piku_session_path: "piku-sessions/example.json",
             })
             .unwrap();
         let context_path = ledger
@@ -365,6 +411,7 @@ mod tests {
                 prior_verified_history: "[MAJOR] previous deterministic failure",
                 scenario_goal: "return 1-based line numbers",
                 scenario_results: &["fail: cargo test --quiet".to_string()],
+                piku_session_path: "piku-sessions/example.json",
                 verified_findings: &verified,
                 hypotheses: &hypotheses,
                 next_action: "fix_piku_for_failed_scenario_acceptance",
