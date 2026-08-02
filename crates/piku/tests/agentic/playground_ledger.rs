@@ -87,6 +87,9 @@ pub struct ObserverRecord<'a> {
     pub piku_observations: &'a [String],
     pub verdict: &'a str,
     pub primary_review_grounded: bool,
+    /// `valid`, `skipped`, `provider_failure`, or `invalid_json`. Read
+    /// `primary_review_grounded` as a judgment only when this is `valid`.
+    pub status: &'a str,
 }
 
 /// The bridge from evaluation evidence to an engineering action. Verified
@@ -291,6 +294,7 @@ mod tests {
                 piku_observations: &piku_observations,
                 verdict: "keep",
                 primary_review_grounded: true,
+                status: "valid",
             })
             .unwrap();
         let contract_verifications = vec!["cargo test --quiet".to_string()];

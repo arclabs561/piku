@@ -186,3 +186,17 @@ measured against the workspace rather than inferred from the terminal.
 Readiness checks say the terminal behaved; acceptance checks say the work
 succeeded, and a run that produced plausible prose with a failing workspace is
 a failed run.
+
+Every LLM review call reports one of `valid`, `provider_failure`, or
+`invalid_json`. Invalid JSON gets one schema-specific repair attempt; a
+provider failure returns immediately rather than paying for a retry of a
+transport or quota error, and neither falls back to another LLM layer. A
+non-valid outcome contributes no observations and is recorded as a harness
+finding, so "the judge never ran" is never filed as "the judge found the
+review ungrounded" or as a piku defect.
+
+Findings are stamped with the piku revision they were observed against. A run
+inherits only the deterministic findings reproduced against the build it is
+testing; anything last seen on an older build is named as unreproduced and
+treated as closed until a run reproduces it. History that outlives the code it
+described otherwise steers each run at problems that may already be fixed.

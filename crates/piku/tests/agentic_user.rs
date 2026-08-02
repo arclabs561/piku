@@ -2136,7 +2136,7 @@ impl LlmClient {
         }
     }
 
-    fn call_raw(&self, system: &str, messages: &[(&str, &str)]) -> String {
+    fn call_raw(&self, system: &str, messages: &[(&str, &str)]) -> Result<String, String> {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
@@ -2207,8 +2207,7 @@ impl LlmClient {
         {
             Ok(client) => client,
             Err(error) => {
-                eprintln!("[llm] {} client setup failed: {error}", self.spec.label);
-                return String::new();
+                return Err(format!("{} client setup failed: {error}", self.spec.label));
             }
         };
         let mut request = client.post(url).json(&body);
@@ -2221,67 +2220,116 @@ impl LlmClient {
         let response = match request.send() {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("[llm] {} request failed: {error}", self.spec.label);
-                return String::new();
+                return Err(format!("{} request failed: {error}", self.spec.label));
             }
         };
         let status = response.status();
         let body = response.text().unwrap_or_default();
         if !status.is_success() {
-            eprintln!(
-                "[llm] {} request failed: status={} body={}",
+            return Err(format!(
+                "{} returned status {status}: {}",
                 self.spec.label,
-                status,
                 safe_truncate(&body, 500),
-            );
-            return String::new();
+            ));
         }
 
         let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
-        resp.pointer("/message/content")
+        Ok(resp
+            .pointer("/message/content")
             .or_else(|| resp.pointer("/content/0/text"))
             .or_else(|| resp.pointer("/choices/0/message/content"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .to_string()
+            .to_string())
     }
 
-    fn call_json(&self, system: &str, user: &str) -> serde_json::Value {
+    /// One LLM review attempt plus at most one schema-specific repair.
+    ///
+    /// A provider failure returns immediately: retrying a transport or quota
+    /// error against the same endpoint spends money to learn nothing, and
+    /// stacking another LLM layer on top of a failed one is how an unusable
+    /// call turns into fabricated evidence. Every non-valid path is named, so
+    /// the caller can record a harness finding instead of a product judgment.
+    fn call_json(&self, system: &str, user: &str) -> JudgeOutcome {
         let mut messages: Vec<(String, String)> = vec![("user".into(), user.into())];
+        let mut last_raw = String::new();
         for attempt in 0..2 {
             let refs: Vec<(&str, &str)> = messages
                 .iter()
                 .map(|(r, c)| (r.as_str(), c.as_str()))
                 .collect();
-            let raw = self.call_raw(system, &refs);
+            let raw = match self.call_raw(system, &refs) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    eprintln!("[llm] provider failure: {error}");
+                    return JudgeOutcome::ProviderFailure(error);
+                }
+            };
+            if raw.trim().is_empty() {
+                eprintln!("[llm] {} returned an empty body", self.spec.label);
+                return JudgeOutcome::ProviderFailure(format!(
+                    "{} returned an empty response body",
+                    self.spec.label
+                ));
+            }
             let json_str = extract_json(&raw);
-            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                Ok(v) if v.is_object() => return v,
-                _ => {
-                    if attempt == 0 {
-                        eprintln!("[user_agent] JSON parse failed, retrying");
-                        eprintln!("[user_agent] raw: {}", safe_truncate(&raw, 300));
-                        // Do not replay an invalid response as assistant context. A
-                        // stale or unrelated provider response can otherwise become
-                        // the evidence the retry evaluates.
-                        messages.push((
-                            "user".into(),
-                            "Repeat your review of the original evidence. Your previous response was not valid JSON. \
-                             Respond with ONLY a JSON object. Start with {{ and end with }}."
-                                .into(),
-                        ));
-                    }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if value.is_object() {
+                    return JudgeOutcome::Valid(value);
                 }
             }
+            last_raw = raw;
+            if attempt == 0 {
+                eprintln!("[llm] JSON parse failed, one repair attempt");
+                eprintln!("[llm] raw: {}", safe_truncate(&last_raw, 300));
+                // Do not replay an invalid response as assistant context. A
+                // stale or unrelated provider response can otherwise become
+                // the evidence the retry evaluates.
+                messages.push((
+                    "user".into(),
+                    "Repeat your review of the original evidence. Your previous response was not valid JSON. \
+                     Respond with ONLY a JSON object. Start with {{ and end with }}."
+                        .into(),
+                ));
+            }
         }
-        eprintln!("[user_agent] JSON parse failed after 2 attempts");
-        serde_json::json!({
-            "observations": ["[user-agent parse error]"],
-            "bugs": [],
-            "next_action": {"type": "quit"},
-            "reasoning": "parse error"
-        })
+        eprintln!("[llm] JSON parse failed after the repair attempt");
+        JudgeOutcome::InvalidJson(safe_truncate(&last_raw, 300).to_string())
+    }
+}
+
+/// The result of one LLM review call, named rather than collapsed into a
+/// review-shaped placeholder. A non-valid outcome is a harness fact and must
+/// never reach the improvement handoff as a piku finding.
+#[derive(Debug, Clone)]
+enum JudgeOutcome {
+    Valid(serde_json::Value),
+    ProviderFailure(String),
+    InvalidJson(String),
+}
+
+impl JudgeOutcome {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Valid(_) => "valid",
+            Self::ProviderFailure(_) => "provider_failure",
+            Self::InvalidJson(_) => "invalid_json",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Valid(_) => "",
+            Self::ProviderFailure(detail) | Self::InvalidJson(detail) => detail,
+        }
+    }
+
+    fn value(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Valid(value) => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -2366,7 +2414,7 @@ fn user_agent_critique(
     workspace_diff: &str,
     memory: &ConversationMemory,
     prior_findings: &str,
-) -> (Vec<String>, Vec<Bug>, NextAction) {
+) -> (Vec<String>, Vec<Bug>, NextAction, &'static str) {
     let prior_section = if prior_findings.is_empty() {
         String::new()
     } else {
@@ -2395,7 +2443,18 @@ fn user_agent_critique(
         evidence_excerpt(screen_text, 8_000),
     );
 
-    let parsed = llm.call_json(USER_AGENT_SYSTEM, &user_prompt);
+    let outcome = llm.call_json(USER_AGENT_SYSTEM, &user_prompt);
+    let Some(parsed) = outcome.value() else {
+        // No observations, no bugs, no action. A failed review contributes
+        // nothing rather than a placeholder the next turn would read as
+        // evidence.
+        eprintln!(
+            "[user_agent] review unusable ({}): {}",
+            outcome.status(),
+            safe_truncate(outcome.detail(), 200)
+        );
+        return (Vec::new(), Vec::new(), NextAction::Quit, outcome.status());
+    };
 
     let observations: Vec<String> = parsed["observations"]
         .as_array()
@@ -2427,14 +2486,14 @@ fn user_agent_critique(
         })
         .unwrap_or_default();
 
-    let next_action = playground::parse_decision(&parsed);
+    let next_action = playground::parse_decision(parsed);
 
     let reasoning = parsed["reasoning"].as_str().unwrap_or("");
     if !reasoning.is_empty() {
         eprintln!("[user_agent] reasoning: {reasoning}");
     }
 
-    (observations, bugs, next_action)
+    (observations, bugs, next_action, outcome.status())
 }
 
 // ===========================================================================
@@ -2582,6 +2641,7 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let revision = piku_revision();
 
     for entry in entries {
         // Persist bugs (non-info) and deterministic findings (non-info)
@@ -2598,6 +2658,7 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
                 "expected": bug.expected,
                 "actual": bug.actual,
                 "source": "llm",
+                "piku_revision": revision,
             });
             let _ = writeln!(file, "{record}");
         }
@@ -2614,6 +2675,7 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
                 "expected": finding.expected,
                 "actual": finding.actual,
                 "source": "deterministic",
+                "piku_revision": revision,
             });
             let _ = writeln!(file, "{record}");
         }
@@ -2724,6 +2786,11 @@ fn improvement_handoff(
 struct MetaReview {
     text: String,
     grounded: bool,
+    /// Why the review is or is not usable. `grounded: false` on a `valid`
+    /// status means the judge ran and cited no real turn; on any other status
+    /// it means the judge never produced a review at all. Conflating the two
+    /// reports a missing judge as an ungrounded one.
+    status: &'static str,
 }
 
 fn review_is_grounded(review: &serde_json::Value, entry_count: usize) -> bool {
@@ -2748,6 +2815,7 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
         return MetaReview {
             text: String::new(),
             grounded: true,
+            status: "valid",
         };
     }
 
@@ -2828,9 +2896,25 @@ Return only JSON with this exact schema:
         "[meta-judge] running analysis ({} chars evidence)...",
         evidence.len()
     );
-    let parsed = llm.call_json(system, &evidence);
-    let grounded = review_is_grounded(&parsed, entries.len());
-    let response = serde_json::to_string_pretty(&parsed)
+    let outcome = llm.call_json(system, &evidence);
+    let Some(parsed) = outcome.value() else {
+        eprintln!(
+            "[meta-judge] unavailable ({}): {}",
+            outcome.status(),
+            safe_truncate(outcome.detail(), 300)
+        );
+        return MetaReview {
+            text: format!(
+                "primary judge unavailable ({}): {}",
+                outcome.status(),
+                safe_truncate(outcome.detail(), 300)
+            ),
+            grounded: false,
+            status: outcome.status(),
+        };
+    };
+    let grounded = review_is_grounded(parsed, entries.len());
+    let response = serde_json::to_string_pretty(parsed)
         .unwrap_or_else(|error| format!("{{\"review_error\":\"{error}\"}}"));
 
     // Write to findings dir
@@ -2858,6 +2942,7 @@ Return only JSON with this exact schema:
     MetaReview {
         text: response,
         grounded,
+        status: outcome.status(),
     }
 }
 
@@ -2871,55 +2956,48 @@ fn load_prior_findings(persona: &str) -> String {
         return String::new();
     };
 
-    let mut bug_counts: HashMap<String, usize> = HashMap::new();
-    let mut recent_bugs: Vec<String> = Vec::new();
+    let revision = piku_revision();
+    let (open, earlier, open_for_persona) =
+        partition_findings_by_revision(&content, persona, &revision);
 
-    for line in content.lines() {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if !is_verified_finding(&record) {
-            continue;
-        }
-        // Count recurring bugs across all personas
-        if let Some(desc) = record["description"].as_str() {
-            *bug_counts.entry(desc.to_string()).or_insert(0) += 1;
-        }
-        // Collect recent bugs for this persona (last 20)
-        if record["persona"].as_str() == Some(persona) {
-            if let (Some(sev), Some(desc)) =
-                (record["severity"].as_str(), record["description"].as_str())
-            {
-                recent_bugs.push(format!("[{sev}] {desc}"));
-            }
-        }
-    }
-
-    if bug_counts.is_empty() {
+    if open.is_empty() && earlier.is_empty() {
         return String::new();
     }
 
-    let mut out = String::from("PRIOR FINDINGS (from previous runs):\n");
+    let mut out = format!("PRIOR FINDINGS (piku revision {revision}):\n");
 
-    // Recurring bugs (found 2+ times)
-    let mut recurring: Vec<(&String, &usize)> =
-        bug_counts.iter().filter(|(_, &c)| c >= 2).collect();
-    recurring.sort_by(|a, b| b.1.cmp(a.1));
-    if !recurring.is_empty() {
-        out.push_str("  Recurring bugs (probe these harder):\n");
-        for (desc, count) in recurring.iter().take(5) {
-            out.push_str(&format!("    ({count}x) {desc}\n"));
+    if open.is_empty() {
+        out.push_str("  No prior finding has been reproduced against this build.\n");
+    } else {
+        let mut reproduced: Vec<(&String, &usize)> = open.iter().collect();
+        reproduced.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        out.push_str("  Open against this build (probe these harder):\n");
+        for (description, count) in reproduced.iter().take(5) {
+            out.push_str(&format!("    ({count}x) {description}\n"));
         }
     }
 
-    // Recent persona-specific bugs
-    if !recent_bugs.is_empty() {
+    if !open_for_persona.is_empty() {
         out.push_str(&format!(
-            "  Recent bugs for {persona} ({} total):\n",
-            recent_bugs.len()
+            "  Open for {persona} ({} total):\n",
+            open_for_persona.len()
         ));
-        for bug in recent_bugs.iter().rev().take(5) {
-            out.push_str(&format!("    {bug}\n"));
+        for finding in open_for_persona.iter().rev().take(5) {
+            out.push_str(&format!("    {finding}\n"));
+        }
+    }
+
+    // Named, never asserted. An older build's failure is a question for this
+    // run, not a premise it should inherit.
+    if !earlier.is_empty() {
+        let mut stale: Vec<(&String, &usize)> = earlier.iter().collect();
+        stale.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        out.push_str(&format!(
+            "  Seen on earlier builds only, not reproduced here ({} total). Treat as closed unless you reproduce one:\n",
+            stale.len()
+        ));
+        for (description, count) in stale.iter().take(5) {
+            out.push_str(&format!("    ({count}x) {description}\n"));
         }
     }
 
@@ -2928,6 +3006,63 @@ fn load_prior_findings(persona: &str) -> String {
 
 fn is_verified_finding(record: &serde_json::Value) -> bool {
     record["source"].as_str() == Some("deterministic")
+}
+
+/// The piku revision a finding was observed against.
+///
+/// A finding recorded against an older build says nothing about this one: the
+/// code it described may already have changed, and injecting it as a premise
+/// aims the next run at a problem that may no longer exist.
+fn piku_revision() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|revision| revision.trim().to_string())
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Split prior deterministic findings by whether they were reproduced against
+/// the running revision. Returns (open at this revision, seen only earlier),
+/// each keyed by description with an occurrence count.
+fn partition_findings_by_revision(
+    content: &str,
+    persona: &str,
+    revision: &str,
+) -> (HashMap<String, usize>, HashMap<String, usize>, Vec<String>) {
+    let mut open: HashMap<String, usize> = HashMap::new();
+    let mut earlier: HashMap<String, usize> = HashMap::new();
+    let mut open_for_persona: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !is_verified_finding(&record) {
+            continue;
+        }
+        let Some(description) = record["description"].as_str() else {
+            continue;
+        };
+        if record["piku_revision"].as_str() == Some(revision) {
+            *open.entry(description.to_string()).or_insert(0) += 1;
+            if record["persona"].as_str() == Some(persona) {
+                if let Some(severity) = record["severity"].as_str() {
+                    open_for_persona.push(format!("[{severity}] {description}"));
+                }
+            }
+        } else {
+            *earlier.entry(description.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // A description reproduced at this revision is open, whatever its history.
+    earlier.retain(|description, _| !open.contains_key(description));
+    (open, earlier, open_for_persona)
 }
 
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
@@ -3107,6 +3242,10 @@ fn run_agentic_session(persona: &Persona) {
 
     let turn_limit = phase_turn_limit();
     let mut entries: Vec<CritiqueEntry> = Vec::new();
+    // Turns whose model review never arrived. These are harness facts, not
+    // piku findings, and they say which turns rest on deterministic evidence
+    // alone.
+    let mut review_failures: Vec<String> = Vec::new();
     let mut total_turns = 0;
 
     for phase in &persona.phases {
@@ -3272,7 +3411,7 @@ fn run_agentic_session(persona: &Persona) {
             screen_for_llm.len(),
             screen_for_llm.lines().count()
         );
-        let (observations, bugs, _next) = user_agent_critique(
+        let (observations, bugs, _next, review_status) = user_agent_critique(
             &ua_llm,
             persona,
             phase,
@@ -3283,6 +3422,12 @@ fn run_agentic_session(persona: &Persona) {
             &memory,
             &prior_findings,
         );
+        if review_status != "valid" {
+            review_failures.push(format!(
+                "[harness:MAJOR] user-agent review unusable on turn {} ({review_status}); that turn carries deterministic evidence only",
+                total_turns + 1
+            ));
+        }
 
         // Update memory
         memory.push(TurnSummary {
@@ -3348,7 +3493,7 @@ fn run_agentic_session(persona: &Persona) {
 
             let snap_before_free = observer.snapshot();
 
-            let (_, _, next) = user_agent_critique(
+            let (_, _, next, _) = user_agent_critique(
                 &freeform_llm,
                 persona,
                 phase,
@@ -3425,7 +3570,7 @@ fn run_agentic_session(persona: &Persona) {
                             permission_events.join("\n")
                         ));
                     }
-                    let (obs2, bugs2, _) = user_agent_critique(
+                    let (obs2, bugs2, _, free_review_status) = user_agent_critique(
                         &ua_llm,
                         persona,
                         phase,
@@ -3436,6 +3581,12 @@ fn run_agentic_session(persona: &Persona) {
                         &memory,
                         &prior_findings,
                     );
+                    if free_review_status != "valid" {
+                        review_failures.push(format!(
+                            "[harness:MAJOR] user-agent review unusable on freeform turn {} ({free_review_status}); that turn carries deterministic evidence only",
+                            total_turns + 1
+                        ));
+                    }
 
                     memory.push(TurnSummary {
                         turn: total_turns + 1,
@@ -3507,6 +3658,7 @@ fn run_agentic_session(persona: &Persona) {
         MetaReview {
             text: "meta-judge skipped by PIKU_AGENTIC_FAST=1".to_string(),
             grounded: true,
+            status: "skipped",
         }
     } else {
         meta_judge(&judge_llm, persona, &entries)
@@ -3537,6 +3689,7 @@ fn run_agentic_session(persona: &Persona) {
             piku_observations: Vec::new(),
             verdict: "skipped".to_string(),
             primary_review_grounded: true,
+            status: "skipped",
         }
     } else {
         recursive_observer::observe(&judge_llm, persona, &entries, review)
@@ -3552,23 +3705,35 @@ fn run_agentic_session(persona: &Persona) {
             piku_observations: &recursive_review.piku_observations,
             verdict: &recursive_review.verdict,
             primary_review_grounded: recursive_review.primary_review_grounded,
+            status: recursive_review.status,
         }) {
             eprintln!("[playground] could not append recursive-observer record: {error}");
         }
     }
 
-    let mut harness_findings = Vec::new();
-    if !meta_review.grounded {
-        harness_findings.push(
+    // A judge that ran and cited nothing is a different fact from a judge that
+    // never ran. Both stop the review from becoming a product judgment, but
+    // only the first says anything about review quality.
+    let mut harness_findings = review_failures;
+    match meta_review.status {
+        "valid" if !meta_review.grounded => harness_findings.push(
             "[harness:CRITICAL] primary review referenced missing or no turn evidence; it was not used as a product judgment"
                 .to_string(),
-        );
+        ),
+        "skipped" | "valid" => {}
+        status => harness_findings.push(format!(
+            "[harness:MAJOR] primary judge did not produce a review ({status}); the run rests on deterministic evidence only"
+        )),
     }
-    if !recursive_review.primary_review_grounded {
-        harness_findings.push(
+    match recursive_review.status {
+        "valid" if !recursive_review.primary_review_grounded => harness_findings.push(
             "[harness:CRITICAL] recursive observer found the primary review ungrounded; it was not used as a product judgment"
                 .to_string(),
-        );
+        ),
+        "skipped" | "valid" => {}
+        status => harness_findings.push(format!(
+            "[harness:MAJOR] recursive observer did not run ({status}); no second-order check was applied"
+        )),
     }
     // Run the executable acceptance checks against the workspace piku actually
     // edited. A run where piku produced fluent prose but no passing workspace
@@ -3965,6 +4130,31 @@ fn only_deterministic_findings_are_reused_as_agent_context() {
 }
 
 #[test]
+fn only_findings_reproduced_on_this_build_are_injected_as_premises() {
+    let log = [
+        r#"{"source":"deterministic","persona":"adversarial","severity":"MAJOR","description":"blank reply","piku_revision":"aaaaaaa"}"#,
+        r#"{"source":"deterministic","persona":"adversarial","severity":"MAJOR","description":"blank reply","piku_revision":"bbbbbbb"}"#,
+        r#"{"source":"deterministic","persona":"adversarial","severity":"CRITICAL","description":"cursor hidden","piku_revision":"aaaaaaa"}"#,
+        r#"{"source":"llm","persona":"adversarial","severity":"MAJOR","description":"model allegation","piku_revision":"bbbbbbb"}"#,
+    ]
+    .join("\n");
+
+    let (open, earlier, for_persona) =
+        partition_findings_by_revision(&log, "adversarial", "bbbbbbb");
+
+    // Reproduced on this build, so it is open even though it predates it.
+    assert_eq!(open.get("blank reply"), Some(&1));
+    assert!(!earlier.contains_key("blank reply"));
+    // Last seen on an older build, so it is a question, not a premise.
+    assert_eq!(earlier.get("cursor hidden"), Some(&1));
+    assert!(!open.contains_key("cursor hidden"));
+    // Model allegations never become context, at any revision.
+    assert!(!open.contains_key("model allegation"));
+    assert!(!earlier.contains_key("model allegation"));
+    assert_eq!(for_persona, vec!["[MAJOR] blank reply".to_string()]);
+}
+
+#[test]
 fn review_grounding_rejects_unknown_turns() {
     assert!(review_is_grounded(
         &serde_json::json!({"evidence_turns": [1]}),
@@ -4003,6 +4193,22 @@ fn blank_reply_is_attributed_to_the_harness_when_the_reply_was_discarded() {
     let piku_defect = blank_reply_finding("[1 iter · +12 tokens]\n");
     assert_eq!(piku_defect.severity, Severity::Major);
     assert!(piku_defect.description.contains("no visible agent reply"));
+}
+
+#[test]
+fn judge_outcomes_name_their_failure_instead_of_returning_a_review() {
+    let valid = JudgeOutcome::Valid(serde_json::json!({"verdict": "ok"}));
+    assert_eq!(valid.status(), "valid");
+    assert!(valid.value().is_some());
+
+    let provider = JudgeOutcome::ProviderFailure("openrouter returned status 429".to_string());
+    assert_eq!(provider.status(), "provider_failure");
+    assert!(provider.value().is_none());
+    assert!(provider.detail().contains("429"));
+
+    let invalid = JudgeOutcome::InvalidJson("I think the terminal looked fine".to_string());
+    assert_eq!(invalid.status(), "invalid_json");
+    assert!(invalid.value().is_none());
 }
 
 #[test]

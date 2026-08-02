@@ -7,6 +7,10 @@ pub struct RecursiveReview {
     pub piku_observations: Vec<String>,
     pub verdict: String,
     pub primary_review_grounded: bool,
+    /// Why the observation is or is not usable. Only a `valid` status lets
+    /// `primary_review_grounded` be read as a judgment; on any other status the
+    /// observer never ran and asserts nothing about the primary review.
+    pub status: &'static str,
 }
 
 const SYSTEM: &str = r#"You are the final observer in a terminal-agent evaluation.
@@ -67,7 +71,22 @@ pub fn observe(
         }
     }
 
-    let parsed = llm.call_json(SYSTEM, &evidence);
+    let outcome = llm.call_json(SYSTEM, &evidence);
+    let Some(parsed) = outcome.value() else {
+        return RecursiveReview {
+            judge_observations: Vec::new(),
+            piku_observations: Vec::new(),
+            verdict: format!(
+                "recursive observer unavailable ({}): {}",
+                outcome.status(),
+                safe_truncate(outcome.detail(), 200)
+            ),
+            // The observer made no claim about the primary review, so it must
+            // not be recorded as having refuted it.
+            primary_review_grounded: true,
+            status: outcome.status(),
+        };
+    };
     let strings = |field: &str| {
         parsed[field]
             .as_array()
@@ -87,5 +106,6 @@ pub fn observe(
             .unwrap_or("recursive observer returned no verdict")
             .to_owned(),
         primary_review_grounded: parsed["primary_review_grounded"].as_bool().unwrap_or(false),
+        status: outcome.status(),
     }
 }
