@@ -2371,6 +2371,23 @@ impl LlmClient {
         let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         spend::record_call(&resp);
 
+        // Reviews come back as invalid JSON often enough to matter, and a
+        // truncated object and a model ignoring the schema look identical
+        // downstream. The provider already knows which happened, so record it
+        // rather than guessing from the text.
+        if let Some(reason) = resp
+            .pointer("/choices/0/finish_reason")
+            .and_then(|value| value.as_str())
+        {
+            if reason != "stop" {
+                eprintln!(
+                    "[llm] {} stopped on {reason} after {} response chars",
+                    self.spec.label,
+                    body.len()
+                );
+            }
+        }
+
         Ok(resp
             .pointer("/message/content")
             .or_else(|| resp.pointer("/content/0/text"))
@@ -2430,7 +2447,11 @@ impl LlmClient {
                 ));
             }
         }
-        eprintln!("[llm] JSON parse failed after the repair attempt");
+        eprintln!(
+            "[llm] JSON parse failed after the repair attempt ({} chars, ends {:?})",
+            last_raw.len(),
+            last_raw.chars().rev().take(24).collect::<String>()
+        );
         JudgeOutcome::InvalidJson(safe_truncate(&last_raw, 300).to_string())
     }
 }
