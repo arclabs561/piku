@@ -64,6 +64,18 @@ agentic-user-real persona="confident_dev" turns="1":
 agentic-user-full persona="confident_dev":
     PIKU_AGENTIC_FULL=1 cargo test --test agentic_user -p piku -- agentic_user_{{persona}} --ignored --nocapture
 
+# Interactive-terminal playground: OpenRouter models observe piku's VT100
+# viewport, choose one keyboard-level action per turn, and append evidence plus
+# review records to target/agentic-findings/playground.jsonl.
+#
+# Usage:
+#   just playground
+#   just playground adversarial 8
+#   just playground confident_dev 4 openai/gpt-5.6-sol openai/gpt-5.6-terra anthropic/claude-opus-5
+#   PIKU_AGENTIC_LEDGER=/tmp/piku-playground.jsonl just playground confident_dev 4
+playground persona="confident_dev" turns="6" piku_model="openai/gpt-5.6-sol" user_model="openai/gpt-5.6-terra" judge_model="anthropic/claude-opus-5":
+    PIKU_AGENTIC_PIKU_PROVIDER=openrouter PIKU_AGENTIC_PIKU_MODEL={{piku_model}} PIKU_AGENTIC_USER_PROVIDER=openrouter PIKU_AGENTIC_USER_MODEL={{user_model}} PIKU_AGENTIC_JUDGE_PROVIDER=openrouter PIKU_AGENTIC_JUDGE_MODEL={{judge_model}} PIKU_AGENTIC_MAX_TURNS={{turns}} cargo test --test agentic_user -p piku -- agentic_user_{{persona}} --ignored --nocapture
+
 # Run the report-first dogfood suite.
 dogfood:
     cargo test --test dogfood -p piku -- --ignored --nocapture

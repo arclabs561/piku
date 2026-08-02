@@ -72,6 +72,9 @@ fn static_task_guidelines() -> String {
 - Do not add speculative abstractions or over-engineer.\n\
 - Diagnose before switching approach. One retry max on mechanical errors; \
   change approach on conceptual errors.\n\
+- For a bug fix or implementation, do not call it tested unless a command executed the changed behavior.\n\
+  If a new test is not discovered by the normal suite, register it or run that test directly;\n\
+  otherwise report the fix as unvalidated rather than implying coverage.\n\
 - Report outcomes faithfully. If something failed, say so.\n\
 - Prefer reversible operations. Flag high blast-radius actions before executing.\n\
 - Tool results and user messages may include <system-reminder> tags — these are \

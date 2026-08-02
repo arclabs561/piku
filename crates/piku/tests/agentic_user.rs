@@ -47,6 +47,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "agentic/playground.rs"]
+mod playground;
+#[path = "agentic/playground_ledger.rs"]
+mod playground_ledger;
+#[path = "agentic/recursive_observer.rs"]
+mod recursive_observer;
+
+use playground::PlaygroundDecision as NextAction;
+use playground_ledger::{
+    now_secs, ConfigRecord, ImprovementHandoffRecord, ObserverRecord, PlaygroundLedger,
+    ReviewRecord, TurnRecord,
+};
+use recursive_observer::RecursiveReview;
+
 // ---------------------------------------------------------------------------
 // Gate + binary discovery
 // ---------------------------------------------------------------------------
@@ -60,6 +74,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// so an opt-in `--ignored` run with no provider fails loudly rather than
 /// skipping silently.
 fn is_enabled() -> bool {
+    load_playground_env();
     user_agent_provider(false).is_some() && piku_provider().is_some()
 }
 
@@ -79,6 +94,15 @@ fn piku_binary() -> PathBuf {
 
 fn has_key(var: &str) -> bool {
     std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Load an optional local dotenv file as data, never as shell source.
+fn load_playground_env() {
+    match dotenvy::from_filename(".env") {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("[playground] could not load .env: {error}"),
+    }
 }
 
 fn normalize_ollama_host(host: &str) -> String {
@@ -225,8 +249,71 @@ impl ProviderSpec {
     }
 }
 
+/// Resolve an explicit provider override. Auto-detection remains the default,
+/// but an explicit choice must not silently fall through to another backend.
+fn provider_override(
+    provider_env: &str,
+    model_env: &str,
+    ollama_default: &str,
+    openrouter_default: &str,
+    anthropic_default: &str,
+) -> Option<ProviderSpec> {
+    let provider = std::env::var(provider_env).ok()?;
+    let model = std::env::var(model_env).ok();
+    match provider.as_str() {
+        "ollama" => {
+            let spec = ProviderSpec::ollama(model.unwrap_or_else(|| ollama_default.to_string()));
+            assert!(
+                ollama_is_available(spec.ollama_host.as_deref().expect("ollama host")),
+                "{provider_env}=ollama but {} is unavailable",
+                ollama_host()
+            );
+            Some(spec)
+        }
+        "openrouter" => {
+            assert!(
+                has_key("OPENROUTER_API_KEY"),
+                "{provider_env}=openrouter requires OPENROUTER_API_KEY"
+            );
+            Some(ProviderSpec::openrouter(
+                model.unwrap_or_else(|| openrouter_default.to_string()),
+            ))
+        }
+        "anthropic" => {
+            assert!(
+                has_key("ANTHROPIC_API_KEY"),
+                "{provider_env}=anthropic requires ANTHROPIC_API_KEY"
+            );
+            Some(ProviderSpec::anthropic(
+                model.unwrap_or_else(|| anthropic_default.to_string()),
+            ))
+        }
+        _ => panic!("{provider_env} must be ollama, openrouter, or anthropic"),
+    }
+}
+
 /// User-agent LLM: cheap model for scripted critique, better for freeform.
 fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
+    let openrouter_default = if freeform {
+        "anthropic/claude-sonnet-4-6"
+    } else {
+        "anthropic/claude-haiku-4-5"
+    };
+    let anthropic_default = if freeform {
+        "claude-sonnet-4-6"
+    } else {
+        "claude-haiku-4-5"
+    };
+    if let Some(spec) = provider_override(
+        "PIKU_AGENTIC_USER_PROVIDER",
+        "PIKU_AGENTIC_USER_MODEL",
+        "gemma4:latest",
+        openrouter_default,
+        anthropic_default,
+    ) {
+        return Some(spec);
+    }
+
     // If user explicitly set an OpenRouter-style model (contains /), use OpenRouter directly
     if let Ok(model) = std::env::var("PIKU_AGENTIC_USER_MODEL") {
         if model.contains('/') && has_key("OPENROUTER_API_KEY") {
@@ -241,23 +328,15 @@ fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
         return Some(ollama);
     }
     if has_key("OPENROUTER_API_KEY") {
-        let model = if freeform {
-            "anthropic/claude-sonnet-4-6"
-        } else {
-            "anthropic/claude-haiku-4-5"
-        };
         return Some(ProviderSpec::openrouter(
-            std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| model.to_string()),
+            std::env::var("PIKU_AGENTIC_USER_MODEL")
+                .unwrap_or_else(|_| openrouter_default.to_string()),
         ));
     }
     if has_key("ANTHROPIC_API_KEY") {
-        let model = if freeform {
-            "claude-sonnet-4-6"
-        } else {
-            "claude-haiku-4-5"
-        };
         return Some(ProviderSpec::anthropic(
-            std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| model.to_string()),
+            std::env::var("PIKU_AGENTIC_USER_MODEL")
+                .unwrap_or_else(|_| anthropic_default.to_string()),
         ));
     }
     None
@@ -265,6 +344,16 @@ fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
 
 /// Provider for piku itself.
 fn piku_provider() -> Option<ProviderSpec> {
+    if let Some(spec) = provider_override(
+        "PIKU_AGENTIC_PIKU_PROVIDER",
+        "PIKU_AGENTIC_PIKU_MODEL",
+        "gemma4:latest",
+        "anthropic/claude-sonnet-4-6",
+        "claude-sonnet-4-6",
+    ) {
+        return Some(spec);
+    }
+
     let ollama = ProviderSpec::ollama(
         std::env::var("PIKU_AGENTIC_PIKU_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
     );
@@ -284,6 +373,21 @@ fn piku_provider() -> Option<ProviderSpec> {
         ));
     }
     None
+}
+
+/// The primary judge and bounded recursive observer may use a separately
+/// pinned model so their calibration does not depend on the simulated user.
+fn judge_provider() -> Option<ProviderSpec> {
+    if let Some(spec) = provider_override(
+        "PIKU_AGENTIC_JUDGE_PROVIDER",
+        "PIKU_AGENTIC_JUDGE_MODEL",
+        "gemma4:latest",
+        "anthropic/claude-opus-5",
+        "claude-opus-5",
+    ) {
+        return Some(spec);
+    }
+    user_agent_provider(true)
 }
 
 // ===========================================================================
@@ -391,16 +495,16 @@ impl std::fmt::Display for Action {
             Action::Observe => write!(f, "Observe"),
             Action::Wait(d) => write!(f, "Wait({d:?})"),
             Action::TypeString { text, .. } => {
-                let preview = if text.len() > 30 {
-                    format!("{}...", &text[..30])
+                let preview = if text.chars().count() > 30 {
+                    format!("{}...", text.chars().take(30).collect::<String>())
                 } else {
                     text.clone()
                 };
                 write!(f, "TypeString({preview:?})")
             }
             Action::Submit(s) => {
-                let preview = if s.len() > 40 {
-                    format!("{}...", &s[..40])
+                let preview = if s.chars().count() > 40 {
+                    format!("{}...", s.chars().take(40).collect::<String>())
                 } else {
                     s.clone()
                 };
@@ -847,6 +951,7 @@ struct PtyHandle {
     /// by running through a plain VT100 parser (no DECSTBM interference).
     raw_capture: Vec<u8>,
     eof: bool,
+    ready_wait_timed_out: bool,
 }
 
 impl PtyHandle {
@@ -857,7 +962,7 @@ impl PtyHandle {
         cmd.arg("-c");
 
         let inner_cmd = format!(
-            "cd {} && {} --provider {} --model {}",
+            "cd {} && exec {} --provider {} --model {}",
             shell_escape(&workspace.to_string_lossy()),
             piku_bin.display(),
             spec.label,
@@ -902,6 +1007,7 @@ impl PtyHandle {
             reader,
             raw_capture: Vec::new(),
             eof: false,
+            ready_wait_timed_out: false,
         }
     }
 
@@ -1031,6 +1137,7 @@ impl PtyHandle {
         observer: &mut TerminalObserver,
         timeout: Duration,
     ) -> ScreenSnapshot {
+        self.ready_wait_timed_out = false;
         let deadline = Instant::now() + timeout;
         loop {
             self.drain(observer);
@@ -1050,6 +1157,7 @@ impl PtyHandle {
                 continue;
             }
             if Instant::now() >= deadline {
+                self.ready_wait_timed_out = true;
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
                      (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
@@ -1063,6 +1171,10 @@ impl PtyHandle {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn take_ready_wait_timeout(&mut self) -> bool {
+        std::mem::take(&mut self.ready_wait_timed_out)
     }
 }
 
@@ -1127,11 +1239,14 @@ impl WorkspaceObserver {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // Skip hidden dirs (like .git)
+            // Skip hidden directories (like .git) and build outputs. Compiler
+            // artifacts are piku side effects only in the loosest sense, and
+            // their volume hides the source changes this observer is meant to
+            // make reviewable.
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
+                .is_some_and(|n| n.starts_with('.') || n == "target")
             {
                 continue;
             }
@@ -1415,11 +1530,16 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
             phases: vec![
                 Phase {
                     name: "explore",
-                    scripted: vec![Action::Submit(
-                        "Read src/stats.rs and tell me what the mean() function does.".into(),
-                    )],
+                    scripted: vec![
+                        Action::TypeString {
+                            text: "Read src/stats.rs and tell me what the mean() function does."
+                                .into(),
+                            delay_ms: 8,
+                        },
+                        Action::Key(SpecialKey::Enter),
+                    ],
                     focus: "Did piku read the file? Is the explanation accurate? \
-                            Was the empty-slice panic bug mentioned?",
+                            Was the empty-slice NaN bug mentioned?",
                     freeform_turns: 0,
                 },
                 Phase {
@@ -1427,7 +1547,7 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                     scripted: vec![Action::Submit(
                         "Find bugs in this codebase and explain them.".into(),
                     )],
-                    focus: "Did piku identify the mean() panic, split_csv comma bug, \
+                    focus: "Did piku identify the mean() NaN behavior, split_csv comma bug, \
                             and unimplemented process_batch?",
                     freeform_turns: 0,
                 },
@@ -1859,23 +1979,28 @@ struct CritiqueEntry {
     next_action: NextAction,
 }
 
-#[derive(Debug, Clone)]
-enum NextAction {
-    Send(String),
-    Quit,
-}
-
 // ===========================================================================
 // LLM client
 // ===========================================================================
 
 struct LlmClient {
     spec: ProviderSpec,
+    max_tokens: u32,
 }
 
 impl LlmClient {
     fn new(spec: ProviderSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            max_tokens: 1_024,
+        }
+    }
+
+    fn judge(spec: ProviderSpec) -> Self {
+        Self {
+            spec,
+            max_tokens: 2_048,
+        }
     }
 
     fn call_raw(&self, system: &str, messages: &[(&str, &str)]) -> String {
@@ -1887,7 +2012,7 @@ impl LlmClient {
         let body = match self.spec.backend {
             Backend::Anthropic => serde_json::json!({
                 "model": self.spec.model,
-                "max_tokens": 1024,
+                "max_tokens": self.max_tokens,
                 "system": system,
                 "messages": msgs,
             }),
@@ -1896,7 +2021,7 @@ impl LlmClient {
                 all.extend(msgs.iter().cloned());
                 serde_json::json!({
                     "model": self.spec.model,
-                    "max_tokens": 1024,
+                    "max_tokens": self.max_tokens,
                     "messages": all,
                     "response_format": {"type": "json_object"},
                 })
@@ -1909,24 +2034,24 @@ impl LlmClient {
                     "messages": all,
                     "stream": false,
                     "format": "json",
-                    "options": { "num_predict": 1024 },
+                    "options": { "num_predict": self.max_tokens },
                 })
             }
         };
 
-        let (url, auth_header): (String, Option<String>) = match self.spec.backend {
+        let (url, auth_header): (String, Option<(&str, String)>) = match self.spec.backend {
             Backend::OpenRouter => (
                 "https://openrouter.ai/api/v1/chat/completions".to_string(),
-                Some(format!(
-                    "Authorization: Bearer {}",
-                    self.spec.api_key.as_deref().unwrap_or("")
+                Some((
+                    "Authorization",
+                    format!("Bearer {}", self.spec.api_key.as_deref().unwrap_or("")),
                 )),
             ),
             Backend::Anthropic => (
                 "https://api.anthropic.com/v1/messages".to_string(),
-                Some(format!(
-                    "x-api-key: {}",
-                    self.spec.api_key.as_deref().unwrap_or("")
+                Some((
+                    "x-api-key",
+                    self.spec.api_key.as_deref().unwrap_or("").to_string(),
                 )),
             ),
             Backend::Ollama => (
@@ -1942,34 +2067,44 @@ impl LlmClient {
             ),
         };
 
-        let body_str = serde_json::to_string(&body).unwrap();
-        let mut args: Vec<String> = vec![
-            "-s".into(),
-            "--max-time".into(),
-            "90".into(),
-            "--connect-timeout".into(),
-            "10".into(),
-            "-X".into(),
-            "POST".into(),
-            url,
-            "-H".into(),
-            "Content-Type: application/json".into(),
-        ];
-        if let Some(h) = auth_header {
-            args.push("-H".into());
-            args.push(h);
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[llm] {} client setup failed: {error}", self.spec.label);
+                return String::new();
+            }
+        };
+        let mut request = client.post(url).json(&body);
+        if let Some((name, value)) = auth_header {
+            request = request.header(name, value);
         }
         if matches!(self.spec.backend, Backend::Anthropic) {
-            args.extend(["-H".into(), "anthropic-version: 2023-06-01".into()]);
+            request = request.header("anthropic-version", "2023-06-01");
         }
-        args.extend(["-d".into(), body_str]);
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("[llm] {} request failed: {error}", self.spec.label);
+                return String::new();
+            }
+        };
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if !status.is_success() {
+            eprintln!(
+                "[llm] {} request failed: status={} body={}",
+                self.spec.label,
+                status,
+                safe_truncate(&body, 500),
+            );
+            return String::new();
+        }
 
-        let output = Command::new("curl")
-            .args(&args)
-            .output()
-            .expect("curl must be available");
-
-        let resp: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
         resp.pointer("/message/content")
             .or_else(|| resp.pointer("/content/0/text"))
@@ -1994,10 +2129,12 @@ impl LlmClient {
                     if attempt == 0 {
                         eprintln!("[user_agent] JSON parse failed, retrying");
                         eprintln!("[user_agent] raw: {}", safe_truncate(&raw, 300));
-                        messages.push(("assistant".into(), raw));
+                        // Do not replay an invalid response as assistant context. A
+                        // stale or unrelated provider response can otherwise become
+                        // the evidence the retry evaluates.
                         messages.push((
                             "user".into(),
-                            "Your previous response was not valid JSON. \
+                            "Repeat your review of the original evidence. Your previous response was not valid JSON. \
                              Respond with ONLY a JSON object. Start with {{ and end with }}."
                                 .into(),
                         ));
@@ -2057,7 +2194,13 @@ JSON schema:
       "actual": "what you saw"
     }
   ],
-  "next_action": {"type": "send", "message": "text"} or {"type": "quit"},
+  "next_action": {
+    "type": "type|key|observe|wait|send|quit",
+    "text": "text for type",
+    "key": "enter|tab|escape|backspace|delete|arrow_up|arrow_down|arrow_left|arrow_right|home|end|ctrl_c|ctrl_d|ctrl_l|ctrl_a|ctrl_e|ctrl_w|ctrl_u",
+    "ms": 10-5000 for wait,
+    "message": "legacy whole-message submit"
+  },
   "reasoning": "one sentence"
 }
 
@@ -2074,7 +2217,11 @@ Focus on:
 2. TOOL USAGE: did piku use the right tools? Read the right files?
 3. FORMATTING: is the output readable in the terminal?
 4. INTERACTION FLOW: does the conversation make sense?
-5. WORKSPACE CHANGES: do the filesystem changes match what piku claimed?"#;
+5. WORKSPACE CHANGES: do the filesystem changes match what piku claimed?
+
+For freeform exploration, choose exactly ONE small physical terminal action. Prefer
+observe before acting; use `type` followed by a later `key` enter to simulate a
+human typing. `send` remains available only for a whole-message shortcut."#;
 
 fn user_agent_critique(
     llm: &LlmClient,
@@ -2112,7 +2259,7 @@ fn user_agent_critique(
         prior_section,
         deterministic_report,
         workspace_diff,
-        safe_truncate(screen_text, 4000),
+        evidence_excerpt(screen_text, 8_000),
     );
 
     let parsed = llm.call_json(USER_AGENT_SYSTEM, &user_prompt);
@@ -2147,16 +2294,7 @@ fn user_agent_critique(
         })
         .unwrap_or_default();
 
-    let next_action = match parsed["next_action"]["type"].as_str() {
-        Some("send") => {
-            let msg = parsed["next_action"]["message"]
-                .as_str()
-                .unwrap_or("continue")
-                .to_string();
-            NextAction::Send(msg)
-        }
-        _ => NextAction::Quit,
-    };
+    let next_action = playground::parse_decision(&parsed);
 
     let reasoning = parsed["reasoning"].as_str().unwrap_or("");
     if !reasoning.is_empty() {
@@ -2252,7 +2390,7 @@ fn print_report(persona: &Persona, entries: &[CritiqueEntry]) {
         }
 
         match &entry.next_action {
-            NextAction::Send(m) => println!("  next: {m:?}"),
+            NextAction::Act(action) => println!("  next: {action}"),
             NextAction::Quit => println!("  next: QUIT"),
         }
     }
@@ -2354,6 +2492,109 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
     );
 }
 
+/// Persist one full observe-act-evaluate turn. This retains useful observations
+/// and terminal evidence alongside defects, unlike the historical findings log.
+fn append_playground_turn(
+    ledger: Option<&PlaygroundLedger>,
+    persona: &Persona,
+    entry: &CritiqueEntry,
+    turn: usize,
+    user_agent: &ProviderSpec,
+    piku: &ProviderSpec,
+) {
+    let Some(ledger) = ledger else {
+        return;
+    };
+    let bugs: Vec<String> = entry
+        .bugs
+        .iter()
+        .map(|bug| format!("[{}] {}", bug.severity, bug.description))
+        .collect();
+    let deterministic_findings: Vec<String> = entry
+        .deterministic_findings
+        .iter()
+        .map(|finding| format!("[{}] {}", finding.severity, finding.description))
+        .collect();
+    let record = TurnRecord {
+        schema_version: 1,
+        kind: "turn",
+        run_id: ledger.run_id(),
+        timestamp_secs: now_secs(),
+        persona: persona.name,
+        phase: &entry.phase,
+        turn,
+        user_agent_provider: user_agent.label,
+        user_agent_model: &user_agent.model,
+        piku_provider: piku.label,
+        piku_model: &piku.model,
+        action: &entry.action_desc,
+        viewport: safe_truncate(&entry.screen_text, 4_000),
+        workspace_diff: &entry.workspace_diff,
+        observations: &entry.observations,
+        bugs: &bugs,
+        deterministic_findings: &deterministic_findings,
+    };
+    if let Err(error) = ledger.append_turn(&record) {
+        eprintln!("[playground] could not append turn record: {error}");
+    }
+}
+
+fn improvement_handoff(
+    entries: &[CritiqueEntry],
+    harness_findings: Vec<String>,
+) -> (Vec<String>, Vec<String>, &'static str) {
+    let mut verified_findings = entries
+        .iter()
+        .flat_map(|entry| {
+            entry.deterministic_findings.iter().map(move |finding| {
+                format!(
+                    "[{}:{}] {} — expected: {}; actual: {}",
+                    entry.phase,
+                    finding.severity,
+                    finding.description,
+                    finding.expected,
+                    finding.actual
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    verified_findings.extend(harness_findings);
+    let hypotheses = entries
+        .iter()
+        .flat_map(|entry| {
+            entry.bugs.iter().map(move |bug| {
+                format!(
+                    "[{}:{}] {} — expected: {}; actual: {}",
+                    entry.phase, bug.severity, bug.description, bug.expected, bug.actual
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_action = if !verified_findings.is_empty() {
+        "fix_harness_or_reproduce_verified_findings"
+    } else if !hypotheses.is_empty() {
+        "reproduce_hypotheses_before_changing_piku"
+    } else {
+        "no_product_change_indicated"
+    };
+    (verified_findings, hypotheses, next_action)
+}
+
+struct MetaReview {
+    text: String,
+    grounded: bool,
+}
+
+fn review_is_grounded(review: &serde_json::Value, entry_count: usize) -> bool {
+    review["evidence_turns"].as_array().is_some_and(|turns| {
+        !turns.is_empty()
+            && turns.iter().all(|turn| {
+                turn.as_u64()
+                    .is_some_and(|turn| turn >= 1 && turn <= entry_count as u64)
+            })
+    })
+}
+
 /// Meta-judge: after the agentic test completes, send all collected evidence
 /// to an LLM for a second-opinion analysis. Evaluates whether:
 /// 1. The user-agent's findings about piku are valid (not hallucinated)
@@ -2361,9 +2602,12 @@ fn persist_findings(persona: &str, entries: &[CritiqueEntry]) {
 /// 3. piku's behavior was appropriate for the scenario
 ///
 /// Output is written to the findings dir as `meta_judge_{persona}.txt`.
-fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) {
+fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> MetaReview {
     if entries.is_empty() {
-        return;
+        return MetaReview {
+            text: String::new(),
+            grounded: true,
+        };
     }
 
     // Build evidence summary from all entries
@@ -2381,8 +2625,9 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) {
         ));
         evidence.push_str(&format!("Action: {}\n", entry.action_desc));
 
-        // Include captured response (truncated)
-        let response_preview: String = entry.screen_text.chars().take(1500).collect();
+        // Keep both ends of a long response: the ending is where completion,
+        // validation, and error summaries usually appear.
+        let response_preview = evidence_excerpt(&entry.screen_text, 4_000);
         if !response_preview.trim().is_empty() {
             evidence.push_str(&format!(
                 "Response captured ({} chars):\n{}\n",
@@ -2392,7 +2637,10 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) {
         }
 
         if !entry.workspace_diff.is_empty() && entry.workspace_diff != "no changes" {
-            evidence.push_str(&format!("Workspace changes: {}\n", entry.workspace_diff));
+            evidence.push_str(&format!(
+                "Workspace changes: {}\n",
+                safe_truncate(&entry.workspace_diff, 1_500)
+            ));
         }
 
         // LLM-reported bugs
@@ -2426,22 +2674,23 @@ Your job:
 4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
    behave unexpectedly in ways the user-agent missed?
 
-Be terse. Use this format:
-BUGS:
-- [VALID/HALLUCINATED/INCONCLUSIVE] description -- reason
-
-CHECKS:
-- [CORRECT/INCORRECT] description -- reason
-
-OVERALL: 1-2 sentence assessment
-
-MISSED: anything the user-agent should have caught but didn't";
+Return only JSON with this exact schema:
+{\
+  \"bugs\": [{\"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\"}],\
+  \"checks\": [{\"description\": \"string\", \"verdict\": \"CORRECT|INCORRECT\", \"reason\": \"string\"}],\
+  \"overall\": \"string\",\
+  \"missed\": [\"string\"],\
+  \"evidence_turns\": [1]\
+}";
 
     eprintln!(
         "[meta-judge] running analysis ({} chars evidence)...",
         evidence.len()
     );
-    let response = llm.call_raw(system, &[("user", &evidence)]);
+    let parsed = llm.call_json(system, &evidence);
+    let grounded = review_is_grounded(&parsed, entries.len());
+    let response = serde_json::to_string_pretty(&parsed)
+        .unwrap_or_else(|error| format!("{{\"review_error\":\"{error}\"}}"));
 
     // Write to findings dir
     let dir = findings_log_path().parent().unwrap().to_path_buf();
@@ -2453,7 +2702,7 @@ MISSED: anything the user-agent should have caught but didn't";
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        safe_truncate(&evidence, 4000),
+        evidence_excerpt(&evidence, 8_000),
         response
     );
     match std::fs::write(&meta_path, &content) {
@@ -2465,9 +2714,15 @@ MISSED: anything the user-agent should have caught but didn't";
     eprintln!("\n=== META-JUDGE ANALYSIS ===");
     eprintln!("{response}");
     eprintln!("=== END META-JUDGE ===\n");
+    MetaReview {
+        text: response,
+        grounded,
+    }
 }
 
-/// Load prior findings to give the LLM context on known-weak areas.
+/// Load only deterministic prior findings to give the LLM context on known-weak
+/// areas. LLM allegations remain in the ledger for review, but must not become
+/// future-agent premises without independent confirmation.
 /// Returns a summary string suitable for inclusion in the LLM prompt.
 fn load_prior_findings(persona: &str) -> String {
     let path = findings_log_path();
@@ -2482,6 +2737,9 @@ fn load_prior_findings(persona: &str) -> String {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if !is_verified_finding(&record) {
+            continue;
+        }
         // Count recurring bugs across all personas
         if let Some(desc) = record["description"].as_str() {
             *bug_counts.entry(desc.to_string()).or_insert(0) += 1;
@@ -2527,6 +2785,10 @@ fn load_prior_findings(persona: &str) -> String {
     out
 }
 
+fn is_verified_finding(record: &serde_json::Value) -> bool {
+    record["source"].as_str() == Some("deterministic")
+}
+
 fn safe_truncate(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
@@ -2534,11 +2796,32 @@ fn safe_truncate(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Bound evidence without turning a missing tail into an apparent incomplete
+/// response.  Both the start and end are material to an evaluator.
+fn evidence_excerpt(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+
+    let marker = "\n… [middle omitted for evidence bound] …\n";
+    let available = max_chars.saturating_sub(marker.chars().count());
+    let prefix_chars = available / 2;
+    let suffix_chars = available - prefix_chars;
+    let prefix: String = s.chars().take(prefix_chars).collect();
+    let suffix: String = s
+        .chars()
+        .skip(char_count.saturating_sub(suffix_chars))
+        .collect();
+    format!("{prefix}{marker}{suffix}")
+}
+
 // ===========================================================================
 // Session runner — the main loop
 // ===========================================================================
 
 fn run_agentic_session(persona: &Persona) {
+    load_playground_env();
     let Some(ua_spec) = user_agent_provider(false) else {
         eprintln!("skipping: no user-agent provider");
         return;
@@ -2547,6 +2830,7 @@ fn run_agentic_session(persona: &Persona) {
         eprintln!("skipping: no piku provider");
         return;
     };
+    let judge_spec = judge_provider().unwrap_or_else(|| ua_spec.clone());
 
     // Seed workspace
     let workspace = tempdir(persona.name);
@@ -2579,6 +2863,10 @@ fn run_agentic_session(persona: &Persona) {
         "[agentic_user] piku: {}/{}",
         piku_spec.label, piku_spec.model
     );
+    eprintln!(
+        "[agentic_user] judge + recursive observer: {}/{}",
+        judge_spec.label, judge_spec.model
+    );
     eprintln!("[agentic_user] workspace: {}", workspace.display());
 
     // Load prior findings to inform this session
@@ -2595,6 +2883,32 @@ fn run_agentic_session(persona: &Persona) {
     let mut ws_observer = WorkspaceObserver::new(workspace.clone());
     let mut memory = ConversationMemory::new();
     let ua_llm = LlmClient::new(ua_spec);
+    let judge_llm = LlmClient::judge(judge_spec);
+    let ledger = PlaygroundLedger::open()
+        .map_err(|error| {
+            eprintln!("[playground] ledger disabled: {error}");
+            error
+        })
+        .ok();
+    if let Some(ledger) = &ledger {
+        eprintln!("[playground] run={}", ledger.run_id());
+        if let Err(error) = ledger.append_config(&ConfigRecord {
+            schema_version: 1,
+            kind: "config",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            user_agent_provider: ua_llm.spec.label,
+            user_agent_model: &ua_llm.spec.model,
+            judge_provider: judge_llm.spec.label,
+            judge_model: &judge_llm.spec.model,
+            piku_provider: piku_spec.label,
+            piku_model: &piku_spec.model,
+            user_agent_client: "direct-https/reqwest",
+            judge_client: "direct-https/reqwest",
+        }) {
+            eprintln!("[playground] could not append config record: {error}");
+        }
+    }
 
     // Wait for piku to be ready
     eprintln!("[agentic_user] waiting for piku startup...");
@@ -2625,13 +2939,14 @@ fn run_agentic_session(persona: &Persona) {
 
         // Execute scripted actions
         let snap_before = observer.snapshot();
+        let mut response_timed_out = false;
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
             pty.execute_action(action, &mut observer);
 
             // After Submit: wait for screen to change (thinking/response starts),
             // then wait for ready to come back (response complete).
-            if matches!(action, Action::Submit(_)) {
+            if matches!(action, Action::Submit(_) | Action::Key(SpecialKey::Enter)) {
                 // Phase 1: wait until screen changes from the pre-submit state
                 let pre_contents = observer.snapshot().contents.clone();
                 let change_deadline = Instant::now() + Duration::from_secs(15);
@@ -2654,6 +2969,7 @@ fn run_agentic_session(persona: &Persona) {
 
                 // Phase 2: wait for ready (response complete)
                 let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
+                response_timed_out |= pty.take_ready_wait_timeout();
             }
         }
 
@@ -2681,7 +2997,37 @@ fn run_agentic_session(persona: &Persona) {
             eprintln!("[agentic_user]   ... and {} more", non_empty.len() - 5);
         }
         let last_action = phase.scripted.last().cloned().unwrap_or(Action::Observe);
-        let findings = deterministic_checks(&snap_before, &snap_after, &last_action);
+        let mut findings = deterministic_checks(&snap_before, &snap_after, &last_action);
+        if response_timed_out {
+            let background_progress = snap_after.contents.contains("spawned agent");
+            findings.push(Finding {
+                severity: if background_progress {
+                    Severity::Major
+                } else {
+                    Severity::Critical
+                },
+                description: if background_progress {
+                    "piku showed background-agent progress but did not return control within the 90-second interaction budget"
+                        .to_string()
+                } else {
+                    "piku did not show progress or return to a ready prompt before the 90-second response deadline"
+                        .to_string()
+                },
+                expected: if background_progress {
+                    "a progress update or usable prompt while a background agent continues"
+                        .to_string()
+                } else {
+                    "a visible progress update or completed response followed by an interactive prompt"
+                        .to_string()
+                },
+                actual: format!(
+                    "terminal remained non-ready; cursor={:?}, visible={}, input={:?}",
+                    snap_after.cursor,
+                    snap_after.cursor_visible,
+                    safe_truncate(snap_after.input_row(), 120),
+                ),
+            });
+        }
         let ws_diff = ws_observer.diff_since_checkpoint();
 
         // Log deterministic findings
@@ -2719,7 +3065,7 @@ fn run_agentic_session(persona: &Persona) {
         let screen_for_llm = if captured.lines().count() > 2 {
             format!(
                 "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
-                safe_truncate(&captured, 3500),
+                evidence_excerpt(&captured, 8_000),
                 snap_after.summary(10)
             )
         } else {
@@ -2759,16 +3105,32 @@ fn run_agentic_session(persona: &Persona) {
         entries.push(CritiqueEntry {
             phase: phase.name.to_string(),
             action_desc,
-            screen_text: captured,
+            // Preserve the same viewport evidence supplied to the critic. Raw
+            // PTY capture can be empty after an Observe or key-only action.
+            screen_text: screen_for_llm,
             observations,
             bugs,
             deterministic_findings: findings,
             workspace_diff: ws_diff.summary(),
             next_action: NextAction::Quit, // scripted phase, no next
         });
+        if let Some(entry) = entries.last() {
+            append_playground_turn(
+                ledger.as_ref(),
+                persona,
+                entry,
+                total_turns + 1,
+                &ua_llm.spec,
+                &piku_spec,
+            );
+        }
 
         ws_observer.checkpoint();
         total_turns += 1;
+        if response_timed_out {
+            eprintln!("[agentic_user] stopping after verified response timeout");
+            break;
+        }
 
         // Freeform exploration turns
         for freeform_turn in 0..phase.freeform_turns {
@@ -2802,35 +3164,38 @@ fn run_agentic_session(persona: &Persona) {
             );
 
             match next {
-                NextAction::Send(msg) => {
-                    eprintln!("[agentic_user] freeform: {:?}", safe_truncate(&msg, 60));
-                    pty.execute_action(&Action::Submit(msg.clone()), &mut observer);
-                    // Two-phase wait for freeform too
+                NextAction::Act(action) => {
+                    let action_desc = action.to_string();
+                    let waits_for_response =
+                        matches!(&action, Action::Submit(_) | Action::Key(SpecialKey::Enter));
+                    eprintln!("[agentic_user] freeform: {action_desc}");
+                    pty.execute_action(&action, &mut observer);
                     if pty.is_dead() {
                         eprintln!("[agentic_user] freeform: piku died, skipping wait");
                         break;
                     }
-                    let pre_free = observer.snapshot().contents.clone();
-                    let free_deadline = Instant::now() + Duration::from_secs(15);
-                    loop {
-                        pty.drain(&mut observer);
-                        if pty.is_dead()
-                            || observer.snapshot().contents != pre_free
-                            || Instant::now() >= free_deadline
-                        {
-                            break;
+                    let snap_after_free = if waits_for_response {
+                        let pre_free = observer.snapshot().contents.clone();
+                        let free_deadline = Instant::now() + Duration::from_secs(15);
+                        loop {
+                            pty.drain(&mut observer);
+                            if pty.is_dead()
+                                || observer.snapshot().contents != pre_free
+                                || Instant::now() >= free_deadline
+                            {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
                         }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    // Clear capture after typing echo, before response
-                    pty.clear_capture();
-                    let snap_after_free =
-                        pty.wait_for_ready(&mut observer, Duration::from_secs(90));
-                    let findings_free = deterministic_checks(
-                        &snap_before_free,
-                        &snap_after_free,
-                        &Action::Submit(msg.clone()),
-                    );
+                        // Clear capture after typing echo, before response.
+                        pty.clear_capture();
+                        pty.wait_for_ready(&mut observer, Duration::from_secs(90))
+                    } else {
+                        pty.settle(&mut observer, Duration::from_millis(100));
+                        observer.snapshot()
+                    };
+                    let findings_free =
+                        deterministic_checks(&snap_before_free, &snap_after_free, &action);
                     let ws_diff_free = ws_observer.diff_since_checkpoint();
 
                     let det_report_free: String = findings_free
@@ -2843,7 +3208,7 @@ fn run_agentic_session(persona: &Persona) {
                     let free_screen = if free_captured.lines().count() > 2 {
                         format!(
                             "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
-                            safe_truncate(&free_captured, 3500),
+                            evidence_excerpt(&free_captured, 8_000),
                             snap_after_free.summary(10)
                         )
                     } else {
@@ -2853,7 +3218,7 @@ fn run_agentic_session(persona: &Persona) {
                         &ua_llm,
                         persona,
                         phase,
-                        &format!("freeform: {:?}", safe_truncate(&msg, 40)),
+                        &format!("freeform: {action_desc}"),
                         &free_screen,
                         &det_report_free,
                         &ws_diff_free.summary(),
@@ -2863,7 +3228,7 @@ fn run_agentic_session(persona: &Persona) {
 
                     memory.push(TurnSummary {
                         turn: total_turns + 1,
-                        action_desc: format!("freeform: {:?}", safe_truncate(&msg, 40)),
+                        action_desc: format!("freeform: {action_desc}"),
                         observations: obs2.clone(),
                         bugs: bugs2
                             .iter()
@@ -2876,14 +3241,26 @@ fn run_agentic_session(persona: &Persona) {
 
                     entries.push(CritiqueEntry {
                         phase: phase.name.to_string(),
-                        action_desc: format!("freeform: {:?}", safe_truncate(&msg, 40)),
-                        screen_text: free_captured,
+                        action_desc: format!("freeform: {action_desc}"),
+                        // Keep the visible VT100 viewport when no response
+                        // bytes were captured for an input-only action.
+                        screen_text: free_screen,
                         observations: obs2,
                         bugs: bugs2,
                         deterministic_findings: findings_free,
                         workspace_diff: ws_diff_free.summary(),
                         next_action: NextAction::Quit,
                     });
+                    if let Some(entry) = entries.last() {
+                        append_playground_turn(
+                            ledger.as_ref(),
+                            persona,
+                            entry,
+                            total_turns + 1,
+                            &ua_llm.spec,
+                            &piku_spec,
+                        );
+                    }
 
                     ws_observer.checkpoint();
                 }
@@ -2897,15 +3274,13 @@ fn run_agentic_session(persona: &Persona) {
         }
     }
 
-    // Exit piku cleanly
-    eprintln!("[agentic_user] sending Ctrl-D to exit piku...");
-    pty.send_bytes(b"\x04"); // Ctrl-D
+    // Exit piku cleanly. `exec` in `PtyHandle::spawn` makes this the actual
+    // PTY child, so the detached cleanup thread cannot strand a shell-owned
+    // piku. rexpect can still block while reaping an already-zombie child, so
+    // never make the evaluator's evidence and review depend on that reap.
+    eprintln!("[agentic_user] sending /exit to piku...");
+    pty.send_line("/exit");
     std::thread::sleep(Duration::from_millis(500));
-
-    // Drop the PTY handle in a detached thread. rexpect's kill loop blocks
-    // indefinitely when the child is already a zombie (waitpid consumed by
-    // `sh -c` exec). We don't join the thread -- let it clean up in the
-    // background while we generate the report.
     eprintln!("[agentic_user] dropping PTY handle (detached)...");
     std::thread::spawn(move || drop(pty));
     eprintln!("[agentic_user] generating report...");
@@ -2915,10 +3290,94 @@ fn run_agentic_session(persona: &Persona) {
 
     // Meta-judge: use LLM to evaluate whether the collected findings are valid.
     // Skip if PIKU_AGENTIC_FAST=1 (avoids the extra LLM call in CI/quick runs).
-    if std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1") {
+    let meta_review = if std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1") {
         eprintln!("[meta-judge] skipped (PIKU_AGENTIC_FAST=1)");
+        MetaReview {
+            text: "meta-judge skipped by PIKU_AGENTIC_FAST=1".to_string(),
+            grounded: true,
+        }
     } else {
-        meta_judge(&ua_llm, persona, &entries);
+        meta_judge(&judge_llm, persona, &entries)
+    };
+    let review = &meta_review.text;
+    if let Some(ledger) = &ledger {
+        if let Err(error) = ledger.append_review(&ReviewRecord {
+            schema_version: 1,
+            kind: "review",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            persona: persona.name,
+            review,
+        }) {
+            eprintln!("[playground] could not append review record: {error}");
+        }
+    }
+
+    // This one bounded second-order pass checks whether the primary judge was
+    // grounded in the interaction evidence and records independent piku
+    // observations. It cannot take terminal actions or trigger another judge.
+    let recursive_review = if std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1") {
+        eprintln!("[recursive-observer] skipped (PIKU_AGENTIC_FAST=1)");
+        RecursiveReview {
+            judge_observations: vec![
+                "recursive observer skipped by PIKU_AGENTIC_FAST=1".to_string()
+            ],
+            piku_observations: Vec::new(),
+            verdict: "skipped".to_string(),
+            primary_review_grounded: true,
+        }
+    } else {
+        recursive_observer::observe(&judge_llm, persona, &entries, review)
+    };
+    if let Some(ledger) = &ledger {
+        if let Err(error) = ledger.append_observer(&ObserverRecord {
+            schema_version: 1,
+            kind: "recursive_observer",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            persona: persona.name,
+            judge_observations: &recursive_review.judge_observations,
+            piku_observations: &recursive_review.piku_observations,
+            verdict: &recursive_review.verdict,
+            primary_review_grounded: recursive_review.primary_review_grounded,
+        }) {
+            eprintln!("[playground] could not append recursive-observer record: {error}");
+        }
+    }
+
+    let mut harness_findings = Vec::new();
+    if !meta_review.grounded {
+        harness_findings.push(
+            "[harness:CRITICAL] primary review referenced missing or no turn evidence; it was not used as a product judgment"
+                .to_string(),
+        );
+    }
+    if !recursive_review.primary_review_grounded {
+        harness_findings.push(
+            "[harness:CRITICAL] recursive observer found the primary review ungrounded; it was not used as a product judgment"
+                .to_string(),
+        );
+    }
+    let (verified_findings, hypotheses, next_action) =
+        improvement_handoff(&entries, harness_findings);
+    eprintln!("\n=== PIKU IMPROVEMENT HANDOFF ===");
+    eprintln!("verified findings: {}", verified_findings.len());
+    eprintln!("hypotheses to reproduce: {}", hypotheses.len());
+    eprintln!("next action: {next_action}");
+    eprintln!("=== END PIKU IMPROVEMENT HANDOFF ===\n");
+    if let Some(ledger) = &ledger {
+        if let Err(error) = ledger.append_improvement_handoff(&ImprovementHandoffRecord {
+            schema_version: 1,
+            kind: "improvement_handoff",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            persona: persona.name,
+            verified_findings: &verified_findings,
+            hypotheses: &hypotheses,
+            next_action,
+        }) {
+            eprintln!("[playground] could not append improvement handoff: {error}");
+        }
     }
 }
 
@@ -3220,6 +3679,36 @@ End with VERDICT: one sentence overall assessment.";
 use serial_test::serial;
 
 #[test]
+fn evidence_excerpt_preserves_response_ending() {
+    let input = format!("start{}-end", "x".repeat(100));
+    let excerpt = evidence_excerpt(&input, 60);
+    assert!(excerpt.starts_with("start"));
+    assert!(excerpt.ends_with("-end"));
+    assert!(excerpt.contains("middle omitted"));
+}
+
+#[test]
+fn only_deterministic_findings_are_reused_as_agent_context() {
+    assert!(is_verified_finding(&serde_json::json!({
+        "source": "deterministic"
+    })));
+    assert!(!is_verified_finding(&serde_json::json!({"source": "llm"})));
+}
+
+#[test]
+fn review_grounding_rejects_unknown_turns() {
+    assert!(review_is_grounded(
+        &serde_json::json!({"evidence_turns": [1]}),
+        1
+    ));
+    assert!(!review_is_grounded(
+        &serde_json::json!({"evidence_turns": [2]}),
+        1
+    ));
+    assert!(!review_is_grounded(&serde_json::json!({}), 1));
+}
+
+#[test]
 #[serial(agentic)]
 #[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
 fn agentic_user_confident_dev() {
@@ -3465,6 +3954,16 @@ fn workspace_observer_detects_new_file() {
         "should detect new file: {:?}",
         diff.created
     );
+}
+
+#[test]
+fn workspace_observer_ignores_build_artifacts() {
+    let dir = tempdir("ws_target_test");
+    let ws = WorkspaceObserver::new(dir.clone());
+    std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+    std::fs::write(dir.join("target/debug/output.o"), "artifact").unwrap();
+    assert!(ws.diff_since_checkpoint().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

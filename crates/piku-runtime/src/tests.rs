@@ -982,6 +982,17 @@ mod prompt_extended {
     }
 
     #[test]
+    fn requires_executed_validation_for_bug_fix_claims() {
+        let dir = tempdir();
+        let sections = build_system_prompt(&dir, "2026-04-03", "test-model", &[]);
+        let full = sections.join("\n\n");
+        assert!(
+            full.contains("do not call it tested unless a command executed the changed behavior"),
+            "bug-fix validation instruction should remain in the system prompt"
+        );
+    }
+
+    #[test]
     fn loads_piku_md_from_directory() {
         let dir = tempdir();
         std::fs::write(dir.join("PIKU.md"), "# Project rules\nAlways use tabs.").unwrap();

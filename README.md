@@ -128,3 +128,36 @@ Full multi-turn mode:
 ```bash
 just agentic-user-full
 ```
+
+Terminal playground with a viewport-observing user agent, keyboard-level actions,
+and an append-only local evidence ledger. A primary meta-judge and one bounded
+recursive observer separately review judging quality and piku's behavior; both
+reviews become ledger records:
+
+```bash
+just playground confident_dev 6
+```
+
+Each opt-in run appends turn evidence and its final meta-review to
+`target/agentic-findings/playground.jsonl`. Set `PIKU_AGENTIC_LEDGER` to use a
+different local path.
+
+The simulated user is driven by the test harness's direct HTTPS client to
+OpenRouter; piku itself is the real CLI in a PTY. `just playground` pins
+OpenRouter for every role: GPT-5.6 Sol for piku, GPT-5.6 Terra for the simulated
+user, and Claude Opus 5 for the primary judge plus recursive observer. Override
+the three model arguments in the recipe when comparing a hypothesis. Advanced
+use can pin any role with `PIKU_AGENTIC_{USER,PIKU,JUDGE}_PROVIDER=openrouter`
+and its matching `*_MODEL`. Every resolved provider/model pair is recorded as a
+credential-free `config` entry. The harness reads an optional local `.env` as
+dotenv data; it never shell-sources that file or places credentials in a child
+process command line.
+
+The point of the playground is to improve piku, not accumulate model prose.
+Every completed run ends with an `improvement_handoff`: deterministic failures
+and ungrounded-review detections are **verified findings** to reproduce and
+fix; model-reported bugs are **hypotheses** that require reproduction before
+changing piku. Judge records cite observed turns, and the recursive observer
+can invalidate an ungrounded primary review. The terminal output states the
+next action, and the handoff is append-only evidence for the next engineering
+session.
