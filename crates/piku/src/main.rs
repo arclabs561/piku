@@ -229,6 +229,15 @@ async fn run_single_shot(
         let id = new_session_id();
         (id.clone(), Session::new(id))
     };
+    // A resumed session takes its model from the current config, not from the
+    // file, so say when the transcript being extended was written by something
+    // else. Silently mixing models leaves a record nobody can attribute.
+    if let Some((prior_provider, prior_model)) = session.record_provider(resolved.name(), &model) {
+        eprintln!(
+            "[piku] warning: session was written by {prior_provider}/{prior_model}, continuing with {}/{model}",
+            resolved.name()
+        );
+    }
 
     let tool_defs = if read_only {
         eprintln!("[piku] read-only mode: file-inspection tools only");

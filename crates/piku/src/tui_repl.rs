@@ -1042,6 +1042,14 @@ async fn run_tui_repl_core(
         (id.clone(), Session::new(id))
     };
     let session_path = sessions_dir.join(format!("{session_id}.json"));
+    // Same provenance stamp as the headless path: the file has to say which
+    // model wrote it, because resume takes the model from config instead.
+    if let Some((prior_provider, prior_model)) = session.record_provider(resolved.name(), &model) {
+        eprintln!(
+            "[piku] warning: session was written by {prior_provider}/{prior_model}, continuing with {}/{model}",
+            resolved.name()
+        );
+    }
 
     let mut total_usage = initial_usage;
 

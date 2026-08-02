@@ -221,6 +221,11 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             compacted_session: Session {
                 version: session.version,
                 id: session.id.clone(),
+                // Compaction rewrites the messages, not the run that produced
+                // them; dropping provenance here would lose it on the first
+                // compaction of every long session.
+                provider: session.provider.clone(),
+                model: session.model.clone(),
                 messages: all,
             },
             removed_message_count: 0,
@@ -241,6 +246,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session: Session {
             version: session.version,
             id: session.id.clone(),
+            provider: session.provider.clone(),
+            model: session.model.clone(),
             messages: compacted_messages,
         },
         removed_message_count: masked.len(),
@@ -273,6 +280,8 @@ pub fn apply_compact_summary(
         compacted_session: Session {
             version: session.version,
             id: session.id.clone(),
+            provider: session.provider.clone(),
+            model: session.model.clone(),
             messages: compacted_messages,
         },
         removed_message_count: removed_count,

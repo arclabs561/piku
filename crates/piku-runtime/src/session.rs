@@ -16,6 +16,17 @@ use piku_api::TokenUsage;
 pub struct Session {
     pub version: u32,
     pub id: String,
+    /// Provider and model that produced these messages.
+    ///
+    /// `--resume` takes its model from the current config rather than from the
+    /// file, so without this a resumed session silently continues under a
+    /// different model and no reader can tell afterwards which model wrote
+    /// which turn, or price the transcript. Optional and defaulted so sessions
+    /// written before this field still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -24,8 +35,28 @@ impl Session {
         Self {
             version: 1,
             id,
+            provider: None,
+            model: None,
             messages: Vec::new(),
         }
+    }
+
+    /// Stamp the run's provider and model onto the session.
+    ///
+    /// Returns the previous pair when it differs, so a resume can say that the
+    /// transcript it is about to extend was written by something else.
+    pub fn record_provider(&mut self, provider: &str, model: &str) -> Option<(String, String)> {
+        let previous = match (&self.provider, &self.model) {
+            (Some(old_provider), Some(old_model))
+                if old_provider != provider || old_model != model =>
+            {
+                Some((old_provider.clone(), old_model.clone()))
+            }
+            _ => None,
+        };
+        self.provider = Some(provider.to_string());
+        self.model = Some(model.to_string());
+        previous
     }
 
     pub fn push(&mut self, msg: ConversationMessage) {
@@ -294,6 +325,36 @@ mod save_atomicity_tests {
             leftover.is_empty(),
             "tmp files left after save: {leftover:?}"
         );
+    }
+
+    #[test]
+    fn provenance_round_trips_and_reports_a_model_change() {
+        let mut session = Session::new("s1".to_string());
+        assert_eq!(session.record_provider("openrouter", "model-a"), None);
+        assert_eq!(session.provider.as_deref(), Some("openrouter"));
+
+        // Same pair on a later run is not a change.
+        assert_eq!(session.record_provider("openrouter", "model-a"), None);
+
+        // A different model is what a resume needs to be told about, since it
+        // takes the model from config rather than from the file.
+        assert_eq!(
+            session.record_provider("anthropic", "model-b"),
+            Some(("openrouter".to_string(), "model-a".to_string()))
+        );
+        assert_eq!(session.model.as_deref(), Some("model-b"));
+    }
+
+    #[test]
+    fn a_session_written_before_provenance_existed_still_loads() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("old.json");
+        std::fs::write(&path, r#"{"version":1,"id":"old","messages":[]}"#).expect("write");
+
+        let session = Session::load(&path).expect("load");
+        assert_eq!(session.id, "old");
+        assert_eq!(session.provider, None);
+        assert_eq!(session.model, None);
     }
 
     #[test]
