@@ -952,10 +952,6 @@ struct PtyHandle {
     /// Raw bytes captured since last clear — used to extract response text
     /// by running through a plain VT100 parser (no DECSTBM interference).
     raw_capture: Vec<u8>,
-    /// Bytes discarded by the most recent `clear_capture`. Retained so a
-    /// "no visible reply" finding can distinguish piku producing nothing from
-    /// the harness clearing the buffer after the reply had already arrived.
-    discarded_capture: Vec<u8>,
     eof: bool,
     ready_wait_timed_out: bool,
     permission_response: PermissionResponse,
@@ -1063,7 +1059,6 @@ impl PtyHandle {
             writer,
             reader,
             raw_capture: Vec::new(),
-            discarded_capture: Vec::new(),
             eof: false,
             ready_wait_timed_out: false,
             permission_response: PermissionResponse::from_env(),
@@ -1163,19 +1158,14 @@ impl PtyHandle {
         total
     }
 
-    /// Clear the raw capture buffer, keeping what was discarded.
+    /// Open a fresh capture window at a turn boundary.
     ///
-    /// The capture is cleared once the screen changes after a submit, so that
-    /// only response bytes remain. If the reply lands in the same drain that
-    /// produced the screen change, the reply is in the discarded segment, not
-    /// missing. Evidence for a blank-reply finding must say which happened.
+    /// Called right after a submission is sent, so the window holds this
+    /// turn's bytes and nothing from an earlier one. The echoed submission is
+    /// removed by content afterwards, not by clearing later: clearing on the
+    /// first screen change also discards whatever else arrived in that drain.
     fn clear_capture(&mut self) {
-        self.discarded_capture = std::mem::take(&mut self.raw_capture);
-    }
-
-    /// Text discarded by the most recent `clear_capture`.
-    fn discarded_text(&self) -> String {
-        strip_ansi_bytes(&self.discarded_capture)
+        self.raw_capture.clear();
     }
 
     /// Extract text content from captured raw bytes by stripping ANSI escape
@@ -1567,14 +1557,14 @@ fn deterministic_checks(
     findings
 }
 
-/// Raw capture starts after the typing echo. A completed user turn must leave
-/// either a tool/result line or visible assistant text; the final prompt and
-/// token footer alone are not a reply.
-fn has_visible_turn_output(captured: &str) -> bool {
-    captured
-        .lines()
-        .map(str::trim)
-        .any(|line| !(line.is_empty() || is_terminal_chrome(line)))
+/// The capture opens at the submit, so it holds this turn's bytes and nothing
+/// earlier. A completed user turn must leave a tool/result line or visible
+/// assistant text; the echoed submission, the token footer, and the next
+/// prompt are not a reply.
+fn has_visible_turn_output(captured: &str, submitted: &str) -> bool {
+    captured.lines().map(str::trim).any(|line| {
+        !(line.is_empty() || is_terminal_chrome(line) || is_submission_echo(line, submitted))
+    })
 }
 
 /// UI piku prints every turn whatever the model said: the token footer, the
@@ -1585,37 +1575,45 @@ fn is_terminal_chrome(line: &str) -> bool {
         || line.contains("❯ Send a message or /help")
 }
 
-/// Classify a turn that captured no assistant reply.
+/// The text an action put on the input row, if any.
+fn submitted_text(action: &Action) -> &str {
+    match action {
+        Action::Submit(text) | Action::TypeString { text, .. } => text.as_str(),
+        _ => "",
+    }
+}
+
+/// The terminal's echo of what was just submitted.
 ///
-/// The response capture is cleared once the screen changes after a submit. If
-/// the reply is present in the discarded segment, the capture window closed
-/// too late and the blank turn is a harness artifact, not a piku defect.
-/// Reporting the two as one finding is what previously sent a repair at the
-/// runtime while the real cause was unidentified, so the severity and the
-/// evidence have to distinguish them.
-fn blank_reply_finding(discarded: &str) -> Finding {
-    if has_visible_turn_output(discarded) {
-        Finding {
-            severity: Severity::Info,
-            description: "harness cleared the response capture after the reply had already arrived"
-                .to_string(),
-            expected: "the capture window opens before any assistant output".to_string(),
-            actual: format!(
-                "reply text was found in the discarded pre-response segment: {}",
-                evidence_excerpt(discarded, 600)
-            ),
-        }
-    } else {
-        Finding {
-            severity: Severity::Major,
-            description: "completed user turn produced no visible agent reply".to_string(),
-            expected: "a tool/result line or assistant text before the input prompt".to_string(),
-            actual: format!(
-                "only token/footer UI and the next input prompt were captured; the discarded \
-                 pre-response segment carried no reply either ({} chars)",
-                discarded.trim().len()
-            ),
-        }
+/// Matched on a prefix because a long submission wraps or is elided in the
+/// input row. Counting the echo as agent output is how a turn that produced
+/// nothing looks like a turn that replied.
+fn is_submission_echo(line: &str, submitted: &str) -> bool {
+    if submitted.is_empty() {
+        return false;
+    }
+    let Some(rest) = line.strip_prefix('❯') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty() && submitted.starts_with(rest)
+}
+
+/// A turn that reached a ready prompt with nothing but chrome in its capture.
+///
+/// The capture opens at the submit and closes at the next ready prompt, so
+/// this is the whole byte stream piku emitted for the turn. The stream is
+/// carried as evidence: a claim that piku printed nothing has to show what it
+/// did print.
+fn blank_reply_finding(captured: &str) -> Finding {
+    Finding {
+        severity: Severity::Major,
+        description: "completed user turn produced no visible agent reply".to_string(),
+        expected: "a tool/result line or assistant text before the input prompt".to_string(),
+        actual: format!(
+            "the turn's full capture was {}",
+            evidence_excerpt(captured.trim(), 600)
+        ),
     }
 }
 
@@ -3166,8 +3164,16 @@ fn run_agentic_session(persona: &Persona) {
             error
         })
         .ok();
+    // A control run pins its models and seed so two builds can be compared;
+    // a discovery run randomizes to find new failure shapes. Recording which
+    // is which keeps a sampling difference from reading as a regression.
+    let run_role = std::env::var("PIKU_AGENTIC_RUN_ROLE").unwrap_or_else(|_| "adhoc".to_string());
+    let revision = piku_revision();
     if let Some(ledger) = &ledger {
-        eprintln!("[playground] run={}", ledger.run_id());
+        eprintln!(
+            "[playground] run={} role={run_role} piku={revision}",
+            ledger.run_id()
+        );
         if let Err(error) = ledger.append_config(&ConfigRecord {
             schema_version: 1,
             kind: "config",
@@ -3184,6 +3190,8 @@ fn run_agentic_session(persona: &Persona) {
                 .as_deref(),
             user_agent_client: "direct-https/reqwest",
             judge_client: "direct-https/reqwest",
+            run_role: &run_role,
+            piku_revision: &revision,
         }) {
             eprintln!("[playground] could not append config record: {error}");
         }
@@ -3265,6 +3273,11 @@ fn run_agentic_session(persona: &Persona) {
             // After Submit: wait for screen to change (thinking/response starts),
             // then wait for ready to come back (response complete).
             if matches!(action, Action::Submit(_) | Action::Key(SpecialKey::Enter)) {
+                // Open the capture window at the turn boundary, before waiting
+                // for anything. Clearing after the first screen change also
+                // discarded whatever else arrived in that drain.
+                pty.clear_capture();
+
                 // Phase 1: wait until screen changes from the pre-submit state
                 let pre_contents = observer.snapshot().contents.clone();
                 let change_deadline = Instant::now() + Duration::from_secs(15);
@@ -3280,10 +3293,6 @@ fn run_agentic_session(persona: &Persona) {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-
-                // Clear capture now — everything before this was typing/echo.
-                // Only the response content (thinking, tool calls, text) follows.
-                pty.clear_capture();
 
                 // Phase 2: wait for ready (response complete)
                 let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
@@ -3378,9 +3387,9 @@ fn run_agentic_session(persona: &Persona) {
         if matches!(
             last_action,
             Action::Submit(_) | Action::Key(SpecialKey::Enter)
-        ) && !has_visible_turn_output(&captured)
+        ) && !has_visible_turn_output(&captured, submitted_text(&last_action))
         {
-            findings.push(blank_reply_finding(&pty.discarded_text()));
+            findings.push(blank_reply_finding(&captured));
         }
         eprintln!(
             "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
@@ -3517,6 +3526,9 @@ fn run_agentic_session(persona: &Persona) {
                         break;
                     }
                     let snap_after_free = if waits_for_response {
+                        // Same turn boundary as the scripted path: open the
+                        // window at the submit, filter the echo by content.
+                        pty.clear_capture();
                         let pre_free = observer.snapshot().contents.clone();
                         let free_deadline = Instant::now() + Duration::from_secs(15);
                         loop {
@@ -3529,8 +3541,6 @@ fn run_agentic_session(persona: &Persona) {
                             }
                             std::thread::sleep(Duration::from_millis(50));
                         }
-                        // Clear capture after typing echo, before response.
-                        pty.clear_capture();
                         pty.wait_for_ready(&mut observer, Duration::from_secs(90))
                     } else {
                         pty.settle(&mut observer, Duration::from_millis(100));
@@ -3548,8 +3558,10 @@ fn run_agentic_session(persona: &Persona) {
                         .join("\n");
 
                     let free_captured = pty.captured_text();
-                    if waits_for_response && !has_visible_turn_output(&free_captured) {
-                        findings_free.push(blank_reply_finding(&pty.discarded_text()));
+                    if waits_for_response
+                        && !has_visible_turn_output(&free_captured, submitted_text(&action))
+                    {
+                        findings_free.push(blank_reply_finding(&free_captured));
                     }
                     let mut free_screen = if free_captured.lines().count() > 2 {
                         format!(
@@ -4170,29 +4182,74 @@ fn review_grounding_rejects_unknown_turns() {
 #[test]
 fn visible_turn_output_excludes_footer_only_capture() {
     assert!(!has_visible_turn_output(
-        "[1 iter · +2965 tokens]\nopenrouter · model │ /help ❯ Send a message or /help\n"
+        "[1 iter · +2965 tokens]\nopenrouter · model │ /help ❯ Send a message or /help\n",
+        ""
     ));
     assert!(has_visible_turn_output(
-        "⏺ Read(src/lib.rs:1-20)\n⎿ contents\nopenrouter · model │ /help ❯ Send a message or /help\n"
+        "⏺ Read(src/lib.rs:1-20)\n⎿ contents\nopenrouter · model │ /help ❯ Send a message or /help\n",
+        ""
     ));
     assert!(has_visible_turn_output(
-        "The requested operation was denied.\nopenrouter · model │ /help ❯ Send a message or /help\n"
+        "The requested operation was denied.\nopenrouter · model │ /help ❯ Send a message or /help\n",
+        ""
     ));
     assert!(has_visible_turn_output(
-        "[permission denied: bash] user denied\n[2 iter · +12 tokens]\n"
+        "[permission denied: bash] user denied\n[2 iter · +12 tokens]\n",
+        ""
     ));
 }
 
 #[test]
-fn blank_reply_is_attributed_to_the_harness_when_the_reply_was_discarded() {
-    let harness_artifact = blank_reply_finding("Here is the summary you asked for.\n");
-    assert_eq!(harness_artifact.severity, Severity::Info);
-    assert!(harness_artifact.description.contains("harness cleared"));
-    assert!(harness_artifact.actual.contains("summary you asked for"));
+fn the_echoed_submission_is_not_counted_as_a_reply() {
+    // The capture opens at the submit, so the echo is inside the window. It
+    // was previously the only non-chrome line on a blank turn, which read as
+    // "piku replied" and hid the very case the check exists for.
+    assert!(!has_visible_turn_output(
+        "❯ x\n[1 iter · +2974 tokens]\nopenrouter · model │ /help ❯ Send a message or /help\n",
+        "x"
+    ));
+    // A long submission is elided in the input row, so the echo is matched on
+    // a prefix.
+    assert!(!has_visible_turn_output(
+        "❯ Write a file called test.txt\n[1 iter · +12 tokens]\n",
+        "Write a file called test.txt containing 你好世界"
+    ));
+    // The echo does not suppress a real reply on the same turn.
+    assert!(has_visible_turn_output(
+        "❯ x\n⏺ Read(src/lib.rs:1-20)\n[2 iter · +12 tokens]\n",
+        "x"
+    ));
+    assert!(is_submission_echo("❯ hello", "hello world"));
+    assert!(!is_submission_echo("❯ goodbye", "hello world"));
+    assert!(!is_submission_echo("⏺ Read(x)", "hello world"));
+    assert!(!is_submission_echo("❯ anything", ""));
+}
 
-    let piku_defect = blank_reply_finding("[1 iter · +12 tokens]\n");
-    assert_eq!(piku_defect.severity, Severity::Major);
-    assert!(piku_defect.description.contains("no visible agent reply"));
+#[test]
+fn blank_reply_finding_carries_the_turns_full_capture() {
+    let finding = blank_reply_finding("❯ x\n[1 iter · +2974 tokens]\n");
+    assert_eq!(finding.severity, Severity::Major);
+    assert!(finding.description.contains("no visible agent reply"));
+    // The claim is "piku printed nothing usable", so the finding has to show
+    // what it did print.
+    assert!(finding.actual.contains("+2974 tokens"));
+}
+
+#[test]
+fn submitted_text_reads_the_input_bearing_actions() {
+    assert_eq!(
+        submitted_text(&Action::Submit("hello".to_string())),
+        "hello"
+    );
+    assert_eq!(
+        submitted_text(&Action::TypeString {
+            text: "typed".to_string(),
+            delay_ms: 0
+        }),
+        "typed"
+    );
+    assert_eq!(submitted_text(&Action::Key(SpecialKey::Enter)), "");
+    assert_eq!(submitted_text(&Action::Observe), "");
 }
 
 #[test]

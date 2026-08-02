@@ -200,3 +200,10 @@ inherits only the deterministic findings reproduced against the build it is
 testing; anything last seen on an older build is named as unreproduced and
 treated as closed until a run reproduces it. History that outlives the code it
 described otherwise steers each run at problems that may already be fixed.
+
+Runs come in two roles, recorded in the config ledger with the piku revision.
+`just playground-control` pins models and seed, so the same control on two
+builds is a real before-and-after. `just playground-sample` randomizes to
+reach failure shapes a fixed pair never hits. `just playground-paired` runs
+one of each: comparing two randomized runs measures the sample, not the
+change.

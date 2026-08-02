@@ -76,6 +76,27 @@ agentic-user-full persona="confident_dev":
 playground persona="confident_dev" turns="6" piku_model="openai/gpt-5.6-sol" user_model="openai/gpt-5.6-terra" judge_model="anthropic/claude-opus-5":
     PIKU_AGENTIC_PIKU_PROVIDER=openrouter PIKU_AGENTIC_PIKU_MODEL={{piku_model}} PIKU_AGENTIC_USER_PROVIDER=openrouter PIKU_AGENTIC_USER_MODEL={{user_model}} PIKU_AGENTIC_JUDGE_PROVIDER=openrouter PIKU_AGENTIC_JUDGE_MODEL={{judge_model}} PIKU_AGENTIC_MAX_TURNS={{turns}} cargo test --test agentic_user -p piku -- agentic_user_{{persona}} --ignored --nocapture
 
+# Regression baseline: pinned models, pinned seed, ledgered as run_role=control
+# alongside the piku revision. Compare a control to the same control on another
+# build. Comparing two randomized runs measures the sample, not the change.
+#
+# Usage:
+#   just playground-control
+#   just playground-control adversarial 8
+playground-control persona="adversarial" turns="6":
+    PIKU_AGENTIC_RUN_ROLE=control PIKU_AGENTIC_MODEL_SELECTION_SEED=1 PIKU_AGENTIC_PIKU_PROVIDER=openrouter PIKU_AGENTIC_PIKU_MODEL=openai/gpt-5.6-terra PIKU_AGENTIC_USER_PROVIDER=openrouter PIKU_AGENTIC_USER_MODEL=openai/gpt-5.6-terra PIKU_AGENTIC_JUDGE_PROVIDER=openrouter PIKU_AGENTIC_JUDGE_MODEL=anthropic/claude-opus-5 PIKU_AGENTIC_MAX_TURNS={{turns}} cargo test --test agentic_user -p piku -- agentic_user_{{persona}} --ignored --nocapture
+
+# One control run for comparison, then one randomized discovery run. Run this
+# after a piku change: the control says whether the change moved the baseline,
+# the discovery run looks for failure shapes the fixed pair never reaches.
+#
+# Usage:
+#   just playground-paired
+#   just playground-paired adversarial 8 42
+playground-paired persona="adversarial" turns="6" seed="":
+    just playground-control {{persona}} {{turns}}
+    PIKU_AGENTIC_RUN_ROLE=discovery just playground-sample {{persona}} {{turns}} {{seed}}
+
 # Sample a reproducible OpenRouter subject/user assignment. The judge stays on
 # Claude Opus 5 as a calibration anchor; selected models and seed are recorded
 # in the config ledger, so a finding can be replayed exactly.

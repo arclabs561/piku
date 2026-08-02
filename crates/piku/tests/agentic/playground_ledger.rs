@@ -60,6 +60,14 @@ pub struct ConfigRecord<'a> {
     pub model_selection_seed: Option<&'a str>,
     pub user_agent_client: &'static str,
     pub judge_client: &'static str,
+    /// `control` (pinned models and seed, comparable across builds),
+    /// `discovery` (randomized, finds new failure shapes but is not a
+    /// baseline), or `adhoc`. Comparing a randomized run to a randomized run
+    /// measures the sample, not the change.
+    pub run_role: &'a str,
+    /// The piku revision under test, so a control run can be compared to the
+    /// same control on another build.
+    pub piku_revision: &'a str,
 }
 
 /// The filesystem-backed task contract selected for a run.
@@ -279,6 +287,8 @@ mod tests {
                 model_selection_seed: Some("42"),
                 user_agent_client: "direct-https/reqwest",
                 judge_client: "direct-https/reqwest",
+                run_role: "control",
+                piku_revision: "abc1234",
             })
             .unwrap();
         let judge_observations = vec!["the primary review is grounded".to_string()];
@@ -348,6 +358,8 @@ mod tests {
         assert_eq!(config["kind"], "config");
         assert_eq!(config["judge_model"], "test-judge");
         assert_eq!(config["model_selection_seed"], "42");
+        assert_eq!(config["run_role"], "control");
+        assert_eq!(config["piku_revision"], "abc1234");
         let observer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(observer["kind"], "recursive_observer");
         assert_eq!(observer["verdict"], "keep");
