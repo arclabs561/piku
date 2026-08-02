@@ -176,9 +176,13 @@ free-form judge prose, to select the next piku change and its validation run.
 The packet carries a bounded history of prior deterministic findings (including
 recurrence), never unverified historical model allegations.
 
-A persona with a filesystem task also carries a scenario contract: a stated
-goal plus executable acceptance checks run against the workspace piku edited
-(file contents, and a bounded `cargo test`). The contract and its per-check
+Every persona carries a scenario contract: a stated goal plus executable
+acceptance checks run against the workspace piku edited (file presence and
+contents, and a bounded `cargo test`). The read-only personas assert the
+sources they were asked to describe are unchanged; the adversarial one asserts
+nothing from outside the workspace was copied into it. Each check is calibrated
+against a pristine fixture first, because a check that can fail on an untouched
+workspace teaches readers to ignore the category. The contract and its per-check
 results are ledgered as `scenario_contract` and in the development-context
 packet. A failed acceptance check outranks every screen-level finding and sets
 the next action to `fix_piku_for_failed_scenario_acceptance`, because it is
