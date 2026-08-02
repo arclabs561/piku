@@ -217,3 +217,9 @@ harness's call count, tokens, and the dollar cost the provider itself reported,
 plus piku's own token counts read from its status footer. A local price table
 would go stale without anyone noticing, so the cost figure is the provider's,
 and a zero means it reported none rather than that the run was free.
+
+Set `PIKU_AGENTIC_MAX_USD` to cap the harness's own review spend. Reaching the
+cap stops further review calls and records that as a harness finding, so the
+run still reports its deterministic evidence instead of failing silently. It
+bounds this process only: piku runs separately against the same key, so a
+capped run is not a capped bill.

@@ -1655,6 +1655,25 @@ mod spend {
         PIKU_OUTPUT_TOKENS.fetch_add(output, Ordering::Relaxed);
     }
 
+    /// Optional ceiling on harness spend, in dollars.
+    ///
+    /// Bounds this process's own review calls only. piku runs as a separate
+    /// process billed against the same key, so a capped run is not a capped
+    /// bill; the cap stops the harness from spending unattended, it does not
+    /// stop the subject.
+    pub fn budget_usd() -> Option<f64> {
+        std::env::var("PIKU_AGENTIC_MAX_USD")
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|cap| *cap > 0.0)
+    }
+
+    pub fn over_budget() -> bool {
+        budget_usd().is_some_and(|cap| usd() >= cap)
+    }
+
     pub fn usd() -> f64 {
         #[allow(clippy::cast_precision_loss)]
         {
@@ -2269,6 +2288,18 @@ impl LlmClient {
     }
 
     fn call_raw(&self, system: &str, messages: &[(&str, &str)]) -> Result<String, String> {
+        // A budget stop is honestly "no review was produced", which is already
+        // a named outcome, so it travels the same path as a provider failure
+        // and lands in the handoff as a harness finding rather than silently
+        // degrading the run.
+        if spend::over_budget() {
+            return Err(format!(
+                "run budget of ${:.4} reached after ${:.4}; no further review calls",
+                spend::budget_usd().unwrap_or(0.0),
+                spend::usd()
+            ));
+        }
+
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
@@ -4530,6 +4561,15 @@ fn footer_tokens_are_read_for_piku_spend() {
         Some((20, 2))
     );
     assert_eq!(parse_footer_tokens("no footer here\n"), None);
+}
+
+#[test]
+fn an_unset_or_nonsense_budget_does_not_cap_a_run() {
+    // The cap is opt-in. A missing, empty, unparseable, or non-positive value
+    // must not silently stop every review call, which would look like a
+    // provider outage.
+    assert_eq!(spend::budget_usd(), None);
+    assert!(!spend::over_budget());
 }
 
 #[test]
