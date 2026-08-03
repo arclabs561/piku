@@ -1042,6 +1042,11 @@ async fn run_tui_repl_core(
         (id.clone(), Session::new(id))
     };
     let session_path = sessions_dir.join(format!("{session_id}.json"));
+    // Announce the session at the start, not only on the way out. It is
+    // rewritten after every turn, so a name known up front can be tailed live
+    // or read by anything watching the run; a name given at exit can only be
+    // read afterwards.
+    eprintln!("\x1b[2m[session → {}]\x1b[0m", session_path.display());
     // Same provenance stamp as the headless path: the file has to say which
     // model wrote it, because resume takes the model from config instead.
     if let Some((prior_provider, prior_model)) = session.record_provider(resolved.name(), &model) {

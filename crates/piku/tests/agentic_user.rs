@@ -1686,15 +1686,41 @@ mod spend {
     }
 }
 
-/// Pull piku's session-file path out of the line it prints on exit.
+/// Whether piku produced anything for its last turn, read from its session
+/// rather than from the terminal.
+///
+/// Every false alarm this harness has raised came from judging piku by the
+/// rendered viewport, which is a lossy view: it cannot separate "piku emitted
+/// nothing" from "the harness lost what piku emitted", and it cannot separate
+/// one thing printed twice from two things printed once. The session says what
+/// piku actually produced. `None` means the session could not be read, and the
+/// caller falls back to the terminal rather than inventing a verdict.
+fn session_produced_output(session_path: &Path) -> Option<bool> {
+    let content = std::fs::read_to_string(session_path).ok()?;
+    let session: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let last = session["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")?;
+    Some(last["blocks"].as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| match block["type"].as_str() {
+            Some("text") => !block["text"].as_str().unwrap_or("").trim().is_empty(),
+            Some(_) => true,
+            None => false,
+        })
+    }))
+}
+
+/// Pull piku's session-file path out of the lines it prints.
 ///
 /// Matched on the arrow rather than the whole sentence so a reworded status
-/// line does not silently stop the run from keeping its own subject's history.
+/// line does not silently stop the run from reading its own subject's history.
 fn parse_session_path(captured: &str) -> Option<String> {
     captured
         .lines()
         .rev()
-        .filter(|line| line.contains("session saved"))
+        .filter(|line| line.contains("session"))
         .find_map(|line| {
             let (_, path) = line.split_once('\u{2192}')?;
             let path = path.trim().trim_end_matches(']').trim();
@@ -3437,6 +3463,16 @@ fn run_agentic_session(persona: &Persona) {
             safe_truncate(&startup_snap.contents, 200)
         );
     }
+    // piku names its session on startup, and rewrites that file after every
+    // turn, so the run can consult what piku actually produced while it is
+    // still running rather than only reconstructing it afterwards.
+    let piku_session_path = parse_session_path(&pty.captured_text());
+    match &piku_session_path {
+        Some(path) => eprintln!("[agentic_user] piku session: {path}"),
+        None => eprintln!(
+            "[agentic_user] piku did not name a session; findings fall back to the terminal"
+        ),
+    }
     let startup_permission_events = pty.take_permission_events();
     if !startup_permission_events.is_empty() {
         eprintln!(
@@ -3586,7 +3622,29 @@ fn run_agentic_session(persona: &Persona) {
             Action::Submit(_) | Action::Key(SpecialKey::Enter)
         ) && !has_visible_turn_output(&captured, submitted_text(&last_action))
         {
-            findings.push(blank_reply_finding(&captured));
+            // The terminal showed nothing. Ask the session whether piku
+            // produced nothing, which is a piku defect, or produced something
+            // the terminal did not show, which is a rendering one. Judging
+            // both from the viewport is what produced this harness's false
+            // alarms.
+            match piku_session_path
+                .as_deref()
+                .and_then(|path| session_produced_output(Path::new(path)))
+            {
+                Some(true) => findings.push(Finding {
+                    severity: Severity::Major,
+                    description: "piku produced a reply that never reached the terminal"
+                        .to_string(),
+                    expected: "output recorded in the session is shown to the user".to_string(),
+                    actual: format!(
+                        "session records assistant output for this turn; capture held only {}",
+                        evidence_excerpt(captured.trim(), 400)
+                    ),
+                }),
+                // Confirmed empty, or no session to ask: both report the turn
+                // as blank, and the finding carries the capture either way.
+                Some(false) | None => findings.push(blank_reply_finding(&captured)),
+            }
         }
         if let Some((input, output)) = parse_footer_tokens(&captured) {
             spend::record_piku_turn(input, output);
@@ -3866,7 +3924,9 @@ fn run_agentic_session(persona: &Persona) {
     // usage. The viewport shows what a user would have seen; this shows what
     // piku did.
     pty.settle(&mut observer, Duration::from_millis(500));
-    let piku_session_source = parse_session_path(&pty.captured_text());
+    let piku_session_source = piku_session_path
+        .clone()
+        .or_else(|| parse_session_path(&pty.captured_text()));
     eprintln!("[agentic_user] dropping PTY handle (detached)...");
     std::thread::spawn(move || drop(pty));
     eprintln!("[agentic_user] generating report...");
@@ -4525,6 +4585,44 @@ fn stripping_keeps_a_reply_that_follows_the_spinner_end_to_end() {
     );
     assert!(!stripped.contains("thinking"));
     assert!(has_visible_turn_output(&stripped, "x"));
+}
+
+#[test]
+fn the_session_decides_whether_piku_produced_anything() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("s.json");
+
+    // A text block with content is output.
+    std::fs::write(
+        &path,
+        r#"{"messages":[{"role":"user","blocks":[{"type":"text","text":"x"}]},
+            {"role":"assistant","blocks":[{"type":"text","text":"hello"}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(session_produced_output(&path), Some(true));
+
+    // A tool call is output even with no prose.
+    std::fs::write(
+        &path,
+        r#"{"messages":[{"role":"assistant","blocks":[{"type":"tool_use","name":"bash"}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(session_produced_output(&path), Some(true));
+
+    // An empty or whitespace text block is not output. This is the case the
+    // terminal cannot distinguish from a lost reply.
+    std::fs::write(
+        &path,
+        r#"{"messages":[{"role":"assistant","blocks":[{"type":"text","text":"  "}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(session_produced_output(&path), Some(false));
+
+    // No readable session means no verdict, not a false one.
+    assert_eq!(
+        session_produced_output(&directory.path().join("absent.json")),
+        None
+    );
 }
 
 #[test]
