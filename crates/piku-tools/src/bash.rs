@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -79,6 +80,41 @@ pub fn destructiveness(params: &serde_json::Value) -> Destructiveness {
     Destructiveness::Likely // bash is always at least Likely
 }
 
+/// Cap on each captured stream.
+///
+/// `read_file` already refuses files over 10 MB to avoid an OOM on a huge or
+/// special file. A command's output is the same exposure by another route, and
+/// worse for being unbounded twice: it grows in memory here, then travels into
+/// the conversation, where a stray `find /` or `cat` of a log costs a context
+/// window and the tokens to fill it. Kept generous enough that ordinary build
+/// and test output is untouched.
+const MAX_STREAM_BYTES: usize = 256 * 1024;
+
+/// Decode a captured stream, keeping the head and saying what was dropped.
+///
+/// The head is what a reader wants: a compiler's first errors, a test run's
+/// first failures. Truncating silently would let a model reason from a partial
+/// result it believes is complete.
+fn bound_stream(bytes: &[u8], label: &str) -> String {
+    if bytes.len() <= MAX_STREAM_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    // Back off to a UTF-8 boundary so the cut does not split a character;
+    // a continuation byte has the bit pattern 0b10xx_xxxx.
+    let mut end = MAX_STREAM_BYTES;
+    while end > 0 && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    let mut out = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    let _ = write!(
+        out,
+        "\n[{label} truncated: {} of {} bytes shown]",
+        end,
+        bytes.len()
+    );
+    out
+}
+
 #[must_use]
 pub async fn execute(params: serde_json::Value) -> ToolResult {
     let p: BashParams = match serde_json::from_value(params) {
@@ -110,8 +146,8 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
         )),
         Ok(Err(e)) => ToolResult::error(format!("bash: spawn failed: {e}")),
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let stdout = bound_stream(&output.stdout, "stdout");
+            let stderr = bound_stream(&output.stderr, "stderr");
             let code = output.status.code().unwrap_or(-1);
 
             if code != 0 {

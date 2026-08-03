@@ -249,6 +249,30 @@ mod bash {
     use crate::bash;
 
     #[tokio::test]
+    async fn bounds_a_huge_stream_and_says_so() {
+        // read_file already refuses a file over its limit; a command's output
+        // is the same exposure by another route, and it travels on into the
+        // conversation as well as sitting in memory here.
+        let result = bash::execute(serde_json::json!({
+            "command": "yes abcdefghij | head -c 400000"
+        }))
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.len() < 400_000,
+            "unbounded stream: {} bytes",
+            result.output.len()
+        );
+        // Silent truncation would let a model reason from a partial result it
+        // believes is whole.
+        assert!(
+            result.output.contains("stdout truncated"),
+            "truncation not disclosed: {}",
+            &result.output[result.output.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
     async fn runs_simple_command() {
         let result = bash::execute(serde_json::json!({ "command": "echo hello" })).await;
         assert!(!result.is_error, "{}", result.output);
