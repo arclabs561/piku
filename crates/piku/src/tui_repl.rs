@@ -773,6 +773,12 @@ pub struct TuiSink {
     turn_start_tokens: u32,
     /// Streaming markdown renderer for assistant text.
     md: StreamingMarkdown,
+    /// Structured event log for this session.
+    ///
+    /// Only the headless sink wrote a trace, so the interactive mode, the one
+    /// users run and the one the agentic harness drives, left nothing to read
+    /// afterwards. A run that cannot be reconstructed cannot be debugged.
+    trace: crate::trace::TraceWriter,
 }
 
 fn lock_indicator_label(label: &Mutex<String>) -> MutexGuard<'_, String> {
@@ -782,7 +788,11 @@ fn lock_indicator_label(label: &Mutex<String>) -> MutexGuard<'_, String> {
 }
 
 impl TuiSink {
-    fn new(_model: &str, binary_mtime_baseline: Option<std::time::SystemTime>) -> Self {
+    fn new(
+        _model: &str,
+        binary_mtime_baseline: Option<std::time::SystemTime>,
+        trace: crate::trace::TraceWriter,
+    ) -> Self {
         Self {
             stdout: io::stdout(),
             binary_mtime_baseline,
@@ -792,6 +802,7 @@ impl TuiSink {
             indicator_label: std::sync::Arc::new(std::sync::Mutex::new("thinking".to_string())),
             turn_start_tokens: 0,
             md: StreamingMarkdown::new(),
+            trace,
         }
     }
 
@@ -826,6 +837,7 @@ impl TuiSink {
 
 impl OutputSink for TuiSink {
     fn on_text(&mut self, text: &str) {
+        self.trace.text_chunk(text);
         self.clear_thinking_indicator();
         // Render markdown formatting as text streams in.
         // The renderer buffers partial lines and emits \r\n-terminated output.
@@ -837,7 +849,8 @@ impl OutputSink for TuiSink {
         }
     }
 
-    fn on_tool_start(&mut self, tool_name: &str, _tool_id: &str, input: &serde_json::Value) {
+    fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value) {
+        self.trace.tool_start(tool_name, tool_id, input);
         self.clear_thinking_indicator();
         // Flush any pending markdown before showing the tool label.
         let flushed = self.md.flush();
@@ -860,6 +873,7 @@ impl OutputSink for TuiSink {
     }
 
     fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
+        self.trace.tool_end(tool_name, "", result, !is_error);
         let preview = format_tool_result(tool_name, result, is_error);
         if !preview.is_empty() {
             self.println(&preview);
@@ -898,13 +912,20 @@ impl OutputSink for TuiSink {
     }
 
     fn on_permission_denied(&mut self, tool_name: &str, reason: &str) {
+        self.trace.permission_denied(tool_name, reason);
         self.println(&format!(
             "\x1b[33m[permission denied: {tool_name}]\x1b[0m {reason}"
         ));
         let _ = self.stdout.flush();
     }
 
+    fn on_provider_stream(&mut self, elapsed_ms: u64, blocks: usize, stop_reason: &str) {
+        self.trace.provider_stream(elapsed_ms, blocks, stop_reason);
+    }
+
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        self.trace
+            .turn_end(iterations, usage.input_tokens, usage.output_tokens);
         // Stop the background spinner (prevents task leak).
         self.thinking_stop
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1400,7 +1421,16 @@ async fn run_tui_repl_core(
                     all_tool_definitions()
                 };
                 let prompter = TuiPrompter::new(&config.allow, &config.deny);
-                let mut sink = TuiSink::new(&model, binary_mtime_baseline);
+                let mut sink = TuiSink::new(
+                    &model,
+                    binary_mtime_baseline,
+                    crate::trace::TraceWriter::open(&config.traces_dir(), &session_id),
+                );
+                // The harness rotates models between runs, so a trace that
+                // does not name what answered it cannot be compared with the
+                // next one.
+                sink.trace
+                    .session_config(resolved.name(), &model, read_only);
 
                 // Show a ticking thinking indicator on the input row.
                 // A background task updates it every second with elapsed time.

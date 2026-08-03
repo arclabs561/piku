@@ -142,6 +142,36 @@ impl TraceWriter {
         }));
     }
 
+    /// Which provider and model produced this session's turns.
+    ///
+    /// A trace that does not say what answered it cannot be compared with
+    /// another, and the harness rotates models between runs, so the same
+    /// prompt is not the same experiment twice.
+    pub fn session_config(&mut self, provider: &str, model: &str, read_only: bool) {
+        self.write_event(serde_json::json!({
+            "ts": Self::now_secs(),
+            "event": "session_config",
+            "provider": provider,
+            "model": model,
+            "read_only": read_only,
+        }));
+    }
+
+    /// How long a provider took to finish streaming one iteration.
+    ///
+    /// Turn wall clock alone cannot separate a slow provider from a hang in
+    /// the loop or the terminal, which are different defects with the same
+    /// symptom.
+    pub fn provider_stream(&mut self, elapsed_ms: u64, blocks: usize, stop_reason: &str) {
+        self.write_event(serde_json::json!({
+            "ts": Self::now_secs(),
+            "event": "provider_stream",
+            "elapsed_ms": elapsed_ms,
+            "blocks": blocks,
+            "stop_reason": stop_reason,
+        }));
+    }
+
     pub fn prompt(&mut self, text: &str) {
         self.write_event(serde_json::json!({
             "ts": Self::now_secs(),

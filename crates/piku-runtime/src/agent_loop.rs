@@ -63,6 +63,13 @@ pub trait OutputSink: Send {
     /// future work will use it to trigger rolling-summary compaction.
     /// Default: no-op.
     fn on_context_pressure(&mut self, _pressure: f32) {}
+
+    /// Called after each provider stream completes, with how long it took.
+    ///
+    /// A turn's wall clock cannot separate a slow provider from a hang in the
+    /// loop or the terminal; they are different defects with the same symptom.
+    /// Default: no-op.
+    fn on_provider_stream(&mut self, _elapsed_ms: u64, _blocks: usize, _stop_reason: &str) {}
 }
 
 /// A turn result after the full agentic loop for one user message.
@@ -304,8 +311,15 @@ async fn run_turn_inner(
         let request = build_request(session, model, system_prompt, &tool_defs);
 
         // stream the response
+        let stream_started = std::time::Instant::now();
         let (mut assistant_blocks, usage, mut stop_reason, maybe_err) =
             stream_response(provider, request, sink).await;
+        #[allow(clippy::cast_possible_truncation)]
+        sink.on_provider_stream(
+            stream_started.elapsed().as_millis() as u64,
+            assistant_blocks.len(),
+            &format!("{stop_reason:?}"),
+        );
 
         if let Some(err) = maybe_err {
             stream_error = Some(err);
