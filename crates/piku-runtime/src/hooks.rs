@@ -1,13 +1,17 @@
 /// Lifecycle hooks -- user-defined shell commands that fire at key points.
 ///
-/// Hooks are configured in `.piku/hooks.json` or via `HookRegistry::register`.
+/// Hooks are configured in the XDG-aware global `piku/hooks.json` or the
+/// project-local `.piku/hooks.json`.
 /// Each hook receives JSON context on stdin and can block actions via exit code 2.
 ///
 /// Supported events:
-/// - `PreToolUse`: before a tool call executes (can block or modify)
-/// - `PostToolUse`: after a tool call succeeds
+/// - `PreToolUse`: before a tool call executes (can deny and return context)
+/// - `PostToolUse`: after execution, including error results
 /// - `SessionStart`: when a session begins
 /// - `Stop`: after a turn completes (notifications, logging, cleanup)
+/// - `PreCompact`: before automatic context reduction or compaction
+/// - `SubagentStart`: before a child begins
+/// - `SubagentStop`: after a child finishes
 ///
 /// Inspired by Claude Code's hooks system (code.claude.com/docs/en/hooks).
 use std::path::{Path, PathBuf};
@@ -26,7 +30,8 @@ pub struct HookHandler {
     /// Uses the same syntax as permission rules: `Bash(git *)`, `Edit(*.rs)`.
     #[serde(rename = "if")]
     pub if_condition: Option<String>,
-    /// Run asynchronously (don't wait for result).
+    /// Request asynchronous execution. Currently honored by `PostToolUse`,
+    /// `Stop`, and `SubagentStop`; other events run inline.
     #[serde(default)]
     pub r#async: bool,
     /// Timeout in seconds (default 10).
@@ -159,8 +164,9 @@ impl HookRegistry {
 }
 
 impl HookRegistry {
-    /// Load hooks from global `~/.config/piku/hooks.json` merged with
-    /// project-local `.piku/hooks.json`. Project hooks are appended (run after global).
+    /// Load hooks from `$XDG_CONFIG_HOME/piku/hooks.json` (with the standard
+    /// config fallback), merged with project-local `.piku/hooks.json`.
+    /// Project hooks are appended and run after global hooks.
     #[must_use]
     pub fn load(project_dir: &Path) -> Self {
         // Layer 1: global hooks
@@ -298,7 +304,7 @@ impl HookRegistry {
         HookResult::default()
     }
 
-    /// Run `PostToolUse` hooks (fire-and-forget for sync, ignore for async).
+    /// Run sync `PostToolUse` handlers inline and spawn handlers marked async.
     pub fn run_post_tool_use(
         &self,
         tool_name: &str,
@@ -493,8 +499,8 @@ impl HookRegistry {
         true
     }
 
-    /// Run `SubagentStart` hooks before a subagent begins execution.
-    /// Fire-and-forget (errors logged). The parent continues regardless.
+    /// Run `SubagentStart` hooks inline before a subagent begins execution.
+    /// Errors are logged and cannot block the spawn.
     pub fn run_subagent_start(
         &self,
         task_id: &str,

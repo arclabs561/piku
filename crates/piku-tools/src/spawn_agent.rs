@@ -30,8 +30,8 @@ pub enum Isolation {
     #[default]
     /// Run in the current working directory (default).
     None,
-    /// Run in a temporary git worktree. Auto-cleaned if no changes; if changes
-    /// are made, the worktree path and branch are returned in the result.
+    /// Allocate a temporary git worktree and prompt the agent to route work
+    /// there. This is guidance rather than enforced process containment.
     Worktree,
 }
 
@@ -49,10 +49,11 @@ pub struct SpawnAgentParams {
     pub context_files: Vec<String>,
     /// Maximum turns the subagent may use. Defaults to 20.
     pub max_turns: Option<u32>,
-    /// Isolation mode. Use "worktree" to run in a temporary git worktree.
+    /// Worktree mode allocates a temporary worktree and adds routing guidance.
     #[serde(default)]
     pub isolation: Isolation,
-    /// Run in background (default true). When false, agent_join is implicit.
+    /// Requested background mode. Currently all spawns remain asynchronous;
+    /// false changes only the response hint and does not perform an implicit join.
     #[serde(default = "default_true")]
     pub background: bool,
     /// Fork mode: inherit parent session context. Default false.
@@ -88,20 +89,20 @@ pub fn spawn_agent_schema() -> serde_json::Value {
             },
             "subagent_type": {
                 "type": "string",
-                "description": "Built-in agent type: 'verification' (verify correctness, returns PASS/FAIL) or 'explorer' (read-only research). Omit for general-purpose."
+                "description": "Built-in agent type: 'verification' (returns PASS/FAIL/PARTIAL) or 'explorer' (workspace-file read-only, but still able to mutate agent memory). Omit for general-purpose."
             },
             "isolation": {
                 "type": "string",
                 "enum": ["none", "worktree"],
-                "description": "Isolation mode. Use 'worktree' to run the agent in a temporary git worktree — auto-cleaned if no changes are made. Recommended for any agent that will edit files."
+                "description": "Worktree mode allocates a temporary git worktree and prompts the agent to route work there. The executor does not enforce its working directory."
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in background (default true). Set false to block until done — equivalent to spawn + immediate agent_join."
+                "description": "Requested background mode (default true). Currently all spawns are asynchronous; false changes only the response hint."
             },
             "fork": {
                 "type": "boolean",
-                "description": "Fork mode: inherit parent session context (default false). Use for research tasks where the agent benefits from knowing what you already know. Forks share prompt cache with the parent."
+                "description": "Fork mode: copy parent history into the child prompt context (default false). Individual blocks are truncated, but the aggregate fork context is not yet bounded."
             }
         },
         "required": ["task"]
@@ -110,8 +111,8 @@ pub fn spawn_agent_schema() -> serde_json::Value {
 
 #[must_use]
 pub fn spawn_agent_destructiveness(_params: &serde_json::Value) -> Destructiveness {
-    // Spawning agents is potentially destructive — they can write files and run bash.
-    // Always prompt so the user knows a subagent is being started.
+    // Spawning agents is potentially destructive because they can write files
+    // and run bash. Classify it as Likely so prompt-capable policies may ask.
     Destructiveness::Likely
 }
 

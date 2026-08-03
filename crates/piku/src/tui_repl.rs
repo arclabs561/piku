@@ -1061,7 +1061,7 @@ async fn run_tui_repl_core(
     // or read by anything watching the run; a name given at exit can only be
     // read afterwards.
     eprintln!("\x1b[2m[session → {}]\x1b[0m", session_path.display());
-    // Same provenance stamp as the headless path: the file has to say which
+    // Same provenance stamp as the launch-turn path: the file has to say which
     // model wrote it, because resume takes the model from config instead.
     if let Some((prior_provider, prior_model)) = session.record_provider(resolved.name(), &model) {
         eprintln!(
@@ -1988,7 +1988,7 @@ fn handle_slash_cmd(
         "permissions" | "perms" => {
             if config.allow.is_empty() && config.deny.is_empty() {
                 println!("\x1b[2m[no permission rules configured]\x1b[0m\r");
-                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to ~/.config/piku/settings.json or .piku/settings.json\x1b[0m\r");
+                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.json or .piku/settings.json\x1b[0m\r");
             } else {
                 if !config.allow.is_empty() {
                     println!("\x1b[32mAllow:\x1b[0m\r");
@@ -2014,7 +2014,7 @@ fn handle_slash_cmd(
             } else {
                 println!("\x1b[2m[no hooks configured]\x1b[0m\r");
                 println!(
-                    "\x1b[2mAdd hooks to ~/.config/piku/hooks.json or .piku/hooks.json\x1b[0m\r"
+                    "\x1b[2mAdd hooks to the XDG-aware Piku hooks.json or .piku/hooks.json\x1b[0m\r"
                 );
             }
         }

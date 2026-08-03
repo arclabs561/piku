@@ -1,16 +1,9 @@
-/// Session compaction — summarise old context to stay within the context window.
+/// Session compaction for staying within the context window.
 ///
-/// When `should_compact` returns true, `compact_system_prompt` returns a system
-/// message that the caller should prepend to the session (replacing old messages)
-/// so the model can continue without losing the thread.
-///
-/// The compaction prompt structure mirrors Claude Code's
-/// `src/services/compact/prompt.ts` — 9 sections, `<analysis>` scratchpad
-/// stripped before returning the formatted summary.
-///
-/// piku supports LLM-based compaction via `try_llm_compact` in the agent loop,
-/// which calls the same model to write a summary. If that fails or times out,
-/// the structural `compact_session` is used as a fallback.
+/// The automatic path masks old observations and then uses deterministic
+/// structural compaction. The LLM prompt, formatter, and helper remain in this
+/// module but are not called by the agent loop; activating them requires an
+/// explicit product contract and entry point.
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 // ---------------------------------------------------------------------------

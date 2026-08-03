@@ -238,9 +238,8 @@ async fn run_turn_inner(
         //     matter later ("context rot")
         //   - Observation masking keeps reasoning + tool calls verbatim,
         //     sheds bulk from tool-output observations only
-        // The richer `try_llm_compact` path is still available for the
-        // manual `/compact` slash command, where the user has explicitly
-        // asked for a rewrite and tolerates the latency.
+        // The richer `try_llm_compact` path is retained for a possible future
+        // explicit compaction command. No such command is currently exposed.
         if crate::compact::should_compact(session, compact_cfg) {
             // PreCompact hook: let hooks veto compaction (exit 2 = block).
             let vetoed = hook_registry.is_some_and(|hooks| {
@@ -1197,7 +1196,8 @@ fn build_request(
 
 // Execute `spawn_agent`: fork a background tokio task running `run_turn_inner`
 // with a fresh session and a budget cap. Returns immediately with the task_id.
-// Note: foreground mode runs inline; background uses spawn_local.
+// The current implementation always uses spawn_local. The `background` field
+// changes the response hint but does not make execution synchronous.
 fn execute_spawn_agent(
     params: &serde_json::Value,
     registry: &TaskRegistry,
@@ -1424,9 +1424,11 @@ fn execute_spawn_agent(
     }
 
     if let Some(ref wt) = worktree_path {
-        prompt.push_str("\n\nYou are running in an isolated git worktree at ");
+        prompt.push_str("\n\nA separate git worktree was allocated at ");
         prompt.push_str(&wt.display().to_string());
-        prompt.push_str(". You can freely edit files here without affecting the main checkout.");
+        prompt.push_str(
+            ". Route all file and shell work there. This is prompt guidance, not enforced containment.",
+        );
     }
 
     // Per-agent turn limit: agent def's max_turns overrides the default
@@ -1524,8 +1526,8 @@ async fn run_subagent_task(
     let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
     let mut sink = crate::task::DevNullSink;
 
-    // Worktree guard: Drop will clean up worktree + branch if we exit via
-    // panic / abort before reaching the explicit cleanup below. Defused
+    // Worktree guard: Drop attempts to clean up the worktree and branch if
+    // this future unwinds or returns before the explicit cleanup below. Defused
     // on the happy path so the existing `changed`-aware cleanup can decide
     // whether to keep the worktree.
     let repo_root_for_guard = std::env::current_dir().unwrap_or_default();
@@ -1538,15 +1540,16 @@ async fn run_subagent_task(
         _ => None,
     };
 
-    // For worktree isolation: inject cwd as the first user message so the
-    // agent knows to cd there. We do NOT call set_current_dir — that mutates
-    // global process state and races with the parent's tool calls.
+    // For worktree routing: inject cwd as the first user message so the agent
+    // knows to cd there. This is guidance, not containment. We do NOT call
+    // set_current_dir because that mutates global process state and races with
+    // the parent's tool calls.
     let effective_prompt = if let Some(ref wt) = worktree_cwd {
         let cwd_str = wt.display().to_string();
         format!(
             "{prompt}\n\n<system-reminder>Your working directory is {cwd_str}. \
              Start every bash command with `cd {cwd_str} &&` or use absolute paths. \
-             This is an isolated git worktree — your changes do not affect the main checkout.\
+             A separate git worktree was allocated for this task. Keep every change there.\
              </system-reminder>"
         )
     } else {

@@ -46,7 +46,9 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         format!("{base}/{}", p.pattern)
     };
 
-    // Sandbox check: verify the pattern doesn't escape the base directory via ../
+    // Traversal guard: verify the pattern doesn't escape the selected base via ../.
+    // An explicit absolute `path` may select a base outside the workspace, so
+    // this is not a read-containment boundary.
     // Strategy: check if the literal prefix (before any glob special chars) is
     // contained within base after canonicalization.
     let canonical_base = std::path::Path::new(&base)

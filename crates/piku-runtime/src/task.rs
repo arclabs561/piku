@@ -7,8 +7,9 @@
 /// # Depth and budget
 ///
 /// Every spawned task carries a `depth` counter (root = 0). The hard cap is
-/// `MAX_SPAWN_DEPTH = 4`. Budget is expressed as max turns; the parent
-/// allocates a fraction of its own remaining turns.
+/// `MAX_SPAWN_DEPTH = 4`. Budget is an explicit per-agent maximum turn count,
+/// using the spawn request, agent definition, or default rather than a fraction
+/// of the parent's remaining turns.
 ///
 /// # Thread safety
 ///
@@ -31,7 +32,7 @@ pub const MAX_SPAWN_DEPTH: u32 = 4;
 // Git worktree helpers
 // ---------------------------------------------------------------------------
 
-/// Create a temporary git worktree for agent isolation.
+/// Allocate a temporary git worktree for prompt-directed task routing.
 /// Returns `(worktree_path, branch_name)` on success.
 pub fn create_worktree(
     repo_root: &std::path::Path,
@@ -101,9 +102,9 @@ fn remove_worktree_and_branch(
         .output();
 }
 
-/// Drop-based cleanup for worktrees. If the task panics or is aborted
-/// before it can call `cleanup_worktree`, the Drop impl removes the
-/// worktree and branch so they don't accumulate in /tmp and `git branch -a`.
+/// Drop-based, best-effort cleanup for worktrees. If the owning future unwinds
+/// or is dropped before explicit cleanup, the Drop implementation attempts to
+/// remove the worktree and branch. It cannot run after process termination.
 ///
 /// The happy path calls [`WorktreeGuard::defuse`] to surrender ownership
 /// to the existing `cleanup_worktree` logic (which may keep the worktree
@@ -146,7 +147,7 @@ impl WorktreeGuard {
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         if self.armed {
-            // Panic or abort path: unconditionally clean up. Any partial
+            // Early-drop path: unconditionally clean up. Any partial
             // work inside the worktree is lost, but we avoid a permanent
             // resource leak. Losing half-complete panicking-subagent work
             // is a better outcome than accumulating zombie worktrees.

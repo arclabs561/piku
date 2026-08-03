@@ -1,8 +1,11 @@
-/// Unified piku configuration loaded from file + env + CLI overrides.
+/// Unified Piku settings loaded from global and project files plus CLI overrides.
 ///
-/// Precedence: CLI flags > env vars > settings file > defaults.
+/// Precedence: CLI flags > project settings > global settings > defaults.
+/// Provider-specific environment variables are resolved separately by the
+/// runtime's provider resolver.
 ///
-/// Config file: `~/.config/piku/settings.json` (user-global).
+/// Config file: `$XDG_CONFIG_HOME/piku/settings.json`, falling back to
+/// `~/.config/piku/settings.json` (user-global).
 /// Project-local overrides: `.piku/settings.json` (merged on top).
 use std::path::{Path, PathBuf};
 
@@ -33,7 +36,7 @@ pub struct SettingsFile {
 // Resolved config
 // ---------------------------------------------------------------------------
 
-/// Fully resolved configuration after merging file + env + CLI.
+/// Fully resolved configuration after merging global/project files and CLI.
 #[derive(Debug, Clone)]
 pub struct PikuConfig {
     /// Provider name override (from CLI > file).
@@ -46,7 +49,7 @@ pub struct PikuConfig {
     pub allow: Vec<String>,
     /// Tool names to always deny (global + project merged).
     pub deny: Vec<String>,
-    /// Path to user-global config dir (`~/.config/piku/`).
+    /// Resolved user-global config dir (`XDG_CONFIG_HOME` or `~/.config` fallback).
     pub config_dir: PathBuf,
 }
 

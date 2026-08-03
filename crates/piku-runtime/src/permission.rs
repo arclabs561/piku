@@ -43,12 +43,12 @@ impl PermissionPrompter for DenyAll {
     }
 }
 
-/// Evaluate whether a tool call requires permission and what kind.
+/// Evaluate whether a tool call requires permission.
 ///
-/// Tier 1: static heuristics (free).
-/// Tier 2: for `Likely`, call the prompter (which in TUI mode will run the
-///         cheap classifier; in single-shot mode is `AllowAll`).
-/// Tier 3: for `Definite`, always call the prompter.
+/// Static tool heuristics allow `Safe` calls directly, before configuration
+/// rules. Both `Likely` and `Definite` calls go to the configured prompter. In
+/// the TUI, a prior per-turn allow-all wins; otherwise deny rules precede allow
+/// rules and prompting. Writable launch turns use `AllowAll`.
 pub fn check_permission(
     tool_name: &str,
     params: &serde_json::Value,

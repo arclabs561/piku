@@ -1,8 +1,10 @@
 /// `read_memory` and `write_memory` tools.
 ///
 /// Gives agents persistent storage across sessions via MEMORY.md files.
-/// Three scopes: user (~/.config/piku/memory/), project (.piku/memory/),
-/// local (.piku/memory-local/).
+/// Three scopes: user (`$XDG_CONFIG_HOME/piku/memory/`, with the standard
+/// config fallback), project (`.piku/memory/`), and local
+/// (`.piku/memory-local/`). Piku does not enforce VCS treatment of either
+/// project-scoped path.
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -53,7 +55,7 @@ pub fn read_memory_schema() -> serde_json::Value {
             "scope": {
                 "type": "string",
                 "enum": ["user", "project", "local"],
-                "description": "Memory scope. 'project' is project-local (default). 'user' is cross-project personal memory. 'local' is gitignored project memory."
+                "description": "Memory scope. 'project' is the project-scoped shared path (default), 'user' is cross-project personal memory, and 'local' is the project-scoped local path. Repository policy decides whether either project path is tracked."
             }
         }
     })

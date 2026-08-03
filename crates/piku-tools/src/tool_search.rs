@@ -1,9 +1,8 @@
-/// `tool_search` — lazy tool discovery meta-tool.
+/// `tool_search`: metadata search over the advertised tool catalog.
 ///
-/// When the tool catalog grows (MCP servers, custom tools), dumping all
-/// schemas into context causes tool-selection errors (ITR paper, Toolshed).
-/// Instead, expose only core tools by default and let the model discover
-/// others on demand via keyword search over tool descriptions.
+/// The current runtime still advertises the full writable tool schema. This
+/// helper improves name and description discovery, but does not lazily load
+/// schemas or reduce request context.
 ///
 /// The model calls `tool_search(query: "file editing")` and gets back
 /// matching tool names + descriptions, which it can then use by name.

@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
-    #[error("missing API key — set ANTHROPIC_API_KEY or configure ~/.config/piku/config.toml")]
+    #[error("missing API key: set ANTHROPIC_API_KEY")]
     MissingApiKey,
 
     #[error("HTTP error {status}: {body}")]

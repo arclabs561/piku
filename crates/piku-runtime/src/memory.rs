@@ -2,10 +2,11 @@
 ///
 /// Three scopes mirror Claude Code's `agentMemory.ts`:
 ///
-/// - `User`    — `~/.config/piku/memory/MEMORY.md`  (personal, cross-project)
-/// - `Project` — `.piku/memory/MEMORY.md`            (project-local, checked-in)
-/// - `Local`   — `.piku/memory-local/MEMORY.md`      (project-local, gitignored)
+/// - `User`    — config-dir `piku/memory/MEMORY.md` (personal, cross-project)
+/// - `Project` — `.piku/memory/MEMORY.md`            (project-scoped shared path)
+/// - `Local`   — `.piku/memory-local/MEMORY.md`      (project-scoped local path)
 ///
+/// Piku chooses these paths but does not enforce their version-control policy.
 /// Each scope holds a single `MEMORY.md` file.  The agent reads it at turn
 /// start (injected into the system prompt dynamic section) and can write to it
 /// via the `write_memory` tool.
@@ -31,11 +32,11 @@ const MAX_BYTES: usize = 25_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryScope {
-    /// `~/.config/piku/memory/` — personal, cross-project.
+    /// Config-dir `piku/memory/` — personal, cross-project.
     User,
-    /// `<cwd>/.piku/memory/` — project-local, suitable for VCS.
+    /// `<cwd>/.piku/memory/` — project-scoped shared path.
     Project,
-    /// `<cwd>/.piku/memory-local/` — project-local, gitignored.
+    /// `<cwd>/.piku/memory-local/` — project-scoped local path.
     Local,
 }
 

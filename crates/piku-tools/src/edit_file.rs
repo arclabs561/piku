@@ -59,8 +59,8 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         return ToolResult::error("edit_file: old_string must not be empty".to_string());
     }
 
-    // Sandbox: refuse edits outside the project root. See write_file for
-    // rationale. PIKU_ALLOW_WRITE_ANY=1 opts out.
+    // Apply the same limited path guard as write_file. This is not workspace
+    // containment. PIKU_ALLOW_WRITE_ANY=1 disables the guard.
     if std::env::var("PIKU_ALLOW_WRITE_ANY").as_deref() != Ok("1") {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Err(e) = crate::ensure_within_base(&p.path, &cwd) {

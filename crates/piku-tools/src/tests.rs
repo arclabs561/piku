@@ -467,9 +467,9 @@ fn tempdir() -> std::path::PathBuf {
     base
 }
 
-/// Path-traversal sandbox for `write_file` / `edit_file`.
-/// The risk: a model proposes `../../etc/cron.d/x` or `/Users/a/.ssh/id_rsa`.
-/// Even if the user approves the permission prompt, the tool should refuse.
+/// Limited write-path guard for `write_file` / `edit_file`.
+/// Relative traversal and selected system roots are refused; most absolute
+/// user paths remain allowed, so these checks are not containment.
 #[cfg(test)]
 mod sandbox {
     use super::tempdir;

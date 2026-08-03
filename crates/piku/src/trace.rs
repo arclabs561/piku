@@ -5,6 +5,7 @@
 )]
 
 /// Session trace writer — appends structured JSONL events to
+/// `$XDG_CONFIG_HOME/piku/traces/<session-id>.jsonl`, falling back to
 /// `~/.config/piku/traces/<session-id>.jsonl`.
 ///
 /// Each line is a self-contained JSON object (one event per line).
@@ -19,8 +20,10 @@
 /// {"ts": ..., "event": "permission_denied", "tool": "bash", "reason": "..."}
 /// ```
 ///
-/// The trace file is a complete audit log for a session. One session = one file.
-/// Replay scripts can reconstruct exactly what the agent did and at what cost.
+/// The trace is a selective analysis log, not a complete audit or replay record.
+/// Tool outputs are previewed and tiny text chunks are omitted. Session JSON is
+/// the fuller conversation record, but neither surface captures every approval,
+/// hook, compaction, or external side effect needed for exact replay.
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -89,8 +92,9 @@ impl TraceWriter {
     }
 
     pub fn tool_end(&mut self, tool_name: &str, tool_id: &str, output: &str, ok: bool) {
-        // Truncate very large outputs (e.g. full file reads) to 2000 chars in the trace.
-        // The session JSON already has the full content; trace is for analysis.
+        // Truncate very large outputs at the configured preview boundary.
+        // Session JSON has the fuller result delivered to the runtime; trace is
+        // a preview for analysis.
         let preview = if output.len() > 2000 {
             format!("{}…[{} chars]", &output[..2000], output.len())
         } else {

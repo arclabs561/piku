@@ -14,7 +14,8 @@
 ///   4. piku saves session state to disk (already happens per-turn)
 ///   5. piku atomically replaces itself on disk: do_replace(new_binary)
 ///   6. piku exec(2)s the new binary via exec_self(): same PID, same TTY
-///   7. new piku starts with PIKU_RESTARTED=1, loads session, continues
+///   7. on the already-running TUI path, the new piku also receives the session
+///      ID and continues it; launch-turn replacement restarts the same argv
 ///
 /// The two steps are intentionally split so `do_replace` can be unit-tested
 /// without actually replacing the running test binary.

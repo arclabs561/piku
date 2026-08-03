@@ -450,12 +450,12 @@ PROVIDER SELECTION (opportunistic — first available wins):
 
 EXAMPLES:
     piku \"explain src/main.rs\"
-    piku -p \"explain src/main.rs\" > explanation.txt   # headless, exits after
+    piku -p \"explain src/main.rs\"                     # headless, exits after
     piku --model anthropic/claude-opus-4 \"refactor the permission system\"
     piku --provider anthropic \"what does the agentic loop do?\"
 
 NOTES:
-    Sessions are auto-saved to ~/.config/piku/sessions/
+    Sessions are auto-saved under the Piku config directory (XDG-aware)
     Per-project context: add a PIKU.md file in your project root"
     );
 }

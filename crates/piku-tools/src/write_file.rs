@@ -42,10 +42,9 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         Err(e) => return ToolResult::error(format!("invalid params: {e}")),
     };
 
-    // Sandbox: refuse writes outside the project root. Prevents a model
-    // from writing to /etc/cron.d, ~/.ssh/authorized_keys, etc. even when
-    // the user has approved the permission prompt. PIKU_ALLOW_WRITE_ANY=1
-    // opts out (for users running piku as a general file-editing agent).
+    // Limited path guard: reject traversal and selected system roots. This is
+    // not workspace containment; most absolute paths remain eligible.
+    // PIKU_ALLOW_WRITE_ANY=1 disables the guard.
     if std::env::var("PIKU_ALLOW_WRITE_ANY").as_deref() != Ok("1") {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Err(e) = crate::ensure_within_base(&p.path, &cwd) {

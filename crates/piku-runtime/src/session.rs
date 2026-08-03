@@ -16,13 +16,13 @@ use piku_api::TokenUsage;
 pub struct Session {
     pub version: u32,
     pub id: String,
-    /// Provider and model that produced these messages.
+    /// Most recently recorded provider and model for this session.
     ///
     /// `--resume` takes its model from the current config rather than from the
     /// file, so without this a resumed session silently continues under a
-    /// different model and no reader can tell afterwards which model wrote
-    /// which turn, or price the transcript. Optional and defaulted so sessions
-    /// written before this field still load.
+    /// different model without a warning. These session-level fields are
+    /// replaced on resume; they do not provide per-turn attribution or pricing.
+    /// Optional and defaulted so older sessions still load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,9 +93,9 @@ impl Session {
             None => path.with_extension("tmp"),
         };
         std::fs::write(&tmp_path, &json)?;
-        // Rename is atomic. If this returns error the tmp file is left
-        // on disk; it'll be overwritten by the next save or cleaned on
-        // next startup scan.
+        // Rename is atomic. If this returns an error, the tmp file is left on
+        // disk; a later save from the same process may overwrite it. Piku does
+        // not currently scan and clean stale tmp files at startup.
         std::fs::rename(&tmp_path, path)
     }
 
