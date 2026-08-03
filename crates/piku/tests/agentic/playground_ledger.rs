@@ -112,6 +112,11 @@ pub struct SpendRecord<'a> {
     pub harness_cost_usd: f64,
     pub piku_input_tokens: u64,
     pub piku_output_tokens: u64,
+    /// Wall clock split between the harness's own review calls and waiting on
+    /// piku. Cost and latency do not sit in the same place, and which half
+    /// dominates decides what is worth changing.
+    pub review_wall_ms: u64,
+    pub piku_wait_wall_ms: u64,
 }
 
 /// A bounded second-order review of the judge and the observed piku behavior.

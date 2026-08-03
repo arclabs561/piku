@@ -1241,15 +1241,20 @@ impl PtyHandle {
         timeout: Duration,
     ) -> ScreenSnapshot {
         self.ready_wait_timed_out = false;
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
+        // Time spent here is time spent waiting on piku, which is the other
+        // half of a run's wall clock.
         loop {
             self.drain(observer);
             let snap = observer.snapshot();
             if snap.is_ready() {
+                spend::record_piku_wait_ms(elapsed_ms(started));
                 return snap;
             }
             if self.is_dead() {
                 eprintln!("[pty] process died during ready-wait");
+                spend::record_piku_wait_ms(elapsed_ms(started));
                 return snap;
             }
             // Answer permission prompts using the configured bounded policy.
@@ -1266,6 +1271,7 @@ impl PtyHandle {
             }
             if Instant::now() >= deadline {
                 self.ready_wait_timed_out = true;
+                spend::record_piku_wait_ms(elapsed_ms(started));
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
                      (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
@@ -1633,6 +1639,19 @@ mod spend {
     pub static COST_MICROS: AtomicU64 = AtomicU64::new(0);
     pub static PIKU_INPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
     pub static PIKU_OUTPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
+    /// Wall-clock split. Whether a run is dominated by its own review calls or
+    /// by waiting on piku decides which of the two is worth optimising, and
+    /// that has been asserted here before it was ever measured.
+    pub static LLM_MS: AtomicU64 = AtomicU64::new(0);
+    pub static PIKU_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record_llm_ms(elapsed: u64) {
+        LLM_MS.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    pub fn record_piku_wait_ms(elapsed: u64) {
+        PIKU_WAIT_MS.fetch_add(elapsed, Ordering::Relaxed);
+    }
 
     /// Record one provider response. Absent fields count as zero rather than
     /// dropping the call, so the call count never understates activity.
@@ -1777,6 +1796,11 @@ fn parse_session_path(captured: &str) -> Option<String> {
             let path = path.trim().trim_end_matches(']').trim();
             (!path.is_empty()).then(|| path.to_string())
         })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
 }
 
 /// Read piku's own per-turn token counts out of its status footer.
@@ -2460,12 +2484,15 @@ impl LlmClient {
         if matches!(self.spec.backend, Backend::Anthropic) {
             request = request.header("anthropic-version", "2023-06-01");
         }
+        let request_started = Instant::now();
         let response = match request.send() {
             Ok(response) => response,
             Err(error) => {
                 return Err(format!("{} request failed: {error}", self.spec.label));
             }
         };
+        #[allow(clippy::cast_possible_truncation)]
+        spend::record_llm_ms(request_started.elapsed().as_millis() as u64);
         let status = response.status();
         let body = response.text().unwrap_or_default();
         if !status.is_success() {
@@ -4157,6 +4184,13 @@ fn run_agentic_session(persona: &Persona) {
         spend::get(&spend::PIKU_INPUT_TOKENS),
         spend::get(&spend::PIKU_OUTPUT_TOKENS),
     );
+    // Which half a run spends its wall clock in decides which half is worth
+    // optimising. This has been asserted here before it was measured.
+    eprintln!(
+        "time:    {:.1}s in review calls, {:.1}s waiting on piku",
+        spend::get(&spend::LLM_MS) as f64 / 1000.0,
+        spend::get(&spend::PIKU_WAIT_MS) as f64 / 1000.0,
+    );
     eprintln!("=== END RUN SPEND ===");
     if let Some(ledger) = &ledger {
         if let Err(error) = ledger.append_spend(&SpendRecord {
@@ -4170,6 +4204,8 @@ fn run_agentic_session(persona: &Persona) {
             harness_cost_usd: harness_cost,
             piku_input_tokens: spend::get(&spend::PIKU_INPUT_TOKENS),
             piku_output_tokens: spend::get(&spend::PIKU_OUTPUT_TOKENS),
+            review_wall_ms: spend::get(&spend::LLM_MS),
+            piku_wait_wall_ms: spend::get(&spend::PIKU_WAIT_MS),
         }) {
             eprintln!("[playground] could not append spend record: {error}");
         }
