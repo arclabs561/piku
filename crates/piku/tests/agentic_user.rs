@@ -1944,8 +1944,7 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                     scripted: vec![Action::Submit(
                         "Find bugs in this codebase and explain them.".into(),
                     )],
-                    focus: "Did piku identify the mean() NaN behavior, split_csv comma bug, \
-                            and unimplemented process_batch?",
+                    focus: "Did piku identify the mean() NaN behavior and split_csv comma bug?",
                     freeform_turns: 0,
                 },
                 Phase {
@@ -1976,10 +1975,10 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                 Phase {
                     name: "understand",
                     scripted: vec![Action::Submit(
-                        "Explain what process_batch in lib.rs should do".into(),
+                        "Explain how Config::new in src/lib.rs parses command-line arguments"
+                            .into(),
                     )],
-                    focus:
-                        "Is the explanation clear for a junior dev? Does it reference the README?",
+                    focus: "Is the explanation clear for a junior dev and grounded in lib.rs?",
                     freeform_turns: 1,
                 },
             ],
@@ -4182,23 +4181,26 @@ fn run_agentic_session(persona: &Persona) {
         let results = scenario::verify(contract, &workspace);
         spend::record_verify_ms(elapsed_ms(verify_started));
         for result in results {
-            eprintln!(
-                "[scenario] {} {}",
-                if result.passed { "pass" } else { "FAIL" },
-                result.label
-            );
-            scenario_results.push(format!(
-                "{}: {}",
-                if result.passed { "pass" } else { "fail" },
-                result.label
-            ));
-            if !result.passed {
-                scenario_failures.push(format!(
+            eprintln!("[scenario] {} {}", result.outcome.label(), result.label);
+            scenario_results.push(format!("{}: {}", result.outcome.label(), result.label));
+            match result.outcome {
+                scenario::Outcome::Passed => {}
+                // Only a check that ran and disagreed names piku. This is ADR
+                // 0009's review trigger: a verifier that could not start or ran
+                // out of time proves nothing about the product, and filing it
+                // as a product failure sends an engineer after a defect the
+                // evidence never showed.
+                scenario::Outcome::Failed => scenario_failures.push(format!(
                     "[scenario:{}] acceptance check failed: {} — {}",
                     contract.id,
                     result.label,
                     safe_truncate(result.evidence.trim(), 400)
-                ));
+                )),
+                scenario::Outcome::Inconclusive => harness_findings.push(format!(
+                    "[harness:MAJOR] acceptance check could not be carried out: {} — {}; the run proves nothing about this property",
+                    result.label,
+                    safe_truncate(result.evidence.trim(), 400)
+                )),
             }
         }
     }

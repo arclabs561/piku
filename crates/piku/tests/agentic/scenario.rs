@@ -43,10 +43,38 @@ impl Verification {
     }
 }
 
+/// What a check established.
+///
+/// A verifier that could not start, or ran out of time, proves nothing about
+/// the product. Recording that as a failure sends an engineer after a defect
+/// the evidence never showed, which is the same class of false alarm this
+/// harness has produced before. ADR 0009 rejects treating every deterministic
+/// failure as a complete product verdict for exactly this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The asserted property holds.
+    Passed,
+    /// The asserted property does not hold. This is a product claim.
+    Failed,
+    /// The check could not be carried out. This is a harness fact.
+    Inconclusive,
+}
+
+impl Outcome {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "pass",
+            Self::Failed => "fail",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
     pub label: String,
-    pub passed: bool,
+    pub outcome: Outcome,
     pub evidence: String,
 }
 
@@ -180,16 +208,27 @@ pub fn verify(scenario: Scenario, workspace: &Path) -> Vec<VerificationResult> {
                 match std::fs::read_to_string(&full_path) {
                     Ok(content) => VerificationResult {
                         label: format!("{path} contains {needle:?}"),
-                        passed: content.contains(needle),
+                        outcome: if content.contains(needle) {
+                            Outcome::Passed
+                        } else {
+                            Outcome::Failed
+                        },
                         evidence: if content.contains(needle) {
                             "required text present".to_string()
                         } else {
                             "required text absent".to_string()
                         },
                     },
+                    // A missing file is a claim about the workspace the run was
+                    // supposed to leave behind, so it is a product failure. An
+                    // unreadable one says nothing about the product.
                     Err(error) => VerificationResult {
                         label: format!("{path} contains {needle:?}"),
-                        passed: false,
+                        outcome: if error.kind() == std::io::ErrorKind::NotFound {
+                            Outcome::Failed
+                        } else {
+                            Outcome::Inconclusive
+                        },
                         evidence: format!("could not read file: {error}"),
                     },
                 }
@@ -204,7 +243,11 @@ pub fn verify(scenario: Scenario, workspace: &Path) -> Vec<VerificationResult> {
                 let exists = full_path.exists();
                 VerificationResult {
                     label: format!("{path} does not exist"),
-                    passed: !exists,
+                    outcome: if exists {
+                        Outcome::Failed
+                    } else {
+                        Outcome::Passed
+                    },
                     evidence: if exists {
                         format!(
                             "{path} was created during the run ({} bytes)",
@@ -235,9 +278,10 @@ fn run_bounded_command(
     {
         Ok(child) => child,
         Err(error) => {
+            // The verifier never ran, so it says nothing about the product.
             return VerificationResult {
                 label,
-                passed: false,
+                outcome: Outcome::Inconclusive,
                 evidence: format!("could not start command: {error}"),
             };
         }
@@ -256,7 +300,11 @@ fn run_bounded_command(
                 }
                 return VerificationResult {
                     label,
-                    passed: status.success(),
+                    outcome: if status.success() {
+                        Outcome::Passed
+                    } else {
+                        Outcome::Failed
+                    },
                     evidence: bounded_evidence(&output),
                 };
             }
@@ -266,9 +314,10 @@ fn run_bounded_command(
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // A verifier that ran out of time proves nothing either way.
                 return VerificationResult {
                     label,
-                    passed: false,
+                    outcome: Outcome::Inconclusive,
                     evidence: format!("timed out after {timeout_secs}s"),
                 };
             }
@@ -277,7 +326,7 @@ fn run_bounded_command(
                 let _ = child.wait();
                 return VerificationResult {
                     label,
-                    passed: false,
+                    outcome: Outcome::Inconclusive,
                     evidence: format!("could not poll command: {error}"),
                 };
             }
@@ -346,6 +395,56 @@ mod tests {
         assert!(for_persona("no_such_persona").is_none());
     }
 
+    /// ADR 0009's review trigger: a verifier that cannot start or run out of
+    /// time must not read as a product failure, while a real predicate failure
+    /// still must.
+    #[test]
+    fn a_verifier_that_never_ran_is_not_a_product_failure() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let spawn_failure = Scenario {
+            id: "spawn",
+            contexts: &["test"],
+            goal: "test",
+            verifications: &[Verification::CommandSucceeds {
+                program: "piku-no-such-program-exists",
+                args: &[],
+                timeout_secs: 5,
+            }],
+        };
+        let results = verify(spawn_failure, directory.path());
+        assert_eq!(results[0].outcome, Outcome::Inconclusive);
+        assert!(results[0].evidence.contains("could not start"));
+
+        let timeout = Scenario {
+            id: "timeout",
+            contexts: &["test"],
+            goal: "test",
+            verifications: &[Verification::CommandSucceeds {
+                program: "sleep",
+                args: &["5"],
+                timeout_secs: 1,
+            }],
+        };
+        let results = verify(timeout, directory.path());
+        assert_eq!(results[0].outcome, Outcome::Inconclusive);
+        assert!(results[0].evidence.contains("timed out"));
+
+        // A command that ran and failed is still a product claim.
+        let real_failure = Scenario {
+            id: "real",
+            contexts: &["test"],
+            goal: "test",
+            verifications: &[Verification::CommandSucceeds {
+                program: "sh",
+                args: &["-c", "exit 3"],
+                timeout_secs: 5,
+            }],
+        };
+        let results = verify(real_failure, directory.path());
+        assert_eq!(results[0].outcome, Outcome::Failed);
+    }
+
     #[test]
     fn absence_is_checked_as_absence() {
         let directory = tempfile::tempdir().unwrap();
@@ -361,8 +460,16 @@ mod tests {
         std::fs::write(directory.path().join("present"), "x").unwrap();
 
         let results = verify(scenario, directory.path());
-        assert!(results[0].passed, "absent path should pass");
-        assert!(!results[1].passed, "existing path should fail");
+        assert_eq!(
+            results[0].outcome,
+            Outcome::Passed,
+            "absent path should pass"
+        );
+        assert_eq!(
+            results[1].outcome,
+            Outcome::Failed,
+            "existing path should fail"
+        );
         assert!(results[1].evidence.contains("created during the run"));
     }
 
@@ -387,7 +494,7 @@ mod tests {
         };
 
         let results = verify(scenario, directory.path());
-        assert!(results[0].passed);
-        assert!(!results[1].passed);
+        assert_eq!(results[0].outcome, Outcome::Passed);
+        assert_eq!(results[1].outcome, Outcome::Failed);
     }
 }
