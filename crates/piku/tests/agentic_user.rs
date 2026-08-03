@@ -45,6 +45,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 #[path = "agentic/playground.rs"]
@@ -990,6 +992,7 @@ struct PtyHandle {
     ready_wait_timed_out: bool,
     permission_response: PermissionResponse,
     permission_events: Vec<String>,
+    spend: Arc<RunSpend>,
 }
 
 /// The explicit response used when the observed terminal asks for permission.
@@ -1042,7 +1045,7 @@ impl PermissionResponse {
 }
 
 impl PtyHandle {
-    fn spawn(workspace: &Path, spec: &ProviderSpec) -> Self {
+    fn spawn(workspace: &Path, spec: &ProviderSpec, spend: Arc<RunSpend>) -> Self {
         let piku_bin = piku_binary();
 
         let mut cmd = Command::new("sh");
@@ -1097,6 +1100,7 @@ impl PtyHandle {
             ready_wait_timed_out: false,
             permission_response: PermissionResponse::from_env(),
             permission_events: Vec::new(),
+            spend,
         }
     }
 
@@ -1249,12 +1253,12 @@ impl PtyHandle {
             self.drain(observer);
             let snap = observer.snapshot();
             if snap.is_ready() {
-                spend::record_piku_wait_ms(elapsed_ms(started));
+                self.spend.record_piku_wait_ms(elapsed_ms(started));
                 return snap;
             }
             if self.is_dead() {
                 eprintln!("[pty] process died during ready-wait");
-                spend::record_piku_wait_ms(elapsed_ms(started));
+                self.spend.record_piku_wait_ms(elapsed_ms(started));
                 return snap;
             }
             // Answer permission prompts using the configured bounded policy.
@@ -1271,7 +1275,7 @@ impl PtyHandle {
             }
             if Instant::now() >= deadline {
                 self.ready_wait_timed_out = true;
-                spend::record_piku_wait_ms(elapsed_ms(started));
+                self.spend.record_piku_wait_ms(elapsed_ms(started));
                 eprintln!(
                     "[pty] ready-wait timed out after {timeout:?} \
                      (cursor_visible={}, cursor={:?}, cursor_row={:?}, \
@@ -1629,47 +1633,34 @@ fn is_terminal_chrome(line: &str) -> bool {
 /// looks cheap per call is not obviously cheap in aggregate. Cost comes from
 /// the provider's own accounting rather than a local price table, which would
 /// go stale silently.
-mod spend {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    pub static CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
-    pub static COMPLETION_TOKENS: AtomicU64 = AtomicU64::new(0);
+/// What one run spent, owned by that run.
+///
+/// These were process-global statics, which pooled two runs sharing a process
+/// into one set of totals and made a parallel run's accounting meaningless.
+/// A run owns its counters and hands a handle to the things that spend.
+#[derive(Debug, Default)]
+struct RunSpend {
+    calls: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
     /// Millionths of a dollar, so the running total stays exact.
-    pub static COST_MICROS: AtomicU64 = AtomicU64::new(0);
-    pub static PIKU_INPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
-    pub static PIKU_OUTPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
+    cost_micros: AtomicU64,
+    piku_input_tokens: AtomicU64,
+    piku_output_tokens: AtomicU64,
     /// Wall-clock split. Whether a run is dominated by its own review calls or
     /// by waiting on piku decides which of the two is worth optimising, and
     /// that has been asserted here before it was ever measured.
-    pub static LLM_MS: AtomicU64 = AtomicU64::new(0);
-    pub static PIKU_WAIT_MS: AtomicU64 = AtomicU64::new(0);
-    /// The post-submit loop that waits for the screen to change at all, and
-    /// the scenario's own acceptance checks. Both were unaccounted for in the
-    /// first split, and between them they are most of a run.
-    pub static CHANGE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
-    pub static VERIFY_MS: AtomicU64 = AtomicU64::new(0);
+    llm_ms: AtomicU64,
+    piku_wait_ms: AtomicU64,
+    change_wait_ms: AtomicU64,
+    verify_ms: AtomicU64,
+}
 
-    pub fn record_change_wait_ms(elapsed: u64) {
-        CHANGE_WAIT_MS.fetch_add(elapsed, Ordering::Relaxed);
-    }
-
-    pub fn record_verify_ms(elapsed: u64) {
-        VERIFY_MS.fetch_add(elapsed, Ordering::Relaxed);
-    }
-
-    pub fn record_llm_ms(elapsed: u64) {
-        LLM_MS.fetch_add(elapsed, Ordering::Relaxed);
-    }
-
-    pub fn record_piku_wait_ms(elapsed: u64) {
-        PIKU_WAIT_MS.fetch_add(elapsed, Ordering::Relaxed);
-    }
-
+impl RunSpend {
     /// Record one provider response. Absent fields count as zero rather than
     /// dropping the call, so the call count never understates activity.
-    pub fn record_call(response: &serde_json::Value) {
-        CALLS.fetch_add(1, Ordering::Relaxed);
+    fn record_call(&self, response: &serde_json::Value) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let usage = &response["usage"];
         let prompt = usage["prompt_tokens"]
             .as_u64()
@@ -1679,29 +1670,57 @@ mod spend {
             .as_u64()
             .or_else(|| usage["output_tokens"].as_u64())
             .unwrap_or(0);
-        PROMPT_TOKENS.fetch_add(prompt, Ordering::Relaxed);
-        COMPLETION_TOKENS.fetch_add(completion, Ordering::Relaxed);
+        self.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(completion, Ordering::Relaxed);
         if let Some(cost) = usage["cost"].as_f64() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            COST_MICROS.fetch_add(
+            self.cost_micros.fetch_add(
                 (cost * 1_000_000.0).round().max(0.0) as u64,
                 Ordering::Relaxed,
             );
         }
     }
 
-    pub fn record_piku_turn(input: u64, output: u64) {
-        PIKU_INPUT_TOKENS.fetch_add(input, Ordering::Relaxed);
-        PIKU_OUTPUT_TOKENS.fetch_add(output, Ordering::Relaxed);
+    fn record_piku_turn(&self, input: u64, output: u64) {
+        self.piku_input_tokens.fetch_add(input, Ordering::Relaxed);
+        self.piku_output_tokens.fetch_add(output, Ordering::Relaxed);
+    }
+
+    fn record_llm_ms(&self, elapsed: u64) {
+        self.llm_ms.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_piku_wait_ms(&self, elapsed: u64) {
+        self.piku_wait_ms.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_change_wait_ms(&self, elapsed: u64) {
+        self.change_wait_ms.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_verify_ms(&self, elapsed: u64) {
+        self.verify_ms.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn usd(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            Self::get(&self.cost_micros) as f64 / 1_000_000.0
+        }
     }
 
     /// Optional ceiling on harness spend, in dollars.
     ///
-    /// Bounds this process's own review calls only. piku runs as a separate
+    /// Bounds this run's own review calls only. piku runs as a separate
     /// process billed against the same key, so a capped run is not a capped
     /// bill; the cap stops the harness from spending unattended, it does not
     /// stop the subject.
-    pub fn budget_usd() -> Option<f64> {
+    fn budget_usd() -> Option<f64> {
         std::env::var("PIKU_AGENTIC_MAX_USD")
             .ok()?
             .trim()
@@ -1710,63 +1729,9 @@ mod spend {
             .filter(|cap| *cap > 0.0)
     }
 
-    pub fn over_budget() -> bool {
-        budget_usd().is_some_and(|cap| usd() >= cap)
+    fn over_budget(&self) -> bool {
+        Self::budget_usd().is_some_and(|cap| self.usd() >= cap)
     }
-
-    pub fn usd() -> f64 {
-        #[allow(clippy::cast_precision_loss)]
-        {
-            COST_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0
-        }
-    }
-
-    pub fn get(counter: &AtomicU64) -> u64 {
-        counter.load(Ordering::Relaxed)
-    }
-}
-
-/// A compact account of what piku did, from its own session file.
-///
-/// The judges were shown the screen and nothing else, so they were asked to
-/// tell a rendering fault from a product fault using the one view that cannot
-/// distinguish them. Both of their worst calls were about rendering. This is
-/// what piku sent and received, in the order it happened, bounded so it can
-/// sit in a prompt beside the viewport rather than replace the token budget.
-fn session_transcript(session_path: &Path, max_turns: usize) -> Option<String> {
-    let content = std::fs::read_to_string(session_path).ok()?;
-    let session: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let messages = session["messages"].as_array()?;
-    let start = messages.len().saturating_sub(max_turns);
-
-    let mut out = String::from("WHAT PIKU ACTUALLY DID (from its session, not the screen):\n");
-    if start > 0 {
-        out.push_str(&format!("  ... {start} earlier messages omitted\n"));
-    }
-    for message in messages.iter().skip(start) {
-        let role = message["role"].as_str().unwrap_or("?");
-        for block in message["blocks"].as_array().into_iter().flatten() {
-            let line = match block["type"].as_str() {
-                Some("text") => format!(
-                    "  {role} text: {}",
-                    safe_truncate(block["text"].as_str().unwrap_or("").trim(), 300)
-                ),
-                Some("tool_use") => format!(
-                    "  {role} calls {}({})",
-                    block["name"].as_str().unwrap_or("?"),
-                    safe_truncate(&block["input"].to_string(), 200)
-                ),
-                Some("tool_result") => format!(
-                    "  tool result: {}",
-                    safe_truncate(block["output"].as_str().unwrap_or("").trim(), 300)
-                ),
-                _ => continue,
-            };
-            out.push_str(&line);
-            out.push('\n');
-        }
-    }
-    Some(out)
 }
 
 /// Whether piku produced anything for its last turn, read from its session
@@ -1814,6 +1779,49 @@ fn parse_session_path(captured: &str) -> Option<String> {
 #[allow(clippy::cast_possible_truncation)]
 fn elapsed_ms(since: Instant) -> u64 {
     since.elapsed().as_millis() as u64
+}
+
+/// A compact account of what piku did, from its own session file.
+///
+/// The judges were shown the screen and nothing else, so they were asked to
+/// tell a rendering fault from a product fault using the one view that cannot
+/// distinguish them. Both of their worst calls were about rendering. This is
+/// what piku sent and received, in the order it happened, bounded so it can
+/// sit in a prompt beside the viewport rather than replace the token budget.
+fn session_transcript(session_path: &Path, max_turns: usize) -> Option<String> {
+    let content = std::fs::read_to_string(session_path).ok()?;
+    let session: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let messages = session["messages"].as_array()?;
+    let start = messages.len().saturating_sub(max_turns);
+
+    let mut out = String::from("WHAT PIKU ACTUALLY DID (from its session, not the screen):\n");
+    if start > 0 {
+        out.push_str(&format!("  ... {start} earlier messages omitted\n"));
+    }
+    for message in messages.iter().skip(start) {
+        let role = message["role"].as_str().unwrap_or("?");
+        for block in message["blocks"].as_array().into_iter().flatten() {
+            let line = match block["type"].as_str() {
+                Some("text") => format!(
+                    "  {role} text: {}",
+                    safe_truncate(block["text"].as_str().unwrap_or("").trim(), 300)
+                ),
+                Some("tool_use") => format!(
+                    "  {role} calls {}({})",
+                    block["name"].as_str().unwrap_or("?"),
+                    safe_truncate(&block["input"].to_string(), 200)
+                ),
+                Some("tool_result") => format!(
+                    "  tool result: {}",
+                    safe_truncate(block["output"].as_str().unwrap_or("").trim(), 300)
+                ),
+                _ => continue,
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Read piku's own per-turn token counts out of its status footer.
@@ -2383,6 +2391,7 @@ struct CritiqueEntry {
 struct LlmClient {
     spec: ProviderSpec,
     max_tokens: u32,
+    spend: Arc<RunSpend>,
     /// Which layer this client serves. Reviews are nine parts in ten of a
     /// run's wall clock, and the layers differ in whether anything waits on
     /// them, so a total is not enough to decide what to change.
@@ -2390,18 +2399,20 @@ struct LlmClient {
 }
 
 impl LlmClient {
-    fn new(spec: ProviderSpec) -> Self {
+    fn new(spec: ProviderSpec, spend: Arc<RunSpend>) -> Self {
         Self {
             spec,
             max_tokens: 1_024,
+            spend,
             role: "user_agent",
         }
     }
 
-    fn judge(spec: ProviderSpec) -> Self {
+    fn judge(spec: ProviderSpec, spend: Arc<RunSpend>) -> Self {
         Self {
             spec,
             max_tokens: 2_048,
+            spend,
             role: "judge",
         }
     }
@@ -2411,11 +2422,11 @@ impl LlmClient {
         // a named outcome, so it travels the same path as a provider failure
         // and lands in the handoff as a harness finding rather than silently
         // degrading the run.
-        if spend::over_budget() {
+        if self.spend.over_budget() {
             return Err(format!(
                 "run budget of ${:.4} reached after ${:.4}; no further review calls",
-                spend::budget_usd().unwrap_or(0.0),
-                spend::usd()
+                RunSpend::budget_usd().unwrap_or(0.0),
+                self.spend.usd()
             ));
         }
 
@@ -2516,7 +2527,7 @@ impl LlmClient {
         // seven calls in a 128.7s run and left 86% of the clock unexplained.
         let body = response.text().unwrap_or_default();
         let elapsed = elapsed_ms(request_started);
-        spend::record_llm_ms(elapsed);
+        self.spend.record_llm_ms(elapsed);
         eprintln!(
             "[llm] {} {} took {:.1}s",
             self.role,
@@ -2532,7 +2543,7 @@ impl LlmClient {
         }
 
         let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        spend::record_call(&resp);
+        self.spend.record_call(&resp);
 
         // Reviews come back as invalid JSON often enough to matter, and a
         // truncated object and a model ignoring the schema look identical
@@ -3559,12 +3570,14 @@ fn run_agentic_session(persona: &Persona) {
         );
     }
 
+    // One run's accounting, owned here and shared with the things that spend.
+    let spend = Arc::new(RunSpend::default());
     let mut observer = TerminalObserver::new(40, 120);
-    let mut pty = PtyHandle::spawn(&workspace, &piku_spec);
+    let mut pty = PtyHandle::spawn(&workspace, &piku_spec, Arc::clone(&spend));
     let mut ws_observer = WorkspaceObserver::new(workspace.clone());
     let mut memory = ConversationMemory::new();
-    let ua_llm = LlmClient::new(ua_spec);
-    let judge_llm = LlmClient::judge(judge_spec);
+    let ua_llm = LlmClient::new(ua_spec, Arc::clone(&spend));
+    let judge_llm = LlmClient::judge(judge_spec, Arc::clone(&spend));
     let ledger = PlaygroundLedger::open()
         .map_err(|error| {
             eprintln!("[playground] ledger disabled: {error}");
@@ -3718,7 +3731,7 @@ fn run_agentic_session(persona: &Persona) {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                spend::record_change_wait_ms(elapsed_ms(change_started));
+                spend.record_change_wait_ms(elapsed_ms(change_started));
 
                 // Phase 2: wait for ready (response complete)
                 let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
@@ -3844,7 +3857,7 @@ fn run_agentic_session(persona: &Persona) {
             }
         }
         if let Some((input, output)) = parse_footer_tokens(&captured) {
-            spend::record_piku_turn(input, output);
+            spend.record_piku_turn(input, output);
         }
         eprintln!(
             "[agentic_user] raw_capture: {} bytes, captured_text: {} chars, {} lines",
@@ -3961,7 +3974,7 @@ fn run_agentic_session(persona: &Persona) {
             let Some(freeform_spec) = user_agent_provider(true) else {
                 break;
             };
-            let freeform_llm = LlmClient::new(freeform_spec);
+            let freeform_llm = LlmClient::new(freeform_spec, Arc::clone(&spend));
             eprintln!("[agentic_user] freeform critique starting (turn {freeform_turn})...");
 
             let snap_before_free = observer.snapshot();
@@ -4028,7 +4041,7 @@ fn run_agentic_session(persona: &Persona) {
                         findings_free.push(blank_reply_finding(&free_captured));
                     }
                     if let Some((input, output)) = parse_footer_tokens(&free_captured) {
-                        spend::record_piku_turn(input, output);
+                        spend.record_piku_turn(input, output);
                     }
                     let mut free_screen = if free_captured.lines().count() > 2 {
                         format!(
@@ -4260,7 +4273,7 @@ fn run_agentic_session(persona: &Persona) {
         scenario_goal = contract.goal();
         let verify_started = Instant::now();
         let results = scenario::verify(contract, &workspace);
-        spend::record_verify_ms(elapsed_ms(verify_started));
+        spend.record_verify_ms(elapsed_ms(verify_started));
         for result in results {
             eprintln!("[scenario] {} {}", result.outcome.label(), result.label);
             scenario_results.push(format!("{}: {}", result.outcome.label(), result.label));
@@ -4294,27 +4307,27 @@ fn run_agentic_session(persona: &Persona) {
 
     let (verified_findings, hypotheses, next_action) =
         improvement_handoff(&entries, harness_findings, &scenario_failures);
-    let harness_cost = spend::usd();
+    let harness_cost = spend.usd();
     eprintln!("\n=== RUN SPEND ===");
     eprintln!(
         "harness: {} calls, {}↑ {}↓ tokens, ${harness_cost:.4} reported by provider",
-        spend::get(&spend::CALLS),
-        spend::get(&spend::PROMPT_TOKENS),
-        spend::get(&spend::COMPLETION_TOKENS),
+        RunSpend::get(&spend.calls),
+        RunSpend::get(&spend.prompt_tokens),
+        RunSpend::get(&spend.completion_tokens),
     );
     eprintln!(
         "piku:    {}↑ {}↓ tokens (from its status footer; cost not reported)",
-        spend::get(&spend::PIKU_INPUT_TOKENS),
-        spend::get(&spend::PIKU_OUTPUT_TOKENS),
+        RunSpend::get(&spend.piku_input_tokens),
+        RunSpend::get(&spend.piku_output_tokens),
     );
     // Which half a run spends its wall clock in decides which half is worth
     // optimising. This has been asserted here before it was measured.
     eprintln!(
         "time:    {:.1}s review, {:.1}s piku-ready, {:.1}s screen-change wait, {:.1}s acceptance checks",
-        spend::get(&spend::LLM_MS) as f64 / 1000.0,
-        spend::get(&spend::PIKU_WAIT_MS) as f64 / 1000.0,
-        spend::get(&spend::CHANGE_WAIT_MS) as f64 / 1000.0,
-        spend::get(&spend::VERIFY_MS) as f64 / 1000.0,
+        RunSpend::get(&spend.llm_ms) as f64 / 1000.0,
+        RunSpend::get(&spend.piku_wait_ms) as f64 / 1000.0,
+        RunSpend::get(&spend.change_wait_ms) as f64 / 1000.0,
+        RunSpend::get(&spend.verify_ms) as f64 / 1000.0,
     );
     eprintln!("=== END RUN SPEND ===");
     if let Some(ledger) = &ledger {
@@ -4323,16 +4336,16 @@ fn run_agentic_session(persona: &Persona) {
             kind: "spend",
             run_id: ledger.run_id(),
             timestamp_secs: now_secs(),
-            harness_calls: spend::get(&spend::CALLS),
-            harness_prompt_tokens: spend::get(&spend::PROMPT_TOKENS),
-            harness_completion_tokens: spend::get(&spend::COMPLETION_TOKENS),
+            harness_calls: RunSpend::get(&spend.calls),
+            harness_prompt_tokens: RunSpend::get(&spend.prompt_tokens),
+            harness_completion_tokens: RunSpend::get(&spend.completion_tokens),
             harness_cost_usd: harness_cost,
-            piku_input_tokens: spend::get(&spend::PIKU_INPUT_TOKENS),
-            piku_output_tokens: spend::get(&spend::PIKU_OUTPUT_TOKENS),
-            review_wall_ms: spend::get(&spend::LLM_MS),
-            piku_wait_wall_ms: spend::get(&spend::PIKU_WAIT_MS),
-            change_wait_wall_ms: spend::get(&spend::CHANGE_WAIT_MS),
-            acceptance_wall_ms: spend::get(&spend::VERIFY_MS),
+            piku_input_tokens: RunSpend::get(&spend.piku_input_tokens),
+            piku_output_tokens: RunSpend::get(&spend.piku_output_tokens),
+            review_wall_ms: RunSpend::get(&spend.llm_ms),
+            piku_wait_wall_ms: RunSpend::get(&spend.piku_wait_ms),
+            change_wait_wall_ms: RunSpend::get(&spend.change_wait_ms),
+            acceptance_wall_ms: RunSpend::get(&spend.verify_ms),
         }) {
             eprintln!("[playground] could not append spend record: {error}");
         }
@@ -4476,7 +4489,7 @@ fn run_attempt_session(
     label: &str,
 ) -> (String, String) {
     let mut observer = TerminalObserver::new(40, 120);
-    let mut pty = PtyHandle::spawn(workspace, piku_spec);
+    let mut pty = PtyHandle::spawn(workspace, piku_spec, Arc::new(RunSpend::default()));
     let ws_observer = WorkspaceObserver::new(workspace.to_path_buf());
 
     eprintln!("[attempt-tree] [{label}] waiting for startup...");
@@ -4561,7 +4574,7 @@ fn run_attempt_tree_evaluation() {
         piku_spec.label, piku_spec.model
     );
 
-    let ua_llm = LlmClient::new(ua_spec.clone());
+    let ua_llm = LlmClient::new(ua_spec.clone(), Arc::new(RunSpend::default()));
 
     // =====================================================================
     // SESSION 1: Debug paginate.py -- record attempts
@@ -4888,25 +4901,42 @@ fn an_unset_or_nonsense_budget_does_not_cap_a_run() {
     // The cap is opt-in. A missing, empty, unparseable, or non-positive value
     // must not silently stop every review call, which would look like a
     // provider outage.
-    assert_eq!(spend::budget_usd(), None);
-    assert!(!spend::over_budget());
+    assert_eq!(RunSpend::budget_usd(), None);
+    assert!(!RunSpend::default().over_budget());
 }
 
 #[test]
 fn provider_reported_cost_is_accumulated_not_estimated() {
-    let before = spend::get(&spend::CALLS);
-    let before_micros = spend::get(&spend::COST_MICROS);
-    spend::record_call(&serde_json::json!({
+    // Per-run counters, so this starts from zero rather than from whatever a
+    // concurrent test happened to have spent.
+    let spend = RunSpend::default();
+    spend.record_call(&serde_json::json!({
         "usage": {"prompt_tokens": 100, "completion_tokens": 7, "cost": 0.000_25}
     }));
-    assert_eq!(spend::get(&spend::CALLS), before + 1);
-    assert_eq!(spend::get(&spend::COST_MICROS), before_micros + 250);
+    assert_eq!(RunSpend::get(&spend.calls), 1);
+    assert_eq!(RunSpend::get(&spend.cost_micros), 250);
+    assert_eq!(RunSpend::get(&spend.prompt_tokens), 100);
 
     // A response without usage still counts as a call, so the call count
     // never understates what was sent.
-    let before_calls = spend::get(&spend::CALLS);
-    spend::record_call(&serde_json::json!({"choices": []}));
-    assert_eq!(spend::get(&spend::CALLS), before_calls + 1);
+    spend.record_call(&serde_json::json!({"choices": []}));
+    assert_eq!(RunSpend::get(&spend.calls), 2);
+    assert_eq!(RunSpend::get(&spend.cost_micros), 250);
+}
+
+#[test]
+fn two_runs_do_not_pool_their_spend() {
+    // The counters were process-global, so two runs sharing a process reported
+    // each other's totals and a parallel run's accounting meant nothing.
+    let first = RunSpend::default();
+    let second = RunSpend::default();
+    first.record_call(&serde_json::json!({"usage": {"cost": 0.001}}));
+    first.record_piku_turn(10, 1);
+
+    assert_eq!(RunSpend::get(&second.calls), 0);
+    assert_eq!(RunSpend::get(&second.cost_micros), 0);
+    assert_eq!(RunSpend::get(&second.piku_input_tokens), 0);
+    assert_eq!(RunSpend::get(&first.calls), 1);
 }
 
 #[test]
