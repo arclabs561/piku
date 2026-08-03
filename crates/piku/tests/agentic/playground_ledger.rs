@@ -287,13 +287,23 @@ impl PlaygroundLedger {
         Ok(path)
     }
 
+    /// Append one record as a single write.
+    ///
+    /// Serialising straight into the file took two writes, the record and then
+    /// the newline, so two runs appending at once could interleave and leave a
+    /// line that parses as neither. Building the line first and writing it once
+    /// lets concurrent runs share a ledger: an `O_APPEND` write is atomic up to a
+    /// pipe buffer, which covers a bounded record. Oversized records can still
+    /// tear, which is why turn evidence is truncated before it gets here.
     fn append<T: Serialize>(&self, record: &T) -> std::io::Result<()> {
+        let mut line = serde_json::to_string(record)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        line.push('\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, record)?;
-        writeln!(file)
+        file.write_all(line.as_bytes())
     }
 }
 
@@ -308,6 +318,50 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two runs sharing a ledger must leave lines that each parse. Records are
+    /// written as one call for this reason; the earlier two-call form could
+    /// interleave a record and a newline from different processes.
+    #[test]
+    fn concurrent_writers_leave_parseable_lines() {
+        let directory =
+            std::env::temp_dir().join(format!("piku-ledger-concurrent-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("shared.jsonl");
+
+        let writers: Vec<_> = (0..4)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let ledger = PlaygroundLedger::open_at(path).unwrap();
+                    for turn in 0..25 {
+                        ledger
+                            .append_review(&ReviewRecord {
+                                schema_version: 1,
+                                kind: "review",
+                                run_id: ledger.run_id(),
+                                timestamp_secs: 1,
+                                persona: "tester",
+                                review: &format!("worker {worker} turn {turn}"),
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(lines.len(), 100, "lost or split a record");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("torn line {line:?}: {error}"));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn writes_jsonl_turn_config_and_observer_records() {
