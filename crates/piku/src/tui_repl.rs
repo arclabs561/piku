@@ -73,20 +73,21 @@ impl TuiPrompter {
 }
 
 impl PermissionPrompter for TuiPrompter {
+    fn denies(&self, tool_name: &str, params: &serde_json::Value) -> Option<String> {
+        self.deny_rules
+            .iter()
+            .find(|pattern| crate::config::matches_tool_pattern(pattern, tool_name, params))
+            .map(|pattern| format!("denied by settings.json rule: {pattern}"))
+    }
+
     fn decide(&self, req: &PermissionRequest) -> PermissionOutcome {
         // Fast path: user already said "allow all" earlier this turn.
         if self.allow_all.load(std::sync::atomic::Ordering::Relaxed) {
             return PermissionOutcome::Allow;
         }
 
-        // Config-based rules: deny > allow > fall through to interactive.
-        for pattern in &self.deny_rules {
-            if crate::config::matches_tool_pattern(pattern, &req.tool_name, &req.params) {
-                return PermissionOutcome::Deny {
-                    reason: format!("denied by settings.json rule: {pattern}"),
-                };
-            }
-        }
+        // Deny rules are evaluated in `denies`, before this runs and before
+        // the allow-all fast path above, so only allow rules remain here.
         for pattern in &self.allow_rules {
             if crate::config::matches_tool_pattern(pattern, &req.tool_name, &req.params) {
                 return PermissionOutcome::Allow;
