@@ -3128,16 +3128,61 @@ struct MetaReview {
     /// it means the judge never produced a review at all. Conflating the two
     /// reports a missing judge as an ungrounded one.
     status: &'static str,
+    /// Claims that cited turns which actually happened.
+    claims_kept: usize,
+    /// Claims dropped for citing turns that did not, one description each.
+    /// These are harness facts about the review, never product findings.
+    claims_rejected: Vec<String>,
 }
 
 fn review_is_grounded(review: &serde_json::Value, entry_count: usize) -> bool {
-    review["evidence_turns"].as_array().is_some_and(|turns| {
+    cites_only_real_turns(&review["evidence_turns"], entry_count)
+}
+
+/// Whether a cited turn list is non-empty and names only turns that happened.
+///
+/// A review can be structurally valid JSON describing a turn that never
+/// occurred, which is how prose gets promoted to a finding it has no basis
+/// for. Every citation is checked against the run's actual turn count.
+fn cites_only_real_turns(turns: &serde_json::Value, entry_count: usize) -> bool {
+    turns.as_array().is_some_and(|turns| {
         !turns.is_empty()
             && turns.iter().all(|turn| {
                 turn.as_u64()
                     .is_some_and(|turn| turn >= 1 && turn <= entry_count as u64)
             })
     })
+}
+
+/// Split a review's claims by whether each cites turns that exist.
+///
+/// Grounding was checked once for the whole review, so a single valid citation
+/// carried every claim beside it, including ones resting on nothing. ADR 0009
+/// asks that a claim cite its own evidence. Returns the claims that do and a
+/// description of each that does not.
+fn partition_claims_by_citation(
+    review: &serde_json::Value,
+    entry_count: usize,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut rejected = Vec::new();
+    for claim in review["bugs"].as_array().into_iter().flatten() {
+        let description = claim["description"].as_str().unwrap_or("(no description)");
+        if cites_only_real_turns(&claim["evidence_turns"], entry_count) {
+            kept.push(claim.clone());
+        } else {
+            rejected.push(format!(
+                "{}: cites {}",
+                safe_truncate(description, 160),
+                if claim["evidence_turns"].is_null() {
+                    "no turns".to_string()
+                } else {
+                    claim["evidence_turns"].to_string()
+                }
+            ));
+        }
+    }
+    (kept, rejected)
 }
 
 /// Meta-judge: after the agentic test completes, send all collected evidence
@@ -3153,6 +3198,8 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
             text: String::new(),
             grounded: true,
             status: "valid",
+            claims_kept: 0,
+            claims_rejected: Vec::new(),
         };
     }
 
@@ -3220,9 +3267,14 @@ Your job:
 4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
    behave unexpectedly in ways the user-agent missed?
 
+Every entry in \"bugs\" must cite the turns it rests on in its own \
+\"evidence_turns\". Cite only turn numbers that appear in the evidence above. \
+A claim you cannot tie to a specific turn does not belong in \"bugs\"; put it \
+in \"missed\" instead.
+
 Return only JSON with this exact schema:
 {\
-  \"bugs\": [{\"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\"}],\
+  \"bugs\": [{\"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\", \"evidence_turns\": [1]}],\
   \"checks\": [{\"description\": \"string\", \"verdict\": \"CORRECT|INCORRECT\", \"reason\": \"string\"}],\
   \"overall\": \"string\",\
   \"missed\": [\"string\"],\
@@ -3248,9 +3300,21 @@ Return only JSON with this exact schema:
             ),
             grounded: false,
             status: outcome.status(),
+            claims_kept: 0,
+            claims_rejected: Vec::new(),
         };
     };
     let grounded = review_is_grounded(parsed, entries.len());
+    let (kept, rejected) = partition_claims_by_citation(parsed, entries.len());
+    if !rejected.is_empty() {
+        eprintln!(
+            "[meta-judge] dropped {} claim(s) citing turns that did not happen:",
+            rejected.len()
+        );
+        for claim in &rejected {
+            eprintln!("[meta-judge]   {claim}");
+        }
+    }
     let response = serde_json::to_string_pretty(parsed)
         .unwrap_or_else(|error| format!("{{\"review_error\":\"{error}\"}}"));
 
@@ -3278,8 +3342,12 @@ Return only JSON with this exact schema:
     eprintln!("=== END META-JUDGE ===\n");
     MetaReview {
         text: response,
-        grounded,
+        // A review whose every claim rests on a turn that did not happen is
+        // not grounded, however well-formed its JSON.
+        grounded: grounded && (!kept.is_empty() || rejected.is_empty()),
         status: outcome.status(),
+        claims_kept: kept.len(),
+        claims_rejected: rejected,
     }
 }
 
@@ -4093,6 +4161,8 @@ fn run_agentic_session(persona: &Persona) {
             text: "meta-judge skipped by PIKU_AGENTIC_FAST=1".to_string(),
             grounded: true,
             status: "skipped",
+            claims_kept: 0,
+            claims_rejected: Vec::new(),
         }
     } else {
         meta_judge(&judge_llm, persona, &entries)
@@ -4149,6 +4219,17 @@ fn run_agentic_session(persona: &Persona) {
     // never ran. Both stop the review from becoming a product judgment, but
     // only the first says anything about review quality.
     let mut harness_findings = review_failures;
+    // Claims that cited turns which did not happen are a fact about the
+    // review, not about piku, so they are named and cannot reach the handoff
+    // as product findings.
+    if !meta_review.claims_rejected.is_empty() {
+        harness_findings.push(format!(
+            "[harness:MAJOR] primary judge filed {} claim(s) citing turns that did not happen ({} kept): {}",
+            meta_review.claims_rejected.len(),
+            meta_review.claims_kept,
+            safe_truncate(&meta_review.claims_rejected.join("; "), 400)
+        ));
+    }
     match meta_review.status {
         "valid" if !meta_review.grounded => harness_findings.push(
             "[harness:CRITICAL] primary review referenced missing or no turn evidence; it was not used as a product judgment"
@@ -4644,6 +4725,29 @@ fn only_findings_reproduced_on_this_build_are_injected_as_premises() {
     assert!(!open.contains_key("model allegation"));
     assert!(!earlier.contains_key("model allegation"));
     assert_eq!(for_persona, vec!["[MAJOR] blank reply".to_string()]);
+}
+
+#[test]
+fn a_claim_citing_a_turn_that_never_happened_is_dropped() {
+    // Grounding used to be checked once for the whole review, so one valid
+    // citation carried every claim beside it, including claims resting on
+    // nothing. ADR 0009 asks each claim to cite its own evidence.
+    let review = serde_json::json!({
+        "evidence_turns": [1],
+        "bugs": [
+            {"description": "real one", "evidence_turns": [1, 2]},
+            {"description": "cites a turn that never ran", "evidence_turns": [9]},
+            {"description": "cites nothing at all"},
+            {"description": "cites an empty list", "evidence_turns": []},
+        ]
+    });
+
+    let (kept, rejected) = partition_claims_by_citation(&review, 2);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["description"], "real one");
+    assert_eq!(rejected.len(), 3);
+    assert!(rejected.iter().any(|claim| claim.contains("never ran")));
+    assert!(rejected.iter().any(|claim| claim.contains("no turns")));
 }
 
 #[test]
