@@ -1644,6 +1644,19 @@ mod spend {
     /// that has been asserted here before it was ever measured.
     pub static LLM_MS: AtomicU64 = AtomicU64::new(0);
     pub static PIKU_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+    /// The post-submit loop that waits for the screen to change at all, and
+    /// the scenario's own acceptance checks. Both were unaccounted for in the
+    /// first split, and between them they are most of a run.
+    pub static CHANGE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+    pub static VERIFY_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record_change_wait_ms(elapsed: u64) {
+        CHANGE_WAIT_MS.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    pub fn record_verify_ms(elapsed: u64) {
+        VERIFY_MS.fetch_add(elapsed, Ordering::Relaxed);
+    }
 
     pub fn record_llm_ms(elapsed: u64) {
         LLM_MS.fetch_add(elapsed, Ordering::Relaxed);
@@ -2491,10 +2504,13 @@ impl LlmClient {
                 return Err(format!("{} request failed: {error}", self.spec.label));
             }
         };
-        #[allow(clippy::cast_possible_truncation)]
-        spend::record_llm_ms(request_started.elapsed().as_millis() as u64);
         let status = response.status();
+        // Timed after the body is read, not after the headers arrive. `send`
+        // returns as soon as the response starts; the model's tokens arrive
+        // during `text`. Timing the first alone reported 9.2s of review across
+        // seven calls in a 128.7s run and left 86% of the clock unexplained.
         let body = response.text().unwrap_or_default();
+        spend::record_llm_ms(elapsed_ms(request_started));
         if !status.is_success() {
             return Err(format!(
                 "{} returned status {status}: {}",
@@ -3607,8 +3623,9 @@ fn run_agentic_session(persona: &Persona) {
                 pty.clear_capture();
 
                 // Phase 1: wait until screen changes from the pre-submit state
+                let change_started = Instant::now();
                 let pre_contents = observer.snapshot().contents.clone();
-                let change_deadline = Instant::now() + Duration::from_secs(15);
+                let change_deadline = change_started + Duration::from_secs(15);
                 loop {
                     pty.drain(&mut observer);
                     let snap = observer.snapshot();
@@ -3621,6 +3638,7 @@ fn run_agentic_session(persona: &Persona) {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                spend::record_change_wait_ms(elapsed_ms(change_started));
 
                 // Phase 2: wait for ready (response complete)
                 let _snap = pty.wait_for_ready(&mut observer, Duration::from_secs(90));
@@ -4147,7 +4165,10 @@ fn run_agentic_session(persona: &Persona) {
     let mut scenario_goal = "";
     if let Some(contract) = contract {
         scenario_goal = contract.goal;
-        for result in scenario::verify(contract, &workspace) {
+        let verify_started = Instant::now();
+        let results = scenario::verify(contract, &workspace);
+        spend::record_verify_ms(elapsed_ms(verify_started));
+        for result in results {
             eprintln!(
                 "[scenario] {} {}",
                 if result.passed { "pass" } else { "FAIL" },
@@ -4187,9 +4208,11 @@ fn run_agentic_session(persona: &Persona) {
     // Which half a run spends its wall clock in decides which half is worth
     // optimising. This has been asserted here before it was measured.
     eprintln!(
-        "time:    {:.1}s in review calls, {:.1}s waiting on piku",
+        "time:    {:.1}s review, {:.1}s piku-ready, {:.1}s screen-change wait, {:.1}s acceptance checks",
         spend::get(&spend::LLM_MS) as f64 / 1000.0,
         spend::get(&spend::PIKU_WAIT_MS) as f64 / 1000.0,
+        spend::get(&spend::CHANGE_WAIT_MS) as f64 / 1000.0,
+        spend::get(&spend::VERIFY_MS) as f64 / 1000.0,
     );
     eprintln!("=== END RUN SPEND ===");
     if let Some(ledger) = &ledger {
@@ -4206,6 +4229,8 @@ fn run_agentic_session(persona: &Persona) {
             piku_output_tokens: spend::get(&spend::PIKU_OUTPUT_TOKENS),
             review_wall_ms: spend::get(&spend::LLM_MS),
             piku_wait_wall_ms: spend::get(&spend::PIKU_WAIT_MS),
+            change_wait_wall_ms: spend::get(&spend::CHANGE_WAIT_MS),
+            acceptance_wall_ms: spend::get(&spend::VERIFY_MS),
         }) {
             eprintln!("[playground] could not append spend record: {error}");
         }

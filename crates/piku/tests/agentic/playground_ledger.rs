@@ -117,6 +117,8 @@ pub struct SpendRecord<'a> {
     /// dominates decides what is worth changing.
     pub review_wall_ms: u64,
     pub piku_wait_wall_ms: u64,
+    pub change_wait_wall_ms: u64,
+    pub acceptance_wall_ms: u64,
 }
 
 /// A bounded second-order review of the judge and the observed piku behavior.
