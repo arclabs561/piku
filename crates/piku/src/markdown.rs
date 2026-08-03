@@ -114,6 +114,18 @@ impl StreamingMarkdown {
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             if self.in_code_block {
+                // A closing fence is the last thing a message carries, and it
+                // arrives without the trailing newline that would normally end
+                // the line. Treated as content it renders inside the block it
+                // was meant to close, so every fenced answer that ends a turn
+                // shows a stray ``` above the frame.
+                if line.trim_end() == "```" {
+                    let _ = write!(out, "{DIM}╰──{RESET}{eol}");
+                    self.in_code_block = false;
+                    self.code_frame_open = false;
+                    self.code_lang.clear();
+                    return out;
+                }
                 // Emit the partial line as a code line
                 let _ = write!(out, "{DIM}│{RESET} {line}{eol}");
             } else {
@@ -492,6 +504,39 @@ mod tests {
         let out = md.push("## Hello world\n");
         let plain = strip_ansi(&out);
         assert!(plain.contains("## Hello world"));
+    }
+
+    #[test]
+    fn closing_fence_in_a_final_delta_closes_the_block() {
+        // A provider ends a message without a trailing newline, so the closing
+        // fence reaches flush as a partial line. Rendered as content it lands
+        // inside the block it was meant to close.
+        let mut md = StreamingMarkdown::new();
+        let mut out = md.push("Here it is:\n\n```text\npwned\n");
+        out.push_str(&md.push("```"));
+        out.push_str(&md.flush());
+        let plain = strip_ansi(&out);
+
+        assert!(plain.contains("╭─ text"), "opens the block: {plain}");
+        assert!(plain.contains("pwned"), "keeps the content: {plain}");
+        assert!(plain.contains('╰'), "closes the block: {plain}");
+        assert!(
+            !plain.contains("│ ```"),
+            "closing fence rendered as code: {plain}"
+        );
+    }
+
+    #[test]
+    fn a_partial_code_line_at_flush_is_still_content() {
+        // Only a closing fence is special. Real code cut off mid-stream must
+        // survive.
+        let mut md = StreamingMarkdown::new();
+        let mut out = md.push("```rust\nfn main() {\n");
+        out.push_str(&md.push("    let x = 1;"));
+        out.push_str(&md.flush());
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("let x = 1;"), "lost a code line: {plain}");
+        assert!(plain.contains('╰'), "closes the block: {plain}");
     }
 
     #[test]
