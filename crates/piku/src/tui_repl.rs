@@ -220,8 +220,22 @@ impl PermissionPrompter for TuiPrompter {
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
 /// Set terminal scrolling region rows [top..=bot] (1-indexed).
+///
+/// A region needs `bot` above `top`, and a terminal silently ignores DECSTBM
+/// when it does not, leaving the region at whatever it was while the layout
+/// carries on believing it was set. `scroll_bot` is `rows - 2`, so a terminal
+/// reporting fewer than three rows produces `1;0`. That is not hypothetical:
+/// a PTY opened without a winsize reports zero rows, and captures from one
+/// show piku emitting `\x1b[1;0r` on every redraw.
 fn set_scroll_region(top: u16, bot: u16) {
-    print!("\x1b[{top};{bot}r");
+    if let Some(sequence) = scroll_region_sequence(top, bot) {
+        print!("{sequence}");
+    }
+}
+
+/// The DECSTBM sequence for a region, or `None` when the region is degenerate.
+fn scroll_region_sequence(top: u16, bot: u16) -> Option<String> {
+    (bot > top).then(|| format!("\x1b[{top};{bot}r"))
 }
 
 /// Reset scrolling region to the full screen.
@@ -2179,11 +2193,23 @@ fn announce_self_update(new_binary: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    // Pricing tables are exact hardcoded constants; comparing them with
-    // `assert_eq!` is intentional, not the usual float-equality hazard.
     #![allow(clippy::float_cmp)]
 
     use super::*;
+
+    /// A scroll region needs bot above top; terminals ignore DECSTBM when it
+    /// does not and the layout then draws against a region that was never
+    /// set. Captures from a PTY with no winsize show `\x1b[1;0r`.
+    #[test]
+    fn scroll_region_is_not_emitted_when_it_would_be_degenerate() {
+        assert_eq!(scroll_region_sequence(1, 38).as_deref(), Some("\x1b[1;38r"));
+        assert_eq!(scroll_region_sequence(1, 0), None);
+        assert_eq!(scroll_region_sequence(1, 1), None);
+        assert_eq!(scroll_region_sequence(3, 2), None);
+    }
+
+    // Pricing tables are exact hardcoded constants; comparing them with
+    // `assert_eq!` is intentional, not the usual float-equality hazard.
 
     static CONTEXT_WINDOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
