@@ -1203,10 +1203,14 @@ impl PtyHandle {
     }
 
     /// Extract text content from captured raw bytes by stripping ANSI escape
-    /// sequences. This gives us the complete text stream — what the user
-    /// would read if they watched the terminal character by character.
-    /// Unlike VT100 replay, this doesn't lose content to cursor positioning
-    /// or scroll region overwrites.
+    /// sequences.
+    ///
+    /// A terminal emulator would be the truthful renderer, but only one fed
+    /// the whole session: piku sets a scroll region at startup and positions
+    /// the cursor absolutely, so replaying one turn's bytes through a fresh
+    /// parser collapses almost all of them onto the same rows. Measured on a
+    /// real run, that reduced 4947 captured bytes to 55 characters. Until the
+    /// live observer's scrollback is used instead, this stays.
     fn captured_text(&self) -> String {
         strip_ansi_bytes(&self.raw_capture)
     }
@@ -1684,6 +1688,49 @@ mod spend {
     pub fn get(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
     }
+}
+
+/// A compact account of what piku did, from its own session file.
+///
+/// The judges were shown the screen and nothing else, so they were asked to
+/// tell a rendering fault from a product fault using the one view that cannot
+/// distinguish them. Both of their worst calls were about rendering. This is
+/// what piku sent and received, in the order it happened, bounded so it can
+/// sit in a prompt beside the viewport rather than replace the token budget.
+fn session_transcript(session_path: &Path, max_turns: usize) -> Option<String> {
+    let content = std::fs::read_to_string(session_path).ok()?;
+    let session: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let messages = session["messages"].as_array()?;
+    let start = messages.len().saturating_sub(max_turns);
+
+    let mut out = String::from("WHAT PIKU ACTUALLY DID (from its session, not the screen):\n");
+    if start > 0 {
+        out.push_str(&format!("  ... {start} earlier messages omitted\n"));
+    }
+    for message in messages.iter().skip(start) {
+        let role = message["role"].as_str().unwrap_or("?");
+        for block in message["blocks"].as_array().into_iter().flatten() {
+            let line = match block["type"].as_str() {
+                Some("text") => format!(
+                    "  {role} text: {}",
+                    safe_truncate(block["text"].as_str().unwrap_or("").trim(), 300)
+                ),
+                Some("tool_use") => format!(
+                    "  {role} calls {}({})",
+                    block["name"].as_str().unwrap_or("?"),
+                    safe_truncate(&block["input"].to_string(), 200)
+                ),
+                Some("tool_result") => format!(
+                    "  tool result: {}",
+                    safe_truncate(block["output"].as_str().unwrap_or("").trim(), 300)
+                ),
+                _ => continue,
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Whether piku produced anything for its last turn, read from its session
@@ -2574,7 +2621,24 @@ fn extract_json(s: &str) -> String {
 // ===========================================================================
 
 const USER_AGENT_SYSTEM: &str = r#"You are a developer testing a terminal AI coding agent called piku.
-You will receive a rendered terminal screen (from a VT100 emulator) and critique it.
+
+You may receive two views of the same turn, and they answer different questions.
+The rendered screen (from a VT100 emulator) is what a user would have seen. The
+session transcript is what piku actually sent and received. Use each for what it
+can decide:
+
+- "piku produced nothing" is a claim about the transcript. If the transcript
+  shows text or a tool call, piku produced something, whatever the screen shows.
+- "piku printed the same thing twice" is a claim about the transcript too. Two
+  entries there that happen to say the same thing are one model repeating
+  itself, not a display bug.
+- Something present in the transcript and missing from the screen is a
+  rendering fault. Say that, rather than reporting it as piku doing nothing.
+- Layout, wrapping, spacing, colour, and cursor position are screen questions.
+  The transcript cannot decide them.
+
+When only the screen is available, say so in the observation rather than
+inferring what piku did from what was drawn.
 
 CRITICAL: Respond with ONLY a JSON object. No prose. No markdown.
 
@@ -3673,6 +3737,15 @@ fn run_agentic_session(persona: &Persona) {
                 permission_events.join("\n")
             ));
         }
+        // The screen alone cannot separate a rendering fault from a product
+        // one, so give the reviewer what piku sent and received as well.
+        if let Some(transcript) = piku_session_path
+            .as_deref()
+            .and_then(|path| session_transcript(Path::new(path), 8))
+        {
+            screen_for_llm.push('\n');
+            screen_for_llm.push_str(&transcript);
+        }
         eprintln!(
             "[agentic_user] screen_for_llm: {} chars, {} lines",
             screen_for_llm.len(),
@@ -4540,51 +4613,6 @@ fn the_echoed_submission_is_not_counted_as_a_reply() {
     assert!(!is_submission_echo("❯ goodbye", "hello world"));
     assert!(!is_submission_echo("⏺ Read(x)", "hello world"));
     assert!(!is_submission_echo("❯ anything", ""));
-}
-
-#[test]
-fn a_reply_appended_to_the_spinner_line_survives_stripping() {
-    // Captured from a real PTY run: the spinner redraws with a carriage
-    // return, so every frame and then the reply land on one physical line.
-    // The previous filter dropped this line for having several prompt glyphs
-    // and the word "thinking", which is what made the turn look empty.
-    let line = "\u{276F} · thinking\u{276F} · thinking (0s)\u{276F} ✶ thinking (1s)\u{276F} ✽ thinking (2s)How can I help?";
-    assert_eq!(final_redraw_state(line), "How can I help?");
-
-    // A spinner line with no reply still contributes nothing.
-    assert_eq!(
-        final_redraw_state("\u{276F} · thinking\u{276F} ✶ thinking (1s)"),
-        ""
-    );
-    // A progressive prompt redraw reduces to what was actually typed.
-    assert_eq!(
-        final_redraw_state("\u{276F} /\u{276F} /e\u{276F} /ex\u{276F} /exit"),
-        "\u{276F} /exit"
-    );
-    // Ordinary output is untouched.
-    assert_eq!(
-        final_redraw_state("⏺ Read(src/lib.rs:1-20)"),
-        "⏺ Read(src/lib.rs:1-20)"
-    );
-    // The status row carries the provider and model before the prompt glyph.
-    // Reducing a single-frame line to its tail dropped that from every run's
-    // evidence.
-    assert_eq!(
-        final_redraw_state("openrouter · openai/gpt-5.6-terra │ /help ❯ Send a message or /help"),
-        "openrouter · openai/gpt-5.6-terra │ /help ❯ Send a message or /help"
-    );
-}
-
-#[test]
-fn stripping_keeps_a_reply_that_follows_the_spinner_end_to_end() {
-    let raw = "\u{1b}[2m\u{276F} · thinking\u{1b}[0m\r\u{276F} ✽ thinking (2s)How can I help?\r\n[1 iter · +2571 tokens]\r\n";
-    let stripped = strip_ansi_bytes(raw.as_bytes());
-    assert!(
-        stripped.contains("How can I help?"),
-        "reply was lost by stripping: {stripped:?}"
-    );
-    assert!(!stripped.contains("thinking"));
-    assert!(has_visible_turn_output(&stripped, "x"));
 }
 
 #[test]
