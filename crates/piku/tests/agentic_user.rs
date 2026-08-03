@@ -3549,10 +3549,10 @@ fn run_agentic_session(persona: &Persona) {
     // succeeded.
     let contract = scenario::for_persona(persona.name);
     if let Some(contract) = contract {
-        eprintln!("[scenario] {} — {}", contract.id, contract.goal);
+        eprintln!("[scenario] {} — {}", contract.id, contract.goal());
         if let Some(ledger) = &ledger {
             let verifications: Vec<String> = contract
-                .verifications
+                .checks()
                 .iter()
                 .map(|verification| verification.label())
                 .collect();
@@ -3563,7 +3563,7 @@ fn run_agentic_session(persona: &Persona) {
                 timestamp_secs: now_secs(),
                 scenario_id: contract.id,
                 contexts: contract.contexts,
-                goal: contract.goal,
+                goal: &contract.goal(),
                 verifications: &verifications,
             }) {
                 eprintln!("[playground] could not append scenario contract: {error}");
@@ -4174,9 +4174,9 @@ fn run_agentic_session(persona: &Persona) {
     // is a failed run, whatever the judges concluded.
     let mut scenario_results: Vec<String> = Vec::new();
     let mut scenario_failures: Vec<String> = Vec::new();
-    let mut scenario_goal = "";
+    let mut scenario_goal = String::new();
     if let Some(contract) = contract {
-        scenario_goal = contract.goal;
+        scenario_goal = contract.goal();
         let verify_started = Instant::now();
         let results = scenario::verify(contract, &workspace);
         spend::record_verify_ms(elapsed_ms(verify_started));
@@ -4202,6 +4202,12 @@ fn run_agentic_session(persona: &Persona) {
                     safe_truncate(result.evidence.trim(), 400)
                 )),
             }
+        }
+        // A goal clause no predicate covers is stated, not omitted. Left out,
+        // a reader counts the passing checks and concludes the goal was met.
+        for clause in contract.unverified_clauses() {
+            eprintln!("[scenario] unverified {clause}");
+            scenario_results.push(format!("unverified: {clause}"));
         }
     }
 
@@ -4269,7 +4275,7 @@ fn run_agentic_session(persona: &Persona) {
                 run_id: ledger.run_id(),
                 persona: persona.name,
                 prior_verified_history: &prior_findings,
-                scenario_goal,
+                scenario_goal: &scenario_goal,
                 scenario_results: &scenario_results,
                 piku_session_path: &piku_session_copy,
                 verified_findings: &verified_findings,
