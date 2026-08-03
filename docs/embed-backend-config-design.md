@@ -4,11 +4,18 @@ status: accepted
 decisions: ADR-0002
 decided: 2026-06-18
 
-## Problem
+## Implementation status
 
-Embedding config currently guesses the backend protocol from URL text. It also
-keeps its own copy of the default Ollama host, separate from the Ollama provider
-module.
+Implemented in `e08f3d0`, then moved behind the existing
+`piku_runtime::embed_memory` facade in `6161f15`. The backend and configuration
+implementation now lives in `crates/piku-runtime/src/embed_memory/backend.rs`,
+and the shared Ollama default remains in `piku-api`.
+
+## Original problem
+
+At decision time, embedding config guessed the backend protocol from URL text
+and kept its own copy of the default Ollama host, separate from the Ollama
+provider module.
 
 ## Chosen approach
 

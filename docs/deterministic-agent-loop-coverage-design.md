@@ -4,12 +4,19 @@ status: accepted
 decisions: ADR-0004
 decided: 2026-06-19
 
-## Problem
+## Implementation status
 
-The live LLM suites are now honest: default CI reports them as ignored, and an
-opt-in run without provider keys fails loudly. That fixes false confidence, but
-it leaves the agent loop without enough always-on PR coverage for scenarios that
-currently live only in `llm_e2e` and `dogfood`.
+Implemented. Commits `f08e647` and `d9e84a3` added scripted-provider coverage
+to `crates/piku-runtime/tests/e2e.rs`; later changes added deterministic
+verification-read and multi-file-rename cases. The live suites remain ignored
+by the normal test runner and serve as opt-in provider and product probes.
+
+## Original problem
+
+At decision time, the live LLM suites were honest: default CI reported them as
+ignored, and an opt-in run without provider keys failed loudly. That fixed false
+confidence, but left the agent loop without enough always-on PR coverage for
+scenarios that lived only in `llm_e2e` and `dogfood`.
 
 ## Chosen approach
 
@@ -36,22 +43,23 @@ permissions, sessions, and filesystem effects without needing a network key.
 - If CI gets a secret-gated nightly lane, keep it separate from PR-blocking
   deterministic coverage.
 
-## First implementation slice
+## Original first implementation slice
 
 Start with an audit, not new tests. Map each live assertion to an existing
 runtime e2e test and only add coverage for real gaps. The first pass found that
 the simple `llm_e2e` file-effect cases are mostly already represented in
 `crates/piku-runtime/tests/e2e.rs`.
 
-Likely next candidates are dogfood scenarios that check loop shape rather than
-provider quality:
+The original candidates were dogfood scenarios that checked loop shape rather
+than provider quality:
 
 - read, edit, then verify by reading again
 - multi-file rename using search before edit
 - trace/session artifact checks that do not need a live model
 - any live-only scenario whose assertion is about tool order or filesystem state
 
-Each moved scenario should name the property it checks and should call
+The verification-read and multi-file-rename candidates have since landed. Any
+remaining moved scenario should name the property it checks and should call
 `run_turn` with scripted events. Leave the live test in place unless the live
 version becomes duplicate noise after the deterministic version lands.
 

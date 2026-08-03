@@ -1,40 +1,57 @@
 # Contributing to piku
 
-Thanks for your interest. This crate is part of the workspace.
+Thanks for contributing. Piku is a Rust workspace; the binary, runtime,
+provider API, and tools are separate crates with a one-way dependency graph.
+Read [the architecture note](docs/design.md) before changing a public boundary.
 
 ## Before you start
 
-For non-trivial work (new APIs, features, large refactors), open an issue first to align on scope. Drive-by bug fixes and doc patches don't need an issue.
+Open an issue before a new public API, feature, data model, or large refactor so
+the scope and placement can be reviewed. Small fixes and documentation updates
+do not need one.
 
-## Setup
+Use the stable Rust toolchain and install `just`. Build from the repository root:
 
-- Rust toolchain: stable. Use `rustup` to manage.
-- Optional: `cargo-nextest` for faster test runs (`cargo install cargo-nextest`).
-
-```
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+```bash
+cargo build --workspace
 ```
 
-## Style
+## Make changes
 
-- Direct, lowercase prose in commits. No marketing words ("powerful", "robust", "elegant"). No em-dashes in prose.
-- Commit messages: `piku: short lowercase description`. One commit per logical change.
-- `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` must pass before `git add`.
+- Read the target, its callers, nearby tests, and existing conventions first.
+- Keep changes scoped to one concern and preserve unrelated work in a dirty
+  tree.
+- Prefer property-level tests at the changed boundary. Model review and live
+  LLM output do not replace deterministic assertions.
+- Use direct, lowercase prose. Avoid marketing language and em dashes.
+- Follow the repository's scope-style commit subjects, such as
+  `runtime: preserve tool results during compaction`.
 
-## Testing
+## Verify
 
-- `cargo test --all-features` for the full matrix.
-- Test names should describe the property under test, not the function under test.
+Run the canonical gate before requesting review:
+
+```bash
+just check
+```
+
+The gate is defined in `scripts/ci.sh` and shared with CI. It runs formatting,
+shell self-tests, Clippy with warnings denied, deterministic workspace tests,
+isolated PTY smoke tests, and a release build.
+
+Live LLM suites are intentionally separate. Run a relevant `just live*`,
+`just agentic-user*`, or `just playground*` recipe when the change affects a
+provider or agent interaction. Include the provider/model and deterministic
+acceptance evidence in the review; treat model-only findings as hypotheses.
 
 ## Pull requests
 
-- Keep PRs scoped to one concern.
-- Show before/after for behavior changes.
-- Link the related issue.
-- CI must be green before requesting review.
+- Keep the PR focused on one concern.
+- Explain the behavior change and the evidence that verifies it.
+- Link the related issue when one exists.
+- Wait for CI to pass before requesting merge.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0 at your option. By contributing you agree your contributions are licensed under both.
+Piku is licensed under the MIT License. By contributing, you agree that your
+contribution is licensed under the same terms.

@@ -4,6 +4,13 @@ status: accepted
 decisions: ADR-0007
 decided: 2026-06-20
 
+## Implementation status
+
+The promotion policy and `docs/live-failure-promotions.md` ledger were added in
+`18ad91d`. No failure has yet been promoted from the placeholder ledger into a
+deterministic test, quarantine, or product decision. The policy is implemented;
+its usefulness still depends on real live-run evidence reaching it.
+
 ## Problem
 
 Live dogfood is useful only if its failures improve the normal development

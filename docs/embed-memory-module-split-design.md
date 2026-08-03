@@ -4,9 +4,19 @@ status: accepted
 decisions: ADR-0003
 decided: 2026-06-18
 
+## Implementation status
+
+In progress. Commit `6161f15` extracted the backend and configuration slice to
+`crates/piku-runtime/src/embed_memory/backend.rs` without changing the public
+facade. The remaining `embed_memory.rs` is currently about 2,500 lines and
+still contains storage, scoring, eviction, attempt-tree, extraction, and test
+concerns. The later slices described below remain optional, boundary-driven
+work rather than a requirement to split for its own sake.
+
 ## Problem
 
-`crates/piku-runtime/src/embed_memory.rs` is over 2700 lines. It mixes storage
+At the time of this decision, `crates/piku-runtime/src/embed_memory.rs` was over
+2700 lines. It mixed storage
 types, embedding HTTP clients, scoring, eviction, attempt trees, extraction, and
 tests in one file.
 

@@ -6,7 +6,6 @@ This is the piku dogfood fixture — a small intentionally-imperfect Rust librar
 
 - `src/stats.rs`: `mean()` returns `NaN` on an empty slice — add an empty check
 - `src/parser.rs`: `split_csv()` drops empty fields — remove the `.filter()`
-- `src/lib.rs`: `process_batch()` is unimplemented — see README for spec
 - `src/utils.rs`: `format_output` has no doc comment — add one
 
 ## Build command

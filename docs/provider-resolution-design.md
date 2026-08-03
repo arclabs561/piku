@@ -4,11 +4,18 @@ status: accepted
 decisions: ADR-0001
 decided: 2026-06-18
 
-## Problem
+## Implementation status
 
-`piku` currently parses CLI arguments and also constructs concrete provider clients.
-That makes the binary know about both the runtime-level `Provider` trait and each
-provider implementation in `piku-api`.
+Implemented in `da4cdc0`. Provider selection now lives in
+`crates/piku-runtime/src/provider.rs`; the binary remains responsible for CLI
+parsing and user-facing presentation, while `piku-api` retains the protocol
+clients.
+
+## Original problem
+
+At decision time, `piku` parsed CLI arguments and constructed concrete provider
+clients. That made the binary know about both the runtime-level `Provider` trait
+and each provider implementation in `piku-api`.
 
 ## Chosen approach
 

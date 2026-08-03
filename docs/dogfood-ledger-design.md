@@ -4,13 +4,20 @@ status: accepted
 decisions: ADR-0006
 decided: 2026-06-20
 
-## Problem
+## Implementation status
 
-The live matrix tells us whether a model row passed, but it does not leave a
-small record that can be compared across runs. The trace files already contain
-tool events and token counts, but live tests write traces under per-test temp
-config directories, so a standalone post-run script cannot reliably discover
-them.
+Implemented in `b611211`. The shared live-test helper writes scenario JSONL,
+the live scripts choose a ledger path when one is not supplied, and the manual
+workflow uploads `target/live-ledger/*.jsonl`. Corpus-backed dogfood later
+adopted the same artifact family through `scripts/github-corpus-run.sh`.
+
+## Original problem
+
+At decision time, the live matrix reported whether a model row passed but left
+no small record that could be compared across runs. Trace files already
+contained tool events and token counts, but live tests wrote traces under
+per-test temp config directories, so a standalone post-run script could not
+reliably discover them.
 
 ## Chosen approach
 

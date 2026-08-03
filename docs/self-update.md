@@ -1,138 +1,93 @@
-# piku Self-Update Design
+# piku self-update implementation
 
-How piku rebuilds itself while it's running.
+status: implemented
 
----
+Piku can replace and restart itself after it builds a newer
+`target/release/piku`. This is local self-hosting support, not a release updater:
+Piku never downloads a binary or checks a remote service.
 
-## The Problem
+## Current flow
 
-piku is a coding agent. One of the first things you'll use it for is building piku itself. That creates a specific challenge: the running binary is being asked to edit its own source and recompile itself.
+1. A writable Piku run executes a successful `bash` tool call.
+2. The output must contain Cargo's `Finished` marker and a Piku-specific marker:
+   either `Compiling piku v` or `target/release/piku`.
+3. `target/release/piku` must exist and have an mtime newer than the running
+   binary or the TUI's startup mtime baseline.
+4. Piku saves the current session before attempting replacement.
+5. `self_replace::self_replace` replaces the running executable. The lower-level
+   test path uses a copy to a temporary file beside the target followed by
+   `rename`.
+6. `exec` starts the replacement with the same arguments and
+   `PIKU_RESTARTED=1`.
 
-The three hard constraints:
+The TUI also compares the release binary with its startup baseline before it
+draws the interface and at each input-loop iteration. This catches a release
+build produced by another process while the TUI is running. Read-only TUI mode
+does not perform these restart checks.
 
-1. **No data loss** — session history and tool results must survive the restart
-2. **No process corruption** — the running binary must not be overwritten mid-execution
-3. **Clean restart** — the new binary must come up correctly and pick up where it left off
+## Session behavior by surface
 
----
+The interactive TUI passes `PIKU_SESSION_ID` into the replacement process. The
+new process loads that saved session and resumes the TUI. This preserves the
+conversation, tool results, terminal ownership, and process identity across the
+`exec`.
 
-## The Flow
+Every writable launch turn, including `--print` and an ordinary prompt that
+would later enter the TUI, saves its session but calls `replace_and_exec` without
+`PIKU_SESSION_ID`. Replacement therefore restarts the same argument vector
+rather than restoring the saved session. Only updates detected inside an
+already-running TUI pass the session ID for seamless resume.
 
-```
-piku "add streaming progress bar to the TUI"
-  │
-  ├─ reads src/tui.rs
-  ├─ edits src/tui.rs
-  ├─ bash: cargo build --release
-  │         └─ writes target/release/piku  (new inode, different from running binary)
-  │
-  ├─ piku detects: target/release/piku is newer than current exe
-  │
-  ├─ session auto-persisted to ~/.config/piku/sessions/<id>.json  ← already done per-turn
-  │
-  ├─ self_replace::self_replace("target/release/piku")
-  │         └─ tempfile in same dir as current exe → rename()
-  │            atomic on same filesystem, new inode at old path
-  │
-  └─ exec(current_exe, same_args, PIKU_RESTARTED=1)
-            └─ process image replaced, same PID, same TTY
-               new piku starts, loads session, continues
-```
+If replacement or `exec` fails, Piku reports the error and continues with the
+old process where the caller can recover.
 
----
+## Why replacement precedes `exec`
 
-## Why This Design
+Writing into a running executable can fail or leave a partial binary. The
+replacement path installs a complete new file and only then calls `exec`. The
+testable arbitrary-target path places its temporary file beside the target so
+the final rename stays on one filesystem. For the actual executable,
+`self_replace` owns platform and symlink handling.
 
-### Atomic rename, not in-place write
+`exec` preserves the PID and terminal association. Piku explicitly forwards its
+arguments, inherited environment, the restart marker, and, for TUI restarts,
+the session identifier.
 
-Writing directly to the running binary (`open(O_WRONLY)`) triggers `ETXTBSY` on some platforms. More importantly, a partial write would corrupt the binary.
+## Detection contract
 
-The correct approach: write to a tempfile in the same directory as the current executable, then `rename()` into place. POSIX guarantees `rename()` is atomic within a filesystem — readers see either the old binary or the new one, never a partial state.
-
-### Same directory for the tempfile
-
-`rename()` is only atomic within a single filesystem. `/tmp` is often a separate tmpfs mount. Placing the tempfile in the same directory as the current executable ensures same-filesystem semantics.
-
-### Why exec(2) not spawn+exit
-
-`exec(2)` replaces the process image without creating a new process:
-- Same PID — shell job control stays intact
-- Same TTY — the terminal doesn't see a disconnect
-- Same file descriptors — no fd leaks
-- No zombie process
-
-Rust stdlib: `std::os::unix::process::CommandExt::exec()`.
-
-### macOS Gatekeeper note
-
-macOS Gatekeeper caches code signatures by inode number. Overwriting a file in-place retains the old inode; the OS sends `SIGKILL` to any new process trying to exec it. `rename()` into place always gives the new binary a fresh inode at the old path — correct behavior.
-
-### Session persistence enables seamless resume
-
-piku already auto-persists sessions after every turn (`~/.config/piku/sessions/<id>.json`). The bash tool result (cargo build output) is in the session. After exec, the new binary sees `PIKU_RESTARTED=1` and can load the session to continue.
-
----
-
-## Detection
-
-piku detects a self-rebuild by checking two conditions after any bash tool call:
-
-1. The bash output contains `"Finished"` (cargo's success indicator)
-2. `target/release/piku` exists and has a newer mtime than `current_exe()`
-
-This is intentionally conservative. False negatives (rebuild happened but not detected) are safe — the old binary just keeps running. False positives would cause unnecessary restarts but are very unlikely given the mtime check.
-
----
-
-## What piku Does NOT Do
-
-- **No automatic update from GitHub releases** — piku is your tool, you build it
-- **No signature verification** — you built it yourself, on your machine
-- **No rollback mechanism** — git is the rollback mechanism (`git checkout HEAD~1`)
-- **No background update check** — no network calls without prompting
-
----
-
-## Implementation
-
-`crates/piku/src/self_update.rs`:
+`crates/piku/src/self_update.rs` exposes these relevant operations:
 
 ```rust
-// Check if a new build is available
-pub fn is_newer_than_running(new_binary: &Path) -> bool
-
-// Get the default cargo build output path
-pub fn default_build_output() -> PathBuf  // "target/release/piku"
-
-// Detect if a bash command just rebuilt piku
-pub fn detect_self_build(bash_output: &str, exit_success: bool) -> Option<PathBuf>
-
-// Atomic replace + exec — does not return on success
+pub fn default_build_output() -> PathBuf
+pub fn detect_self_build(output: &str, exit_success: bool) -> Option<PathBuf>
+pub fn running_mtime() -> Option<SystemTime>
+pub fn is_newer_than_mtime(path: &Path, baseline: SystemTime) -> bool
 pub fn replace_and_exec(new_binary: &Path) -> Result<(), SelfUpdateError>
-
-// Was this process started via self-update?
+pub fn replace_and_exec_with_env(
+    new_binary: &Path,
+    extra_env: &[(&str, &str)],
+) -> Result<(), SelfUpdateError>
 pub fn was_restarted() -> bool
 ```
 
-The bash tool's `execute()` return value is checked in the agentic loop. If `detect_self_build()` returns `Some(path)`, the loop:
+The content markers are deliberately conservative. A successful `cargo check`
+or a build of another workspace crate should not trigger replacement. Mtime is
+the final guard, so matching output alone is insufficient.
 
-1. Confirms the session is persisted (already done)
-2. Prints a status line: `[piku] rebuilt — restarting...`
-3. Calls `replace_and_exec(&path)`
+## Boundaries and recovery
 
-The new process sees `PIKU_RESTARTED=1` and can optionally print a banner like `[piku] restarted after self-rebuild`.
+- There is no interactive confirmation. A qualifying writable build restarts
+  automatically.
+- There is no GitHub release updater, background network check, signature
+  verifier, or built-in rollback.
+- Source control can help an operator reconstruct an older build, but Piku does
+  not prescribe a destructive Git command as rollback.
+- Detection assumes the default release path relative to Piku's working
+  directory.
+- A copied executable outside that path is replaced only when the release build
+  is detected and is newer.
 
----
-
-## Future: Interactive Confirmation
-
-In the TUI (v1), before exec:
-
-```
-╔══════════════════════════════════════════╗
-║ piku was rebuilt. Restart with new binary? ║
-║ [y] restart now  [n] keep running         ║
-╚══════════════════════════════════════════╝
-```
-
-In single-shot mode (v0), auto-restart without prompting since there's no interactive session.
+Unit and binary tests in `crates/piku/src/self_update.rs` and
+`crates/piku/tests/self_update_e2e.rs` cover marker discrimination, mtimes,
+replacement error paths, restart markers, and integration with the bash result
+path.

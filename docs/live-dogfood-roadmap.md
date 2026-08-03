@@ -1,195 +1,306 @@
-# Roadmap: live dogfood quality loop
+# Roadmap: agentic quality loop
 
-Status: proposal
-Scope: live LLM dogfood, deterministic coverage, trace evidence, and the Codex Online comparison
-Date: 2026-06-20
+Status: active operational evidence loop
 
-Grounded in:
+Created: 2026-06-20
 
-- ADR-0004: deterministic agent loop coverage
-- ADR-0005: live LLM matrix
-- `docs/trace-backed-dogfood-design.md`
-- `.claude/reports/research-2026-06-20-codex-online-comparison.md`
+Last reviewed: 2026-08-03
 
-Review trigger:
+Scope: deterministic agent coverage, live-model dogfood, terminal playground
+evidence, and promotion of findings into product changes. Broader product
+sequencing remains in the intentionally owner-local design corpus.
 
-- after the first 3 manual live matrix runs
-- before adding any scheduled live model spend
-- before adding a user-facing random or "top model" mode
+Grounded in the tracked deterministic-loop, live-matrix, dogfood-ledger,
+failure-promotion, repository-artifact, and trace-backed focused designs under
+`docs/`, plus `docs/agentic-harness-landscape.md`. The intentionally owner-local
+decision ledger is not required to interpret this tracked roadmap.
 
-## Where we are
+## Current state
 
-Already done:
+Implemented:
 
-- PR-blocking agent coverage uses scripted providers for deterministic loop behavior.
-- Runtime e2e tests already cover read-edit-verify and multi-file rename.
-- Dogfood tests assert real trace JSONL instead of parsing model prose.
-- The generated-tests dogfood now compiles and runs the generated test binary.
-- A manual live matrix is committed in `d94cddd` with an owner gate and GitHub environment approval.
-- ADR-0005 is tracked even though new ADR files are hidden by the global gitignore.
-- Local live runs can write timestamped ledgers by default through `just live`, `just live-random`, and `just live-dogfood`.
-- ADR-0006 records the live ledger decision.
-- ADR-0007 records the promotion policy for repeated live failures.
-- `.gitignore` now unignores `docs/adr/*.md`, so future ADRs are not hidden by the global gitignore.
-- ADR-0008 records the repo artifact corpus boundary.
-- `just github-corpus` exports PR and issue artifacts.
-- `just github-prompt` turns one PR row into a dogfood prompt seed.
-- `just github-dogfood` runs one prompt seed against a temp repo copy and writes a ledger row.
-- Corpus dogfood now rejects mutating tools, failed tools, weak evidence gathering, and weak responses.
-- One local `llm_e2e` run produced and reviewed a ledger row for `openrouter/openai/gpt-4o-mini`.
-- One corpus-backed ledger row for PR #15 ran against a temp repo copy with `openrouter/openai/gpt-4o-mini`: 10 `read_file` calls, zero failed tools, two iterations.
+- Pull-request CI exercises the runtime agent loop with scripted providers.
+- Deterministic tests cover multi-iteration reads, edits, verification, retries,
+  permissions, traces, sessions, hooks, memory, and background-agent behavior.
+- PTY smoke tests run separately from the normal workspace test stage.
+- Live LLM and dogfood suites are explicitly ignored and opt-in.
+- A manual GitHub Actions live matrix exists behind owner and environment gates.
+- Live helpers can append provider, model, result, trace, token, duration, and
+  failure-class records to JSONL ledgers.
+- Repository pull-request and issue artifacts can seed local read-only dogfood.
+- The agentic-user playground drives the real binary through a PTY, records
+  viewport and transcript evidence, and verifies the resulting workspace.
+- Every regular persona has an executable scenario contract calibrated against
+  the pristine fixture.
+- Model review failures are named, invalid reviews contribute no product
+  observations, and findings expire unless reproduced against the current Piku
+  revision.
+- Runs record model attribution, elapsed-time components, review spend, and a
+  deterministic development-context handoff.
 
-Not done yet:
+Fresh remote check on 2026-08-03: the `live-llm.yml` workflow has no recorded
+runs. Local corpus-backed and terminal-playground ledgers exist, but they do not
+replace remote workflow verification.
 
-- The GitHub live matrix has not run through real environment secrets, by choice.
-- No local `dogfood` ledger row has been reviewed yet.
-- No real live finding has been promoted into a deterministic test yet.
+## Evidence hierarchy
 
-Current drift:
+When signals conflict, use this order:
 
-- `.claude/reports/status.md` has stale findings. For example, clippy `-D warnings` is now wired into `scripts/ci.sh`.
+1. Executable workspace acceptance for the exact property its predicate checks.
+2. Deterministic trace and process facts.
+3. PTY viewport and session transcript evidence.
+4. Primary LLM review tied to existing turn identifiers.
+5. Recursive review of the primary review.
+6. Unreproduced historical allegations.
 
-## Phase 0: checkpoint the live-matrix branch
+A lower tier may explain a higher-tier failure but does not overturn it by
+opinion. A plausible response with a failing exact-property predicate is a failed
+run. A verifier that cannot start, times out, or lacks a predicate for part of the
+goal is inconclusive for that property, not proof of product failure. A model
+claim with no reproducible evidence is a hypothesis.
 
-Status: done in `d94cddd`.
+## Completed phases
 
-Goal: make the current branch reviewable before adding more ideas.
+### Deterministic loop coverage
 
-Work:
+The normal gate no longer relies on provider keys to prove the core loop. Live
+scenarios that reveal a deterministic runtime property should still be distilled
+into `crates/piku-runtime/tests/e2e.rs` or a focused parser/tool test.
 
-- Run `cargo fmt`.
-- Keep `live-random` and the workflow matrix aligned.
-- Force-add `docs/adr/0005-live-llm-matrix.md`, or add a repo-local ignore override if that is the preferred fix.
-- Verify shell syntax, Rust test compilation, and whitespace.
+### Trace-backed dogfood
 
-Gate:
+Tool assertions prefer trace events; final-state assertions inspect the workspace;
+rendering assertions inspect terminal output. This prevents UI wording from
+silently changing what the harness believes happened.
 
-- `cargo fmt --check`
-- `bash -n scripts/ci.sh`
-- `cargo test -p piku --test llm_e2e --no-run`
-- `cargo test -p piku --test dogfood --no-run`
-- `git status --ignored` confirms the ADR is not silently lost.
+### Local live ledger
 
-## Phase 1: land the protected manual live matrix
+Opt-in suites can write comparable JSONL rows. The ledger is evidence input, not
+a score table. Provider outages, invalid model responses, harness defects, and
+product failures remain distinct classes.
 
-Status: available but deferred by the local-first decision.
+### Repository-artifact corpus
 
-Goal: get live dogfood without automatic spend or public-trigger risk.
+`just github-corpus`, `just github-prompt`, and `just github-dogfood` use repository
+history as local evaluation input without making GitHub access a runtime feature.
+The original “run the corpus once” next action is complete.
 
-Work:
+### Grounded terminal playground
 
-- Commit and push the live matrix PR.
-- Confirm the `live-llm` GitHub environment has required reviewer approval and provider keys as environment secrets.
-- Run one manual `llm_e2e` dispatch.
-- Do not add `pull_request`, `push`, or `schedule` triggers.
+The playground now combines real PTY interaction, session transcripts, workspace
+checks, a primary review, a bounded recursive review, spend accounting, and an
+append-only improvement handoff. Recent work corrected blank viewport evidence,
+expired stale findings by revision, separated review latency from Piku latency,
+and made task acceptance authoritative.
 
-Gate:
+## Active operational priorities
 
-- The workflow can only run by `workflow_dispatch`.
-- The job is gated to `github.actor == 'arclabs561'`.
-- The environment requires approval.
-- Missing optional provider secrets skip only that provider row.
+### 1. Preserve pass, fail, and inconclusive evidence
 
-## Phase 2: add a dogfood ledger
+The evaluator currently maps any scenario-verifier `passed: false`, including
+spawn and timeout failures, to the same engineering next action as a failed
+product assertion. Some scenario goal clauses also lack a direct predicate.
 
-Status: implemented after ADR-0006.
+Next shape:
 
-Goal: make model quality differences visible over time.
-
-Smallest useful version:
-
-- Live test helpers append one JSONL row per completed scenario when `PIKU_LIVE_LEDGER` is set.
-- Fields: date, suite, provider, model, result, failure class, trace path, input tokens, output tokens, duration if available.
-- No pricing table yet. Token counts are enough for the first version.
-
-Decision:
-
-- ADR-0006: live dogfood ledger.
-
-Options:
-
-- Post-run trace discovery script. Rejected because traces live under per-test temp config dirs.
-- Test harness writes ledger rows directly. Chosen because the helper knows the trace path.
-- GitHub artifact-only reporting. Rejected because local dogfood should produce the same rows.
+- Represent product failure, harness failure, unavailable evidence, and timeout
+  as distinct outcomes.
+- Bind each scenario goal clause to a predicate or mark it explicitly unverified.
+- Apply deterministic precedence only to the exact asserted property.
 
 Gate:
 
-- One manual `llm_e2e` run and one manual `dogfood` run produce comparable rows.
-- The ledger does not parse model prose.
+- Injected verifier spawn and timeout failures cannot produce a product-failure
+  disposition, while an actual predicate failure still does.
 
-## Phase 3: promote repeated live failures into deterministic tests
+### 2. Finish evidence-addressed review
 
-Status: policy accepted in ADR-0007.
+Current review validation requires a nonempty, in-range run-level
+`evidence_turns` list. Review bodies and recursive observations are still opaque
+strings, so individual allegations are not bound to stable evidence addresses.
 
-Goal: live dogfood should improve the normal PR gate, not become a parallel universe.
+Next shape:
 
-Work:
-
-- Use `docs/live-failure-promotions.md` as the promotion ledger.
-- Classify failures as provider outage, provider behavior, piku parsing, piku tool loop, prompt weakness, test harness bug, or product decision.
-- For each repeated live failure, either:
-  - add a scripted-provider runtime e2e test,
-  - add a parser or trace test,
-  - quarantine the provider/model with a short note,
-  - or mark it as product behavior that needs a design decision.
-
-Gate:
-
-- At least one real live finding is converted into a no-secret test or explicitly classified as provider-only.
-
-## Phase 4: decide whether model selection belongs in the product
-
-Goal: avoid turning a dogfood tool into product behavior without evidence.
-
-Recommendation for now:
-
-- Keep random model selection dogfood-only.
-- Do not add `piku --random-top-model` or similar until the ledger shows repeated model differences that users benefit from.
-
-Recommended ADR fork:
-
-- ADR-0008: user-facing model selection.
-
-Options:
-
-- Keep randomness only in `scripts/ci.sh live-random`. Recommended now.
-- Add a user-facing random/top model mode. Needs evidence and a threat model.
-- Add a provider policy config table. Bigger surface, only worth it if users need repeatable provider routing.
+- Give each review claim a stable ID and disposition.
+- Require every claim to cite one or more turn, trace, transcript, or workspace
+  evidence IDs.
+- Reject unknown IDs and keep deterministic findings independently authoritative.
+- Let the recursive reviewer retract or mark a claim inconclusive only through
+  those IDs.
+- Build the final handoff from dispositions rather than free-form review text.
 
 Gate:
 
-- At least 3 manual matrix runs show a stable pattern that product behavior could help.
+- A fabricated turn, unsupported claim count, or missing evidence ID produces an
+  invalid review record and cannot change the engineering next action.
 
-## Phase 5: use repo artifacts as dogfood material
+### 3. Make mutation authority an executable invariant
 
-Status: implemented after ADR-0008.
+The current permission path allows `Safe` calls before configuration rules and
+lets a prior per-turn allow-all precede deny rules. New unprotected files,
+Markdown-memory writes, and attempt writes are state mutations currently
+classified `Safe`.
 
-Goal: move beyond synthetic prompts without making piku runtime a GitHub client.
+Next shape:
 
-Work:
-
-- Run `just github-corpus` to export PR and issue artifacts under `target/github-corpus/`.
-- Run `just github-dogfood` to turn one PR detail row into a local dogfood prompt,
-  execute it against a temp repo copy, and append a ledger row.
-- Compare the model's behavior against the PR's changed files and commit message.
-- Promote repeated failures through `docs/live-failure-promotions.md`.
+- Evaluate configured deny rules before `Safe` classification and per-turn
+  allow-all.
+- Require each state mutation to be promptable or covered by an explicit,
+  inspectable capability lease.
+- Record the effective authority decision as evidence without mistaking policy
+  for process containment.
 
 Gate:
 
-- One corpus-backed prompt produces a ledger row.
-- Any finding is classified as provider behavior, prompt weakness, harness bug,
-  product decision, or deterministic-test candidate.
+- Deterministic scenarios prove a configured deny blocks new-file,
+  Markdown-memory, and attempt writes, including after per-turn allow-all.
+- Writable launch and child turns cannot silently widen the declared lease.
 
-## Later: hosted control plane
+### 4. Make tool effects dependable evidence
 
-Codex Online's useful shape is hosted execution, GitHub review, worktrees, setup automation, and background tasks. That is not piku's best next lane.
+Before optimizing tool discovery, define the result contract that both the agent
+and evaluator can trust:
 
-Recommendation:
+- bounded inline output with a durable full artifact when truncated;
+- authoritative completion state and recoverable failure class;
+- changed-file inventory for the declared task workspace, including repository
+  changes made through shell, with an explicit incomplete marker when
+  unrestricted external shell effects are possible;
+- stale-read detection or explicit precondition failure;
+- a retry ceiling that prevents unchanged failures from consuming turns.
 
-- Do not chase a hosted control plane now.
-- Keep piku focused on local, provider-agnostic, trace-backed agent work.
-- If hosted work becomes serious, write a separate ADR for the boundary before code.
+Gate:
+
+- Deterministic fault-injection tests distinguish completed, failed,
+  inconclusive, truncated, stale, and retry-exhausted outcomes. The changed-file
+  inventory agrees with repository state inside the task workspace and never
+  implies coverage of uncontained external effects.
+
+### 5. Prepare a genuinely lazy tool-disclosure experiment
+
+`tool_search` currently searches schemas already sent to the model. Replace this
+with a small always-hot safety/orchestration set plus on-demand schema disclosure
+and a deterministic full-catalog fallback only after the tool-result and
+delegation contracts below are reliable. This priority defines the experiment;
+it does not move implementation ahead of those prerequisites.
+
+Gate:
+
+- Measure prompt tokens, tool-selection misses, added round trips, and task
+  acceptance against the current full-catalog control.
+- Do not ship if context savings merely move cost into retries or missed tools.
+
+### 6. Complete background-agent lifecycle
+
+The TUI already injects completion through a bounded notification channel. Before
+adding more concurrent writers, make delivery reliable and bounded, then define
+acknowledgement, cancellation, inherited authority, file ownership,
+changed-worktree disposition, and parent verification. The launch-turn surface must
+either provide a task registry or stop advertising agent tools. `background:
+false` must block or cease claiming that it does. Semantic memory injected into
+a child must first gain source and policy provenance or be disabled for that
+verified path.
+
+Gate:
+
+- A deterministic scenario can spawn work in an executor-scoped directory,
+  observe and acknowledge completion, detect file changes made through both file
+  tools and shell, verify or reject the result, and leave no unexplained
+  temporary branch or process.
+
+### 7. Test the need for portable repository instructions
+
+Piku currently loads `PIKU.md`. Before adding native `AGENTS.md` discovery,
+record a reproducible Piku workflow that fails because portable instructions
+exist only in `AGENTS.md`. If that scenario passes its entry gate, use
+`AGENTS.md` as the portable base convention and document `PIKU.md` as a
+Piku-specific overlay or override.
+
+Gate:
+
+- The scenario proves a concrete compatibility failure. If implementation then
+  proceeds, tests cover discovery order, nesting, size bounds, conflicts, and
+  the exact prompt sections visible to parent and child agents.
+
+### 8. Make context reduction inspectable
+
+Record why compaction fired, what content classes contributed tokens, which
+observations were masked, and where the pre-rewrite artifact can be inspected.
+Keep automatic masking deterministic.
+
+Gate:
+
+- A resumed run can explain what changed without storing full duplicate snapshots
+  in every turn or making the memory footprint dominate the session.
+
+### 9. Measure human attention without deleting useful reasoning
+
+The current TUI truncates successful tool cards but offers no lossless expansion,
+adds one row for every tool event, resumes from a fixed recent tail, and has no
+first-class semantic diff or completion-review surface. A child completion can
+also re-enter the parent as a large block. These choices can produce both hidden
+evidence and reading fatigue.
+
+Next shape:
+
+- Add a stable decision view that coalesces routine successful activity while
+  keeping errors, mutations, invariant failures, and divergences visible.
+- Retain an expandable or durable full artifact behind every collapsed item.
+- Summarize completion by goal, semantic change group, files, tests, risks, and
+  unresolved decisions rather than transcript chronology.
+- Add an opt-in learning and ownership experiment using prediction, active
+  modification, or compact explanation. Do not equate added delay with learning.
+
+Gate:
+
+- Compare transcript lines and bytes, scroll distance, time to locate the result,
+  expansion rate, and approval prompts against missed failures and defect
+  detection.
+- For learning-oriented runs, measure delayed explanation, modification, and
+  debugging, not only immediate task completion.
+- Reject a concise presentation that saves reading by hiding evidence users need
+  to understand or verify the result.
+
+### 10. Audit semantic-memory provenance and usefulness
+
+Automatically extracted semantic memory currently has no source session, model,
+evidence, or authorization provenance. Before expanding automatic recall:
+
+- attach stable source and extraction provenance to every generated entry;
+- distinguish user-authored, project-authored, and model-extracted material;
+- record which retrieved entries entered a turn and whether the result used them;
+- test stale, conflicting, and unauthorized entries.
+
+Gate:
+
+- A reviewer can trace every injected entry to its source and policy, and a
+  dogfood comparison shows retrieval improves an acceptance measure without
+  increasing stale-instruction failures.
+
+## Deferred until evidence changes
+
+- Hosted execution, web UI, GitHub application, and multi-user control plane.
+- Scheduled provider spend or live-model pull-request gating.
+- User-facing random or “top model” selection.
+- MCP, LSP, browser, or image capabilities added only for parity.
+- Full workspace rewind while arbitrary shell side effects are not recorded.
+- Parallel writes without explicit ownership and merge disposition.
+- Mutable self-authored skills without versioned provenance and rollback.
+
+## Review triggers
+
+Revisit this roadmap when any of the following occurs:
+
+- the first protected remote live-matrix run completes;
+- three comparable control/sample pairs exist for one product hypothesis;
+- a second Piku client needs the runtime lifecycle state;
+- a real user workflow requires a remote integration rather than a local CLI;
+- a repeated failure crosses the permission, context, or subagent boundaries;
+- a deferred capability becomes necessary for a concrete acceptance scenario.
+- a compact-output experiment changes defect detection or delayed comprehension.
 
 ## Next action
 
-Do local dev first: run `just github-corpus`, then `just github-dogfood`, then inspect the new ledger row.
+Separate product failure from verifier failure and bind every authoritative
+scenario claim to a direct predicate. The strategic roadmap then begins with the
+non-interactive authority and execution-boundary decisions.

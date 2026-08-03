@@ -1,13 +1,22 @@
 # Design: Trace-backed dogfood assertions
 
 status: accepted
+decisions: none (ADR pending)
 decided: 2026-06-19
 
-## Problem
+## Implementation status
 
-`crates/piku/tests/dogfood.rs` parses human stdout to infer which tools ran. That
-keeps the report readable, but it makes assertions depend on display text that is
-not the stable record of the run.
+Implemented in `2bea6d3`. `crates/piku/tests/dogfood.rs` reads trace JSONL for
+tool-order and tool-success assertions while retaining stdout for the human
+report and workspace state for final-effect assertions. The decision predates
+the local ADR ledger and has not yet been recorded as an ADR; the roadmap
+should treat that as an archival decision-record task, not as missing code.
+
+## Original problem
+
+At decision time, `crates/piku/tests/dogfood.rs` parsed human stdout to infer
+which tools ran. That kept the report readable, but made assertions depend on
+display text that was not the stable record of the run.
 
 ## Chosen approach
 

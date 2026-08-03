@@ -1,5 +1,17 @@
 # Design: repo artifact dogfood corpus
 
+status: accepted
+decisions: ADR-0008
+decided: 2026-06-20
+
+## Implementation status
+
+Implemented across `a631f79`, `6a62af1`, `0297d96`, `df81522`, `1cbb247`, and
+`f806f48`. The exporter, prompt generator, read-only runner, ledger integration,
+trace validation, and deterministic script selftests are all present. Networked
+GitHub export remains an explicit local action; normal checks exercise only the
+deterministic selftests.
+
 ## Problem
 
 Synthetic dogfood prompts are useful, but they are too clean. Real project
@@ -65,10 +77,8 @@ handling, and a threat model. The local harness can learn from the data first.
 - If the corpus exporter starts needing pagination, caching, or redaction rules,
   split those into a second design.
 
-## Next step
+## Operator check
 
-Run `just github-corpus`, then `just github-dogfood`. Inspect the new row under
-`target/live-ledger/`.
-
----
-Decided: 2026-06-20
+To gather fresh evidence, run `just github-corpus`, then `just github-dogfood`,
+and inspect the resulting row under `target/live-ledger/`. This is an opt-in
+dogfood operation, not unfinished implementation work.

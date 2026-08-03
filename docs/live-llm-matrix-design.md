@@ -4,6 +4,14 @@ status: accepted
 decisions: ADR-0005
 decided: 2026-06-20
 
+## Implementation status
+
+Implemented in `cf95047`. `.github/workflows/live-llm.yml` exposes the manual
+matrix, environment-scoped secrets, optional suite selection, per-row ledger
+artifacts, and a 30-minute bound. This records the repository implementation;
+whether the protected environment is configured and whether any run has
+completed are separate remote-state checks.
+
 ## Problem
 
 The deterministic PR gate checks the agent loop without network keys. That is
