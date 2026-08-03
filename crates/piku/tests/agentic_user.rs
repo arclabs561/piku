@@ -1205,12 +1205,16 @@ impl PtyHandle {
     /// Extract text content from captured raw bytes by stripping ANSI escape
     /// sequences.
     ///
-    /// A terminal emulator would be the truthful renderer, but only one fed
-    /// the whole session: piku sets a scroll region at startup and positions
-    /// the cursor absolutely, so replaying one turn's bytes through a fresh
-    /// parser collapses almost all of them onto the same rows. Measured on a
-    /// real run, that reduced 4947 captured bytes to 55 characters. Until the
-    /// live observer's scrollback is used instead, this stays.
+    /// An emulator would be the truthful renderer and cannot be used here.
+    /// Two shapes were measured against live runs and both lose the
+    /// transcript. Replaying one turn's bytes through a fresh parser collapses
+    /// them onto the same rows, because piku positions the cursor absolutely:
+    /// 4947 captured bytes rendered as 55 characters. Diffing the live
+    /// observer's scrollback across a turn returns nothing at all, because
+    /// piku sets a scroll region and its transcript scrolls inside that region
+    /// without ever entering the parser's scrollback: three consecutive turns
+    /// gave an empty delta against 224, 346, and 287 characters of bytes.
+    /// The byte stream is the only view that sees the whole transcript.
     fn captured_text(&self) -> String {
         strip_ansi_bytes(&self.raw_capture)
     }
@@ -3679,7 +3683,11 @@ fn run_agentic_session(persona: &Persona) {
                 .join(" -> ")
         );
 
-        // Get full response content from raw byte capture (bypasses DECSTBM clipping)
+        // Raw bytes, not an emulator rendering. Measured on live runs: piku
+        // sets a scroll region, so its transcript scrolls inside that region
+        // and never enters the emulator's scrollback. The observer's
+        // before/after delta for a turn came back empty every time while the
+        // byte stream held 224 to 346 characters. See captured_text.
         let captured = pty.captured_text();
         if matches!(
             last_action,
