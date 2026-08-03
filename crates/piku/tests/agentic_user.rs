@@ -2384,6 +2384,10 @@ struct CritiqueEntry {
 struct LlmClient {
     spec: ProviderSpec,
     max_tokens: u32,
+    /// Which layer this client serves. Reviews are nine parts in ten of a
+    /// run's wall clock, and the layers differ in whether anything waits on
+    /// them, so a total is not enough to decide what to change.
+    role: &'static str,
 }
 
 impl LlmClient {
@@ -2391,6 +2395,7 @@ impl LlmClient {
         Self {
             spec,
             max_tokens: 1_024,
+            role: "user_agent",
         }
     }
 
@@ -2398,6 +2403,7 @@ impl LlmClient {
         Self {
             spec,
             max_tokens: 2_048,
+            role: "judge",
         }
     }
 
@@ -2510,7 +2516,14 @@ impl LlmClient {
         // during `text`. Timing the first alone reported 9.2s of review across
         // seven calls in a 128.7s run and left 86% of the clock unexplained.
         let body = response.text().unwrap_or_default();
-        spend::record_llm_ms(elapsed_ms(request_started));
+        let elapsed = elapsed_ms(request_started);
+        spend::record_llm_ms(elapsed);
+        eprintln!(
+            "[llm] {} {} took {:.1}s",
+            self.role,
+            self.spec.model,
+            elapsed as f64 / 1000.0
+        );
         if !status.is_success() {
             return Err(format!(
                 "{} returned status {status}: {}",
