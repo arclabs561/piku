@@ -62,6 +62,18 @@ pub struct ReviewClaimRecord {
     pub evidence_turns: Vec<u64>,
 }
 
+/// One validated second-order attestation of a primary-review claim.
+///
+/// This is deliberately separate from [`ReviewClaimRecord`]: an observer can
+/// challenge an attestation, but must not overwrite its historical record.
+#[derive(Debug, Serialize)]
+pub struct ObserverClaimRecord {
+    pub target_claim_id: String,
+    pub disposition: String,
+    pub rationale: String,
+    pub evidence_turns: Vec<u64>,
+}
+
 /// Resolved model drivers for one playground session. This is evidence, not a
 /// credential record: provider labels and model identifiers only.
 #[derive(Serialize)]
@@ -151,9 +163,12 @@ pub struct ObserverRecord<'a> {
     pub judge_observations: &'a [String],
     pub piku_observations: &'a [String],
     pub verdict: &'a str,
-    pub primary_review_grounded: bool,
-    /// `valid`, `skipped`, `provider_failure`, or `invalid_json`. Read
-    /// `primary_review_grounded` as a judgment only when this is `valid`.
+    /// Typed counter-attestations retained only when the observer accounted
+    /// for every primary claim with known turn evidence.
+    pub claim_assessments: &'a [ObserverClaimRecord],
+    /// Why an invalid observer record could not be admitted.
+    pub invalid_reasons: &'a [String],
+    /// `valid`, `invalid`, `skipped`, `provider_failure`, or `invalid_json`.
     pub status: &'a str,
 }
 
@@ -499,9 +514,15 @@ mod tests {
             .unwrap();
         let judge_observations = vec!["the primary review is grounded".to_string()];
         let piku_observations = vec!["the prompt stayed visible".to_string()];
+        let claim_assessments = vec![ObserverClaimRecord {
+            target_claim_id: "user-bug-1-1".to_string(),
+            disposition: "SUPPORTED".to_string(),
+            rationale: "turn 1 contains the observed failure".to_string(),
+            evidence_turns: vec![1],
+        }];
         ledger
             .append_observer(&ObserverRecord {
-                schema_version: 1,
+                schema_version: 2,
                 kind: "recursive_observer",
                 run_id: ledger.run_id(),
                 timestamp_secs: 1,
@@ -509,7 +530,8 @@ mod tests {
                 judge_observations: &judge_observations,
                 piku_observations: &piku_observations,
                 verdict: "keep",
-                primary_review_grounded: true,
+                claim_assessments: &claim_assessments,
+                invalid_reasons: &[],
                 status: "valid",
             })
             .unwrap();
@@ -571,6 +593,11 @@ mod tests {
         let observer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(observer["kind"], "recursive_observer");
         assert_eq!(observer["verdict"], "keep");
+        assert_eq!(observer["schema_version"], 2);
+        assert_eq!(
+            observer["claim_assessments"][0]["target_claim_id"],
+            "user-bug-1-1"
+        );
         let contract: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
         assert_eq!(contract["kind"], "scenario_contract");
         assert_eq!(contract["scenario_id"], "feature-line-numbers");

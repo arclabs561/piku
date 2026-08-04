@@ -60,9 +60,9 @@ mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord, ObserverRecord,
-    PlaygroundLedger, ReviewClaimRecord, ReviewRecord, ScenarioContractRecord, SpendRecord,
-    TurnRecord,
+    now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord,
+    ObserverClaimRecord, ObserverRecord, PlaygroundLedger, ReviewClaimRecord, ReviewRecord,
+    ScenarioContractRecord, SpendRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -4313,15 +4313,16 @@ fn run_agentic_session(persona: &Persona) {
             ],
             piku_observations: Vec::new(),
             verdict: "skipped".to_string(),
-            primary_review_grounded: true,
+            claim_assessments: Vec::new(),
+            invalid_reasons: Vec::new(),
             status: "skipped",
         }
     } else {
-        recursive_observer::observe(&judge_llm, persona, &entries, review)
+        recursive_observer::observe(&judge_llm, persona, &entries, &meta_review.claims)
     };
     if let Some(ledger) = &ledger {
         if let Err(error) = ledger.append_observer(&ObserverRecord {
-            schema_version: 1,
+            schema_version: 2,
             kind: "recursive_observer",
             run_id: ledger.run_id(),
             timestamp_secs: now_secs(),
@@ -4329,7 +4330,8 @@ fn run_agentic_session(persona: &Persona) {
             judge_observations: &recursive_review.judge_observations,
             piku_observations: &recursive_review.piku_observations,
             verdict: &recursive_review.verdict,
-            primary_review_grounded: recursive_review.primary_review_grounded,
+            claim_assessments: &recursive_review.claim_assessments,
+            invalid_reasons: &recursive_review.invalid_reasons,
             status: recursive_review.status,
         }) {
             eprintln!("[playground] could not append recursive-observer record: {error}");
@@ -4356,17 +4358,17 @@ fn run_agentic_session(persona: &Persona) {
             "[harness:CRITICAL] primary review referenced missing or no turn evidence; it was not used as a product judgment"
                 .to_string(),
         ),
-        "skipped" | "valid" => {}
+        "skipped" => {}
         status => harness_findings.push(format!(
             "[harness:MAJOR] primary judge did not produce a review ({status}); the run rests on deterministic evidence only"
         )),
     }
     match recursive_review.status {
-        "valid" if !recursive_review.primary_review_grounded => harness_findings.push(
-            "[harness:CRITICAL] recursive observer found the primary review ungrounded; it was not used as a product judgment"
-                .to_string(),
-        ),
-        "skipped" | "valid" => {}
+        "valid" | "skipped" => {}
+        "invalid" => harness_findings.push(format!(
+            "[harness:CRITICAL] recursive observer returned an invalid claim assessment; no assessment was admitted: {}",
+            safe_truncate(&recursive_review.invalid_reasons.join("; "), 400)
+        )),
         status => harness_findings.push(format!(
             "[harness:MAJOR] recursive observer did not run ({status}); no second-order check was applied"
         )),
