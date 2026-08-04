@@ -3168,17 +3168,17 @@ fn cites_only_real_turns(turns: &serde_json::Value, entry_count: usize) -> bool 
     })
 }
 
-/// Split a review's claims by whether each cites turns that exist.
+/// Validate every claim in a primary review against the frozen source catalog.
 ///
-/// Grounding was checked once for the whole review, so a single valid citation
-/// carried every claim beside it, including ones resting on nothing. ADR 0009
-/// asks that a claim cite its own evidence. Returns the claims that do and a
-/// description of each that does not.
-fn partition_claims_by_citation(
+/// A review is one attestation, not a bag of independently trusted fragments.
+/// If any claim has an unknown, duplicate, or uncited source reference, none of
+/// its claims enter the evidence ledger. Keeping the valid subset would let a
+/// malformed model response influence the engineering handoff.
+fn validate_review_claims(
     review: &serde_json::Value,
     entry_count: usize,
     source_claim_ids: &HashSet<String>,
-) -> (Vec<serde_json::Value>, Vec<String>) {
+) -> Result<Vec<serde_json::Value>, Vec<String>> {
     let mut kept = Vec::new();
     let mut rejected = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -3208,7 +3208,11 @@ fn partition_claims_by_citation(
             ));
         }
     }
-    (kept, rejected)
+    if rejected.is_empty() {
+        Ok(kept)
+    } else {
+        Err(rejected)
+    }
 }
 
 fn source_claim_ids(entries: &[CritiqueEntry]) -> HashSet<String> {
@@ -3352,11 +3356,17 @@ Return only JSON with this exact schema:
             claims_rejected: Vec::new(),
         };
     };
-    let grounded = review_is_grounded(parsed, entries.len());
-    let (kept, rejected) = partition_claims_by_citation(parsed, entries.len(), &source_claim_ids);
+    let mut grounded = review_is_grounded(parsed, entries.len());
+    let (kept, rejected) = match validate_review_claims(parsed, entries.len(), &source_claim_ids) {
+        Ok(kept) => (kept, Vec::new()),
+        Err(rejected) => {
+            grounded = false;
+            (Vec::new(), rejected)
+        }
+    };
     if !rejected.is_empty() {
         eprintln!(
-            "[meta-judge] dropped {} claim(s) citing turns that did not happen:",
+            "[meta-judge] rejected invalid review record with {} malformed claim(s):",
             rejected.len()
         );
         for claim in &rejected {
@@ -3390,9 +3400,7 @@ Return only JSON with this exact schema:
     eprintln!("=== END META-JUDGE ===\n");
     MetaReview {
         text: response,
-        // A review whose every claim rests on a turn that did not happen is
-        // not grounded, however well-formed its JSON.
-        grounded: grounded && (!kept.is_empty() || rejected.is_empty()),
+        grounded,
         status: outcome.status(),
         claims_kept: kept.len(),
         claims_rejected: rejected,
@@ -4800,10 +4808,9 @@ fn only_findings_reproduced_on_this_build_are_injected_as_premises() {
 }
 
 #[test]
-fn a_claim_citing_a_turn_that_never_happened_is_dropped() {
-    // Grounding used to be checked once for the whole review, so one valid
-    // citation carried every claim beside it, including claims resting on
-    // nothing. ADR 0009 asks each claim to cite its own evidence.
+fn a_malformed_claim_invalidates_the_whole_review() {
+    // A valid claim beside fabricated claims must not be retained. The review
+    // is one model attestation and has no trustworthy partial result.
     let review = serde_json::json!({
         "evidence_turns": [1],
         "bugs": [
@@ -4815,9 +4822,7 @@ fn a_claim_citing_a_turn_that_never_happened_is_dropped() {
     });
 
     let source_claim_ids = HashSet::from(["user-bug-1-1".to_string()]);
-    let (kept, rejected) = partition_claims_by_citation(&review, 2, &source_claim_ids);
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0]["description"], "real one");
+    let rejected = validate_review_claims(&review, 2, &source_claim_ids).unwrap_err();
     assert_eq!(rejected.len(), 3);
     assert!(rejected
         .iter()
@@ -4828,6 +4833,23 @@ fn a_claim_citing_a_turn_that_never_happened_is_dropped() {
     assert!(rejected
         .iter()
         .any(|claim| claim.contains("duplicate claim id")));
+}
+
+#[test]
+fn a_complete_well_cited_review_is_kept() {
+    let review = serde_json::json!({
+        "evidence_turns": [1, 2],
+        "bugs": [
+            {"claim_id": "user-bug-1-1", "description": "first", "evidence_turns": [1]},
+            {"claim_id": "user-bug-2-1", "description": "second", "evidence_turns": [2]},
+        ]
+    });
+    let source_claim_ids = HashSet::from(["user-bug-1-1".to_string(), "user-bug-2-1".to_string()]);
+
+    let kept = validate_review_claims(&review, 2, &source_claim_ids).unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0]["claim_id"], "user-bug-1-1");
+    assert_eq!(kept[1]["claim_id"], "user-bug-2-1");
 }
 
 #[test]
