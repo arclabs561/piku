@@ -115,11 +115,14 @@ impl Provider for OpenAiCompatProvider {
 
             let mut stream = resp.bytes_stream();
             let mut parser = SseParser::new();
+            let mut decoder = crate::sse::Utf8Stream::new();
             let mut line_buf = String::new();
 
             while let Some(chunk) = stream.next().await {
                 let bytes = chunk?;
-                let text = String::from_utf8_lossy(&bytes);
+                // Decoded across chunk boundaries: a character split by the
+                // transport must not become U+FFFD.
+                let text = decoder.push(&bytes);
 
                 for ch in text.chars() {
                     if ch == '\n' {

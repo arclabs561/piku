@@ -520,3 +520,55 @@ mod sse_extended {
         assert_eq!(ev.event_type.as_deref(), Some("content_block_delta"));
     }
 }
+
+#[test]
+fn a_character_split_across_chunks_survives_decoding() {
+    use crate::sse::Utf8Stream;
+
+    // The transport chunks wherever it likes. Decoding each chunk on its own
+    // turned a split character into U+FFFD, and because that is valid UTF-8
+    // inside a JSON string the payload still parsed, so the corruption
+    // reached the terminal and the session with no error anywhere.
+    let payload = "data: {\"delta\":{\"text\":\"日本語\"}}\n\n".as_bytes();
+
+    for split in 1..payload.len() {
+        let mut decoder = Utf8Stream::new();
+        let mut out = decoder.push(&payload[..split]);
+        out.push_str(&decoder.push(&payload[split..]));
+        assert_eq!(
+            out,
+            std::str::from_utf8(payload).unwrap(),
+            "split at byte {split} corrupted the stream"
+        );
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "split at byte {split} produced U+FFFD"
+        );
+    }
+}
+
+#[test]
+fn a_character_split_across_three_chunks_survives() {
+    use crate::sse::Utf8Stream;
+
+    // A four-byte character can straddle two boundaries at once.
+    let payload = "🦀".as_bytes();
+    let mut decoder = Utf8Stream::new();
+    let mut out = decoder.push(&payload[..1]);
+    out.push_str(&decoder.push(&payload[1..3]));
+    out.push_str(&decoder.push(&payload[3..]));
+    assert_eq!(out, "🦀");
+}
+
+#[test]
+fn genuinely_invalid_bytes_do_not_stall_the_stream() {
+    use crate::sse::Utf8Stream;
+
+    // A byte that cannot start a sequence is corrupt, not incomplete. Holding
+    // it back forever would stall every later token behind it.
+    let mut decoder = Utf8Stream::new();
+    let out = decoder.push(&[b'a', 0xFF, b'b']);
+    assert!(out.starts_with('a'), "{out:?}");
+    assert!(out.ends_with('b'), "{out:?}");
+    assert!(out.contains('\u{FFFD}'), "{out:?}");
+}
