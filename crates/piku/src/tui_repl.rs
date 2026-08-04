@@ -110,12 +110,7 @@ impl PermissionPrompter for TuiPrompter {
         let dim = "\x1b[2m";
         let desc = &req.description;
         // Truncate description so it fits: cols minus ~25 for the framing
-        let max_desc = (cols as usize).saturating_sub(25);
-        let short_desc = if desc.len() > max_desc {
-            format!("{}…", &desc[..max_desc.saturating_sub(1)])
-        } else {
-            desc.clone()
-        };
+        let short_desc = truncate_permission_description(desc, cols);
         // Format: "  bash  rm -rf build/   y/n/a? "
         let prompt = format!("\x1b[2K\r  {color}{label}{reset}  {short_desc}  {dim}y/n/a?{reset} ");
 
@@ -251,6 +246,23 @@ fn goto(row: u16, col: u16) {
 
 fn term_size() -> (u16, u16) {
     terminal::size().unwrap_or((80, 24))
+}
+
+/// Bound a permission description by terminal bytes without splitting UTF-8.
+///
+/// The description comes from tool arguments and can contain arbitrary model or
+/// user text. A byte slice at the display budget therefore must use a character
+/// boundary, just like the other piku output truncators.
+fn truncate_permission_description(description: &str, cols: u16) -> String {
+    let max_desc = usize::from(cols).saturating_sub(25);
+    if description.len() <= max_desc {
+        return description.to_string();
+    }
+
+    format!(
+        "{}…",
+        crate::truncate_on_char_boundary(description, max_desc.saturating_sub(1))
+    )
 }
 
 // ── Signal-driven terminal restore ────────────────────────────────────────────
@@ -2237,6 +2249,16 @@ mod tests {
         assert_eq!(scroll_region_sequence(1, 0), None);
         assert_eq!(scroll_region_sequence(1, 1), None);
         assert_eq!(scroll_region_sequence(3, 2), None);
+    }
+
+    #[test]
+    fn permission_description_truncation_keeps_unicode_boundaries() {
+        // At 80 columns the 54-byte prefix budget falls inside `日`.
+        let description = format!("{}日 then continue", "a".repeat(53));
+        assert_eq!(
+            truncate_permission_description(&description, 80),
+            format!("{}…", "a".repeat(53))
+        );
     }
 
     // Pricing tables are exact hardcoded constants; comparing them with
