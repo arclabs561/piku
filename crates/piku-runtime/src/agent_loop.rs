@@ -836,6 +836,8 @@ async fn stream_response(
 
     // map __idx_N → real tool id for delta correlation
     let mut idx_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // The tool call whose content block is currently streaming.
+    let mut open_tool_id: Option<String> = None;
 
     while let Some(event) = stream.next().await {
         match event {
@@ -852,18 +854,35 @@ async fn stream_response(
                 tool_order.push(id.clone());
                 // Map any index-based placeholder ids → the real id.
                 // Two naming conventions in use:
-                //   Anthropic: __idx_N  (from anthropic.rs, 0-indexed by arrival order)
-                //   OAI-compat: __tc_N  (from openai_compat.rs, uses tc.index from wire)
+                //   Anthropic: __idx_N  (from anthropic.rs, the wire's content
+                //     block index, which counts text blocks too)
+                //   OAI-compat: __tc_N  (from openai_compat.rs, uses tc.index)
                 // We register both so either convention resolves correctly.
                 let arrival_idx = tool_order.len() - 1;
                 idx_to_id.insert(format!("__idx_{arrival_idx}"), id.clone());
                 idx_to_id.insert(format!("__tc_{arrival_idx}"), id.clone());
                 // Also register the id itself as an identity mapping (no-op lookup)
                 idx_to_id.insert(id.clone(), id.clone());
+                // Arrival order and the Anthropic content-block index agree only
+                // when no text block precedes the tool. When one does, deltas
+                // arrive under a placeholder nobody registered, and the
+                // arguments were being dropped: the tool then ran on an empty
+                // object. Content blocks stream one at a time, so an
+                // unrecognised delta belongs to the most recently started call.
+                open_tool_id = Some(id.clone());
             }
             Ok(Event::ToolUseDelta { id, partial_json }) => {
-                // resolve placeholder id → real id (or use directly if already real)
-                let real_id = idx_to_id.get(&id).cloned().unwrap_or_else(|| id.clone());
+                // Resolve placeholder → real id, falling back to the open call
+                // for a placeholder that was never registered.
+                let real_id = idx_to_id
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| {
+                        (!tool_calls.contains_key(&id))
+                            .then(|| open_tool_id.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| id.clone());
                 if let Some(entry) = tool_calls.get_mut(&real_id) {
                     entry.1.push_str(&partial_json);
                 }

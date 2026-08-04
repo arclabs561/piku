@@ -2067,3 +2067,74 @@ async fn task_failure_notification_fires() {
         "notification should say failed: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Anthropic content-block index vs tool arrival order.
+// A text block before a tool block makes the two disagree, so the deltas
+// resolved to nothing and the tool ran on an empty argument object.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn regression_anthropic_tool_args_survive_a_leading_text_block() {
+    let dir = tempdir();
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "the file content").unwrap();
+    let input = serde_json::json!({"path": file}).to_string();
+
+    let provider = ScriptedProvider::new(vec![
+        // Content block 0 is text, so the tool is block 1 on the wire while
+        // being the first tool to arrive.
+        Event::TextDelta {
+            text: "Let me look.".to_string(),
+        },
+        Event::ToolUseStart {
+            id: "toolu_real".to_string(),
+            name: "read_file".to_string(),
+        },
+        Event::ToolUseDelta {
+            id: "__idx_1".to_string(),
+            partial_json: input,
+        },
+        Event::ToolUseEnd {
+            id: "__idx_1".to_string(),
+        },
+        Event::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        },
+        Event::TextDelta {
+            text: "done".to_string(),
+        },
+        Event::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]);
+
+    let mut session = Session::new("anthropic-idx".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "read notes.txt",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_ends.len(), 1, "the tool should execute");
+    assert!(
+        !sink.tool_ends[0].2,
+        "read_file errored, so its arguments were dropped: {}",
+        sink.tool_ends[0].1
+    );
+    assert!(
+        sink.tool_ends[0].1.contains("the file content"),
+        "read_file did not read the requested path: {}",
+        sink.tool_ends[0].1
+    );
+}
