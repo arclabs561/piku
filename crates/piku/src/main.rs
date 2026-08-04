@@ -368,7 +368,7 @@ impl OutputSink for StdoutSink {
             "\x1b[32mok\x1b[0m"
         };
         let preview = if result.len() > 400 {
-            format!("{}…", &result[..400])
+            format!("{}…", piku::truncate_on_char_boundary(result, 400))
         } else {
             result.to_string()
         };

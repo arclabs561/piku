@@ -96,7 +96,11 @@ impl TraceWriter {
         // Session JSON has the fuller result delivered to the runtime; trace is
         // a preview for analysis.
         let preview = if output.len() > 2000 {
-            format!("{}…[{} chars]", &output[..2000], output.len())
+            format!(
+                "{}…[{} chars]",
+                crate::truncate_on_char_boundary(output, 2000),
+                output.len()
+            )
         } else {
             output.to_string()
         };

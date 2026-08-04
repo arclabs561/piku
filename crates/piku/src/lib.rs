@@ -217,11 +217,63 @@ pub fn try_pretty_json(s: &str) -> String {
     }
 }
 
+/// Longest prefix of `s` that is at most `max` bytes and ends on a character
+/// boundary.
+///
+/// `&s[..max]` panics when `max` lands inside a multi-byte character, and
+/// everything truncated here is model or tool output, so an em-dash, a CJK
+/// character, or an emoji at the wrong offset was a crash rather than a
+/// display glitch. Bytes stay the unit because these are size guards, not
+/// column budgets.
+#[must_use]
+pub fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn truncate_arg(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
     if first_line.len() <= max {
         first_line.to_string()
     } else {
-        format!("{}…", &first_line[..max])
+        format!("{}…", truncate_on_char_boundary(first_line, max))
+    }
+}
+#[cfg(test)]
+mod truncation_tests {
+    use super::truncate_on_char_boundary;
+
+    #[test]
+    fn a_multibyte_character_at_the_limit_does_not_panic() {
+        // Every site that truncates here handles model or tool output, so the
+        // character at the cut is routinely an em-dash, a CJK character, or an
+        // emoji. `&s[..max]` panicked on each of them.
+        for filler in ["—", "日", "🦀", "é"] {
+            for max in 1..12 {
+                let text = "ab".to_string() + &filler.repeat(6);
+                let cut = truncate_on_char_boundary(&text, max);
+                assert!(cut.len() <= max, "{filler} at {max}: {cut:?}");
+                assert!(text.starts_with(cut), "{filler} at {max}: {cut:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_string_is_returned_whole() {
+        assert_eq!(truncate_on_char_boundary("short", 200), "short");
+        assert_eq!(truncate_on_char_boundary("", 10), "");
+    }
+
+    #[test]
+    fn a_cut_inside_the_first_character_yields_nothing_rather_than_panicking() {
+        // The first character is four bytes and the budget is one, so there is
+        // no valid prefix. Returning empty is correct; panicking is not.
+        assert_eq!(truncate_on_char_boundary("🦀tail", 1), "");
     }
 }

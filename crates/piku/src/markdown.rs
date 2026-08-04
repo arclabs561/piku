@@ -160,7 +160,7 @@ impl StreamingMarkdown {
         if line.starts_with("```") {
             return true;
         }
-        let sample = if line.len() > 200 { &line[..200] } else { line };
+        let sample = crate::truncate_on_char_boundary(line, 200);
         sample
             .bytes()
             .any(|b| matches!(b, b'#' | b'*' | b'`' | b'>' | b'_' | b'~' | b'[' | b'-'))
