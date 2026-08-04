@@ -40,7 +40,26 @@ pub struct ReviewRecord<'a> {
     pub run_id: &'a str,
     pub timestamp_secs: u64,
     pub persona: &'a str,
+    /// `valid`, `invalid`, `skipped`, `provider_failure`, or `invalid_json`.
+    pub status: &'a str,
+    /// Machine-readable attestations retained only when the entire review
+    /// validates against the run's frozen source/evidence catalog.
+    pub claims: &'a [ReviewClaimRecord],
+    /// Reasons an invalid review could not be admitted. Empty means either a
+    /// valid review or an unavailable judge; those cases are named by `status`.
+    pub invalid_reasons: &'a [String],
+    /// Human-readable rendering for operator inspection; it is never the
+    /// authoritative claim representation.
     pub review: &'a str,
+}
+
+/// One validated primary-review attestation.
+#[derive(Serialize)]
+pub struct ReviewClaimRecord {
+    pub id: String,
+    pub verdict: String,
+    pub rationale: String,
+    pub evidence_turns: Vec<u64>,
 }
 
 /// Resolved model drivers for one playground session. This is evidence, not a
@@ -359,6 +378,9 @@ mod tests {
                                 run_id: ledger.run_id(),
                                 timestamp_secs: 1,
                                 persona: "tester",
+                                status: "valid",
+                                claims: &[],
+                                invalid_reasons: &[],
                                 review: &format!("worker {worker} turn {turn}"),
                             })
                             .unwrap();
@@ -377,6 +399,45 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|error| panic!("torn line {line:?}: {error}"));
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn review_record_keeps_typed_claims_separate_from_prose() {
+        let directory =
+            std::env::temp_dir().join(format!("piku-review-ledger-{}", std::process::id()));
+        let path = directory.join("ledger.jsonl");
+        std::fs::create_dir_all(&directory).unwrap();
+        let ledger = PlaygroundLedger::open_at(path.clone()).unwrap();
+        let claims = vec![ReviewClaimRecord {
+            id: "user-bug-1-1".to_string(),
+            verdict: "VALID".to_string(),
+            rationale: "the prompt was absent on turn one".to_string(),
+            evidence_turns: vec![1],
+        }];
+        ledger
+            .append_review(&ReviewRecord {
+                schema_version: 1,
+                kind: "review",
+                run_id: ledger.run_id(),
+                timestamp_secs: 1,
+                persona: "tester",
+                status: "valid",
+                claims: &claims,
+                invalid_reasons: &[],
+                review: "human-readable rendering",
+            })
+            .unwrap();
+
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(record["status"], "valid");
+        assert_eq!(record["claims"][0]["id"], "user-bug-1-1");
+        assert_eq!(
+            record["claims"][0]["evidence_turns"],
+            serde_json::json!([1])
+        );
+        assert_eq!(record["review"], "human-readable rendering");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

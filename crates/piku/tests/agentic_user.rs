@@ -61,7 +61,8 @@ mod scenario;
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
     now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord, ObserverRecord,
-    PlaygroundLedger, ReviewRecord, ScenarioContractRecord, SpendRecord, TurnRecord,
+    PlaygroundLedger, ReviewClaimRecord, ReviewRecord, ScenarioContractRecord, SpendRecord,
+    TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -3142,6 +3143,9 @@ struct MetaReview {
     /// it means the judge never produced a review at all. Conflating the two
     /// reports a missing judge as an ungrounded one.
     status: &'static str,
+    /// Typed primary-review attestations, populated only after full-record
+    /// validation against the frozen source/evidence catalog.
+    claims: Vec<ReviewClaimRecord>,
     /// Claims that cited turns which actually happened.
     claims_kept: usize,
     /// Claims dropped for citing turns that did not, one description each.
@@ -3187,7 +3191,14 @@ fn validate_review_claims(
         let claim_id = claim["claim_id"].as_str();
         let valid_id = claim_id.is_some_and(|id| source_claim_ids.contains(id));
         let duplicate_id = claim_id.is_some_and(|id| !seen_ids.insert(id.to_string()));
-        if valid_id && !duplicate_id && cites_only_real_turns(&claim["evidence_turns"], entry_count)
+        let valid_verdict = matches!(
+            claim["verdict"].as_str(),
+            Some("VALID" | "HALLUCINATED" | "INCONCLUSIVE")
+        );
+        if valid_id
+            && !duplicate_id
+            && valid_verdict
+            && cites_only_real_turns(&claim["evidence_turns"], entry_count)
         {
             kept.push(claim.clone());
         } else {
@@ -3197,8 +3208,13 @@ fn validate_review_claims(
                 Some(id) => id.to_string(),
                 None => "missing claim id".to_string(),
             };
+            let verdict = if valid_verdict {
+                String::new()
+            } else {
+                format!("; invalid verdict {}", claim["verdict"])
+            };
             rejected.push(format!(
-                "{identity}: {}: cites {}",
+                "{identity}{verdict}: {}: cites {}",
                 safe_truncate(description, 160),
                 if claim["evidence_turns"].is_null() {
                     "no turns".to_string()
@@ -3213,6 +3229,23 @@ fn validate_review_claims(
     } else {
         Err(rejected)
     }
+}
+
+fn review_claim_records(claims: &[serde_json::Value]) -> Vec<ReviewClaimRecord> {
+    claims
+        .iter()
+        .map(|claim| ReviewClaimRecord {
+            id: claim["claim_id"].as_str().unwrap_or_default().to_string(),
+            verdict: claim["verdict"].as_str().unwrap_or_default().to_string(),
+            rationale: safe_truncate(claim["reason"].as_str().unwrap_or_default(), 500).to_string(),
+            evidence_turns: claim["evidence_turns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_u64)
+                .collect(),
+        })
+        .collect()
 }
 
 fn source_claim_ids(entries: &[CritiqueEntry]) -> HashSet<String> {
@@ -3242,6 +3275,7 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
             text: String::new(),
             grounded: true,
             status: "valid",
+            claims: Vec::new(),
             claims_kept: 0,
             claims_rejected: Vec::new(),
         };
@@ -3352,6 +3386,7 @@ Return only JSON with this exact schema:
             ),
             grounded: false,
             status: outcome.status(),
+            claims: Vec::new(),
             claims_kept: 0,
             claims_rejected: Vec::new(),
         };
@@ -3398,11 +3433,13 @@ Return only JSON with this exact schema:
     eprintln!("\n=== META-JUDGE ANALYSIS ===");
     eprintln!("{response}");
     eprintln!("=== END META-JUDGE ===\n");
+    let claims = review_claim_records(&kept);
     MetaReview {
         text: response,
         grounded,
         status: outcome.status(),
-        claims_kept: kept.len(),
+        claims_kept: claims.len(),
+        claims,
         claims_rejected: rejected,
     }
 }
@@ -4241,6 +4278,7 @@ fn run_agentic_session(persona: &Persona) {
             text: "meta-judge skipped by PIKU_AGENTIC_FAST=1".to_string(),
             grounded: true,
             status: "skipped",
+            claims: Vec::new(),
             claims_kept: 0,
             claims_rejected: Vec::new(),
         }
@@ -4255,6 +4293,9 @@ fn run_agentic_session(persona: &Persona) {
             run_id: ledger.run_id(),
             timestamp_secs: now_secs(),
             persona: persona.name,
+            status: meta_review.status,
+            claims: &meta_review.claims,
+            invalid_reasons: &meta_review.claims_rejected,
             review,
         }) {
             eprintln!("[playground] could not append review record: {error}");
@@ -4814,7 +4855,7 @@ fn a_malformed_claim_invalidates_the_whole_review() {
     let review = serde_json::json!({
         "evidence_turns": [1],
         "bugs": [
-            {"claim_id": "user-bug-1-1", "description": "real one", "evidence_turns": [1, 2]},
+            {"claim_id": "user-bug-1-1", "description": "real one", "verdict": "VALID", "evidence_turns": [1, 2]},
             {"claim_id": "unknown", "description": "cites a turn that never ran", "evidence_turns": [9]},
             {"description": "cites nothing at all"},
             {"claim_id": "user-bug-1-1", "description": "duplicate claim", "evidence_turns": [1]},
@@ -4840,8 +4881,8 @@ fn a_complete_well_cited_review_is_kept() {
     let review = serde_json::json!({
         "evidence_turns": [1, 2],
         "bugs": [
-            {"claim_id": "user-bug-1-1", "description": "first", "evidence_turns": [1]},
-            {"claim_id": "user-bug-2-1", "description": "second", "evidence_turns": [2]},
+            {"claim_id": "user-bug-1-1", "description": "first", "verdict": "VALID", "evidence_turns": [1]},
+            {"claim_id": "user-bug-2-1", "description": "second", "verdict": "INCONCLUSIVE", "evidence_turns": [2]},
         ]
     });
     let source_claim_ids = HashSet::from(["user-bug-1-1".to_string(), "user-bug-2-1".to_string()]);
