@@ -41,7 +41,7 @@
 ///
 /// ALL PERSONAS:
 ///   cargo test --test `agentic_user` -- --nocapture
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -3177,16 +3177,28 @@ fn cites_only_real_turns(turns: &serde_json::Value, entry_count: usize) -> bool 
 fn partition_claims_by_citation(
     review: &serde_json::Value,
     entry_count: usize,
+    source_claim_ids: &HashSet<String>,
 ) -> (Vec<serde_json::Value>, Vec<String>) {
     let mut kept = Vec::new();
     let mut rejected = Vec::new();
+    let mut seen_ids = HashSet::new();
     for claim in review["bugs"].as_array().into_iter().flatten() {
         let description = claim["description"].as_str().unwrap_or("(no description)");
-        if cites_only_real_turns(&claim["evidence_turns"], entry_count) {
+        let claim_id = claim["claim_id"].as_str();
+        let valid_id = claim_id.is_some_and(|id| source_claim_ids.contains(id));
+        let duplicate_id = claim_id.is_some_and(|id| !seen_ids.insert(id.to_string()));
+        if valid_id && !duplicate_id && cites_only_real_turns(&claim["evidence_turns"], entry_count)
+        {
             kept.push(claim.clone());
         } else {
+            let identity = match claim_id {
+                Some(id) if duplicate_id => format!("duplicate claim id {id}"),
+                Some(id) if !valid_id => format!("unknown claim id {id}"),
+                Some(id) => id.to_string(),
+                None => "missing claim id".to_string(),
+            };
             rejected.push(format!(
-                "{}: cites {}",
+                "{identity}: {}: cites {}",
                 safe_truncate(description, 160),
                 if claim["evidence_turns"].is_null() {
                     "no turns".to_string()
@@ -3197,6 +3209,20 @@ fn partition_claims_by_citation(
         }
     }
     (kept, rejected)
+}
+
+fn source_claim_ids(entries: &[CritiqueEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .enumerate()
+        .flat_map(|(turn, entry)| {
+            entry
+                .bugs
+                .iter()
+                .enumerate()
+                .map(move |(bug, _)| format!("user-bug-{}-{}", turn + 1, bug + 1))
+        })
+        .collect()
 }
 
 /// Meta-judge: after the agentic test completes, send all collected evidence
@@ -3216,6 +3242,8 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
             claims_rejected: Vec::new(),
         };
     }
+
+    let source_claim_ids = source_claim_ids(entries);
 
     // Build evidence summary from all entries
     let mut evidence = String::with_capacity(8000);
@@ -3251,10 +3279,15 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
         }
 
         // LLM-reported bugs
-        for bug in &entry.bugs {
+        for (bug_index, bug) in entry.bugs.iter().enumerate() {
             evidence.push_str(&format!(
-                "  BUG [{}]: {} (expected: {}, actual: {})\n",
-                bug.severity, bug.description, bug.expected, bug.actual
+                "  BUG [user-bug-{}-{}] [{}]: {} (expected: {}, actual: {})\n",
+                i + 1,
+                bug_index + 1,
+                bug.severity,
+                bug.description,
+                bug.expected,
+                bug.actual
             ));
         }
         // Deterministic findings
@@ -3281,14 +3314,15 @@ Your job:
 4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
    behave unexpectedly in ways the user-agent missed?
 
-Every entry in \"bugs\" must cite the turns it rests on in its own \
-\"evidence_turns\". Cite only turn numbers that appear in the evidence above. \
+Every entry in \"bugs\" must name one existing BUG's \"claim_id\" and cite \
+the turns it rests on in its own \"evidence_turns\". Cite only turn numbers \
+that appear in the evidence above. Each claim_id may occur once. \
 A claim you cannot tie to a specific turn does not belong in \"bugs\"; put it \
 in \"missed\" instead.
 
 Return only JSON with this exact schema:
 {\
-  \"bugs\": [{\"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\", \"evidence_turns\": [1]}],\
+  \"bugs\": [{\"claim_id\": \"user-bug-1-1\", \"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\", \"evidence_turns\": [1]}],\
   \"checks\": [{\"description\": \"string\", \"verdict\": \"CORRECT|INCORRECT\", \"reason\": \"string\"}],\
   \"overall\": \"string\",\
   \"missed\": [\"string\"],\
@@ -3319,7 +3353,7 @@ Return only JSON with this exact schema:
         };
     };
     let grounded = review_is_grounded(parsed, entries.len());
-    let (kept, rejected) = partition_claims_by_citation(parsed, entries.len());
+    let (kept, rejected) = partition_claims_by_citation(parsed, entries.len(), &source_claim_ids);
     if !rejected.is_empty() {
         eprintln!(
             "[meta-judge] dropped {} claim(s) citing turns that did not happen:",
@@ -4773,19 +4807,27 @@ fn a_claim_citing_a_turn_that_never_happened_is_dropped() {
     let review = serde_json::json!({
         "evidence_turns": [1],
         "bugs": [
-            {"description": "real one", "evidence_turns": [1, 2]},
-            {"description": "cites a turn that never ran", "evidence_turns": [9]},
+            {"claim_id": "user-bug-1-1", "description": "real one", "evidence_turns": [1, 2]},
+            {"claim_id": "unknown", "description": "cites a turn that never ran", "evidence_turns": [9]},
             {"description": "cites nothing at all"},
-            {"description": "cites an empty list", "evidence_turns": []},
+            {"claim_id": "user-bug-1-1", "description": "duplicate claim", "evidence_turns": [1]},
         ]
     });
 
-    let (kept, rejected) = partition_claims_by_citation(&review, 2);
+    let source_claim_ids = HashSet::from(["user-bug-1-1".to_string()]);
+    let (kept, rejected) = partition_claims_by_citation(&review, 2, &source_claim_ids);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0]["description"], "real one");
     assert_eq!(rejected.len(), 3);
-    assert!(rejected.iter().any(|claim| claim.contains("never ran")));
-    assert!(rejected.iter().any(|claim| claim.contains("no turns")));
+    assert!(rejected
+        .iter()
+        .any(|claim| claim.contains("unknown claim id")));
+    assert!(rejected
+        .iter()
+        .any(|claim| claim.contains("missing claim id")));
+    assert!(rejected
+        .iter()
+        .any(|claim| claim.contains("duplicate claim id")));
 }
 
 #[test]
