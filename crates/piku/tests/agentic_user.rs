@@ -241,7 +241,10 @@ impl ProviderSpec {
             ("TERM".into(), "xterm-256color".into()),
             ("COLUMNS".into(), "120".into()),
             ("LINES".into(), "40".into()),
-            ("PIKU_NO_TRACE".into(), "1".into()),
+            // Tracing is deliberately left on. The harness exists to make piku
+            // debuggable, and it was starting the subject with its own event
+            // log suppressed, so a run could be judged but not explained. The
+            // trace is copied beside the run's evidence on exit.
         ];
         if let Some(host) = &self.ollama_host {
             pairs.push(("OLLAMA_HOST".into(), host.clone()));
@@ -4158,6 +4161,28 @@ fn run_agentic_session(persona: &Persona) {
                 piku_session_copy = path.display().to_string();
             }
             Err(error) => eprintln!("[playground] could not copy piku session: {error}"),
+        }
+        // The trace sits beside the session under the same id, and carries the
+        // timing the session does not: how long each provider stream took.
+        // Without it a slow turn and a hung turn look identical.
+        let trace_source = Path::new(source)
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| {
+                root.join("traces")
+                    .join(Path::new(source).file_stem().map_or_else(
+                        || "unknown".into(),
+                        |stem| format!("{}.jsonl", stem.to_string_lossy()),
+                    ))
+            });
+        if let Some(trace_source) = trace_source {
+            match ledger.copy_piku_trace(&trace_source) {
+                Ok(path) => eprintln!("[playground] piku trace: {}", path.display()),
+                Err(error) => eprintln!(
+                    "[playground] could not copy piku trace from {}: {error}",
+                    trace_source.display()
+                ),
+            }
         }
     } else {
         eprintln!("[playground] piku did not report a session file on exit");

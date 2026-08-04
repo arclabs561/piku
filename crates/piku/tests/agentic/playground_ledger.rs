@@ -248,6 +248,23 @@ impl PlaygroundLedger {
     /// a user may prune, so a path recorded now can point at nothing later. A
     /// copy beside the ledger keeps the messages, tool calls, and usage
     /// readable for as long as the evidence is.
+    /// Keep piku's event trace with the run, alongside its session.
+    ///
+    /// The session says what was exchanged; the trace says when, and how long
+    /// each provider stream took. Separating a slow provider from a hang needs
+    /// the second.
+    pub fn copy_piku_trace(&self, source: &Path) -> std::io::Result<PathBuf> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("piku-traces");
+        fs::create_dir_all(&directory)?;
+        let destination = directory.join(format!("{}.jsonl", self.run_id));
+        fs::copy(source, &destination)?;
+        Ok(destination)
+    }
+
     pub fn copy_piku_session(&self, source: &Path) -> std::io::Result<PathBuf> {
         let directory = self
             .path
