@@ -3091,6 +3091,8 @@ fn improvement_handoff(
     entries: &[CritiqueEntry],
     harness_findings: Vec<String>,
     scenario_failures: &[String],
+    primary_claims: &[ReviewClaimRecord],
+    observer_claims: Option<&[ObserverClaimRecord]>,
 ) -> (Vec<String>, Vec<String>, &'static str) {
     let mut verified_findings = entries
         .iter()
@@ -3109,15 +3111,60 @@ fn improvement_handoff(
         .collect::<Vec<_>>();
     verified_findings.extend(harness_findings);
     verified_findings.extend(scenario_failures.iter().cloned());
+    let primary_by_id = primary_claims
+        .iter()
+        .map(|claim| (claim.id.as_str(), claim))
+        .collect::<HashMap<_, _>>();
+    let observer_by_target = observer_claims.map(|claims| {
+        claims
+            .iter()
+            .map(|claim| (claim.target_claim_id.as_str(), claim))
+            .collect::<HashMap<_, _>>()
+    });
     let hypotheses = entries
         .iter()
-        .flat_map(|entry| {
-            entry.bugs.iter().map(move |bug| {
-                format!(
-                    "[{}:{}] {} — expected: {}; actual: {}",
-                    entry.phase, bug.severity, bug.description, bug.expected, bug.actual
-                )
-            })
+        .enumerate()
+        .flat_map(|(turn, entry)| {
+            let primary_by_id = &primary_by_id;
+            let observer_by_target = &observer_by_target;
+            entry
+                .bugs
+                .iter()
+                .enumerate()
+                .filter_map(move |(bug, allegation)| {
+                    let claim_id = format!("user-bug-{}-{}", turn + 1, bug + 1);
+                    let primary = primary_by_id.get(claim_id.as_str());
+                    let observer = observer_by_target
+                        .as_ref()
+                        .and_then(|claims| claims.get(claim_id.as_str()));
+                    let disposition = observer.map(|claim| claim.disposition.as_str());
+                    let primary_verdict = primary.map(|claim| claim.verdict.as_str());
+                    // A second-order retraction only has force after the observer's
+                    // whole response validated. Its historical primary/source
+                    // records remain in the append-only ledger either way.
+                    if matches!(primary_verdict, Some("HALLUCINATED"))
+                        || matches!(disposition, Some("RETRACTED"))
+                    {
+                        return None;
+                    }
+                    let provenance = match (primary_verdict, disposition) {
+                        (Some("VALID"), Some("SUPPORTED")) => "corroborated",
+                        (Some("VALID"), Some("INCONCLUSIVE")) => "observer-inconclusive",
+                        (Some("VALID"), None) => "primary-reviewed",
+                        (Some("INCONCLUSIVE"), _) => "primary-inconclusive",
+                        // The validator excludes unknown variants, but keep this
+                        // conservative default if old ledger data is ever read.
+                        _ => "unreviewed",
+                    };
+                    Some(format!(
+                        "[{provenance}:{}:{}] {} — expected: {}; actual: {}",
+                        entry.phase,
+                        allegation.severity,
+                        allegation.description,
+                        allegation.expected,
+                        allegation.actual
+                    ))
+                })
         })
         .collect::<Vec<_>>();
     // A failed acceptance check is the one outcome that names piku as the thing
@@ -4415,8 +4462,15 @@ fn run_agentic_session(persona: &Persona) {
         }
     }
 
-    let (verified_findings, hypotheses, next_action) =
-        improvement_handoff(&entries, harness_findings, &scenario_failures);
+    let observer_claims = (recursive_review.status == "valid")
+        .then_some(recursive_review.claim_assessments.as_slice());
+    let (verified_findings, hypotheses, next_action) = improvement_handoff(
+        &entries,
+        harness_findings,
+        &scenario_failures,
+        &meta_review.claims,
+        observer_claims,
+    );
     let harness_cost = spend.usd();
     eprintln!("\n=== RUN SPEND ===");
     eprintln!(
@@ -5134,17 +5188,93 @@ fn failed_acceptance_check_outranks_screen_findings_in_the_handoff() {
     }];
     let failures = vec!["[scenario:x] acceptance check failed: cargo test --quiet".to_string()];
 
-    let (verified, _, next_action) = improvement_handoff(&entries, Vec::new(), &failures);
+    let (verified, _, next_action) =
+        improvement_handoff(&entries, Vec::new(), &failures, &[], None);
     assert!(verified
         .iter()
         .any(|finding| finding.contains("scenario:x")));
     assert_eq!(next_action, "fix_piku_for_failed_scenario_acceptance");
 
-    let (_, _, without_scenario) = improvement_handoff(&entries, Vec::new(), &[]);
+    let (_, _, without_scenario) = improvement_handoff(&entries, Vec::new(), &[], &[], None);
     assert_eq!(
         without_scenario,
         "fix_harness_or_reproduce_verified_findings"
     );
+}
+
+#[test]
+fn review_dispositions_bound_handoff_hypotheses() {
+    let entries = vec![CritiqueEntry {
+        phase: "interaction".to_string(),
+        action_desc: "Observe".to_string(),
+        screen_text: String::new(),
+        observations: Vec::new(),
+        bugs: vec![
+            Bug {
+                severity: Severity::Major,
+                description: "corroborated issue".to_string(),
+                expected: "expected one".to_string(),
+                actual: "actual one".to_string(),
+            },
+            Bug {
+                severity: Severity::Minor,
+                description: "retracted issue".to_string(),
+                expected: "expected two".to_string(),
+                actual: "actual two".to_string(),
+            },
+            Bug {
+                severity: Severity::Info,
+                description: "unreviewed issue".to_string(),
+                expected: "expected three".to_string(),
+                actual: "actual three".to_string(),
+            },
+        ],
+        deterministic_findings: Vec::new(),
+        workspace_diff: "no changes".to_string(),
+        permission_events: Vec::new(),
+        next_action: NextAction::Quit,
+    }];
+    let primary = vec![
+        ReviewClaimRecord {
+            id: "user-bug-1-1".to_string(),
+            verdict: "VALID".to_string(),
+            rationale: String::new(),
+            evidence_turns: vec![1],
+        },
+        ReviewClaimRecord {
+            id: "user-bug-1-2".to_string(),
+            verdict: "VALID".to_string(),
+            rationale: String::new(),
+            evidence_turns: vec![1],
+        },
+    ];
+    let observer = vec![
+        ObserverClaimRecord {
+            target_claim_id: "user-bug-1-1".to_string(),
+            disposition: "SUPPORTED".to_string(),
+            rationale: String::new(),
+            evidence_turns: vec![1],
+        },
+        ObserverClaimRecord {
+            target_claim_id: "user-bug-1-2".to_string(),
+            disposition: "RETRACTED".to_string(),
+            rationale: String::new(),
+            evidence_turns: vec![1],
+        },
+    ];
+
+    let (_, hypotheses, _) =
+        improvement_handoff(&entries, Vec::new(), &[], &primary, Some(&observer));
+
+    assert!(hypotheses
+        .iter()
+        .any(|hypothesis| hypothesis.contains("corroborated issue")));
+    assert!(hypotheses
+        .iter()
+        .any(|hypothesis| hypothesis.contains("unreviewed issue")));
+    assert!(!hypotheses
+        .iter()
+        .any(|hypothesis| hypothesis.contains("retracted issue")));
 }
 
 #[test]
