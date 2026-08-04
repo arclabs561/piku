@@ -67,8 +67,18 @@ pub struct MemoryEntry {
     pub is_valid: bool,
     /// ID of the memory this one supersedes (if any).
     pub supersedes: Option<u64>,
-    /// Pre-normalized embedding vector (768d for nomic-embed-text).
+    /// Pre-normalized embedding vector.
+    ///
+    /// Its dimension depends on the model that produced it, and comparing
+    /// vectors from two models is meaningless. The model is recorded beside
+    /// the vector so a store written under one model is not silently scored
+    /// against another. Roadmap priority 10 requires this provenance anyway.
     pub embedding: Vec<f32>,
+    /// Model that produced `embedding`, absent on entries written before this
+    /// was recorded. Those are treated as belonging to no model and are not
+    /// compared against a tagged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 
     // --- Tree / attempt fields (v2) ---
     /// Entry type: Fact (default, backward-compat) or Attempt.
@@ -107,6 +117,13 @@ pub struct RetrievedMemory {
 pub struct MemoryStore {
     pub next_id: u64,
     pub entries: Vec<MemoryEntry>,
+    /// Model that produced the vectors in this store.
+    ///
+    /// Set from the resolved embedding config so entries carry their
+    /// provenance, which roadmap priority 10 requires and which keeps a store
+    /// written under one model from being scored against another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 /// Minimum cosine similarity for retrieval (confidence gate).
@@ -153,8 +170,15 @@ fn composite_score(similarity: f32, entry: &MemoryEntry, now: u64) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// Dot product of two pre-normalized vectors (= cosine similarity).
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+/// Cosine similarity of two pre-normalized vectors, or `None` when they cannot
+/// be compared.
+///
+/// `zip` silently truncates to the shorter vector, so a 768-dimension entry
+/// scored against a 1024-dimension query produced a plausible-looking number
+/// with no meaning. Changing the embedding model made every stored entry
+/// quietly wrong rather than visibly incompatible.
+fn dot(a: &[f32], b: &[f32]) -> Option<f32> {
+    (a.len() == b.len()).then(|| a.iter().zip(b).map(|(x, y)| x * y).sum())
 }
 
 /// L2-normalize a vector in place.
@@ -205,6 +229,14 @@ impl MemoryStore {
         std::fs::write(path, json).map_err(|e| format!("write failed: {e}"))
     }
 
+    /// Record which model produced this store's vectors.
+    ///
+    /// Entries inserted afterwards carry it. Existing untagged entries keep
+    /// no model, which is honest: nothing recorded what wrote them.
+    pub fn set_embedding_model(&mut self, model: &str) {
+        self.embedding_model = Some(model.to_string());
+    }
+
     /// Insert a new memory entry with a pre-computed embedding and importance score.
     /// Returns `None` if importance is below `MIN_IMPORTANCE` (admission gate).
     pub fn insert(
@@ -231,6 +263,7 @@ impl MemoryStore {
             access_count: 0,
             is_valid: true,
             supersedes: None,
+            embedding_model: self.embedding_model.clone(),
             embedding,
             entry_type: EntryType::Fact,
             parent: None,
@@ -268,6 +301,7 @@ impl MemoryStore {
             last_accessed: now,
             access_count: 0,
             is_valid: true,
+            embedding_model: self.embedding_model.clone(),
             supersedes: Some(supersedes_id),
             embedding,
             entry_type: EntryType::Fact,
@@ -290,10 +324,10 @@ impl MemoryStore {
             .iter()
             .enumerate()
             .filter(|(_, e)| e.is_valid)
-            .map(|(i, e)| {
-                let sim = dot(query_embedding, &e.embedding);
+            .filter_map(|(i, e)| {
+                let sim = dot(query_embedding, &e.embedding)?;
                 let score = composite_score(sim, e, now);
-                (sim, score, i)
+                Some((sim, score, i))
             })
             .filter(|(sim, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
@@ -324,10 +358,10 @@ impl MemoryStore {
             .entries
             .iter()
             .filter(|e| e.is_valid)
-            .map(|e| {
-                let sim = dot(query_embedding, &e.embedding);
+            .filter_map(|e| {
+                let sim = dot(query_embedding, &e.embedding)?;
                 let score = composite_score(sim, e, now);
-                (sim, score, e)
+                Some((sim, score, e))
             })
             .filter(|(sim, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
@@ -374,8 +408,8 @@ impl MemoryStore {
             .iter()
             .enumerate()
             .filter(|(_, e)| e.is_valid)
-            .map(|(i, e)| {
-                let sim = dot(query_embedding, &e.embedding);
+            .filter_map(|(i, e)| {
+                let sim = dot(query_embedding, &e.embedding)?;
                 let base_score = composite_score(sim, e, now);
 
                 // Keyword boost: check tags and content for query term matches
@@ -393,7 +427,7 @@ impl MemoryStore {
                 let keyword_boost = (keyword_hits as f32 * 0.05).min(0.15);
 
                 let final_score = base_score + keyword_boost;
-                (sim, final_score, keyword_boost, i)
+                Some((sim, final_score, keyword_boost, i))
             })
             .filter(|(sim, _, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
@@ -449,6 +483,7 @@ impl MemoryStore {
             access_count: 0,
             is_valid: true,
             supersedes: None,
+            embedding_model: self.embedding_model.clone(),
             embedding,
             entry_type: EntryType::Attempt,
             parent,
@@ -544,10 +579,10 @@ impl MemoryStore {
             .entries
             .iter()
             .filter(|e| e.entry_type == EntryType::Attempt && e.is_valid)
-            .map(|e| {
+            .filter_map(|e| {
                 // Match against goal text if present, otherwise content.
                 let match_text = e.goal.as_deref().unwrap_or(&e.content).to_lowercase();
-                let sim = dot(goal_embedding, &e.embedding);
+                let sim = dot(goal_embedding, &e.embedding)?;
                 let keyword_hits = query_terms
                     .iter()
                     .filter(|t| match_text.contains(t.as_str()))
@@ -555,7 +590,7 @@ impl MemoryStore {
                 #[allow(clippy::cast_precision_loss)]
                 let boost = (keyword_hits as f32 * 0.05).min(0.15);
                 let score = composite_score(sim, e, now) + boost;
-                (score, e)
+                Some((score, e))
             })
             .filter(|(score, _)| *score > MIN_SIMILARITY)
             .collect();
@@ -1539,6 +1574,7 @@ pub mod tests {
             access_count: 0,
             is_valid: true,
             supersedes: None,
+            embedding_model: None,
             embedding: vec![],
             entry_type: EntryType::Fact,
             parent: None,
@@ -1683,7 +1719,7 @@ pub mod tests {
         let mut b = vec![1.0, 0.0, 0.0];
         normalize(&mut a);
         normalize(&mut b);
-        assert!((dot(&a, &b) - 1.0).abs() < 1e-6);
+        assert!((dot(&a, &b).unwrap() - 1.0).abs() < 1e-6);
     }
 
     // --- MemoryStoreView trait tests ---
@@ -1794,6 +1830,7 @@ pub mod tests {
             access_count: 0,
             is_valid: true,
             supersedes: None,
+            embedding_model: None,
             embedding: vec![],
             entry_type: EntryType::Fact,
             parent: None,
@@ -1818,6 +1855,7 @@ pub mod tests {
             access_count: 1_000_000,
             is_valid: true,
             supersedes: None,
+            embedding_model: None,
             embedding: vec![],
             entry_type: EntryType::Fact,
             parent: None,
