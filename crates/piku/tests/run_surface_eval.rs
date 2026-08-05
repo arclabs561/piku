@@ -98,6 +98,8 @@ fn build_fixture(directory: &std::path::Path) -> std::path::PathBuf {
                 tool_call_id: "call-1".to_string(),
                 result: inline("ordinary distractor evidence"),
                 is_error: false,
+                effects: Vec::new(),
+                verification: None,
             },
         )
         .unwrap();

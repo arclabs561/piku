@@ -63,6 +63,17 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
         audit.content.artifact_items,
         audit.content.unavailable_items
     );
+    let _ = writeln!(
+        output,
+        "effects: {} created / {} modified / {} unchanged / {} unknown · verification: {} passed / {} failed / {} indeterminate",
+        audit.files_created,
+        audit.files_modified,
+        audit.file_writes_unchanged,
+        audit.file_writes_unknown,
+        audit.verification_passed,
+        audit.verification_failed,
+        audit.verification_indeterminate
+    );
     for finding in &audit.findings {
         let _ = writeln!(
             output,
@@ -127,10 +138,35 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                 let _ = writeln!(output, "  ◆ permission {decision:?}");
             }
             RunEvent::ToolCompleted {
-                result, is_error, ..
+                result,
+                is_error,
+                effects,
+                verification,
+                ..
             } => {
                 let mark = if *is_error { "×" } else { "✓" };
                 let _ = writeln!(output, "  {mark} {}", content_preview(result, 120));
+                for effect in effects {
+                    match effect {
+                        piku_runtime::RunToolEffect::FileWrite {
+                            path,
+                            content_change,
+                        } => {
+                            let _ = writeln!(
+                                output,
+                                "    ↳ file {content_change:?} {}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+                if let Some(verification) = verification {
+                    let _ = writeln!(
+                        output,
+                        "    ↳ verify {:?} · {}",
+                        verification.status, verification.description
+                    );
+                }
             }
             RunEvent::TurnCompleted { usage, stop_reason } => {
                 let _ = writeln!(
@@ -226,8 +262,8 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const searchBySequence=new Map(documentData.search_index.map(e=>[e.sequence,e]));const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
 const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>searchBySequence.get(e.sequence)?.search_text??'';const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
-function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}`;case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
-function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['tools',`${{audit.tool_calls_completed}} / ${{audit.tool_calls_started}}`,`${{audit.tool_calls_with_permission_decision}} permission decisions`],['context',`${{audit.context.messages_selected}} / ${{audit.context.messages_excluded}}`,'selected / excluded messages']];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
+function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
+function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
 function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;const scope=scopeLabel(e);if(!seen.has(scope)){{seen.add(scope);const b=document.createElement('button');b.textContent=scope;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['scope',scope],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','scope','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
@@ -386,7 +422,10 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piku_runtime::{ArtifactRef, RunContentRef, UsageRecord, RUN_RECORD_SCHEMA_VERSION};
+    use piku_runtime::{
+        ArtifactRef, RunContentChange, RunContentRef, RunToolEffect, UsageRecord,
+        VerificationRecord, VerificationStatus, RUN_RECORD_SCHEMA_VERSION,
+    };
 
     fn event(event: RunEvent) -> RunEventEnvelope {
         RunEventEnvelope {
@@ -422,6 +461,33 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         })]);
         assert!(output.contains("12↑ 7↓ · end_turn"));
+    }
+
+    #[test]
+    fn projections_surface_effect_and_verification_evidence() {
+        let completion = event(RunEvent::ToolCompleted {
+            tool_call_id: "call-1".to_string(),
+            result: RunContentRef::Inline {
+                text: "ok".to_string(),
+            },
+            is_error: false,
+            effects: vec![RunToolEffect::FileWrite {
+                path: "src/lib.rs".into(),
+                content_change: RunContentChange::Modified,
+            }],
+            verification: Some(VerificationRecord {
+                description: "unit tests".to_string(),
+                status: VerificationStatus::Passed,
+            }),
+        });
+
+        let text = render_text(std::slice::from_ref(&completion));
+        let html = render_html(&[completion]).unwrap();
+
+        assert!(text.contains("file Modified src/lib.rs"));
+        assert!(text.contains("verify Passed · unit tests"));
+        assert!(html.contains("verify ${e.verification.status}"));
+        assert!(html.contains("tool_effect_count"));
     }
 
     #[test]
