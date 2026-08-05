@@ -2012,8 +2012,11 @@ fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> 
                 (
                     format!(
                         "task {id_str}\nstatus: {}\ndepth: {}\nelapsed: {elapsed}s\nturns: {}\n\
-                         output:\n{summary}",
-                        entry.status, entry.depth, entry.turns_used
+                         {}output:\n{summary}",
+                        entry.status,
+                        entry.depth,
+                        entry.turns_used,
+                        task_evidence_summary(&entry)
                     ),
                     false,
                 )
@@ -2058,7 +2061,14 @@ async fn execute_agent_join(params: &serde_json::Value, registry: &TaskRegistry)
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(entry)) => {
             let out = entry.output.as_deref().unwrap_or("(no output)");
-            (format!("task {id_str} {}\n\n{out}", entry.status), false)
+            (
+                format!(
+                    "task {id_str} {}\n{}\n{out}",
+                    entry.status,
+                    task_evidence_summary(&entry)
+                ),
+                false,
+            )
         }
         Ok(Err(_)) => (format!("task {id_str}: channel closed unexpectedly"), true),
         Err(_) => (
@@ -2066,6 +2076,20 @@ async fn execute_agent_join(params: &serde_json::Value, registry: &TaskRegistry)
             true,
         ),
     }
+}
+
+fn task_evidence_summary(entry: &crate::task::TaskEntry) -> String {
+    entry
+        .evidence
+        .as_ref()
+        .map_or_else(String::new, |evidence| {
+            format!(
+                "child session: {}\nrun record: {}\nparent link: {}\n",
+                evidence.session_path.display(),
+                evidence.run_record_path.display(),
+                evidence.link_path.display()
+            )
+        })
 }
 
 /// Attempt LLM-based compaction: send old messages to the model with the compact
