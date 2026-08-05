@@ -2,13 +2,48 @@
 
 use std::fmt::Write;
 
-use piku_runtime::{RunContentRef as ContentRef, RunEvent, RunEventEnvelope};
+use piku_runtime::{audit_run_record, RunContentRef as ContentRef, RunEvent, RunEventEnvelope};
 
 #[must_use]
 pub fn render_text(events: &[RunEventEnvelope]) -> String {
     let mut output = String::new();
     let session = events.first().map_or("unknown", |event| &event.session_id);
-    let _ = writeln!(output, "run {session} · {} events", events.len());
+    let audit = audit_run_record(events);
+    let status = if audit.is_structurally_complete() {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    let _ = writeln!(
+        output,
+        "run {session} · {} events · evidence {status}",
+        events.len()
+    );
+    let _ = writeln!(
+        output,
+        "{} / {} turns complete · {} / {} tools complete · {} permission decisions",
+        audit.completed_turn_count,
+        audit.turn_count,
+        audit.tool_calls_completed,
+        audit.tool_calls_started,
+        audit.tool_calls_with_permission_decision
+    );
+    let _ = writeln!(
+        output,
+        "context: {} selected / {} excluded messages · content: {} inline / {} artifact / {} unavailable",
+        audit.context.messages_selected,
+        audit.context.messages_excluded,
+        audit.content.inline_items,
+        audit.content.artifact_items,
+        audit.content.unavailable_items
+    );
+    for finding in &audit.findings {
+        let _ = writeln!(
+            output,
+            "audit {:?} {} · {}",
+            finding.severity, finding.code, finding.message
+        );
+    }
     let mut current_turn = "";
     for envelope in events {
         if envelope.turn_id != current_turn {
@@ -88,19 +123,25 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
 }
 
 pub fn render_json(events: &[RunEventEnvelope]) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(events)
+    serde_json::to_string_pretty(&serde_json::json!({
+        "audit": audit_run_record(events),
+        "events": events,
+    }))
 }
 
 pub fn render_html(events: &[RunEventEnvelope]) -> serde_json::Result<String> {
     let title = events
         .first()
         .map_or("Piku run", |event| event.session_id.as_str());
-    let data = serde_json::to_string(events)?
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
+    let data = serde_json::to_string(&serde_json::json!({
+        "audit": audit_run_record(events),
+        "events": events,
+    }))?
+    .replace('&', "\\u0026")
+    .replace('<', "\\u003c")
+    .replace('>', "\\u003e")
+    .replace('\u{2028}', "\\u2028")
+    .replace('\u{2029}', "\\u2029");
     Ok(format!(
         r#"<!doctype html>
 <html lang="en">
@@ -117,23 +158,24 @@ h1{{margin:0;font-family:"Iowan Old Style",Georgia,serif;font-size:clamp(1.6rem,
 input{{width:100%;border:0;border-bottom:1px solid var(--rule);padding:.65rem .1rem;background:transparent;color:var(--paper);font:inherit;outline:none}}input:focus{{border-color:var(--signal)}}
 main{{display:grid;grid-template-columns:minmax(12rem,19rem) minmax(0,1fr);min-height:calc(100vh - 6rem)}}nav{{position:sticky;top:6.2rem;align-self:start;max-height:calc(100vh - 6.2rem);overflow:auto;padding:1.5rem 1.2rem 3rem 2rem;border-right:1px solid #555146}}
 nav button{{display:block;width:100%;margin:0 0 .45rem;border:0;padding:.35rem 0;background:none;color:var(--muted);font:inherit;text-align:left;cursor:pointer}}nav button:hover,nav button:focus{{color:var(--signal);outline:none}}
-#timeline{{padding:2rem clamp(1rem,5vw,6rem) 8rem;max-width:90rem}}article{{display:grid;grid-template-columns:5rem minmax(0,1fr);gap:1.2rem;padding:1.15rem 0;border-top:1px solid #555146;animation:arrive .28s ease-out both;animation-delay:calc(var(--i) * 12ms)}}
+#workbench{{min-width:0}}#audit{{display:grid;grid-template-columns:repeat(4,minmax(8rem,1fr));gap:1px;margin:2rem clamp(1rem,5vw,6rem) 0;background:#555146;border:1px solid #555146;max-width:78rem}}.metric{{min-height:7rem;padding:1rem;background:#1d1d19}}.metric strong{{display:block;margin-top:.5rem;font-family:"Iowan Old Style",Georgia,serif;font-size:2rem;font-weight:500;line-height:1}}.metric.error strong{{color:#ff7966}}.metric .detail{{color:var(--muted);font-size:.72rem}}#timeline{{padding:2rem clamp(1rem,5vw,6rem) 8rem;max-width:90rem}}article{{display:grid;grid-template-columns:5rem minmax(0,1fr);gap:1.2rem;padding:1.15rem 0;border-top:1px solid #555146;animation:arrive .28s ease-out both;animation-delay:calc(var(--i) * 12ms)}}
 .seq{{color:var(--muted);font-size:.72rem}}h2{{margin:0 0 .55rem;font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--signal)}}pre{{max-height:28rem;overflow:auto;margin:.4rem 0 0;padding:1rem;background:#22221e;color:#e9e4d7;white-space:pre-wrap;word-break:break-word}}
 dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4rem 0}}dt{{color:var(--muted)}}dd{{margin:0}}.summary{{max-width:76ch;margin:.7rem 0;color:#d7d2c6}}details{{margin-top:.6rem}}summary{{cursor:pointer;color:var(--muted)}}.error h2{{color:#ff7966}}.empty{{padding:5rem 0;color:var(--muted)}}
-@keyframes arrive{{from{{opacity:0;transform:translateY(5px)}}to{{opacity:1;transform:none}}}}@media(max-width:720px){{header{{grid-template-columns:1fr}}main{{display:block}}nav{{position:static;border-right:0;border-bottom:1px solid #555146;padding:1rem 1.2rem}}article{{grid-template-columns:3rem 1fr}}}}
+@keyframes arrive{{from{{opacity:0;transform:translateY(5px)}}to{{opacity:1;transform:none}}}}@media(max-width:720px){{header{{grid-template-columns:1fr}}main{{display:block}}nav{{position:static;border-right:0;border-bottom:1px solid #555146;padding:1rem 1.2rem}}#audit{{grid-template-columns:repeat(2,minmax(8rem,1fr))}}article{{grid-template-columns:3rem 1fr}}}}
 @media(prefers-reduced-motion:reduce){{article{{animation:none}}}}
 </style>
 </head>
 <body>
 <header><div><div class="kicker">durable investigation record</div><h1>{}</h1></div><label><span class="kicker">filter evidence</span><input id="filter" type="search" placeholder="tool, turn, reason, content…" autocomplete="off"></label></header>
-<main><nav id="turns" aria-label="Turns"></nav><section id="timeline" aria-live="polite"></section></main>
+<main><nav id="turns" aria-label="Turns"></nav><div id="workbench"><section id="audit" aria-label="Run evidence metrics"></section><section id="timeline" aria-live="polite"></section></div></main>
 <script id="run-data" type="application/json">{}</script>
 <script>
-const events=JSON.parse(document.getElementById('run-data').textContent);const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
+const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
 const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>JSON.stringify(e).toLowerCase();const content=c=>c?.text??(c?.relative_path?`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');
 function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}`;case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;default:return''}}}}
+function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['tools',`${{audit.tool_calls_completed}} / ${{audit.tool_calls_started}}`,`${{audit.tool_calls_with_permission_decision}} permission decisions`],['context',`${{audit.context.messages_selected}} / ${{audit.context.messages_excluded}}`,'selected / excluded messages']];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
 function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;if(!seen.has(e.turn_id)){{seen.add(e.turn_id);const b=document.createElement('button');b.textContent=e.turn_id;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['turn',e.turn_id],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
-filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});draw();
+filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
 </body></html>"#,
         escape_html(title),
@@ -194,6 +236,27 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         })]);
         assert!(output.contains("12↑ 7↓ · end_turn"));
+    }
+
+    #[test]
+    fn json_projection_keeps_metrics_beside_raw_events() {
+        let json = render_json(&[event(RunEvent::TurnCompleted {
+            usage: UsageRecord {
+                input_tokens: 12,
+                output_tokens: 7,
+            },
+            stop_reason: Some("end_turn".to_string()),
+        })])
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["events"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["audit"]["event_count"], 1);
+        assert_eq!(value["audit"]["completed_turn_count"], 1);
+        assert_eq!(
+            value["audit"]["findings"][0]["code"],
+            "event_before_turn_start"
+        );
     }
 
     #[test]
