@@ -5,7 +5,9 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::{Destructiveness, ToolResult};
+use crate::{
+    Destructiveness, ToolResult, VerificationIndeterminate, VerificationRecord, VerificationStatus,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -49,6 +51,16 @@ pub struct BashParams {
     pub timeout_ms: Option<u64>,
     /// Description for display in permission prompts.
     pub description: Option<String>,
+    #[serde(default)]
+    pub purpose: BashPurpose,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashPurpose {
+    #[default]
+    Operation,
+    Verification,
 }
 
 #[must_use]
@@ -58,7 +70,12 @@ pub fn schema() -> serde_json::Value {
         "properties": {
             "command": { "type": "string", "description": "Shell command to execute" },
             "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 30000)" },
-            "description": { "type": "string", "description": "Short description of what this command does" }
+            "description": { "type": "string", "description": "Short description of what this command does" },
+            "purpose": {
+                "type": "string",
+                "enum": ["operation", "verification"],
+                "description": "Use verification only when this command checks a claimed result"
+            }
         },
         "required": ["command"]
     })
@@ -123,6 +140,7 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
     };
 
     let timeout_duration = Duration::from_millis(p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let verification_description = p.description.clone().unwrap_or_else(|| p.command.clone());
 
     // Use `sh -c` not `sh -lc` to avoid sourcing login shell profiles.
     // Login shell startup (nvm, pyenv, etc.) can consume 200-800ms before
@@ -139,18 +157,32 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
     let fut = cmd.output();
 
     match timeout(timeout_duration, fut).await {
-        Err(_) => ToolResult::error(format!(
-            "bash: command timed out after {}ms: {}",
-            p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            p.command
-        )),
-        Ok(Err(e)) => ToolResult::error(format!("bash: spawn failed: {e}")),
+        Err(_) => attach_verification(
+            ToolResult::error(format!(
+                "bash: command timed out after {}ms: {}",
+                p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+                p.command
+            )),
+            p.purpose,
+            verification_description,
+            VerificationStatus::Indeterminate {
+                reason: VerificationIndeterminate::TimedOut,
+            },
+        ),
+        Ok(Err(e)) => attach_verification(
+            ToolResult::error(format!("bash: spawn failed: {e}")),
+            p.purpose,
+            verification_description,
+            VerificationStatus::Indeterminate {
+                reason: VerificationIndeterminate::SpawnFailed,
+            },
+        ),
         Ok(Ok(output)) => {
             let stdout = bound_stream(&output.stdout, "stdout");
             let stderr = bound_stream(&output.stderr, "stderr");
             let code = output.status.code().unwrap_or(-1);
 
-            if code != 0 {
+            let result = if code != 0 {
                 let mut msg = format!("exit code {code}");
                 if !stdout.is_empty() {
                     msg.push_str("\nstdout:\n");
@@ -171,7 +203,35 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                     out.push_str(&stderr);
                 }
                 ToolResult::ok(out)
-            }
+            };
+            attach_verification(
+                result,
+                p.purpose,
+                verification_description,
+                if output.status.success() {
+                    VerificationStatus::Passed
+                } else {
+                    VerificationStatus::Failed {
+                        exit_code: output.status.code(),
+                    }
+                },
+            )
         }
+    }
+}
+
+fn attach_verification(
+    result: ToolResult,
+    purpose: BashPurpose,
+    description: String,
+    status: VerificationStatus,
+) -> ToolResult {
+    if purpose == BashPurpose::Verification {
+        result.with_verification(VerificationRecord {
+            description,
+            status,
+        })
+    } else {
+        result
     }
 }

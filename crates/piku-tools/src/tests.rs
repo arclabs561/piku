@@ -86,7 +86,17 @@ mod read_file {
 #[cfg(test)]
 mod write_file {
     use super::tempdir;
-    use crate::write_file;
+    use crate::{write_file, ContentChange, ToolEffect};
+
+    fn assert_file_write(result: &crate::ToolResult, change: ContentChange) {
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ToolEffect::FileWrite {
+                content_change,
+                ..
+            }] if *content_change == change
+        ));
+    }
 
     #[test]
     fn creates_new_file() {
@@ -96,6 +106,7 @@ mod write_file {
             write_file::execute(serde_json::json!({ "path": path, "content": "hello world" }));
         assert!(!result.is_error, "{}", result.output);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+        assert_file_write(&result, ContentChange::Created);
     }
 
     #[test]
@@ -107,6 +118,19 @@ mod write_file {
             write_file::execute(serde_json::json!({ "path": path, "content": "new content" }));
         assert!(!result.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+        assert_file_write(&result, ContentChange::Modified);
+    }
+
+    #[test]
+    fn records_unchanged_content_without_claiming_a_modification() {
+        let dir = tempdir();
+        let path = dir.join("same.txt");
+        std::fs::write(&path, "same content").unwrap();
+        let result =
+            write_file::execute(serde_json::json!({ "path": path, "content": "same content" }));
+
+        assert!(!result.is_error);
+        assert_file_write(&result, ContentChange::Unchanged);
     }
 
     #[test]
@@ -139,7 +163,7 @@ mod write_file {
 #[cfg(test)]
 mod edit_file {
     use super::tempdir;
-    use crate::edit_file;
+    use crate::{edit_file, ContentChange, ToolEffect};
 
     #[test]
     fn replaces_exact_match() {
@@ -155,6 +179,34 @@ mod edit_file {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("fn foo(x: i32) {}"));
         assert!(content.contains("fn bar() {}"));
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ToolEffect::FileWrite {
+                content_change: ContentChange::Modified,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn records_a_successful_noop_edit_as_unchanged() {
+        let dir = tempdir();
+        let path = dir.join("same.txt");
+        std::fs::write(&path, "same").unwrap();
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": "same",
+            "new_string": "same",
+        }));
+
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ToolEffect::FileWrite {
+                content_change: ContentChange::Unchanged,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -246,7 +298,7 @@ mod edit_file {
 
 #[cfg(test)]
 mod bash {
-    use crate::bash;
+    use crate::{bash, VerificationIndeterminate, VerificationStatus};
 
     #[tokio::test]
     async fn bounds_a_huge_stream_and_says_so() {
@@ -292,6 +344,52 @@ mod bash {
             bash::execute(serde_json::json!({ "command": "sleep 10", "timeout_ms": 100 })).await;
         assert!(result.is_error);
         assert!(result.output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn records_declared_verification_outcomes_from_process_status() {
+        let passed = bash::execute(serde_json::json!({
+            "command": "exit 0",
+            "description": "smoke check",
+            "purpose": "verification"
+        }))
+        .await;
+        let failed = bash::execute(serde_json::json!({
+            "command": "exit 2",
+            "purpose": "verification"
+        }))
+        .await;
+        let timed_out = bash::execute(serde_json::json!({
+            "command": "sleep 10",
+            "timeout_ms": 20,
+            "purpose": "verification"
+        }))
+        .await;
+
+        assert!(matches!(
+            passed.verification.as_ref().map(|v| v.status),
+            Some(VerificationStatus::Passed)
+        ));
+        assert_eq!(
+            passed.verification.as_ref().map(|v| v.description.as_str()),
+            Some("smoke check")
+        );
+        assert!(matches!(
+            failed.verification.as_ref().map(|v| v.status),
+            Some(VerificationStatus::Failed { exit_code: Some(2) })
+        ));
+        assert!(matches!(
+            timed_out.verification.as_ref().map(|v| v.status),
+            Some(VerificationStatus::Indeterminate {
+                reason: VerificationIndeterminate::TimedOut
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_commands_do_not_claim_verification() {
+        let result = bash::execute(serde_json::json!({ "command": "exit 0" })).await;
+        assert!(result.verification.is_none());
     }
 
     #[test]

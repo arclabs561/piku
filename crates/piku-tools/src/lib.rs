@@ -14,6 +14,7 @@ pub mod tool_search;
 pub mod write_file;
 
 use piku_api::ToolDefinition;
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -23,6 +24,8 @@ use piku_api::ToolDefinition;
 pub struct ToolResult {
     pub output: String,
     pub is_error: bool,
+    pub effects: Vec<ToolEffect>,
+    pub verification: Option<VerificationRecord>,
 }
 
 impl ToolResult {
@@ -31,6 +34,8 @@ impl ToolResult {
         Self {
             output,
             is_error: false,
+            effects: Vec::new(),
+            verification: None,
         }
     }
 
@@ -39,8 +44,62 @@ impl ToolResult {
         Self {
             output,
             is_error: true,
+            effects: Vec::new(),
+            verification: None,
         }
     }
+
+    #[must_use]
+    pub fn with_effect(mut self, effect: ToolEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    #[must_use]
+    pub fn with_verification(mut self, verification: VerificationRecord) -> Self {
+        self.verification = Some(verification);
+        self
+    }
+}
+
+/// A side effect observed by the concrete tool implementation.
+///
+/// This list is intentionally incomplete: arbitrary shell commands, partial
+/// failures, memory writes, and agent work may have effects Piku cannot yet
+/// describe structurally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEffect {
+    FileWrite {
+        path: PathBuf,
+        content_change: ContentChange,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentChange {
+    Created,
+    Modified,
+    Unchanged,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationRecord {
+    pub description: String,
+    pub status: VerificationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    Passed,
+    Failed { exit_code: Option<i32> },
+    Indeterminate { reason: VerificationIndeterminate },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationIndeterminate {
+    TimedOut,
+    SpawnFailed,
 }
 
 /// How destructive a tool call is, used by the permission system.

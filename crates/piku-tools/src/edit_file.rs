@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::{Destructiveness, ToolResult};
+use crate::{ContentChange, Destructiveness, ToolEffect, ToolResult};
 
 #[derive(Debug, Deserialize)]
 pub struct EditFileParams {
@@ -59,10 +59,17 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         return ToolResult::error("edit_file: old_string must not be empty".to_string());
     }
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let requested_path = std::path::PathBuf::from(&p.path);
+    let resolved_path = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        cwd.join(requested_path)
+    };
+
     // Apply the same limited path guard as write_file. This is not workspace
     // containment. PIKU_ALLOW_WRITE_ANY=1 disables the guard.
     if std::env::var("PIKU_ALLOW_WRITE_ANY").as_deref() != Ok("1") {
-        let cwd = std::env::current_dir().unwrap_or_default();
         if let Err(e) = crate::ensure_within_base(&p.path, &cwd) {
             return ToolResult::error(format!("edit_file refused: {e}"));
         }
@@ -101,8 +108,20 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         if count == 0 {
             return ToolResult::error(format!("edit_file: old_string not found in {}", p.path));
         }
-        return match std::fs::write(&p.path, restore(new_content)) {
-            Ok(()) => ToolResult::ok(format!("replaced {count} occurrences in {}", p.path)),
+        let final_content = restore(new_content);
+        let content_change = if final_content == raw {
+            ContentChange::Unchanged
+        } else {
+            ContentChange::Modified
+        };
+        return match std::fs::write(&p.path, final_content) {
+            Ok(()) => ToolResult::ok(format!("replaced {count} occurrences in {}", p.path))
+                .with_effect(ToolEffect::FileWrite {
+                    path: resolved_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| resolved_path.clone()),
+                    content_change,
+                }),
             Err(e) => ToolResult::error(format!("edit_file: write {}: {e}", p.path)),
         };
     }
@@ -116,8 +135,19 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         )),
         1 => {
             let new_content = content.replacen(&old_string_normalized, &new_string_normalized, 1);
-            match std::fs::write(&p.path, restore(new_content)) {
-                Ok(()) => ToolResult::ok(format!("edited {}", p.path)),
+            let final_content = restore(new_content);
+            let content_change = if final_content == raw {
+                ContentChange::Unchanged
+            } else {
+                ContentChange::Modified
+            };
+            match std::fs::write(&p.path, final_content) {
+                Ok(()) => ToolResult::ok(format!("edited {}", p.path)).with_effect(
+                    ToolEffect::FileWrite {
+                        path: resolved_path.canonicalize().unwrap_or(resolved_path),
+                        content_change,
+                    },
+                ),
                 Err(e) => ToolResult::error(format!("edit_file: write {}: {e}", p.path)),
             }
         }
