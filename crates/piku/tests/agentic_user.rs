@@ -60,9 +60,10 @@ mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord,
-    ObserverClaimRecord, ObserverRecord, PlaygroundLedger, ReviewClaimRecord, ReviewRecord,
-    RunEvidenceRecord, ScenarioContractRecord, SpendRecord, TurnRecord,
+    now_secs, AttentionMetrics, ConfigRecord, ControlMetrics, DevelopmentContextRecord,
+    EvidenceMetrics, ImprovementHandoffRecord, ObserverClaimRecord, ObserverRecord, OutcomeMetrics,
+    PlaygroundLedger, PrincipleMetricsRecord, ReviewClaimRecord, ReviewRecord, RunEvidenceRecord,
+    ScenarioContractRecord, SpendRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -4291,6 +4292,10 @@ fn run_agentic_session(persona: &Persona) {
     let mut piku_session_copy = String::new();
     let mut piku_run_record_copy = String::new();
     let mut run_evidence_findings = Vec::new();
+    let mut run_evidence_audit: Option<piku_runtime::RunAudit> = None;
+    let mut compact_projection_chars = 0;
+    let mut compact_projection_lines = 0;
+    let mut raw_record_bytes = 0;
     if let (Some(source), Some(ledger)) = (&piku_session_source, &ledger) {
         match ledger.copy_piku_session(Path::new(source)) {
             Ok(path) => {
@@ -4334,6 +4339,12 @@ fn run_agentic_session(persona: &Persona) {
                 )),
                 Ok(events) => {
                     let audit = piku_runtime::audit_run_record(&events);
+                    let compact_projection = piku::run_view::render_text(&events);
+                    compact_projection_chars = compact_projection.chars().count();
+                    compact_projection_lines = compact_projection.lines().count();
+                    raw_record_bytes = std::fs::metadata(&run_source)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
                     eprintln!(
                         "[run-evidence] turns {}/{}, tools {}/{}, permissions {}, context {} selected/{} excluded, findings {}",
                         audit.completed_turn_count,
@@ -4388,6 +4399,7 @@ fn run_agentic_session(persona: &Persona) {
                             )),
                         }
                     }
+                    run_evidence_audit = Some(audit);
                 }
                 Err(error) => run_evidence_findings.push(format!(
                     "[harness:MAJOR] could not read piku's durable run record at {}: {error}",
@@ -4553,6 +4565,113 @@ fn run_agentic_session(persona: &Persona) {
         for clause in contract.unverified_clauses() {
             eprintln!("[scenario] unverified {clause}");
             scenario_results.push(format!("unverified: {clause}"));
+        }
+    }
+
+    if let Some(ledger) = &ledger {
+        let audit_errors = run_evidence_audit.as_ref().map_or(0, |audit| {
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == piku_runtime::AuditSeverity::Error)
+                .count()
+        });
+        let audit_warnings = run_evidence_audit.as_ref().map_or(0, |audit| {
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == piku_runtime::AuditSeverity::Warning)
+                .count()
+        });
+        let metric = PrincipleMetricsRecord {
+            schema_version: 1,
+            kind: "principle_metrics",
+            run_id: ledger.run_id(),
+            timestamp_secs: now_secs(),
+            scenario_id: contract.map_or("none", |scenario| scenario.id),
+            outcome: OutcomeMetrics {
+                passed_checks: scenario_results
+                    .iter()
+                    .filter(|result| result.starts_with("pass:"))
+                    .count(),
+                failed_checks: scenario_results
+                    .iter()
+                    .filter(|result| result.starts_with("fail:"))
+                    .count(),
+                inconclusive_checks: scenario_results
+                    .iter()
+                    .filter(|result| result.starts_with("inconclusive:"))
+                    .count(),
+                unverified_clauses: scenario_results
+                    .iter()
+                    .filter(|result| result.starts_with("unverified:"))
+                    .count(),
+            },
+            attention: AttentionMetrics {
+                observed_terminal_chars: entries
+                    .iter()
+                    .map(|entry| entry.screen_text.chars().count())
+                    .sum(),
+                observed_terminal_lines: entries
+                    .iter()
+                    .map(|entry| entry.screen_text.lines().count())
+                    .sum(),
+                semantic_event_count: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.event_count),
+                compact_projection_chars,
+                compact_projection_lines,
+                raw_record_bytes,
+                artifact_bytes: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.content.artifact_bytes),
+            },
+            evidence: EvidenceMetrics {
+                structurally_complete: run_evidence_audit
+                    .as_ref()
+                    .map(piku_runtime::RunAudit::is_structurally_complete),
+                audit_errors,
+                audit_warnings,
+                context_messages_selected: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.context.messages_selected),
+                context_messages_excluded: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.context.messages_excluded),
+                unavailable_content_items: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.content.unavailable_items),
+                primary_claims: meta_review.claims.len(),
+                primary_valid_claims: meta_review
+                    .claims
+                    .iter()
+                    .filter(|claim| claim.verdict == "VALID")
+                    .count(),
+                observer_supported_claims: recursive_review
+                    .claim_assessments
+                    .iter()
+                    .filter(|claim| claim.disposition == "SUPPORTED")
+                    .count(),
+            },
+            control: ControlMetrics {
+                tool_calls_started: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.tool_calls_started),
+                permission_decisions_recorded: run_evidence_audit
+                    .as_ref()
+                    .map_or(0, |audit| audit.tool_calls_with_permission_decision),
+                permission_prompts_observed: entries
+                    .iter()
+                    .map(|entry| entry.permission_events.len())
+                    .sum(),
+            },
+            understanding_measurement: "not_measured_requires_human_trial",
+            continuity_measurement: "not_measured_requires_recovery_or_fork_scenario",
+        };
+        if let Err(error) = ledger.append_principle_metrics(&metric) {
+            harness_findings.push(format!(
+                "[harness:MAJOR] could not append principle metrics: {error}"
+            ));
         }
     }
 

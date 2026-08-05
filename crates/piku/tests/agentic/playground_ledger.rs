@@ -165,6 +165,62 @@ pub struct RunEvidenceRecord<'a> {
     pub audit: &'a piku_runtime::RunAudit,
 }
 
+/// Cross-domain metric vector for one run. Unmeasured human properties remain
+/// named as unavailable instead of being replaced with simulator proxies.
+#[derive(Serialize)]
+pub struct PrincipleMetricsRecord<'a> {
+    pub schema_version: u8,
+    pub kind: &'static str,
+    pub run_id: &'a str,
+    pub timestamp_secs: u64,
+    pub scenario_id: &'a str,
+    pub outcome: OutcomeMetrics,
+    pub attention: AttentionMetrics,
+    pub evidence: EvidenceMetrics,
+    pub control: ControlMetrics,
+    pub understanding_measurement: &'static str,
+    pub continuity_measurement: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct OutcomeMetrics {
+    pub passed_checks: usize,
+    pub failed_checks: usize,
+    pub inconclusive_checks: usize,
+    pub unverified_clauses: usize,
+}
+
+#[derive(Serialize)]
+pub struct AttentionMetrics {
+    pub observed_terminal_chars: usize,
+    pub observed_terminal_lines: usize,
+    pub semantic_event_count: usize,
+    pub compact_projection_chars: usize,
+    pub compact_projection_lines: usize,
+    pub raw_record_bytes: u64,
+    pub artifact_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct EvidenceMetrics {
+    pub structurally_complete: Option<bool>,
+    pub audit_errors: usize,
+    pub audit_warnings: usize,
+    pub context_messages_selected: usize,
+    pub context_messages_excluded: usize,
+    pub unavailable_content_items: usize,
+    pub primary_claims: usize,
+    pub primary_valid_claims: usize,
+    pub observer_supported_claims: usize,
+}
+
+#[derive(Serialize)]
+pub struct ControlMetrics {
+    pub tool_calls_started: usize,
+    pub permission_decisions_recorded: usize,
+    pub permission_prompts_observed: usize,
+}
+
 /// A bounded second-order review of the judge and the observed piku behavior.
 #[derive(Serialize)]
 pub struct ObserverRecord<'a> {
@@ -293,6 +349,13 @@ impl PlaygroundLedger {
     }
 
     pub fn append_run_evidence(&self, record: &RunEvidenceRecord<'_>) -> std::io::Result<()> {
+        self.append(record)
+    }
+
+    pub fn append_principle_metrics(
+        &self,
+        record: &PrincipleMetricsRecord<'_>,
+    ) -> std::io::Result<()> {
         self.append(record)
     }
 
@@ -446,6 +509,68 @@ mod tests {
             )
             .unwrap(),
             "evidence"
+        );
+    }
+
+    #[test]
+    fn principle_metrics_keep_human_dimensions_explicitly_unmeasured() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.jsonl");
+        let ledger = PlaygroundLedger::open_at(path.clone()).unwrap();
+        ledger
+            .append_principle_metrics(&PrincipleMetricsRecord {
+                schema_version: 1,
+                kind: "principle_metrics",
+                run_id: ledger.run_id(),
+                timestamp_secs: 1,
+                scenario_id: "delivery",
+                outcome: OutcomeMetrics {
+                    passed_checks: 2,
+                    failed_checks: 0,
+                    inconclusive_checks: 0,
+                    unverified_clauses: 1,
+                },
+                attention: AttentionMetrics {
+                    observed_terminal_chars: 500,
+                    observed_terminal_lines: 20,
+                    semantic_event_count: 8,
+                    compact_projection_chars: 180,
+                    compact_projection_lines: 9,
+                    raw_record_bytes: 1_200,
+                    artifact_bytes: 4_000,
+                },
+                evidence: EvidenceMetrics {
+                    structurally_complete: Some(true),
+                    audit_errors: 0,
+                    audit_warnings: 0,
+                    context_messages_selected: 4,
+                    context_messages_excluded: 2,
+                    unavailable_content_items: 0,
+                    primary_claims: 2,
+                    primary_valid_claims: 1,
+                    observer_supported_claims: 1,
+                },
+                control: ControlMetrics {
+                    tool_calls_started: 1,
+                    permission_decisions_recorded: 1,
+                    permission_prompts_observed: 0,
+                },
+                understanding_measurement: "not_measured_requires_human_trial",
+                continuity_measurement: "not_measured_requires_recovery_or_fork_scenario",
+            })
+            .unwrap();
+
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record["outcome"]["passed_checks"], 2);
+        assert_eq!(record["attention"]["compact_projection_chars"], 180);
+        assert_eq!(
+            record["understanding_measurement"],
+            "not_measured_requires_human_trial"
+        );
+        assert_eq!(
+            record["continuity_measurement"],
+            "not_measured_requires_recovery_or_fork_scenario"
         );
     }
 
