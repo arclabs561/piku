@@ -17,6 +17,10 @@ use piku_api::TokenUsage;
 /// Current on-disk schema for [`RunEventEnvelope`].
 pub const RUN_RECORD_SCHEMA_VERSION: u32 = 1;
 
+/// Content larger than this is stored beside the JSONL record as an artifact.
+/// The event stream stays cheap to scan while retaining the complete value.
+pub const RUN_INLINE_CONTENT_LIMIT_BYTES: usize = 16 * 1024;
+
 /// One ordered event in a durable run record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEventEnvelope {
@@ -143,6 +147,8 @@ pub struct UsageRecord {
 #[derive(Debug)]
 pub struct RunRecorder {
     path: PathBuf,
+    artifact_dir: PathBuf,
+    artifact_relative_dir: PathBuf,
     session_id: String,
     next_sequence: u64,
     writer: BufWriter<File>,
@@ -232,9 +238,16 @@ impl RunRecorder {
         let next_sequence = u64::try_from(existing.len())
             .map_err(|_| io::Error::other("run record contains too many events"))?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let artifact_dir = path.with_extension("artifacts");
+        let artifact_relative_dir = artifact_dir
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("run record path has no file name"))?;
 
         Ok(Self {
             path,
+            artifact_dir,
+            artifact_relative_dir,
             session_id,
             next_sequence,
             writer: BufWriter::new(file),
@@ -246,8 +259,9 @@ impl RunRecorder {
         &self.path
     }
 
-    pub fn append(&mut self, turn_id: impl Into<String>, event: RunEvent) -> io::Result<u64> {
+    pub fn append(&mut self, turn_id: impl Into<String>, mut event: RunEvent) -> io::Result<u64> {
         let sequence = self.next_sequence;
+        self.materialize_large_content(sequence, &mut event)?;
         let envelope = RunEventEnvelope {
             schema_version: RUN_RECORD_SCHEMA_VERSION,
             sequence,
@@ -264,6 +278,67 @@ impl RunRecorder {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("run event sequence overflow"))?;
         Ok(sequence)
+    }
+
+    fn materialize_large_content(&self, sequence: u64, event: &mut RunEvent) -> io::Result<()> {
+        let target = match event {
+            RunEvent::TurnStarted { input, .. } => Some(("input", input)),
+            RunEvent::CompactionApplied { summary, .. } => Some(("summary", summary)),
+            RunEvent::AssistantMessage { content } => Some(("assistant", content)),
+            RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
+            RunEvent::ContextBuilt { .. }
+            | RunEvent::ToolStarted { .. }
+            | RunEvent::PermissionDecision { .. }
+            | RunEvent::TurnCompleted { .. }
+            | RunEvent::Warning { .. } => None,
+        };
+        if let Some((label, content)) = target {
+            self.materialize_content(sequence, label, content)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_content(
+        &self,
+        sequence: u64,
+        label: &str,
+        content: &mut ContentRef,
+    ) -> io::Result<()> {
+        let ContentRef::Inline { text } = content else {
+            return Ok(());
+        };
+        if text.len() <= RUN_INLINE_CONTENT_LIMIT_BYTES {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.artifact_dir)?;
+        let file_name = format!("{sequence:08}-{label}.txt");
+        let destination = self.artifact_dir.join(&file_name);
+        let temporary = self
+            .artifact_dir
+            .join(format!(".{file_name}.tmp-{}", std::process::id()));
+        let bytes = u64::try_from(text.len())
+            .map_err(|_| io::Error::other("artifact length does not fit in u64"))?;
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            fs::rename(&temporary, &destination)
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result?;
+
+        *content = ContentRef::Artifact(ArtifactRef {
+            relative_path: self.artifact_relative_dir.join(file_name),
+            media_type: "text/plain; charset=utf-8".to_string(),
+            bytes,
+        });
+        Ok(())
     }
 }
 
@@ -412,6 +487,64 @@ mod tests {
         let error = read_run_record(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("line 1"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_large_content_before_referencing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session-1.jsonl");
+        let large = "evidence".repeat(RUN_INLINE_CONTENT_LIMIT_BYTES / 8 + 1);
+        let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
+        recorder
+            .append(
+                "turn-0",
+                RunEvent::AssistantMessage {
+                    content: ContentRef::Inline {
+                        text: large.clone(),
+                    },
+                },
+            )
+            .unwrap();
+        drop(recorder);
+
+        let events = read_run_record(&path).unwrap();
+        let RunEvent::AssistantMessage {
+            content: ContentRef::Artifact(artifact),
+        } = &events[0].event
+        else {
+            panic!("large assistant message was not materialized");
+        };
+        assert_eq!(artifact.bytes, u64::try_from(large.len()).unwrap());
+        assert_eq!(
+            fs::read_to_string(path.parent().unwrap().join(&artifact.relative_path)).unwrap(),
+            large
+        );
+    }
+
+    #[test]
+    fn leaves_small_content_inline() {
+        let path = test_path("inline");
+        let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
+        recorder
+            .append(
+                "turn-0",
+                RunEvent::AssistantMessage {
+                    content: ContentRef::Inline {
+                        text: "small".to_string(),
+                    },
+                },
+            )
+            .unwrap();
+        drop(recorder);
+
+        let events = read_run_record(&path).unwrap();
+        assert!(matches!(
+            &events[0].event,
+            RunEvent::AssistantMessage {
+                content: ContentRef::Inline { text }
+            } if text == "small"
+        ));
         fs::remove_file(path).unwrap();
     }
 }

@@ -54,7 +54,8 @@ pub use run_audit::{
 pub use run_record::{
     read_run_record, ArtifactRef, ContentRef as RunContentRef, ContextManifest, ContextMessage,
     ContextSection, ContextTool, PermissionDecision as RunPermissionDecision, RecordingSink,
-    RunEvent, RunEventEnvelope, RunRecorder, UsageRecord, RUN_RECORD_SCHEMA_VERSION,
+    RunEvent, RunEventEnvelope, RunRecorder, UsageRecord, RUN_INLINE_CONTENT_LIMIT_BYTES,
+    RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
