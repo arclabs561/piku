@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::run_record::{
-    ContentRef, EventScope, RunDisposition, RunEvent, RunEventEnvelope, UsageRecord,
+    ContentChange, ContentRef, EventScope, RunDisposition, RunEvent, RunEventEnvelope, ToolEffect,
+    UsageRecord, VerificationRecord, VerificationStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,15 @@ pub struct RunAudit {
     pub tool_calls_started: usize,
     pub tool_calls_completed: usize,
     pub tool_calls_with_permission_decision: usize,
+    pub tool_effect_count: usize,
+    pub files_created: usize,
+    pub files_modified: usize,
+    pub file_writes_unchanged: usize,
+    pub file_writes_unknown: usize,
+    pub verification_count: usize,
+    pub verification_passed: usize,
+    pub verification_failed: usize,
+    pub verification_indeterminate: usize,
     pub user_disposition_count: usize,
     pub latest_user_disposition: Option<RunDisposition>,
     pub context: ContextAudit,
@@ -117,6 +127,15 @@ impl<'a> Auditor<'a> {
                 tool_calls_started: 0,
                 tool_calls_completed: 0,
                 tool_calls_with_permission_decision: 0,
+                tool_effect_count: 0,
+                files_created: 0,
+                files_modified: 0,
+                file_writes_unchanged: 0,
+                file_writes_unknown: 0,
+                verification_count: 0,
+                verification_passed: 0,
+                verification_failed: 0,
+                verification_indeterminate: 0,
                 user_disposition_count: 0,
                 latest_user_disposition: None,
                 context: ContextAudit::default(),
@@ -178,10 +197,18 @@ impl<'a> Auditor<'a> {
             RunEvent::ToolCompleted {
                 tool_call_id,
                 result,
-                ..
+                is_error: _,
+                effects,
+                verification,
             } => {
                 audit_content(&mut self.audit.content, result);
-                self.on_tool_completed(turn_id, envelope, tool_call_id);
+                self.on_tool_completed(
+                    turn_id,
+                    envelope,
+                    tool_call_id,
+                    effects,
+                    verification.as_ref(),
+                );
             }
             RunEvent::TurnCompleted { usage, .. } => {
                 self.on_turn_completed(turn_id, envelope, usage);
@@ -351,6 +378,8 @@ impl<'a> Auditor<'a> {
         turn_id: &str,
         envelope: &RunEventEnvelope,
         tool_call_id: &str,
+        effects: &[ToolEffect],
+        verification: Option<&VerificationRecord>,
     ) {
         let Some(tool) = self.tools.get_mut(tool_call_id) else {
             self.add_finding(
@@ -381,6 +410,47 @@ impl<'a> Auditor<'a> {
             );
         } else {
             self.audit.tool_calls_completed += 1;
+        }
+        self.audit.tool_effect_count += effects.len();
+        for effect in effects {
+            let (path, content_change) = match effect {
+                ToolEffect::FileWrite {
+                    path,
+                    content_change,
+                } => (path, content_change),
+            };
+            match content_change {
+                ContentChange::Created => self.audit.files_created += 1,
+                ContentChange::Modified => self.audit.files_modified += 1,
+                ContentChange::Unchanged => self.audit.file_writes_unchanged += 1,
+                ContentChange::Unknown => self.audit.file_writes_unknown += 1,
+            }
+            if path.as_os_str().is_empty() {
+                self.add_finding(
+                    AuditSeverity::Error,
+                    "empty_effect_path",
+                    format!("tool call {tool_call_id} reports an empty effect path"),
+                    vec![envelope.sequence],
+                );
+            }
+        }
+        if let Some(verification) = verification {
+            self.audit.verification_count += 1;
+            match verification.status {
+                VerificationStatus::Passed => self.audit.verification_passed += 1,
+                VerificationStatus::Failed { .. } => self.audit.verification_failed += 1,
+                VerificationStatus::Indeterminate { .. } => {
+                    self.audit.verification_indeterminate += 1;
+                }
+            }
+            if verification.description.trim().is_empty() {
+                self.add_finding(
+                    AuditSeverity::Warning,
+                    "empty_verification_description",
+                    format!("tool call {tool_call_id} records verification without a description"),
+                    vec![envelope.sequence],
+                );
+            }
         }
     }
 
@@ -615,6 +685,8 @@ mod tests {
                     tool_call_id: "tool-1".to_string(),
                     result: inline("contents"),
                     is_error: false,
+                    effects: Vec::new(),
+                    verification: None,
                 },
             ),
             envelope(
@@ -659,6 +731,88 @@ mod tests {
             Some(RunDisposition::NeedsWork)
         );
         assert_eq!(audit.content.inline_items, 1);
+    }
+
+    #[test]
+    fn audits_effects_and_verification_as_separate_evidence_dimensions() {
+        let mut events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("test".to_string()),
+                    model: "model".to_string(),
+                    input: inline("change and verify"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextBuilt {
+                    manifest: ContextManifest {
+                        model: "model".to_string(),
+                        context_window_tokens: 100,
+                        estimated_input_tokens: 10,
+                        system_sections: Vec::new(),
+                        messages: Vec::new(),
+                        tools: Vec::new(),
+                    },
+                },
+            ),
+        ];
+        let statuses = [
+            VerificationStatus::Passed,
+            VerificationStatus::Failed { exit_code: Some(2) },
+            VerificationStatus::Indeterminate {
+                reason: crate::run_record::VerificationIndeterminate::TimedOut,
+            },
+        ];
+        for (index, status) in statuses.into_iter().enumerate() {
+            let sequence = 2 + u64::try_from(index).unwrap() * 2;
+            let tool_call_id = format!("tool-{index}");
+            events.push(envelope(
+                sequence,
+                RunEvent::ToolStarted {
+                    tool_call_id: tool_call_id.clone(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"purpose": "verification"}),
+                },
+            ));
+            events.push(envelope(
+                sequence + 1,
+                RunEvent::ToolCompleted {
+                    tool_call_id,
+                    result: inline("observed result"),
+                    is_error: !matches!(status, VerificationStatus::Passed),
+                    effects: (index == 1)
+                        .then(|| ToolEffect::FileWrite {
+                            path: "partial.txt".into(),
+                            content_change: ContentChange::Created,
+                        })
+                        .into_iter()
+                        .collect(),
+                    verification: Some(VerificationRecord {
+                        description: format!("check {index}"),
+                        status,
+                    }),
+                },
+            ));
+        }
+        events.push(envelope(
+            8,
+            RunEvent::TurnCompleted {
+                usage: UsageRecord::default(),
+                stop_reason: Some("end_turn".to_string()),
+            },
+        ));
+
+        let audit = audit_run_record(&events);
+
+        assert!(audit.is_structurally_complete());
+        assert_eq!(audit.tool_effect_count, 1);
+        assert_eq!(audit.files_created, 1);
+        assert_eq!(audit.verification_count, 3);
+        assert_eq!(audit.verification_passed, 1);
+        assert_eq!(audit.verification_failed, 1);
+        assert_eq!(audit.verification_indeterminate, 1);
     }
 
     #[test]
@@ -733,6 +887,8 @@ mod tests {
                     tool_call_id: "tool-1".to_string(),
                     result: inline("not available"),
                     is_error: true,
+                    effects: Vec::new(),
+                    verification: None,
                 },
             ),
             envelope(

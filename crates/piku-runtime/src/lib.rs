@@ -52,11 +52,12 @@ pub use run_audit::{
     audit_run_record, AuditSeverity, ContentAudit, ContextAudit, RunAudit, RunAuditFinding,
 };
 pub use run_record::{
-    read_run_record, ArtifactRef, ContentRef as RunContentRef, ContextManifest, ContextMessage,
-    ContextSection, ContextTool, EventScope as RunEventScope,
+    read_run_record, ArtifactRef, ContentChange as RunContentChange, ContentRef as RunContentRef,
+    ContextManifest, ContextMessage, ContextSection, ContextTool, EventScope as RunEventScope,
     PermissionDecision as RunPermissionDecision, RecordingSink, RunDisposition, RunEvent,
-    RunEventEnvelope, RunRecorder, UsageRecord, RUN_INLINE_CONTENT_LIMIT_BYTES,
-    RUN_RECORD_SCHEMA_VERSION,
+    RunEventEnvelope, RunRecorder, ToolEffect as RunToolEffect, UsageRecord,
+    VerificationIndeterminate, VerificationRecord, VerificationStatus,
+    RUN_INLINE_CONTENT_LIMIT_BYTES, RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{

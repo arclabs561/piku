@@ -15,7 +15,11 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
 use piku_api::{ApiError, Event, MessageRequest, Provider, StopReason, TokenUsage, ToolDefinition};
-use piku_runtime::{build_system_prompt, run_turn, AllowAll, OutputSink, PostToolAction, Session};
+use piku_runtime::{
+    build_system_prompt, read_run_record, run_turn, AllowAll, OutputSink, PostToolAction,
+    RecordingSink, RunContentChange, RunEvent, RunRecorder, RunToolEffect, Session,
+    VerificationStatus,
+};
 use piku_tools::all_tool_definitions;
 
 // ---------------------------------------------------------------------------
@@ -279,6 +283,76 @@ async fn e2e_reads_file_via_tool() {
 
     // Session: user + assistant(tool_use) + tool_result(user) + assistant(text)
     assert_eq!(session.messages.len(), 4);
+}
+
+#[tokio::test]
+async fn e2e_preserves_tool_reported_effect_and_verification_evidence() {
+    let dir = tempdir();
+    let changed_path = dir.join("created.txt");
+    let write_input = serde_json::json!({
+        "path": changed_path,
+        "content": "durable evidence"
+    })
+    .to_string();
+    let verification_input = serde_json::json!({
+        "command": "true",
+        "description": "fixture remains valid",
+        "purpose": "verification"
+    })
+    .to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("write-1", "write_file", &write_input),
+        tool_call_events("verify-1", "bash", &verification_input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("e2e-tool-evidence".to_string());
+    let mut sink = CollectSink::default();
+    let record_path = dir.join("run.jsonl");
+    let mut recorder = RunRecorder::open(&record_path, &session.id).unwrap();
+    {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, "turn-0");
+        run_turn(
+            "create and verify",
+            &mut session,
+            &provider,
+            "m",
+            &[],
+            all_tool_definitions(),
+            &AllowAll,
+            &mut recording_sink,
+            None,
+            None,
+        )
+        .await;
+        assert!(recording_sink.take_record_error().is_none());
+    }
+    drop(recorder);
+
+    let events = read_run_record(record_path).unwrap();
+    let completions = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            RunEvent::ToolCompleted {
+                tool_call_id,
+                effects,
+                verification,
+                ..
+            } => Some((tool_call_id, effects, verification)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 2);
+    assert!(matches!(
+        completions[0].1.as_slice(),
+        [RunToolEffect::FileWrite {
+            content_change: RunContentChange::Created,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        completions[1].2.as_ref().map(|record| record.status),
+        Some(VerificationStatus::Passed)
+    ));
 }
 
 #[tokio::test]

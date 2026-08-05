@@ -173,6 +173,10 @@ pub enum RunEvent {
         tool_call_id: String,
         result: ContentRef,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        effects: Vec<ToolEffect>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<VerificationRecord>,
     },
     TurnCompleted {
         usage: UsageRecord,
@@ -210,6 +214,101 @@ pub enum RunDisposition {
     Accepted,
     NeedsWork,
     Abandoned,
+}
+
+/// A concrete side effect reported by the tool implementation boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case")]
+pub enum ToolEffect {
+    FileWrite {
+        path: PathBuf,
+        content_change: ContentChange,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentChange {
+    Created,
+    Modified,
+    Unchanged,
+    Unknown,
+}
+
+/// The observed result of a command explicitly invoked as verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRecord {
+    pub description: String,
+    #[serde(flatten)]
+    pub status: VerificationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Passed,
+    Failed { exit_code: Option<i32> },
+    Indeterminate { reason: VerificationIndeterminate },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationIndeterminate {
+    TimedOut,
+    SpawnFailed,
+}
+
+impl From<piku_tools::ToolEffect> for ToolEffect {
+    fn from(effect: piku_tools::ToolEffect) -> Self {
+        match effect {
+            piku_tools::ToolEffect::FileWrite {
+                path,
+                content_change,
+            } => Self::FileWrite {
+                path,
+                content_change: content_change.into(),
+            },
+        }
+    }
+}
+
+impl From<piku_tools::ContentChange> for ContentChange {
+    fn from(change: piku_tools::ContentChange) -> Self {
+        match change {
+            piku_tools::ContentChange::Created => Self::Created,
+            piku_tools::ContentChange::Modified => Self::Modified,
+            piku_tools::ContentChange::Unchanged => Self::Unchanged,
+            piku_tools::ContentChange::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<piku_tools::VerificationRecord> for VerificationRecord {
+    fn from(record: piku_tools::VerificationRecord) -> Self {
+        Self {
+            description: record.description,
+            status: record.status.into(),
+        }
+    }
+}
+
+impl From<piku_tools::VerificationStatus> for VerificationStatus {
+    fn from(status: piku_tools::VerificationStatus) -> Self {
+        match status {
+            piku_tools::VerificationStatus::Passed => Self::Passed,
+            piku_tools::VerificationStatus::Failed { exit_code } => Self::Failed { exit_code },
+            piku_tools::VerificationStatus::Indeterminate { reason } => Self::Indeterminate {
+                reason: match reason {
+                    piku_tools::VerificationIndeterminate::TimedOut => {
+                        VerificationIndeterminate::TimedOut
+                    }
+                    piku_tools::VerificationIndeterminate::SpawnFailed => {
+                        VerificationIndeterminate::SpawnFailed
+                    }
+                },
+            },
+        }
+    }
 }
 
 /// Content retained inline, delegated to an artifact, or explicitly missing.
@@ -771,6 +870,59 @@ mod tests {
         assert_eq!(values[1]["schema_version"], 2);
         assert_eq!(values[1]["scope"], "turn");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_tool_completion_written_before_effect_evidence_existed() {
+        let legacy = r#"{"schema_version":2,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"tool_completed","tool_call_id":"call-1","result":{"storage":"inline","text":"ok"},"is_error":false}"#;
+
+        let event: RunEventEnvelope = serde_json::from_str(legacy).unwrap();
+        let RunEvent::ToolCompleted {
+            effects,
+            verification,
+            ..
+        } = &event.event
+        else {
+            panic!("expected tool completion");
+        };
+        assert!(effects.is_empty());
+        assert!(verification.is_none());
+
+        let value = serde_json::to_value(event).unwrap();
+        assert!(value.get("effects").is_none());
+        assert!(value.get("verification").is_none());
+    }
+
+    #[test]
+    fn effect_and_verification_evidence_round_trip() {
+        let event = RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence: 0,
+            recorded_at_ms: 0,
+            session_id: "session-1".to_string(),
+            scope: EventScope::Turn {
+                turn_id: "turn-0".to_string(),
+            },
+            event: RunEvent::ToolCompleted {
+                tool_call_id: "call-1".to_string(),
+                result: ContentRef::Inline {
+                    text: "tests passed".to_string(),
+                },
+                is_error: false,
+                effects: vec![ToolEffect::FileWrite {
+                    path: PathBuf::from("src/lib.rs"),
+                    content_change: ContentChange::Modified,
+                }],
+                verification: Some(VerificationRecord {
+                    description: "unit tests".to_string(),
+                    status: VerificationStatus::Passed,
+                }),
+            },
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        let decoded: RunEventEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
     }
 
     #[test]

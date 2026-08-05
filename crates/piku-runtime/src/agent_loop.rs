@@ -436,6 +436,8 @@ async fn run_turn_inner(
                     tool_call_id: tool_use_id.clone(),
                     result: crate::run_record::ContentRef::Inline { text: msg },
                     is_error: true,
+                    effects: Vec::new(),
+                    verification: None,
                 });
                 continue;
             }
@@ -463,6 +465,8 @@ async fn run_turn_inner(
                             text: format!("Blocked by hook: {reason}"),
                         },
                         is_error: true,
+                        effects: Vec::new(),
+                        verification: None,
                     });
                     continue;
                 }
@@ -493,6 +497,8 @@ async fn run_turn_inner(
                         tool_call_id: tool_use_id.clone(),
                         result: crate::run_record::ContentRef::Inline { text: result },
                         is_error: true,
+                        effects: Vec::new(),
+                        verification: None,
                     });
                     continue;
                 }
@@ -523,6 +529,8 @@ async fn run_turn_inner(
                         tool_call_id: tool_use_id.clone(),
                         result: crate::run_record::ContentRef::Inline { text: dedup_msg },
                         is_error: true,
+                        effects: Vec::new(),
+                        verification: None,
                     });
                     continue;
                 }
@@ -531,6 +539,8 @@ async fn run_turn_inner(
             sink.on_tool_start(tool_name, tool_use_id, params);
 
             // Route special tools through the runtime; everything else through execute_tool.
+            let mut tool_effects = Vec::new();
+            let mut verification = None;
             let (output, is_error) = if tool_name == "search_memory" {
                 // Semantic search over embedding store -- needs embedding the query
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -597,7 +607,7 @@ async fn run_turn_inner(
                 if is_mutating {
                     let _ = store.save(&store_path);
                 }
-                (result.output, result.is_error)
+                unpack_tool_result(result, &mut tool_effects, &mut verification)
             } else if tool_name == "record_attempt" {
                 // Record an attempt in the embedding store -- needs embedding
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -750,7 +760,7 @@ async fn run_turn_inner(
                     })
                     .collect();
                 let r = piku_tools::tool_search::execute_tool_search(params.clone(), &catalog);
-                (r.output, r.is_error)
+                unpack_tool_result(r, &mut tool_effects, &mut verification)
             } else if let Some(registry) = task_registry {
                 match tool_name.as_str() {
                     "spawn_agent" => execute_spawn_agent(
@@ -770,7 +780,7 @@ async fn run_turn_inner(
                     _ => {
                         let r = execute_tool(tool_name, params.clone()).await;
                         match r {
-                            Some(r) => (r.output, r.is_error),
+                            Some(r) => unpack_tool_result(r, &mut tool_effects, &mut verification),
                             None => (format!("unknown tool: {tool_name}"), true),
                         }
                     }
@@ -778,7 +788,7 @@ async fn run_turn_inner(
             } else {
                 let result = execute_tool(tool_name, params.clone()).await;
                 match result {
-                    Some(r) => (r.output, r.is_error),
+                    Some(r) => unpack_tool_result(r, &mut tool_effects, &mut verification),
                     None => (format!("unknown tool: {tool_name}"), true),
                 }
             };
@@ -816,6 +826,8 @@ async fn run_turn_inner(
                 tool_call_id: tool_use_id.clone(),
                 result: crate::run_record::ContentRef::Inline { text: output },
                 is_error,
+                effects: tool_effects,
+                verification,
             });
 
             // Self-update: sink detected a new binary — break cleanly after
@@ -911,6 +923,16 @@ async fn run_turn_inner(
         replace_and_exec,
         cancelled,
     }
+}
+
+fn unpack_tool_result(
+    result: piku_tools::ToolResult,
+    effects: &mut Vec<crate::run_record::ToolEffect>,
+    verification: &mut Option<crate::run_record::VerificationRecord>,
+) -> (String, bool) {
+    effects.extend(result.effects.into_iter().map(Into::into));
+    *verification = result.verification.map(Into::into);
+    (result.output, result.is_error)
 }
 
 // ---------------------------------------------------------------------------
