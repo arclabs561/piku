@@ -139,10 +139,6 @@ fn ollama_is_available(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 fn tempdir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1050,23 +1046,26 @@ impl PermissionResponse {
 }
 
 impl PtyHandle {
-    fn spawn(workspace: &Path, spec: &ProviderSpec, spend: Arc<RunSpend>) -> Self {
+    fn spawn(
+        workspace: &Path,
+        config_home: &Path,
+        spec: &ProviderSpec,
+        extra_args: &[String],
+        spend: Arc<RunSpend>,
+    ) -> Self {
         let piku_bin = piku_binary();
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c");
-
-        let inner_cmd = format!(
-            "cd {} && exec {} --provider {} --model {}",
-            shell_escape(&workspace.to_string_lossy()),
-            piku_bin.display(),
-            spec.label,
-            spec.model
-        );
-        cmd.arg(&inner_cmd);
+        let mut cmd = Command::new(&piku_bin);
+        cmd.current_dir(workspace)
+            .arg("--provider")
+            .arg(spec.label)
+            .arg("--model")
+            .arg(&spec.model)
+            .args(extra_args);
 
         // Clean env, set only what we need
         cmd.env_clear();
+        cmd.env("XDG_CONFIG_HOME", config_home);
         for (k, v) in spec.env_pairs() {
             cmd.env(&k, &v);
         }
@@ -3712,7 +3711,14 @@ fn run_agentic_session(persona: &Persona) {
     // One run's accounting, owned here and shared with the things that spend.
     let spend = Arc::new(RunSpend::default());
     let mut observer = TerminalObserver::new(40, 120);
-    let mut pty = PtyHandle::spawn(&workspace, &piku_spec, Arc::clone(&spend));
+    let piku_config_home = tempfile::tempdir().expect("isolated piku config home");
+    let mut pty = PtyHandle::spawn(
+        &workspace,
+        piku_config_home.path(),
+        &piku_spec,
+        &[],
+        Arc::clone(&spend),
+    );
     let mut ws_observer = WorkspaceObserver::new(workspace.clone());
     let mut memory = ConversationMemory::new();
     let ua_llm = LlmClient::new(ua_spec, Arc::clone(&spend));
@@ -4268,9 +4274,9 @@ fn run_agentic_session(persona: &Persona) {
         }
     }
 
-    // Exit piku cleanly. `exec` in `PtyHandle::spawn` makes this the actual
-    // PTY child, so the detached cleanup thread cannot strand a shell-owned
-    // piku. rexpect can still block while reaping an already-zombie child, so
+    // Exit piku cleanly. `PtyHandle::spawn` launches piku directly as the PTY
+    // child, so the detached cleanup thread cannot strand a shell-owned
+    // process. rexpect can still block while reaping an already-zombie child, so
     // never make the evaluator's evidence and review depend on that reap.
     eprintln!("[agentic_user] sending /exit to piku...");
     pty.clear_capture();
@@ -4868,7 +4874,14 @@ fn run_attempt_session(
     label: &str,
 ) -> (String, String) {
     let mut observer = TerminalObserver::new(40, 120);
-    let mut pty = PtyHandle::spawn(workspace, piku_spec, Arc::new(RunSpend::default()));
+    let config_home = tempfile::tempdir().expect("isolated piku config home");
+    let mut pty = PtyHandle::spawn(
+        workspace,
+        config_home.path(),
+        piku_spec,
+        &[],
+        Arc::new(RunSpend::default()),
+    );
     let ws_observer = WorkspaceObserver::new(workspace.to_path_buf());
 
     eprintln!("[attempt-tree] [{label}] waiting for startup...");
@@ -5576,6 +5589,173 @@ fn agentic_attempt_tree_learning() {
          run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
     );
     run_attempt_tree_evaluation();
+}
+
+fn wait_for_durable_turns(
+    pty: &mut PtyHandle,
+    observer: &mut TerminalObserver,
+    run_path: &Path,
+    expected_completed: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        pty.drain(observer);
+        if let Ok(events) = piku_runtime::read_run_record(run_path) {
+            if piku_runtime::audit_run_record(&events).completed_turn_count >= expected_completed {
+                return true;
+            }
+        }
+        if pty.is_dead() || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn latest_assistant_contains(session_path: &Path, needle: &str) -> bool {
+    piku_runtime::Session::load(session_path)
+        .ok()
+        .and_then(|session| {
+            session
+                .messages
+                .into_iter()
+                .rev()
+                .find(|message| message.role == piku_runtime::MessageRole::Assistant)
+        })
+        .is_some_and(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, piku_runtime::ContentBlock::Text { text } if text.contains(needle))
+            })
+        })
+}
+
+#[test]
+#[serial(agentic)]
+#[ignore = "live recovery trial; run with `cargo test --test agentic_user agentic_recovery_continuity -- --ignored --nocapture` and a provider"]
+fn agentic_recovery_continuity() {
+    load_playground_env();
+    let provider = piku_provider()
+        .expect("agentic recovery is opt-in and needs Ollama or a configured remote provider key");
+    eprintln!(
+        "[recovery-continuity] provider={} model={}",
+        provider.label, provider.model
+    );
+    let workspace = tempfile::tempdir().expect("recovery workspace");
+    let config_home = tempfile::tempdir().expect("isolated piku config home");
+    let marker = "recovery-trial-cobalt-7319";
+
+    let mut first_observer = TerminalObserver::new(40, 120);
+    let mut first = PtyHandle::spawn(
+        workspace.path(),
+        config_home.path(),
+        &provider,
+        &[],
+        Arc::new(RunSpend::default()),
+    );
+    let startup = first.wait_for_ready(&mut first_observer, Duration::from_secs(30));
+    assert!(
+        startup.is_ready(),
+        "initial piku process did not become ready"
+    );
+    let session_path = parse_session_path(&first.captured_text())
+        .map(PathBuf::from)
+        .expect("startup must report the isolated session path");
+    let session_id = session_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("session file must have a UTF-8 stem")
+        .to_string();
+    let run_path = config_home
+        .path()
+        .join("piku/runs")
+        .join(format!("{session_id}.jsonl"));
+
+    first.clear_capture();
+    first.send_line(&format!(
+        "Remember the exact marker {marker}. Do not call tools. Reply with only the marker."
+    ));
+    let first_completed = wait_for_durable_turns(
+        &mut first,
+        &mut first_observer,
+        &run_path,
+        1,
+        Duration::from_mins(3),
+    );
+    let first_acknowledged = latest_assistant_contains(&session_path, marker);
+    if !first_completed {
+        first.send_bytes(b"\x03");
+        first.settle(&mut first_observer, Duration::from_secs(1));
+    }
+    first.send_line("/exit");
+    first.settle(&mut first_observer, Duration::from_secs(2));
+    std::thread::spawn(move || drop(first));
+    assert!(first_completed, "first recovery turn did not finish");
+    assert!(
+        first_acknowledged,
+        "first process did not acknowledge the marker"
+    );
+    assert!(
+        session_path.exists(),
+        "first process did not save its session"
+    );
+
+    let resume_args = vec!["--resume".to_string(), session_id.clone()];
+    let mut resumed_observer = TerminalObserver::new(40, 120);
+    let mut resumed = PtyHandle::spawn(
+        workspace.path(),
+        config_home.path(),
+        &provider,
+        &resume_args,
+        Arc::new(RunSpend::default()),
+    );
+    let resumed_startup = resumed.wait_for_ready(&mut resumed_observer, Duration::from_secs(30));
+    assert!(
+        resumed_startup.is_ready(),
+        "resumed piku process did not become ready"
+    );
+    resumed.clear_capture();
+    resumed.send_line("Reply with only the exact marker retained by the prior process.");
+    let resumed_completed = wait_for_durable_turns(
+        &mut resumed,
+        &mut resumed_observer,
+        &run_path,
+        2,
+        Duration::from_mins(3),
+    );
+    let marker_recalled = latest_assistant_contains(&session_path, marker);
+    if !resumed_completed {
+        resumed.send_bytes(b"\x03");
+        resumed.settle(&mut resumed_observer, Duration::from_secs(1));
+    }
+    resumed.send_line("/exit");
+    resumed.settle(&mut resumed_observer, Duration::from_secs(2));
+    std::thread::spawn(move || drop(resumed));
+
+    let events = piku_runtime::read_run_record(&run_path).expect("recovered run record");
+    let audit = piku_runtime::audit_run_record(&events);
+    let sequence_contiguous = events
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event.sequence == u64::try_from(index).unwrap());
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "kind": "recovery_continuity_trial",
+            "provider": provider.label,
+            "model": provider.model,
+            "marker_recalled": marker_recalled,
+            "same_session_id": events.iter().all(|event| event.session_id == session_id),
+            "sequence_contiguous": sequence_contiguous,
+            "attempted_turns": audit.turn_count,
+            "completed_turns": audit.completed_turn_count,
+        })
+    );
+    assert!(resumed_completed, "recovered turn did not finish");
+    assert!(marker_recalled, "resumed process did not recall the marker");
+    assert!(sequence_contiguous);
+    assert_eq!(audit.turn_count, 2);
+    assert_eq!(audit.completed_turn_count, 2);
 }
 
 // ===========================================================================
