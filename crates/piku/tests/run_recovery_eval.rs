@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
+use piku::run_view::{build_search_index_with_artifacts, render_html_with_artifacts, render_text};
 use piku_api::{ApiError, Event, MessageRequest, Provider, RequestContent, StopReason, TokenUsage};
 use piku_runtime::{
     audit_run_record, read_run_record, AllowAll, ContentBlock, OutputSink, PostToolAction,
@@ -28,6 +29,27 @@ struct RecoveryMetric {
     sequence_contiguous: bool,
     attempted_turns: usize,
     completed_turns: usize,
+}
+
+/// What a surface exposes for one exact recovery-selection question.
+///
+/// This is a raw vector, not a score: each surface has a different trade-off
+/// between immediate inspection and its ability to join the run record back to
+/// the durable session message that supplied the selected context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryPresentationMetric {
+    surface: &'static str,
+    marker_candidates: usize,
+    recovered_context_candidates: usize,
+    false_positives: usize,
+    target_rank: Option<usize>,
+    chars_exposed_after_query: usize,
+    exact_session_index_visible: bool,
+    selected_flag_visible: bool,
+    typed_marker_to_selection_link_resolved: bool,
+    navigation_actions_to_context_event: Option<usize>,
+    navigation_actions_to_end_to_end_proof: Option<usize>,
+    provenance: BTreeSet<&'static str>,
 }
 
 struct CapturingProvider {
@@ -137,6 +159,152 @@ async fn run_recorded_turn(
     assert!(recording_sink.take_record_error().is_none());
 }
 
+fn measure_recovery_presentation(
+    events: &[piku_runtime::RunEventEnvelope],
+    session: &Session,
+    session_path: &std::path::Path,
+    recovered_run_path: &std::path::Path,
+    prior_marker_index: usize,
+) -> Vec<RecoveryPresentationMetric> {
+    let selection_query = format!("\"session_index\":{prior_marker_index}");
+    let compact = render_text(events);
+    let selected_context = events
+        .iter()
+        .filter(|event| {
+            event.scope.turn_id() == Some("turn-1")
+                && matches!(
+                    &event.event,
+                    RunEvent::ContextBuilt { manifest }
+                        if manifest.messages.iter().any(|message| {
+                            message.session_index == prior_marker_index && message.selected
+                        })
+                )
+        })
+        .collect::<Vec<_>>();
+    let selected_context_chars = selected_context
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap().chars().count())
+        .sum();
+    let search_index = build_search_index_with_artifacts(events, recovered_run_path).unwrap();
+    let selected_message = &session.messages[prior_marker_index];
+    let session_file_contains_marker = std::fs::read_to_string(session_path)
+        .unwrap()
+        .contains(PRIOR_MARKER);
+    let html = render_html_with_artifacts(events, recovered_run_path).unwrap();
+
+    assert!(compact.contains("turn-0"));
+    assert!(compact.contains("turn-1"));
+    assert!(compact.contains("2 / 2 turns complete"));
+    assert!(!compact.contains(&selection_query));
+    assert!(html.contains("default-src 'none'"));
+    assert!(html.contains("id=\"run-data\""));
+    assert!(session_file_contains_marker);
+    assert!(message_contains_marker(&selected_message.blocks));
+
+    vec![
+        RecoveryPresentationMetric {
+            surface: "terminal_compact",
+            marker_candidates: compact.match_indices(PRIOR_MARKER).count(),
+            recovered_context_candidates: 0,
+            false_positives: 0,
+            target_rank: None,
+            chars_exposed_after_query: compact.chars().count(),
+            exact_session_index_visible: false,
+            selected_flag_visible: false,
+            typed_marker_to_selection_link_resolved: false,
+            navigation_actions_to_context_event: None,
+            navigation_actions_to_end_to_end_proof: None,
+            provenance: BTreeSet::new(),
+        },
+        RecoveryPresentationMetric {
+            surface: "terminal_composed",
+            marker_candidates: usize::from(message_contains_marker(&selected_message.blocks)),
+            recovered_context_candidates: selected_context.len(),
+            false_positives: selected_context.len().saturating_sub(1),
+            target_rank: Some(1),
+            chars_exposed_after_query: selected_context_chars,
+            exact_session_index_visible: true,
+            selected_flag_visible: true,
+            typed_marker_to_selection_link_resolved: true,
+            navigation_actions_to_context_event: Some(2),
+            navigation_actions_to_end_to_end_proof: Some(3),
+            provenance: BTreeSet::from([
+                "sequence",
+                "scope",
+                "event_kind",
+                "session_index",
+                "selected",
+            ]),
+        },
+        browser_recovery_presentation(&search_index, &selection_query),
+    ]
+}
+
+fn browser_recovery_presentation(
+    search_index: &[piku::run_view::RunSearchEntry],
+    selection_query: &str,
+) -> RecoveryPresentationMetric {
+    let matches = search_index
+        .iter()
+        .filter(|entry| entry.search_text.contains(selection_query))
+        .collect::<Vec<_>>();
+    RecoveryPresentationMetric {
+        surface: "browser_workbench",
+        marker_candidates: search_index
+            .iter()
+            .filter(|entry| entry.search_text.contains(PRIOR_MARKER))
+            .count(),
+        recovered_context_candidates: matches.len(),
+        false_positives: matches.len().saturating_sub(1),
+        target_rank: matches
+            .iter()
+            .position(|entry| entry.event_kind == "context_built" && entry.scope == "turn-1")
+            .map(|index| index + 1),
+        chars_exposed_after_query: matches
+            .iter()
+            .map(|entry| entry.preview_text.chars().count())
+            .sum(),
+        exact_session_index_visible: matches
+            .iter()
+            .any(|entry| entry.search_text.contains(selection_query)),
+        selected_flag_visible: matches
+            .iter()
+            .any(|entry| entry.search_text.contains("\"selected\":true")),
+        typed_marker_to_selection_link_resolved: false,
+        navigation_actions_to_context_event: Some(1),
+        navigation_actions_to_end_to_end_proof: None,
+        provenance: BTreeSet::from([
+            "sequence",
+            "scope",
+            "event_kind",
+            "session_index",
+            "selected",
+        ]),
+    }
+}
+
+fn assert_recovery_presentation(presentation: &[RecoveryPresentationMetric]) {
+    let compact = &presentation[0];
+    let composed = &presentation[1];
+    let browser = &presentation[2];
+    assert_eq!(compact.surface, "terminal_compact");
+    assert_eq!(browser.surface, "browser_workbench");
+    assert_eq!(composed.recovered_context_candidates, 1);
+    assert_eq!(browser.recovered_context_candidates, 1);
+    assert_eq!(composed.target_rank, Some(1));
+    assert_eq!(browser.target_rank, Some(1));
+    assert_eq!(composed.false_positives, 0);
+    assert_eq!(browser.false_positives, 0);
+    assert!(browser.chars_exposed_after_query < compact.chars_exposed_after_query);
+    assert!(browser.exact_session_index_visible);
+    assert!(browser.selected_flag_visible);
+    assert!(!browser.typed_marker_to_selection_link_resolved);
+    assert!(composed.typed_marker_to_selection_link_resolved);
+    assert_eq!(browser.navigation_actions_to_context_event, Some(1));
+    assert_eq!(browser.navigation_actions_to_end_to_end_proof, None);
+    assert_eq!(composed.navigation_actions_to_end_to_end_proof, Some(3));
+}
+
 async fn evaluate_recovered_case(directory: &std::path::Path) -> RecoveryMetric {
     let session_path = directory.join("session.json");
     let recovered_run_path = directory.join("recovered-run.jsonl");
@@ -210,6 +378,14 @@ async fn evaluate_recovered_case(directory: &std::path::Path) -> RecoveryMetric 
                     })
             )
     });
+    let presentation = measure_recovery_presentation(
+        &events,
+        &recovered,
+        &session_path,
+        &recovered_run_path,
+        prior_marker_index.expect("the positive recovery fixture has the marker"),
+    );
+    assert_recovery_presentation(&presentation);
     let metrics = RecoveryMetric {
         prior_marker_available,
         prior_message_selected,
