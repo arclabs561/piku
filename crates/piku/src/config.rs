@@ -110,6 +110,12 @@ impl PikuConfig {
         self.config_dir.join("runs")
     }
 
+    /// Durable parent-child links for spawned agent runs.
+    #[must_use]
+    pub fn agent_links_dir(&self) -> PathBuf {
+        self.config_dir.join("agent-links")
+    }
+
     /// Check if a tool call is pre-allowed by the config allowlist.
     /// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rule matches.
     #[must_use]
@@ -276,6 +282,7 @@ mod tests {
         assert!(cfg.sessions_dir().ends_with("piku/sessions"));
         assert!(cfg.traces_dir().ends_with("piku/traces"));
         assert!(cfg.runs_dir().ends_with("piku/runs"));
+        assert!(cfg.agent_links_dir().ends_with("piku/agent-links"));
     }
 
     #[test]

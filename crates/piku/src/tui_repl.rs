@@ -1072,13 +1072,6 @@ async fn run_tui_repl_core(
         }
     }
 
-    let task_registry = TaskRegistry::new();
-    // Wire a notification channel so background agent completions inject
-    // a user-role message into the parent's interjection stream.
-    let (notif_tx, notif_rx): (InterjectionTx, InterjectionRx) = tokio::sync::mpsc::channel(32);
-    task_registry.set_notification_channel(notif_tx);
-    let mut notif_rx = notif_rx;
-
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
 
@@ -1089,6 +1082,17 @@ async fn run_tui_repl_core(
         let id = crate::new_session_id();
         (id.clone(), Session::new(id))
     };
+    let task_registry = TaskRegistry::with_persistence(
+        &session_id,
+        &sessions_dir,
+        config.runs_dir(),
+        config.agent_links_dir(),
+    );
+    // Wire a notification channel so background agent completions inject
+    // a user-role message into the parent's interjection stream.
+    let (notif_tx, notif_rx): (InterjectionTx, InterjectionRx) = tokio::sync::mpsc::channel(32);
+    task_registry.set_notification_channel(notif_tx);
+    let mut notif_rx = notif_rx;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
     // Announce the session at the start, not only on the way out. It is
     // rewritten after every turn, so a name known up front can be tailed live
