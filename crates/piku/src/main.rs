@@ -55,6 +55,11 @@ async fn main() -> anyhow::Result<()> {
         CliAction::Inspect { session_id, format } => {
             inspect_run(&config, &session_id, format)?;
         }
+        CliAction::Conclude {
+            session_id,
+            disposition,
+            note,
+        } => conclude_run(&config, &session_id, disposition, &note)?,
         CliAction::ArgError(msg) => {
             eprintln!("error: {msg}");
             eprintln!("Run `piku --help` for usage.");
@@ -113,6 +118,27 @@ fn inspect_run(config: &PikuConfig, session_id: &str, format: InspectFormat) -> 
             println!("{}", output_path.display());
         }
     }
+    Ok(())
+}
+
+fn conclude_run(
+    config: &PikuConfig,
+    session_id: &str,
+    disposition: piku_runtime::RunDisposition,
+    note: &str,
+) -> anyhow::Result<()> {
+    let path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        anyhow::bail!("no durable run record found at {}", path.display());
+    }
+    let mut recorder = RunRecorder::open(&path, session_id)?;
+    recorder.append_run(piku_runtime::RunEvent::UserDisposition {
+        disposition,
+        note: piku_runtime::RunContentRef::Inline {
+            text: note.to_string(),
+        },
+    })?;
+    println!("recorded {disposition:?} for {session_id}");
     Ok(())
 }
 
@@ -467,6 +493,7 @@ fn print_help() {
 USAGE:
     piku [OPTIONS] [PROMPT]
     piku inspect <SESSION_ID> [--json|--html]
+    piku conclude <SESSION_ID> --status <accepted|needs-work|abandoned> --note <TEXT>
 
 OPTIONS:
     -p, --print          Headless: run the prompt, print the result, and exit

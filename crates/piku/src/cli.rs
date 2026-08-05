@@ -14,6 +14,11 @@ pub enum CliAction {
         session_id: String,
         format: InspectFormat,
     },
+    Conclude {
+        session_id: String,
+        disposition: piku_runtime::RunDisposition,
+        note: String,
+    },
     /// Interactive REPL — no prompt given.
     Repl {
         model: Option<String>,
@@ -58,6 +63,9 @@ pub enum InspectFormat {
 pub fn parse_args(args: &[String]) -> CliAction {
     if args.first().is_some_and(|arg| arg == "inspect") {
         return parse_inspect_args(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "conclude") {
+        return parse_conclude_args(&args[1..]);
     }
     let mut model: Option<String> = None;
     let mut provider_override: Option<String> = None;
@@ -206,6 +214,61 @@ fn parse_inspect_args(args: &[String]) -> CliAction {
     }
 }
 
+fn parse_conclude_args(args: &[String]) -> CliAction {
+    let Some(session_id) = args.first().filter(|value| !value.starts_with('-')) else {
+        return CliAction::ArgError(
+            "conclude requires a session ID, --status, and --note".to_string(),
+        );
+    };
+    let mut disposition = None;
+    let mut note = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--status" => {
+                let Some(value) = args.get(index + 1) else {
+                    return CliAction::ArgError("--status requires a value".to_string());
+                };
+                disposition = match value.as_str() {
+                    "accepted" => Some(piku_runtime::RunDisposition::Accepted),
+                    "needs-work" => Some(piku_runtime::RunDisposition::NeedsWork),
+                    "abandoned" => Some(piku_runtime::RunDisposition::Abandoned),
+                    _ => {
+                        return CliAction::ArgError(
+                            "--status must be accepted, needs-work, or abandoned".to_string(),
+                        );
+                    }
+                };
+                index += 2;
+            }
+            "--note" => {
+                let Some(value) = args.get(index + 1).filter(|value| !value.trim().is_empty())
+                else {
+                    return CliAction::ArgError("--note requires non-empty text".to_string());
+                };
+                note = Some(value.clone());
+                index += 2;
+            }
+            other => {
+                return CliAction::ArgError(format!(
+                    "unknown conclude option {other} (expected --status or --note)"
+                ));
+            }
+        }
+    }
+    match (disposition, note) {
+        (Some(disposition), Some(note)) => CliAction::Conclude {
+            session_id: session_id.clone(),
+            disposition,
+            note,
+        },
+        _ => CliAction::ArgError(
+            "conclude requires both --status and --note (piku conclude <id> --status needs-work --note \"reason\")"
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +373,29 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["inspect", "--json"])),
             CliAction::ArgError(message) if message.contains("requires a session ID")
+        ));
+    }
+
+    #[test]
+    fn conclude_requires_an_explicit_disposition_and_note() {
+        assert!(matches!(
+            parse_args(&args(&[
+                "conclude",
+                "session-1",
+                "--status",
+                "needs-work",
+                "--note",
+                "verify the browser projection"
+            ])),
+            CliAction::Conclude {
+                session_id,
+                disposition: piku_runtime::RunDisposition::NeedsWork,
+                note,
+            } if session_id == "session-1" && note == "verify the browser projection"
+        ));
+        assert!(matches!(
+            parse_args(&args(&["conclude", "session-1", "--status", "accepted"])),
+            CliAction::ArgError(message) if message.contains("both --status and --note")
         ));
     }
 }

@@ -430,6 +430,44 @@ fn xdg_config_home_controls_session_location() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn conclude_appends_a_run_scoped_user_disposition() {
+    let config = tempfile::tempdir().unwrap();
+    let runs = config.path().join("piku/runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let record = runs.join("session-1.jsonl");
+    std::fs::write(
+        &record,
+        concat!(
+            r#"{"schema_version":2,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"warning","message":"initial"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let output = piku_clean_env()
+        .args([
+            "conclude",
+            "session-1",
+            "--status",
+            "needs-work",
+            "--note",
+            "verify the browser projection",
+        ])
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = std::fs::read_to_string(record).unwrap();
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(last["scope"], "run");
+    assert!(last.get("turn_id").is_none());
+    assert_eq!(last["event"], "user_disposition");
+    assert_eq!(last["disposition"], "needs_work");
+    assert_eq!(last["note"]["text"], "verify the browser projection");
+}
+
 // ---------------------------------------------------------------------------
 // ArgError: bad flag usage exits non-zero with actionable message
 // ---------------------------------------------------------------------------

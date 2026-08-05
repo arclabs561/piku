@@ -46,11 +46,12 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
             finding.severity, finding.code, finding.message
         );
     }
-    let mut current_turn = "";
+    let mut current_scope = "";
     for envelope in events {
-        if envelope.turn_id != current_turn {
-            current_turn = &envelope.turn_id;
-            let _ = writeln!(output, "\n{current_turn}");
+        let scope = envelope.scope.turn_id().unwrap_or("run");
+        if scope != current_scope {
+            current_scope = scope;
+            let _ = writeln!(output, "\n{current_scope}");
         }
         match &envelope.event {
             RunEvent::TurnStarted {
@@ -118,6 +119,13 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
             }
             RunEvent::Warning { message } => {
                 let _ = writeln!(output, "  ! {message}");
+            }
+            RunEvent::UserDisposition { disposition, note } => {
+                let _ = writeln!(
+                    output,
+                    "  ◆ user {disposition:?} · {}",
+                    content_preview(note, 160)
+                );
             }
         }
     }
@@ -191,10 +199,10 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script id="run-data" type="application/json">{}</script>
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
-const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>JSON.stringify(e).toLowerCase();const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result;
-function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}`;case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;default:return''}}}}
+const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>JSON.stringify(e).toLowerCase();const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
+function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}`;case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
 function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['tools',`${{audit.tool_calls_completed}} / ${{audit.tool_calls_started}}`,`${{audit.tool_calls_with_permission_decision}} permission decisions`],['context',`${{audit.context.messages_selected}} / ${{audit.context.messages_excluded}}`,'selected / excluded messages']];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
-function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q)&&!artifactText(eventContent(e))?.toLowerCase().includes(q))return;shown++;if(!seen.has(e.turn_id)){{seen.add(e.turn_id);const b=document.createElement('button');b.textContent=e.turn_id;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['turn',e.turn_id],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
+function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q)&&!artifactText(eventContent(e))?.toLowerCase().includes(q))return;shown++;const scope=scopeLabel(e);if(!seen.has(scope)){{seen.add(scope);const b=document.createElement('button');b.textContent=scope;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['scope',scope],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','scope','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
 </body></html>"#,
@@ -259,6 +267,7 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         | RunEvent::PermissionDecision { .. }
         | RunEvent::TurnCompleted { .. }
         | RunEvent::Warning { .. } => None,
+        RunEvent::UserDisposition { note, .. } => Some(note),
     }
 }
 
@@ -299,7 +308,20 @@ mod tests {
             sequence: 0,
             recorded_at_ms: 0,
             session_id: "session-1".to_string(),
-            turn_id: "turn-0".to_string(),
+            scope: piku_runtime::RunEventScope::Turn {
+                turn_id: "turn-0".to_string(),
+            },
+            event,
+        }
+    }
+
+    fn run_event(event: RunEvent) -> RunEventEnvelope {
+        RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence: 0,
+            recorded_at_ms: 0,
+            session_id: "session-1".to_string(),
+            scope: piku_runtime::RunEventScope::Run,
             event,
         }
     }
@@ -314,6 +336,24 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         })]);
         assert!(output.contains("12↑ 7↓ · end_turn"));
+    }
+
+    #[test]
+    fn projections_label_user_disposition_as_run_level() {
+        let disposition = run_event(RunEvent::UserDisposition {
+            disposition: piku_runtime::RunDisposition::Accepted,
+            note: RunContentRef::Inline {
+                text: "the evidence is sufficient".to_string(),
+            },
+        });
+
+        let text = render_text(std::slice::from_ref(&disposition));
+        let html = render_html(&[disposition]).unwrap();
+
+        assert!(text.contains("\nrun\n"));
+        assert!(text.contains("user Accepted · the evidence is sufficient"));
+        assert!(html.contains("user_disposition"));
+        assert!(html.contains("scopeLabel"));
     }
 
     #[test]
