@@ -1,4 +1,4 @@
-use piku::cli::{parse_args, CliAction};
+use piku::cli::{parse_args, CliAction, InspectFormat};
 use piku::config::PikuConfig;
 use piku::self_update;
 use piku::trace::TraceWriter;
@@ -52,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
         CliAction::Version => println!("piku {VERSION}"),
         CliAction::Help => print_help(),
         CliAction::Providers => print_providers(),
+        CliAction::Inspect { session_id, format } => {
+            inspect_run(&config, &session_id, format)?;
+        }
         CliAction::ArgError(msg) => {
             eprintln!("error: {msg}");
             eprintln!("Run `piku --help` for usage.");
@@ -89,6 +92,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn inspect_run(config: &PikuConfig, session_id: &str, format: InspectFormat) -> anyhow::Result<()> {
+    let path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    let events = piku_runtime::read_run_record(&path)?;
+    if events.is_empty() {
+        anyhow::bail!("no durable run record found at {}", path.display());
+    }
+    match format {
+        InspectFormat::Text => print!("{}", piku::run_view::render_text(&events)),
+        InspectFormat::Json => println!("{}", piku::run_view::render_json(&events)?),
+        InspectFormat::Html => {
+            let output_path = config.runs_dir().join(format!("{session_id}.html"));
+            std::fs::write(&output_path, piku::run_view::render_html(&events)?)?;
+            println!("{}", output_path.display());
+        }
+    }
     Ok(())
 }
 
@@ -442,6 +463,7 @@ fn print_help() {
 
 USAGE:
     piku [OPTIONS] [PROMPT]
+    piku inspect <SESSION_ID> [--json|--html]
 
 OPTIONS:
     -p, --print          Headless: run the prompt, print the result, and exit

@@ -10,6 +10,10 @@ pub enum CliAction {
     Version,
     Help,
     Providers,
+    Inspect {
+        session_id: String,
+        format: InspectFormat,
+    },
     /// Interactive REPL — no prompt given.
     Repl {
         model: Option<String>,
@@ -43,8 +47,18 @@ pub enum CliAction {
     ArgError(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectFormat {
+    Text,
+    Json,
+    Html,
+}
+
 #[must_use]
 pub fn parse_args(args: &[String]) -> CliAction {
+    if args.first().is_some_and(|arg| arg == "inspect") {
+        return parse_inspect_args(&args[1..]);
+    }
     let mut model: Option<String> = None;
     let mut provider_override: Option<String> = None;
     let mut resume_session: Option<String> = None;
@@ -168,6 +182,30 @@ pub fn parse_args(args: &[String]) -> CliAction {
     }
 }
 
+fn parse_inspect_args(args: &[String]) -> CliAction {
+    let Some(session_id) = args.first().filter(|value| !value.starts_with('-')) else {
+        return CliAction::ArgError(
+            "inspect requires a session ID (piku inspect <id> [--json|--html])".to_string(),
+        );
+    };
+    let mut format = InspectFormat::Text;
+    for arg in &args[1..] {
+        format = match arg.as_str() {
+            "--json" => InspectFormat::Json,
+            "--html" => InspectFormat::Html,
+            other => {
+                return CliAction::ArgError(format!(
+                    "unknown inspect option {other} (expected --json or --html)"
+                ));
+            }
+        };
+    }
+    CliAction::Inspect {
+        session_id: session_id.clone(),
+        format,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +291,25 @@ mod tests {
         assert!(matches!(
             parse_args(&args(&["--providers"])),
             CliAction::Providers
+        ));
+    }
+
+    #[test]
+    fn inspect_selects_a_projection() {
+        assert!(matches!(
+            parse_args(&args(&["inspect", "session-1", "--html"])),
+            CliAction::Inspect {
+                session_id,
+                format: InspectFormat::Html,
+            } if session_id == "session-1"
+        ));
+    }
+
+    #[test]
+    fn inspect_requires_an_id() {
+        assert!(matches!(
+            parse_args(&args(&["inspect", "--json"])),
+            CliAction::ArgError(message) if message.contains("requires a session ID")
         ));
     }
 }
