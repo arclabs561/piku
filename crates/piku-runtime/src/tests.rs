@@ -235,6 +235,7 @@ mod agent_loop {
         tool_ends: Vec<(String, bool)>,
         denied: Vec<String>,
         complete: bool,
+        run_events: Vec<crate::run_record::RunEvent>,
     }
 
     impl OutputSink for CaptureSink {
@@ -258,6 +259,9 @@ mod agent_loop {
         }
         fn on_turn_complete(&mut self, _usage: &TokenUsage, _iterations: u32) {
             self.complete = true;
+        }
+        fn on_run_event(&mut self, event: &crate::run_record::RunEvent) {
+            self.run_events.push(event.clone());
         }
     }
 
@@ -305,6 +309,57 @@ mod agent_loop {
         assert!(sink.complete);
         // session should have user + assistant messages
         assert_eq!(session.messages.len(), 2);
+        assert!(matches!(
+            sink.run_events.as_slice(),
+            [
+                crate::run_record::RunEvent::TurnStarted { .. },
+                crate::run_record::RunEvent::ContextBuilt { .. },
+                crate::run_record::RunEvent::AssistantMessage { .. },
+                crate::run_record::RunEvent::TurnCompleted { .. }
+            ]
+        ));
+        let crate::run_record::RunEvent::ContextBuilt { manifest } = &sink.run_events[1] else {
+            unreachable!();
+        };
+        assert_eq!(manifest.model, "test-model");
+        assert_eq!(manifest.messages.len(), 1);
+        assert!(manifest.messages[0].selected);
+    }
+
+    #[tokio::test]
+    async fn real_turn_reloads_from_the_durable_record() {
+        let provider = text_only_provider("durable answer");
+        let mut session = Session::new("durable-session".to_string());
+        let mut sink = CaptureSink::default();
+        let dir = tempdir();
+        let path = dir.join("run.jsonl");
+        let mut recorder = crate::run_record::RunRecorder::open(&path, &session.id).unwrap();
+        {
+            let mut recording_sink =
+                crate::run_record::RecordingSink::new(&mut sink, &mut recorder, "turn-0");
+            run_turn(
+                "durable question",
+                &mut session,
+                &provider,
+                "test-model",
+                &["You are helpful.".to_string()],
+                vec![],
+                &AllowAll,
+                &mut recording_sink,
+                None,
+                None,
+            )
+            .await;
+            assert!(recording_sink.take_record_error().is_none());
+        }
+
+        let events = crate::run_record::read_run_record(path).unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].turn_id, "turn-0");
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(crate::run_record::RunEvent::TurnCompleted { .. })
+        ));
     }
 
     #[tokio::test]

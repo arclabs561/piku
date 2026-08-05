@@ -104,6 +104,12 @@ impl PikuConfig {
         self.config_dir.join("traces")
     }
 
+    /// Durable semantic run records directory.
+    #[must_use]
+    pub fn runs_dir(&self) -> PathBuf {
+        self.config_dir.join("runs")
+    }
+
     /// Check if a tool call is pre-allowed by the config allowlist.
     /// Returns `Some(true)` if allowed, `Some(false)` if denied, `None` if no rule matches.
     #[must_use]
@@ -265,10 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn sessions_and_traces_dirs() {
+    fn sessions_traces_and_runs_dirs() {
         let cfg = PikuConfig::load(None, None, None);
         assert!(cfg.sessions_dir().ends_with("piku/sessions"));
         assert!(cfg.traces_dir().ends_with("piku/traces"));
+        assert!(cfg.runs_dir().ends_with("piku/runs"));
     }
 
     #[test]

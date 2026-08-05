@@ -49,8 +49,8 @@ pub use provider::{
 };
 pub use run_record::{
     read_run_record, ArtifactRef, ContentRef as RunContentRef, ContextManifest, ContextMessage,
-    ContextSection, ContextTool, PermissionDecision as RunPermissionDecision, RunEvent,
-    RunEventEnvelope, RunRecorder, UsageRecord, RUN_RECORD_SCHEMA_VERSION,
+    ContextSection, ContextTool, PermissionDecision as RunPermissionDecision, RecordingSink,
+    RunEvent, RunEventEnvelope, RunRecorder, UsageRecord, RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{

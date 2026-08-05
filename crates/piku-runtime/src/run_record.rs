@@ -11,6 +11,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{OutputSink, PostToolAction};
+use piku_api::TokenUsage;
+
 /// Current on-disk schema for [`RunEventEnvelope`].
 pub const RUN_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -118,6 +121,7 @@ pub struct ContextMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextTool {
     pub name: String,
+    pub estimated_tokens: usize,
     pub selected: bool,
     pub reason: String,
 }
@@ -142,6 +146,77 @@ pub struct RunRecorder {
     session_id: String,
     next_sequence: u64,
     writer: BufWriter<File>,
+}
+
+/// Adds durable semantic recording to any existing presentation sink.
+pub struct RecordingSink<'a> {
+    inner: &'a mut dyn OutputSink,
+    recorder: &'a mut RunRecorder,
+    turn_id: String,
+    record_error: Option<io::Error>,
+}
+
+impl<'a> RecordingSink<'a> {
+    pub fn new(
+        inner: &'a mut dyn OutputSink,
+        recorder: &'a mut RunRecorder,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            recorder,
+            turn_id: turn_id.into(),
+            record_error: None,
+        }
+    }
+
+    pub fn take_record_error(&mut self) -> Option<io::Error> {
+        self.record_error.take()
+    }
+}
+
+impl OutputSink for RecordingSink<'_> {
+    fn on_text(&mut self, text: &str) {
+        self.inner.on_text(text);
+    }
+
+    fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value) {
+        self.inner.on_tool_start(tool_name, tool_id, input);
+    }
+
+    fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
+        self.inner.on_tool_end(tool_name, result, is_error)
+    }
+
+    fn on_permission_denied(&mut self, tool_name: &str, reason: &str) {
+        self.inner.on_permission_denied(tool_name, reason);
+    }
+
+    fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
+        self.inner.on_turn_complete(usage, iterations);
+    }
+
+    fn on_interjection(&mut self, text: &str) {
+        self.inner.on_interjection(text);
+    }
+
+    fn on_context_pressure(&mut self, pressure: f32) {
+        self.inner.on_context_pressure(pressure);
+    }
+
+    fn on_provider_stream(&mut self, elapsed_ms: u64, blocks: usize, stop_reason: &str) {
+        self.inner
+            .on_provider_stream(elapsed_ms, blocks, stop_reason);
+    }
+
+    fn on_run_event(&mut self, event: &RunEvent) {
+        self.inner.on_run_event(event);
+        if self.record_error.is_none() {
+            if let Err(error) = self.recorder.append(&self.turn_id, event.clone()) {
+                self.record_error = Some(error);
+            }
+        }
+    }
 }
 
 impl RunRecorder {

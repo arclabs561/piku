@@ -1443,6 +1443,9 @@ async fn run_tui_repl_core(
                 // next one.
                 sink.trace
                     .session_config(resolved.name(), &model, read_only);
+                let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
+                let turn_id = format!("turn-{}", session.messages.len());
+                let mut recorder = piku_runtime::RunRecorder::open(&run_path, &session_id)?;
 
                 // Show a ticking thinking indicator on the input row.
                 // A background task updates it every second with elapsed time.
@@ -1542,6 +1545,8 @@ async fn run_tui_repl_core(
                     }
                 });
 
+                let mut recording_sink =
+                    piku_runtime::RecordingSink::new(&mut sink, &mut recorder, turn_id);
                 let result: TurnResult = run_turn_with_registry(
                     &full_input,
                     &mut session,
@@ -1550,7 +1555,7 @@ async fn run_tui_repl_core(
                     &system_sections,
                     tool_defs,
                     &prompter,
-                    &mut sink,
+                    &mut recording_sink,
                     config.max_turns,
                     Some(&mut notif_rx),
                     &task_registry,
@@ -1560,6 +1565,12 @@ async fn run_tui_repl_core(
                     Some(&cancel_flag),
                 )
                 .await;
+                if let Some(error) = recording_sink.take_record_error() {
+                    return Err(anyhow::anyhow!(
+                        "could not persist run record {}: {error}",
+                        run_path.display()
+                    ));
+                }
 
                 // Stop the keypress reader.
                 cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);

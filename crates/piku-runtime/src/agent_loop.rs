@@ -70,6 +70,10 @@ pub trait OutputSink: Send {
     /// loop or the terminal; they are different defects with the same symptom.
     /// Default: no-op.
     fn on_provider_stream(&mut self, _elapsed_ms: u64, _blocks: usize, _stop_reason: &str) {}
+
+    /// Called for durable semantic events. Presentation-only sinks may ignore
+    /// these; [`crate::run_record::RecordingSink`] persists them.
+    fn on_run_event(&mut self, _event: &crate::run_record::RunEvent) {}
 }
 
 /// A turn result after the full agentic loop for one user message.
@@ -190,6 +194,13 @@ async fn run_turn_inner(
 
     // push user message
     session.push(ConversationMessage::user(input));
+    sink.on_run_event(&crate::run_record::RunEvent::TurnStarted {
+        provider: Some(provider.name().to_string()),
+        model: model.to_string(),
+        input: crate::run_record::ContentRef::Inline {
+            text: input.to_string(),
+        },
+    });
 
     let turn_start = std::time::Instant::now();
     let mut tracker = UsageTracker::default();
@@ -256,6 +267,7 @@ async fn run_turn_inner(
             if vetoed {
                 // Hook vetoed compaction -- skip this cycle.
             } else {
+                let before_messages = session.messages.len();
                 let result = crate::compact::compact_session(session, compact_cfg);
                 let method = if result.removed_message_count == 0 {
                     "mask"
@@ -263,6 +275,27 @@ async fn run_turn_inner(
                     "structural"
                 };
                 if result.removed_message_count > 0 {
+                    let masked_tool_results = result
+                        .compacted_session
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.blocks)
+                        .filter(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::ToolResult { output, .. }
+                                    if output.starts_with("[masked:")
+                            )
+                        })
+                        .count();
+                    sink.on_run_event(&crate::run_record::RunEvent::CompactionApplied {
+                        before_messages,
+                        after_messages: result.compacted_session.messages.len(),
+                        masked_tool_results,
+                        summary: crate::run_record::ContentRef::Inline {
+                            text: result.formatted_summary.clone(),
+                        },
+                    });
                     // Trigger memory extraction on the messages being compacted away.
                     // Guarded: skip if a previous extraction is still in flight (prevents
                     // race conditions on the store file).
@@ -308,7 +341,8 @@ async fn run_turn_inner(
             } // else compact_allowed
         }
 
-        let request = build_request(session, model, system_prompt, &tool_defs);
+        let (request, manifest) = build_request(session, model, system_prompt, &tool_defs);
+        sink.on_run_event(&crate::run_record::RunEvent::ContextBuilt { manifest });
 
         // stream the response
         let stream_started = std::time::Instant::now();
@@ -343,6 +377,20 @@ async fn run_turn_inner(
             });
         }
 
+        let assistant_text = assistant_blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        sink.on_run_event(&crate::run_record::RunEvent::AssistantMessage {
+            content: crate::run_record::ContentRef::Inline {
+                text: assistant_text,
+            },
+        });
+
         // extract tool calls from this assistant message
         let tool_calls: Vec<(String, String, serde_json::Value)> = assistant_blocks
             .iter()
@@ -370,15 +418,25 @@ async fn run_turn_inner(
         let session_id_for_hooks = session.id.clone();
 
         for (tool_use_id, tool_name, params) in &tool_calls {
+            sink.on_run_event(&crate::run_record::RunEvent::ToolStarted {
+                tool_call_id: tool_use_id.clone(),
+                name: tool_name.clone(),
+                arguments: params.clone(),
+            });
             if !advertised_tool_names.contains(tool_name) {
                 let msg = format!("{tool_name} is not available in this mode");
                 sink.on_tool_start(tool_name, tool_use_id, params);
                 sink.on_tool_end(tool_name, &msg, true);
                 session.push(ConversationMessage::tool_result(
                     tool_use_id.clone(),
-                    msg,
+                    msg.clone(),
                     true,
                 ));
+                sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                    tool_call_id: tool_use_id.clone(),
+                    result: crate::run_record::ContentRef::Inline { text: msg },
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -399,6 +457,13 @@ async fn run_turn_inner(
                         format!("Blocked by hook: {reason}"),
                         true,
                     ));
+                    sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                        tool_call_id: tool_use_id.clone(),
+                        result: crate::run_record::ContentRef::Inline {
+                            text: format!("Blocked by hook: {reason}"),
+                        },
+                        is_error: true,
+                    });
                     continue;
                 }
                 hook_context = hook_result.context;
@@ -406,14 +471,29 @@ async fn run_turn_inner(
 
             // permission check
             match check_permission(tool_name, params, prompter) {
-                PermissionOutcome::Allow => {}
+                PermissionOutcome::Allow => {
+                    sink.on_run_event(&crate::run_record::RunEvent::PermissionDecision {
+                        tool_call_id: tool_use_id.clone(),
+                        decision: crate::run_record::PermissionDecision::Allowed,
+                    });
+                }
                 PermissionOutcome::Deny { reason } => {
+                    sink.on_run_event(&crate::run_record::RunEvent::PermissionDecision {
+                        tool_call_id: tool_use_id.clone(),
+                        decision: crate::run_record::PermissionDecision::Denied,
+                    });
                     sink.on_permission_denied(tool_name, &reason);
+                    let result = format!("Permission denied: {reason}");
                     session.push(ConversationMessage::tool_result(
                         tool_use_id.clone(),
-                        format!("Permission denied: {reason}"),
+                        result.clone(),
                         true,
                     ));
+                    sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                        tool_call_id: tool_use_id.clone(),
+                        result: crate::run_record::ContentRef::Inline { text: result },
+                        is_error: true,
+                    });
                     continue;
                 }
             }
@@ -436,9 +516,14 @@ async fn run_turn_inner(
                     sink.on_tool_end(tool_name, &dedup_msg, true);
                     session.push(ConversationMessage::tool_result(
                         tool_use_id.clone(),
-                        dedup_msg,
+                        dedup_msg.clone(),
                         true,
                     ));
+                    sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                        tool_call_id: tool_use_id.clone(),
+                        result: crate::run_record::ContentRef::Inline { text: dedup_msg },
+                        is_error: true,
+                    });
                     continue;
                 }
             }
@@ -724,9 +809,14 @@ async fn run_turn_inner(
 
             session.push(ConversationMessage::tool_result(
                 tool_use_id.clone(),
-                output,
+                output.clone(),
                 is_error,
             ));
+            sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                tool_call_id: tool_use_id.clone(),
+                result: crate::run_record::ContentRef::Inline { text: output },
+                is_error,
+            });
 
             // Self-update: sink detected a new binary — break cleanly after
             // persisting this tool result, then signal the caller.
@@ -771,6 +861,25 @@ async fn run_turn_inner(
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
 
+    let completion_reason = if replace_and_exec.is_some() {
+        "replace_and_exec"
+    } else if cancelled {
+        "cancelled"
+    } else if stream_error.is_some() {
+        "error"
+    } else if iterations >= max {
+        "max_turns"
+    } else {
+        "end_turn"
+    };
+    sink.on_run_event(&crate::run_record::RunEvent::TurnCompleted {
+        usage: crate::run_record::UsageRecord {
+            input_tokens: u64::from(tracker.cumulative.input_tokens),
+            output_tokens: u64::from(tracker.cumulative.output_tokens),
+        },
+        stop_reason: Some(completion_reason.to_string()),
+    });
+
     // Context pressure: clamped input_tokens / model_window. We only need
     // ~2 significant figures for a 0-1 ratio, so u32→f32 precision loss
     // is fine. `pressure` is always in [0, 1].
@@ -783,24 +892,13 @@ async fn run_turn_inner(
     // Stop hooks -- fire after turn completes (notifications, logging, cleanup).
     if let Some(hooks) = hook_registry {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let reason = if replace_and_exec.is_some() {
-            "replace_and_exec"
-        } else if cancelled {
-            "cancelled"
-        } else if stream_error.is_some() {
-            "error"
-        } else if iterations >= max {
-            "max_turns"
-        } else {
-            "end_turn"
-        };
         #[allow(clippy::cast_possible_truncation)] // turn durations won't exceed u64::MAX ms
         let duration_ms = turn_start.elapsed().as_millis() as u64;
         hooks.run_stop(
             &session.id,
             &cwd,
             iterations,
-            reason,
+            completion_reason,
             &tracker.cumulative,
             duration_ms,
         );
@@ -970,10 +1068,21 @@ const CONTEXT_USAGE_CAP: f32 = 0.70;
 /// message of a pair is selected.
 ///
 /// `model_window` is the provider's context window in tokens.
+#[cfg(test)]
 pub(crate) fn curate_messages(
     messages: &[crate::session::ConversationMessage],
     model_window: usize,
 ) -> Vec<&crate::session::ConversationMessage> {
+    curate_message_indices(messages, model_window)
+        .into_iter()
+        .map(|index| &messages[index])
+        .collect()
+}
+
+fn curate_message_indices(
+    messages: &[crate::session::ConversationMessage],
+    model_window: usize,
+) -> Vec<usize> {
     let total: usize = messages
         .iter()
         .map(crate::session::ConversationMessage::estimated_tokens)
@@ -988,7 +1097,7 @@ pub(crate) fn curate_messages(
     )]
     let budget = ((model_window as f32) * CONTEXT_USAGE_CAP) as usize;
     if total <= budget || messages.len() <= CURATION_TAIL_SIZE {
-        return messages.iter().collect();
+        return (0..messages.len()).collect();
     }
 
     let tail_start = messages.len() - CURATION_TAIL_SIZE;
@@ -1031,7 +1140,7 @@ pub(crate) fn curate_messages(
         }
     }
 
-    included.into_iter().map(|i| &messages[i]).collect()
+    included.into_iter().collect()
 }
 
 /// Find the last index of the pair that starts at `idx`. If the message
@@ -1059,29 +1168,48 @@ fn build_request(
     model: &str,
     system_prompt: &[String],
     tool_defs: &[ToolDefinition],
-) -> MessageRequest {
+) -> (MessageRequest, crate::run_record::ContextManifest) {
     // Split system prompt at the boundary marker.
     // Everything before it is static and can be cached by Anthropic.
     // Everything after is dynamic (cwd, date, git status) and changes per turn.
     let boundary_pos = system_prompt.iter().position(|s| s == DYNAMIC_BOUNDARY);
 
+    let mut manifest_system_sections = Vec::new();
     let system = {
         let mut blocks: Vec<piku_api::SystemBlock> = Vec::new();
         if let Some(idx) = boundary_pos {
             // Static prefix → single cached block
             let static_text = system_prompt[..idx].join("\n\n");
             if !static_text.is_empty() {
+                manifest_system_sections.push(crate::run_record::ContextSection {
+                    label: "static".to_string(),
+                    estimated_tokens: static_text.len() / 4 + 1,
+                    selected: true,
+                    reason: "cached_static_prefix".to_string(),
+                });
                 blocks.push(piku_api::SystemBlock::cached(static_text));
             }
             // Dynamic suffix → uncached block
             let dynamic_text = system_prompt[idx + 1..].join("\n\n");
             if !dynamic_text.is_empty() {
+                manifest_system_sections.push(crate::run_record::ContextSection {
+                    label: "dynamic".to_string(),
+                    estimated_tokens: dynamic_text.len() / 4 + 1,
+                    selected: true,
+                    reason: "uncached_dynamic_suffix".to_string(),
+                });
                 blocks.push(piku_api::SystemBlock::text(dynamic_text));
             }
         } else {
             // No boundary — send everything as a single uncached block
             let text = system_prompt.join("\n\n");
             if !text.is_empty() {
+                manifest_system_sections.push(crate::run_record::ContextSection {
+                    label: "system".to_string(),
+                    estimated_tokens: text.len() / 4 + 1,
+                    selected: true,
+                    reason: "uncached_system_prompt".to_string(),
+                });
                 blocks.push(piku_api::SystemBlock::text(text));
             }
         }
@@ -1099,7 +1227,38 @@ fn build_request(
     // Always keeps the last 6 messages (tail) + any high-importance
     // older messages that fit. See `curate_messages`.
     let window = piku_context_window_for_model(model);
-    let selected = curate_messages(&session.messages, window);
+    let selected_indices = curate_message_indices(&session.messages, window);
+    let selected_set: std::collections::BTreeSet<usize> =
+        selected_indices.iter().copied().collect();
+    let all_messages_selected = selected_indices.len() == session.messages.len();
+    let tail_start = session.messages.len().saturating_sub(CURATION_TAIL_SIZE);
+    let manifest_messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let selected = selected_set.contains(&index);
+            let reason = if all_messages_selected {
+                "within_context_budget"
+            } else if selected && index >= tail_start {
+                "recent_tail"
+            } else if selected {
+                "importance_budget"
+            } else {
+                "excluded_by_importance_budget"
+            };
+            crate::run_record::ContextMessage {
+                session_index: index,
+                role: message_role_name(&message.role).to_string(),
+                estimated_tokens: message.estimated_tokens(),
+                selected,
+                reason: reason.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = selected_indices
+        .iter()
+        .map(|&index| &session.messages[index]);
 
     // System-role messages from compaction are injected as user-role text
     // with a clear wrapper (the API doesn't support mid-conversation system messages).
@@ -1213,13 +1372,56 @@ fn build_request(
     // reject with a 400.
     let api_messages = coalesce_consecutive_roles(api_messages);
 
-    MessageRequest {
+    let manifest_tools = tool_defs
+        .iter()
+        .map(|tool| crate::run_record::ContextTool {
+            name: tool.name.clone(),
+            estimated_tokens: serde_json::to_string(tool).map_or(0, |json| json.len() / 4 + 1),
+            selected: true,
+            reason: "advertised_to_provider".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let estimated_input_tokens = manifest_system_sections
+        .iter()
+        .map(|section| section.estimated_tokens)
+        .sum::<usize>()
+        + manifest_messages
+            .iter()
+            .filter(|message| message.selected)
+            .map(|message| message.estimated_tokens)
+            .sum::<usize>()
+        + manifest_tools
+            .iter()
+            .map(|tool| tool.estimated_tokens)
+            .sum::<usize>();
+    let manifest = crate::run_record::ContextManifest {
         model: model.to_string(),
-        max_tokens: 8192,
-        messages: api_messages,
-        system,
-        tools: Some(tool_defs.to_vec()),
-        stream: true,
+        context_window_tokens: window,
+        estimated_input_tokens,
+        system_sections: manifest_system_sections,
+        messages: manifest_messages,
+        tools: manifest_tools,
+    };
+
+    (
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 8192,
+            messages: api_messages,
+            system,
+            tools: Some(tool_defs.to_vec()),
+            stream: true,
+        },
+        manifest,
+    )
+}
+
+fn message_role_name(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+        MessageRole::System => "system",
     }
 }
 

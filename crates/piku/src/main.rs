@@ -7,7 +7,10 @@ use piku::tui_repl;
 use std::env;
 use std::io::{self, Write};
 
-use piku_runtime::{build_system_prompt, run_turn, AllowAll, OutputSink, Session, TurnResult};
+use piku_runtime::{
+    build_system_prompt, run_turn, AllowAll, OutputSink, RecordingSink, RunRecorder, Session,
+    TurnResult,
+};
 use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
@@ -251,6 +254,10 @@ async fn run_single_shot(
     let trace = TraceWriter::open(&traces_dir, &session_id);
     let mut sink = StdoutSink::new(trace);
     sink.trace.prompt(prompt);
+    let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    let turn_id = format!("turn-{}", session.messages.len());
+    let mut recorder = RunRecorder::open(&run_path, &session_id)?;
+    let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
 
     let result: TurnResult = run_turn(
         prompt,
@@ -260,11 +267,17 @@ async fn run_single_shot(
         &system_sections,
         tool_defs,
         &prompter,
-        &mut sink,
+        &mut recording_sink,
         None,
         None,
     )
     .await;
+    if let Some(error) = recording_sink.take_record_error() {
+        anyhow::bail!(
+            "could not persist run record {}: {error}",
+            run_path.display()
+        );
+    }
 
     if let Some(err) = &result.stream_error {
         eprintln!("[piku] stream error: {err}");
