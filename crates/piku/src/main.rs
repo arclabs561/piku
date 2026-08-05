@@ -106,7 +106,10 @@ fn inspect_run(config: &PikuConfig, session_id: &str, format: InspectFormat) -> 
         InspectFormat::Json => println!("{}", piku::run_view::render_json(&events)?),
         InspectFormat::Html => {
             let output_path = config.runs_dir().join(format!("{session_id}.html"));
-            std::fs::write(&output_path, piku::run_view::render_html(&events)?)?;
+            std::fs::write(
+                &output_path,
+                piku::run_view::render_html_with_artifacts(&events, &path)?,
+            )?;
             println!("{}", output_path.display());
         }
     }

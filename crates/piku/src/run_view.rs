@@ -1,6 +1,8 @@
 //! Read-only projections of Piku's durable semantic run record.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::path::{Component, Path};
 
 use piku_runtime::{audit_run_record, RunContentRef as ContentRef, RunEvent, RunEventEnvelope};
 
@@ -130,11 +132,29 @@ pub fn render_json(events: &[RunEventEnvelope]) -> serde_json::Result<String> {
 }
 
 pub fn render_html(events: &[RunEventEnvelope]) -> serde_json::Result<String> {
+    render_html_document(events, &BTreeMap::new())
+}
+
+/// Render a self-contained workbench with referenced text artifacts embedded.
+/// Artifact paths are constrained to the run directory before they are read.
+pub fn render_html_with_artifacts(
+    events: &[RunEventEnvelope],
+    record_path: &Path,
+) -> std::io::Result<String> {
+    let artifacts = load_artifacts(events, record_path)?;
+    render_html_document(events, &artifacts).map_err(std::io::Error::other)
+}
+
+fn render_html_document(
+    events: &[RunEventEnvelope],
+    artifacts: &BTreeMap<String, String>,
+) -> serde_json::Result<String> {
     let title = events
         .first()
         .map_or("Piku run", |event| event.session_id.as_str());
     let data = serde_json::to_string(&serde_json::json!({
         "audit": audit_run_record(events),
+        "artifacts": artifacts,
         "events": events,
     }))?
     .replace('&', "\\u0026")
@@ -171,10 +191,10 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script id="run-data" type="application/json">{}</script>
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
-const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>JSON.stringify(e).toLowerCase();const content=c=>c?.text??(c?.relative_path?`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');
+const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>JSON.stringify(e).toLowerCase();const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result;
 function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}`;case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;default:return''}}}}
 function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['tools',`${{audit.tool_calls_completed}} / ${{audit.tool_calls_started}}`,`${{audit.tool_calls_with_permission_decision}} permission decisions`],['context',`${{audit.context.messages_selected}} / ${{audit.context.messages_excluded}}`,'selected / excluded messages']];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
-function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;if(!seen.has(e.turn_id)){{seen.add(e.turn_id);const b=document.createElement('button');b.textContent=e.turn_id;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['turn',e.turn_id],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
+function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q)&&!artifactText(eventContent(e))?.toLowerCase().includes(q))return;shown++;if(!seen.has(e.turn_id)){{seen.add(e.turn_id);const b=document.createElement('button');b.textContent=e.turn_id;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['turn',e.turn_id],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
 </body></html>"#,
@@ -182,6 +202,64 @@ filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));doc
         escape_html(title),
         data
     ))
+}
+
+fn load_artifacts(
+    events: &[RunEventEnvelope],
+    record_path: &Path,
+) -> std::io::Result<BTreeMap<String, String>> {
+    let base = record_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("run record path has no parent"))?;
+    let mut artifacts = BTreeMap::new();
+    for content in events.iter().filter_map(event_content) {
+        let ContentRef::Artifact(artifact) = content else {
+            continue;
+        };
+        if artifact.relative_path.is_absolute()
+            || artifact
+                .relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact path escapes run directory: {}",
+                    artifact.relative_path.display()
+                ),
+            ));
+        }
+        let text = std::fs::read_to_string(base.join(&artifact.relative_path))?;
+        let actual_bytes = u64::try_from(text.len())
+            .map_err(|_| std::io::Error::other("artifact length does not fit in u64"))?;
+        if actual_bytes != artifact.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact size mismatch for {}: recorded {}, found {actual_bytes}",
+                    artifact.relative_path.display(),
+                    artifact.bytes
+                ),
+            ));
+        }
+        artifacts.insert(artifact.relative_path.display().to_string(), text);
+    }
+    Ok(artifacts)
+}
+
+fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
+    match &envelope.event {
+        RunEvent::TurnStarted { input, .. } => Some(input),
+        RunEvent::CompactionApplied { summary, .. } => Some(summary),
+        RunEvent::AssistantMessage { content } => Some(content),
+        RunEvent::ToolCompleted { result, .. } => Some(result),
+        RunEvent::ContextBuilt { .. }
+        | RunEvent::ToolStarted { .. }
+        | RunEvent::PermissionDecision { .. }
+        | RunEvent::TurnCompleted { .. }
+        | RunEvent::Warning { .. } => None,
+    }
 }
 
 fn content_preview(content: &ContentRef, limit: usize) -> String {
@@ -213,7 +291,7 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piku_runtime::{RunContentRef, UsageRecord, RUN_RECORD_SCHEMA_VERSION};
+    use piku_runtime::{ArtifactRef, RunContentRef, UsageRecord, RUN_RECORD_SCHEMA_VERSION};
 
     fn event(event: RunEvent) -> RunEventEnvelope {
         RunEventEnvelope {
@@ -270,5 +348,47 @@ mod tests {
         assert!(!html.contains("</script><script>alert(1)</script>"));
         assert!(html.contains("\\u003c/script\\u003e"));
         assert!(html.contains("Content-Security-Policy"));
+    }
+
+    #[test]
+    fn html_projection_embeds_a_verified_run_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let record_path = directory.path().join("session-1.jsonl");
+        let artifact_path = directory
+            .path()
+            .join("session-1.artifacts/00000001-assistant.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        let artifact_text = "the full load-bearing artifact";
+        std::fs::write(&artifact_path, artifact_text).unwrap();
+        let event = event(RunEvent::AssistantMessage {
+            content: RunContentRef::Artifact(ArtifactRef {
+                relative_path: "session-1.artifacts/00000001-assistant.txt".into(),
+                media_type: "text/plain; charset=utf-8".to_string(),
+                bytes: u64::try_from(artifact_text.len()).unwrap(),
+            }),
+        });
+
+        let html = render_html_with_artifacts(&[event], &record_path).unwrap();
+
+        assert!(html.contains(artifact_text));
+        assert!(html.contains("inspect full artifact"));
+    }
+
+    #[test]
+    fn html_projection_rejects_an_artifact_that_escapes_the_run_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let event = event(RunEvent::AssistantMessage {
+            content: RunContentRef::Artifact(ArtifactRef {
+                relative_path: "../outside.txt".into(),
+                media_type: "text/plain".to_string(),
+                bytes: 1,
+            }),
+        });
+
+        let error =
+            render_html_with_artifacts(&[event], &directory.path().join("run.jsonl")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("escapes run directory"));
     }
 }
