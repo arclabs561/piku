@@ -61,5 +61,6 @@ pub use run_record::{
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
-    AgentTaskId, TaskEntry, TaskRegistry, TaskStatus, DEFAULT_SUBAGENT_MAX_TURNS, MAX_SPAWN_DEPTH,
+    AgentTaskId, SubagentEvidence, TaskEntry, TaskRegistry, TaskStatus, DEFAULT_SUBAGENT_MAX_TURNS,
+    MAX_SPAWN_DEPTH,
 };

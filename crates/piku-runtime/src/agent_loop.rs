@@ -771,6 +771,7 @@ async fn run_turn_inner(
                         system_prompt,
                         &tool_defs,
                         depth,
+                        &session.id,
                         &session.messages,
                         custom_agents,
                         hook_registry,
@@ -1463,6 +1464,7 @@ fn execute_spawn_agent(
     system_prompt: &[String],
     tool_defs: &[ToolDefinition],
     depth: u32,
+    parent_session_id: &str,
     parent_session_messages: &[crate::session::ConversationMessage],
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
@@ -1696,7 +1698,8 @@ fn execute_spawn_agent(
         p.max_turns
     };
 
-    let task_id = registry.register(
+    let task_id = registry.register_for_parent(
+        Some(parent_session_id),
         p.name.clone(),
         p.task.clone(),
         depth + 1,
@@ -1780,7 +1783,47 @@ async fn run_subagent_task(
     custom_agents: Vec<crate::agents::AgentDef>,
     hook_registry: Option<crate::hooks::HookRegistry>,
 ) {
-    let mut session = crate::session::Session::new(format!("subagent-{task_id}"));
+    let evidence = registry.evidence(&task_id);
+    if evidence.is_some() {
+        if let Err(error) = registry.persist_evidence_link(&task_id) {
+            fail_subagent_setup(
+                &registry,
+                &task_id,
+                &format!("could not persist subagent link: {error}"),
+                worktree_cwd.as_deref(),
+                worktree_branch.as_deref(),
+                hook_registry.as_ref(),
+            );
+            return;
+        }
+    }
+
+    let child_session_id = evidence.as_ref().map_or_else(
+        || format!("subagent-{task_id}"),
+        |item| item.child_session_id.clone(),
+    );
+    let mut session = crate::session::Session::new(child_session_id);
+    session.record_provider(provider.name(), &model);
+    let mut recorder = match evidence.as_ref() {
+        Some(item) => match crate::run_record::RunRecorder::open(
+            &item.run_record_path,
+            &item.child_session_id,
+        ) {
+            Ok(recorder) => Some(recorder),
+            Err(error) => {
+                fail_subagent_setup(
+                    &registry,
+                    &task_id,
+                    &format!("could not open subagent run record: {error}"),
+                    worktree_cwd.as_deref(),
+                    worktree_branch.as_deref(),
+                    hook_registry.as_ref(),
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     let mut sink = crate::task::DevNullSink;
 
     // Worktree guard: Drop attempts to clean up the worktree and branch if
@@ -1815,24 +1858,60 @@ async fn run_subagent_task(
 
     let repo_root = std::env::current_dir().unwrap_or_default();
 
-    let result = run_turn_inner(
-        &effective_prompt,
-        &mut session,
-        provider.as_ref(),
-        &model,
-        &system_prompt,
-        tool_defs,
-        &crate::permission::AllowAll,
-        &mut sink,
-        Some(max_turns),
-        None,
-        Some(&registry),
-        depth,
-        &custom_agents,
-        hook_registry.as_ref(),
-        None, // subagents don't support mid-turn cancel
-    )
-    .await;
+    let (result, record_error) = if let Some(recorder) = recorder.as_mut() {
+        let mut recording_sink =
+            crate::run_record::RecordingSink::new(&mut sink, recorder, format!("turn-{depth}-0"));
+        let result = run_turn_inner(
+            &effective_prompt,
+            &mut session,
+            provider.as_ref(),
+            &model,
+            &system_prompt,
+            tool_defs,
+            &crate::permission::AllowAll,
+            &mut recording_sink,
+            Some(max_turns),
+            None,
+            Some(&registry),
+            depth,
+            &custom_agents,
+            hook_registry.as_ref(),
+            None, // subagents don't support mid-turn cancel
+        )
+        .await;
+        (result, recording_sink.take_record_error())
+    } else {
+        (
+            run_turn_inner(
+                &effective_prompt,
+                &mut session,
+                provider.as_ref(),
+                &model,
+                &system_prompt,
+                tool_defs,
+                &crate::permission::AllowAll,
+                &mut sink,
+                Some(max_turns),
+                None,
+                Some(&registry),
+                depth,
+                &custom_agents,
+                hook_registry.as_ref(),
+                None, // subagents don't support mid-turn cancel
+            )
+            .await,
+            None,
+        )
+    };
+
+    let durability_error = record_error.map(|error| format!("run record failed: {error}"));
+    let durability_error = match (durability_error, evidence.as_ref()) {
+        (None, Some(item)) => session
+            .save(&item.session_path)
+            .err()
+            .map(|error| format!("session save failed: {error}")),
+        (error, _) => error,
+    };
 
     // Worktree cleanup. Happy path: defuse the guard so its Drop doesn't
     // unconditionally remove the worktree; then delegate to the existing
@@ -1855,7 +1934,10 @@ async fn run_subagent_task(
     // will still fire on function return.
     drop(worktree_guard);
 
-    let (status, iterations) = if let Some(err) = result.stream_error {
+    let (status, iterations) = if let Some(error) = durability_error {
+        registry.fail(&task_id, &error);
+        ("failed", result.iterations)
+    } else if let Some(err) = result.stream_error {
         registry.fail(&task_id, &err);
         ("failed", result.iterations)
     } else {
@@ -1874,6 +1956,24 @@ async fn run_subagent_task(
     // None. Could thread it through if needed later.
     if let Some(hr) = &hook_registry {
         hr.run_subagent_stop(&task_id.to_string(), None, status, iterations, &repo_root);
+    }
+}
+
+fn fail_subagent_setup(
+    registry: &crate::task::TaskRegistry,
+    task_id: &crate::task::AgentTaskId,
+    reason: &str,
+    worktree_cwd: Option<&std::path::Path>,
+    worktree_branch: Option<&str>,
+    hook_registry: Option<&crate::hooks::HookRegistry>,
+) {
+    let repo_root = std::env::current_dir().unwrap_or_default();
+    if let (Some(worktree), Some(branch)) = (worktree_cwd, worktree_branch) {
+        let _ = crate::task::cleanup_worktree(&repo_root, worktree, branch, false);
+    }
+    registry.fail(task_id, reason);
+    if let Some(hooks) = hook_registry {
+        hooks.run_subagent_stop(&task_id.to_string(), None, "failed", 0, &repo_root);
     }
 }
 

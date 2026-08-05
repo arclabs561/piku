@@ -232,6 +232,39 @@ mod task_id_tests {
             assert!(seen.insert(id), "duplicate task id generated");
         }
     }
+
+    #[test]
+    fn persistent_registry_writes_a_typed_parent_child_link() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::with_persistence(
+            "parent-session",
+            root.path().join("sessions"),
+            root.path().join("runs"),
+            root.path().join("links"),
+        );
+        let id = registry.register("child".into(), "inspect".into(), 1, None);
+
+        registry.persist_evidence_link(&id).unwrap();
+
+        let evidence = registry.evidence(&id).unwrap();
+        let decoded: SubagentEvidence =
+            serde_json::from_slice(&std::fs::read(&evidence.link_path).unwrap()).unwrap();
+        assert_eq!(decoded, evidence);
+        assert_eq!(decoded.parent_session_id, "parent-session");
+        assert_eq!(decoded.child_session_id, format!("subagent-{id}"));
+
+        let nested = registry.register_for_parent(
+            Some(&decoded.child_session_id),
+            "grandchild".into(),
+            "inspect deeper".into(),
+            2,
+            None,
+        );
+        assert_eq!(
+            registry.evidence(&nested).unwrap().parent_session_id,
+            decoded.child_session_id
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +302,8 @@ pub struct TaskEntry {
     pub turns_used: u32,
     /// Worktree path if isolation=worktree was requested.
     pub worktree_path: Option<std::path::PathBuf>,
+    /// Durable relationship and evidence locations when persistence is configured.
+    pub evidence: Option<SubagentEvidence>,
 }
 
 impl TaskEntry {
@@ -287,8 +322,29 @@ pub struct TaskRegistry {
     inner: Arc<Mutex<RegistryInner>>,
 }
 
+/// Typed relationship between a parent run and one spawned child run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentEvidence {
+    pub schema_version: u32,
+    pub task_id: AgentTaskId,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub session_path: std::path::PathBuf,
+    pub run_record_path: std::path::PathBuf,
+    pub link_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentPersistence {
+    parent_session_id: String,
+    sessions_dir: std::path::PathBuf,
+    runs_dir: std::path::PathBuf,
+    links_dir: std::path::PathBuf,
+}
+
 struct RegistryInner {
     tasks: HashMap<AgentTaskId, TaskEntry>,
+    persistence: Option<SubagentPersistence>,
     /// Completions channel — callers waiting on join receive via oneshot.
     waiters: HashMap<AgentTaskId, Vec<oneshot::Sender<TaskEntry>>>,
     /// If set, background task completions inject a notification message
@@ -308,10 +364,30 @@ impl TaskRegistry {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 tasks: HashMap::new(),
+                persistence: None,
                 waiters: HashMap::new(),
                 notification_tx: None,
             })),
         }
+    }
+
+    /// Create a registry whose child sessions, run records, and parent links
+    /// survive the process that spawned them.
+    #[must_use]
+    pub fn with_persistence(
+        parent_session_id: impl Into<String>,
+        sessions_dir: impl Into<std::path::PathBuf>,
+        runs_dir: impl Into<std::path::PathBuf>,
+        links_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let registry = Self::new();
+        registry.inner().persistence = Some(SubagentPersistence {
+            parent_session_id: parent_session_id.into(),
+            sessions_dir: sessions_dir.into(),
+            runs_dir: runs_dir.into(),
+            links_dir: links_dir.into(),
+        });
+        registry
     }
 
     fn inner(&self) -> MutexGuard<'_, RegistryInner> {
@@ -335,7 +411,38 @@ impl TaskRegistry {
         depth: u32,
         worktree_path: Option<std::path::PathBuf>,
     ) -> AgentTaskId {
+        self.register_for_parent(None, name, description, depth, worktree_path)
+    }
+
+    /// Register a task with the session that directly spawned it.
+    #[must_use]
+    pub fn register_for_parent(
+        &self,
+        parent_session_id: Option<&str>,
+        name: String,
+        description: String,
+        depth: u32,
+        worktree_path: Option<std::path::PathBuf>,
+    ) -> AgentTaskId {
         let id = AgentTaskId::new();
+        let evidence = self.inner().persistence.as_ref().map(|persistence| {
+            let child_session_id = format!("subagent-{id}");
+            SubagentEvidence {
+                schema_version: 1,
+                task_id: id.clone(),
+                parent_session_id: parent_session_id
+                    .unwrap_or(&persistence.parent_session_id)
+                    .to_string(),
+                session_path: persistence
+                    .sessions_dir
+                    .join(format!("{child_session_id}.json")),
+                run_record_path: persistence
+                    .runs_dir
+                    .join(format!("{child_session_id}.jsonl")),
+                link_path: persistence.links_dir.join(format!("{id}.json")),
+                child_session_id,
+            }
+        });
         let entry = TaskEntry {
             id: id.clone(),
             name,
@@ -346,9 +453,35 @@ impl TaskRegistry {
             output: None,
             turns_used: 0,
             worktree_path,
+            evidence,
         };
         self.inner().tasks.insert(id.clone(), entry);
         id
+    }
+
+    /// Return the durable evidence contract for a spawned task, if enabled.
+    #[must_use]
+    pub fn evidence(&self, id: &AgentTaskId) -> Option<SubagentEvidence> {
+        self.inner()
+            .tasks
+            .get(id)
+            .and_then(|entry| entry.evidence.clone())
+    }
+
+    /// Atomically persist the typed parent-child relationship.
+    pub fn persist_evidence_link(&self, id: &AgentTaskId) -> std::io::Result<()> {
+        let evidence = self
+            .evidence(id)
+            .ok_or_else(|| std::io::Error::other("subagent persistence is not configured"))?;
+        if let Some(parent) = evidence.link_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(&evidence).map_err(std::io::Error::other)?;
+        let tmp = evidence
+            .link_path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(tmp, &evidence.link_path)
     }
 
     /// Mark a task as complete with its final output.
