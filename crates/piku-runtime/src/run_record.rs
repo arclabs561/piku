@@ -15,22 +15,128 @@ use crate::{OutputSink, PostToolAction};
 use piku_api::TokenUsage;
 
 /// Current on-disk schema for [`RunEventEnvelope`].
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 makes run-vs-turn scope explicit. The reader remains compatible
+/// with version 1 records, where `turn_id` implied turn scope.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 2;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
 pub const RUN_INLINE_CONTENT_LIMIT_BYTES: usize = 16 * 1024;
 
 /// One ordered event in a durable run record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunEventEnvelope {
     pub schema_version: u32,
     pub sequence: u64,
     pub recorded_at_ms: u64,
     pub session_id: String,
-    pub turn_id: String,
-    #[serde(flatten)]
+    pub scope: EventScope,
     pub event: RunEvent,
+}
+
+/// The semantic owner of an event. Run-level decisions are not fabricated as
+/// turns, and turn-level activity always names its turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventScope {
+    Run,
+    Turn { turn_id: String },
+}
+
+impl EventScope {
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Run => None,
+            Self::Turn { turn_id } => Some(turn_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventScopeKind {
+    Run,
+    Turn,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunEventEnvelopeWire {
+    schema_version: u32,
+    sequence: u64,
+    recorded_at_ms: u64,
+    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<EventScopeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(flatten)]
+    event: RunEvent,
+}
+
+impl Serialize for RunEventEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let (scope, turn_id) = match &self.scope {
+            EventScope::Run => (EventScopeKind::Run, None),
+            EventScope::Turn { turn_id } => (EventScopeKind::Turn, Some(turn_id.clone())),
+        };
+        RunEventEnvelopeWire {
+            schema_version: self.schema_version,
+            sequence: self.sequence,
+            recorded_at_ms: self.recorded_at_ms,
+            session_id: self.session_id.clone(),
+            scope: (self.schema_version >= 2).then_some(scope),
+            turn_id,
+            event: self.event.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunEventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = RunEventEnvelopeWire::deserialize(deserializer)?;
+        if wire.schema_version == 1 && wire.scope.is_some() {
+            return Err(serde::de::Error::custom(
+                "schema v1 run event must use legacy turn_id scope",
+            ));
+        }
+        let legacy_scope = wire.schema_version == 1 && wire.scope.is_none();
+        let scope = match (wire.scope, wire.turn_id) {
+            (Some(EventScopeKind::Run), None) => EventScope::Run,
+            (Some(EventScopeKind::Turn), Some(turn_id)) => EventScope::Turn { turn_id },
+            (None, Some(turn_id)) if legacy_scope => EventScope::Turn { turn_id },
+            (Some(EventScopeKind::Run), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "run-scoped event must not contain turn_id",
+                ));
+            }
+            (Some(EventScopeKind::Turn), None) => {
+                return Err(serde::de::Error::custom(
+                    "turn-scoped event requires turn_id",
+                ));
+            }
+            (None, _) => {
+                return Err(serde::de::Error::custom(
+                    "schema v2 run event requires explicit scope",
+                ));
+            }
+        };
+        Ok(Self {
+            schema_version: wire.schema_version,
+            sequence: wire.sequence,
+            recorded_at_ms: wire.recorded_at_ms,
+            session_id: wire.session_id,
+            scope,
+            event: wire.event,
+        })
+    }
 }
 
 /// A semantic event that a presentation surface may project differently.
@@ -75,6 +181,35 @@ pub enum RunEvent {
     Warning {
         message: String,
     },
+    UserDisposition {
+        disposition: RunDisposition,
+        note: ContentRef,
+    },
+}
+
+impl RunEvent {
+    fn scope_kind(&self) -> EventScopeKind {
+        match self {
+            Self::UserDisposition { .. } => EventScopeKind::Run,
+            Self::TurnStarted { .. }
+            | Self::ContextBuilt { .. }
+            | Self::CompactionApplied { .. }
+            | Self::AssistantMessage { .. }
+            | Self::ToolStarted { .. }
+            | Self::PermissionDecision { .. }
+            | Self::ToolCompleted { .. }
+            | Self::TurnCompleted { .. }
+            | Self::Warning { .. } => EventScopeKind::Turn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDisposition {
+    Accepted,
+    NeedsWork,
+    Abandoned,
 }
 
 /// Content retained inline, delegated to an artifact, or explicitly missing.
@@ -260,15 +395,38 @@ impl RunRecorder {
     }
 
     pub fn append(&mut self, turn_id: impl Into<String>, mut event: RunEvent) -> io::Result<u64> {
+        self.append_scoped(
+            EventScope::Turn {
+                turn_id: turn_id.into(),
+            },
+            &mut event,
+        )
+    }
+
+    pub fn append_run(&mut self, mut event: RunEvent) -> io::Result<u64> {
+        self.append_scoped(EventScope::Run, &mut event)
+    }
+
+    fn append_scoped(&mut self, scope: EventScope, event: &mut RunEvent) -> io::Result<u64> {
+        let actual_scope = match scope {
+            EventScope::Run => EventScopeKind::Run,
+            EventScope::Turn { .. } => EventScopeKind::Turn,
+        };
+        if actual_scope != event.scope_kind() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "run event has incompatible scope",
+            ));
+        }
         let sequence = self.next_sequence;
-        self.materialize_large_content(sequence, &mut event)?;
+        self.materialize_large_content(sequence, event)?;
         let envelope = RunEventEnvelope {
             schema_version: RUN_RECORD_SCHEMA_VERSION,
             sequence,
             recorded_at_ms: now_ms()?,
             session_id: self.session_id.clone(),
-            turn_id: turn_id.into(),
-            event,
+            scope,
+            event: event.clone(),
         };
         serde_json::to_writer(&mut self.writer, &envelope).map_err(io::Error::other)?;
         self.writer.write_all(b"\n")?;
@@ -286,6 +444,7 @@ impl RunRecorder {
             RunEvent::CompactionApplied { summary, .. } => Some(("summary", summary)),
             RunEvent::AssistantMessage { content } => Some(("assistant", content)),
             RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
+            RunEvent::UserDisposition { note, .. } => Some(("disposition", note)),
             RunEvent::ContextBuilt { .. }
             | RunEvent::ToolStarted { .. }
             | RunEvent::PermissionDecision { .. }
@@ -351,7 +510,8 @@ pub fn read_run_record(path: impl AsRef<Path>) -> io::Result<Vec<RunEventEnvelop
         Err(error) => return Err(error),
     };
 
-    text.lines()
+    let events = text
+        .lines()
         .enumerate()
         .map(|(index, line)| {
             serde_json::from_str(line).map_err(|error| {
@@ -361,12 +521,28 @@ pub fn read_run_record(path: impl AsRef<Path>) -> io::Result<Vec<RunEventEnvelop
                 )
             })
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    validate_record_structure(&events)?;
+    Ok(events)
 }
 
 fn validate_existing(events: &[RunEventEnvelope], session_id: &str) -> io::Result<()> {
+    validate_record_structure(events)?;
     for (index, event) in events.iter().enumerate() {
-        if event.schema_version != RUN_RECORD_SCHEMA_VERSION {
+        if event.session_id != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("run record session mismatch at line {}", index + 1),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_record_structure(events: &[RunEventEnvelope]) -> io::Result<()> {
+    let session_id = events.first().map(|event| event.session_id.as_str());
+    for (index, event) in events.iter().enumerate() {
+        if !(1..=RUN_RECORD_SCHEMA_VERSION).contains(&event.schema_version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -376,10 +552,20 @@ fn validate_existing(events: &[RunEventEnvelope], session_id: &str) -> io::Resul
                 ),
             ));
         }
-        if event.session_id != session_id {
+        let actual_scope = match &event.scope {
+            EventScope::Run => EventScopeKind::Run,
+            EventScope::Turn { .. } => EventScopeKind::Turn,
+        };
+        if actual_scope != event.event.scope_kind() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("run record session mismatch at line {}", index + 1),
+                format!("run event has incompatible scope at line {}", index + 1),
+            ));
+        }
+        if Some(event.session_id.as_str()) != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("run record changes session at line {}", index + 1),
             ));
         }
         let expected = u64::try_from(index)
@@ -545,6 +731,107 @@ mod tests {
                 content: ContentRef::Inline { text }
             } if text == "small"
         ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_v1_turn_scope_and_resumes_with_v2_events() {
+        let path = test_path("v1-resume");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"schema_version":1,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","turn_id":"turn-0","event":"warning","message":"legacy"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let legacy = read_run_record(&path).unwrap();
+        assert_eq!(legacy[0].scope.turn_id(), Some("turn-0"));
+        let legacy_json = serde_json::to_value(&legacy[0]).unwrap();
+        assert!(legacy_json.get("scope").is_none());
+        assert_eq!(legacy_json["turn_id"], "turn-0");
+        let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
+        recorder
+            .append(
+                "turn-0",
+                RunEvent::Warning {
+                    message: "current".to_string(),
+                },
+            )
+            .unwrap();
+        drop(recorder);
+
+        let lines = fs::read_to_string(&path).unwrap();
+        let values = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0]["schema_version"], 1);
+        assert_eq!(values[1]["schema_version"], 2);
+        assert_eq!(values[1]["scope"], "turn");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_or_incompatible_v2_scope() {
+        let missing = r#"{"schema_version":2,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","turn_id":"turn-0","event":"warning","message":"x"}"#;
+        assert!(serde_json::from_str::<RunEventEnvelope>(missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires explicit scope"));
+
+        let path = test_path("invalid-scope");
+        let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
+        let error = recorder
+            .append_run(RunEvent::Warning {
+                message: "not run-level".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = recorder
+            .append(
+                "turn-0",
+                RunEvent::UserDisposition {
+                    disposition: RunDisposition::Accepted,
+                    note: ContentRef::Inline {
+                        text: "ship it".to_string(),
+                    },
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reader_rejects_unsupported_schema_and_sequence_gaps() {
+        let path = test_path("invalid-structure");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"schema_version":99,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"warning","message":"x"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_run_record(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported run record schema"));
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"schema_version":2,"sequence":1,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"warning","message":"x"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_run_record(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("expected 0"));
         fs::remove_file(path).unwrap();
     }
 }

@@ -355,7 +355,7 @@ mod agent_loop {
 
         let events = crate::run_record::read_run_record(path).unwrap();
         assert_eq!(events.len(), 4);
-        assert_eq!(events[0].turn_id, "turn-0");
+        assert_eq!(events[0].scope.turn_id(), Some("turn-0"));
         assert!(matches!(
             events.last().map(|event| &event.event),
             Some(crate::run_record::RunEvent::TurnCompleted { .. })

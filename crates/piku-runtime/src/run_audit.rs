@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::run_record::{ContentRef, RunEvent, RunEventEnvelope, UsageRecord};
+use crate::run_record::{
+    ContentRef, EventScope, RunDisposition, RunEvent, RunEventEnvelope, UsageRecord,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunAudit {
@@ -21,6 +23,8 @@ pub struct RunAudit {
     pub tool_calls_started: usize,
     pub tool_calls_completed: usize,
     pub tool_calls_with_permission_decision: usize,
+    pub user_disposition_count: usize,
+    pub latest_user_disposition: Option<RunDisposition>,
     pub context: ContextAudit,
     pub content: ContentAudit,
     pub usage: UsageRecord,
@@ -113,6 +117,8 @@ impl<'a> Auditor<'a> {
                 tool_calls_started: 0,
                 tool_calls_completed: 0,
                 tool_calls_with_permission_decision: 0,
+                user_disposition_count: 0,
+                latest_user_disposition: None,
                 context: ContextAudit::default(),
                 content: ContentAudit::default(),
                 usage: UsageRecord::default(),
@@ -125,10 +131,37 @@ impl<'a> Auditor<'a> {
 
     fn observe(&mut self, index: usize, envelope: &'a RunEventEnvelope) {
         self.audit_order(index, envelope);
-        self.audit_turn_boundary(envelope);
+        let turn_id = match (&envelope.scope, &envelope.event) {
+            (EventScope::Run, RunEvent::UserDisposition { disposition, note }) => {
+                self.audit.user_disposition_count += 1;
+                self.audit.latest_user_disposition = Some(*disposition);
+                audit_content(&mut self.audit.content, note);
+                return;
+            }
+            (EventScope::Run, _) => {
+                self.add_finding(
+                    AuditSeverity::Error,
+                    "turn_event_has_run_scope",
+                    format!("{} requires turn scope", event_name(&envelope.event)),
+                    vec![envelope.sequence],
+                );
+                return;
+            }
+            (EventScope::Turn { .. }, RunEvent::UserDisposition { .. }) => {
+                self.add_finding(
+                    AuditSeverity::Error,
+                    "run_event_has_turn_scope",
+                    "user_disposition requires run scope".to_string(),
+                    vec![envelope.sequence],
+                );
+                return;
+            }
+            (EventScope::Turn { turn_id }, _) => turn_id.as_str(),
+        };
+        self.audit_turn_boundary(turn_id, envelope);
         match &envelope.event {
-            RunEvent::TurnStarted { input, .. } => self.on_turn_started(envelope, input),
-            RunEvent::ContextBuilt { manifest } => self.on_context(&envelope.turn_id, manifest),
+            RunEvent::TurnStarted { input, .. } => self.on_turn_started(turn_id, envelope, input),
+            RunEvent::ContextBuilt { manifest } => self.on_context(turn_id, manifest),
             RunEvent::CompactionApplied { summary, .. } => {
                 self.audit.compaction_count += 1;
                 audit_content(&mut self.audit.content, summary);
@@ -137,10 +170,10 @@ impl<'a> Auditor<'a> {
                 audit_content(&mut self.audit.content, content);
             }
             RunEvent::ToolStarted { tool_call_id, .. } => {
-                self.on_tool_started(envelope, tool_call_id);
+                self.on_tool_started(turn_id, envelope, tool_call_id);
             }
             RunEvent::PermissionDecision { tool_call_id, .. } => {
-                self.on_permission(envelope, tool_call_id);
+                self.on_permission(turn_id, envelope, tool_call_id);
             }
             RunEvent::ToolCompleted {
                 tool_call_id,
@@ -148,12 +181,13 @@ impl<'a> Auditor<'a> {
                 ..
             } => {
                 audit_content(&mut self.audit.content, result);
-                self.on_tool_completed(envelope, tool_call_id);
+                self.on_tool_completed(turn_id, envelope, tool_call_id);
             }
             RunEvent::TurnCompleted { usage, .. } => {
-                self.on_turn_completed(envelope, usage);
+                self.on_turn_completed(turn_id, envelope, usage);
             }
             RunEvent::Warning { .. } => {}
+            RunEvent::UserDisposition { .. } => unreachable!("scope checked above"),
         }
     }
 
@@ -172,8 +206,8 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn audit_turn_boundary(&mut self, envelope: &'a RunEventEnvelope) {
-        let turn = self.turns.entry(&envelope.turn_id).or_default();
+    fn audit_turn_boundary(&mut self, turn_id: &'a str, envelope: &'a RunEventEnvelope) {
+        let turn = self.turns.entry(turn_id).or_default();
         let missing_start =
             !matches!(envelope.event, RunEvent::TurnStarted { .. }) && turn.started.is_none();
         let completed = turn.completed;
@@ -198,10 +232,15 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_turn_started(&mut self, envelope: &'a RunEventEnvelope, input: &ContentRef) {
+    fn on_turn_started(
+        &mut self,
+        turn_id: &'a str,
+        envelope: &'a RunEventEnvelope,
+        input: &ContentRef,
+    ) {
         let previous = self
             .turns
-            .entry(&envelope.turn_id)
+            .entry(turn_id)
             .or_default()
             .started
             .replace(envelope.sequence);
@@ -209,7 +248,7 @@ impl<'a> Auditor<'a> {
             self.add_finding(
                 AuditSeverity::Error,
                 "duplicate_turn_start",
-                format!("turn {} starts more than once", envelope.turn_id),
+                format!("turn {turn_id} starts more than once"),
                 vec![previous, envelope.sequence],
             );
         }
@@ -248,12 +287,17 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_tool_started(&mut self, envelope: &'a RunEventEnvelope, tool_call_id: &'a str) {
+    fn on_tool_started(
+        &mut self,
+        turn_id: &'a str,
+        envelope: &'a RunEventEnvelope,
+        tool_call_id: &'a str,
+    ) {
         self.audit.tool_calls_started += 1;
         let previous = self.tools.insert(
             tool_call_id,
             ToolState {
-                turn_id: &envelope.turn_id,
+                turn_id,
                 started: envelope.sequence,
                 permission: None,
                 completed: None,
@@ -269,7 +313,7 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_permission(&mut self, envelope: &RunEventEnvelope, tool_call_id: &str) {
+    fn on_permission(&mut self, turn_id: &str, envelope: &RunEventEnvelope, tool_call_id: &str) {
         let Some(tool) = self.tools.get_mut(tool_call_id) else {
             self.add_finding(
                 AuditSeverity::Error,
@@ -280,7 +324,7 @@ impl<'a> Auditor<'a> {
             return;
         };
         let started = tool.started;
-        let crosses_turns = tool.turn_id != envelope.turn_id;
+        let crosses_turns = tool.turn_id != turn_id;
         let previous = tool.permission.replace(envelope.sequence);
         if crosses_turns {
             self.add_finding(
@@ -302,7 +346,12 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_tool_completed(&mut self, envelope: &RunEventEnvelope, tool_call_id: &str) {
+    fn on_tool_completed(
+        &mut self,
+        turn_id: &str,
+        envelope: &RunEventEnvelope,
+        tool_call_id: &str,
+    ) {
         let Some(tool) = self.tools.get_mut(tool_call_id) else {
             self.add_finding(
                 AuditSeverity::Error,
@@ -313,7 +362,7 @@ impl<'a> Auditor<'a> {
             return;
         };
         let started = tool.started;
-        let crosses_turns = tool.turn_id != envelope.turn_id;
+        let crosses_turns = tool.turn_id != turn_id;
         let previous = tool.completed.replace(envelope.sequence);
         if crosses_turns {
             self.add_finding(
@@ -335,10 +384,15 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_turn_completed(&mut self, envelope: &'a RunEventEnvelope, usage: &UsageRecord) {
+    fn on_turn_completed(
+        &mut self,
+        turn_id: &'a str,
+        envelope: &'a RunEventEnvelope,
+        usage: &UsageRecord,
+    ) {
         let previous = self
             .turns
-            .entry(&envelope.turn_id)
+            .entry(turn_id)
             .or_default()
             .completed
             .replace(envelope.sequence);
@@ -346,7 +400,7 @@ impl<'a> Auditor<'a> {
             self.add_finding(
                 AuditSeverity::Error,
                 "duplicate_turn_completion",
-                format!("turn {} completes more than once", envelope.turn_id),
+                format!("turn {turn_id} completes more than once"),
                 vec![previous, envelope.sequence],
             );
         } else {
@@ -477,6 +531,7 @@ fn event_name(event: &RunEvent) -> &'static str {
         RunEvent::ToolCompleted { .. } => "tool_completed",
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::Warning { .. } => "warning",
+        RunEvent::UserDisposition { .. } => "user_disposition",
     }
 }
 
@@ -491,7 +546,9 @@ mod tests {
             sequence,
             recorded_at_ms: sequence,
             session_id: "session-1".to_string(),
-            turn_id: "turn-0".to_string(),
+            scope: EventScope::Turn {
+                turn_id: "turn-0".to_string(),
+            },
             event,
         }
     }
@@ -499,6 +556,17 @@ mod tests {
     fn inline(text: &str) -> ContentRef {
         ContentRef::Inline {
             text: text.to_string(),
+        }
+    }
+
+    fn run_envelope(sequence: u64, event: RunEvent) -> RunEventEnvelope {
+        RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence,
+            recorded_at_ms: sequence,
+            session_id: "session-1".to_string(),
+            scope: EventScope::Run,
+            event,
         }
     }
 
@@ -571,6 +639,26 @@ mod tests {
         assert_eq!(audit.content.inline_items, 2);
         assert_eq!(audit.usage.input_tokens, 12);
         assert!(audit.findings.is_empty());
+    }
+
+    #[test]
+    fn run_disposition_does_not_create_a_synthetic_turn() {
+        let audit = audit_run_record(&[run_envelope(
+            0,
+            RunEvent::UserDisposition {
+                disposition: RunDisposition::NeedsWork,
+                note: inline("verify the browser projection"),
+            },
+        )]);
+
+        assert!(audit.is_structurally_complete());
+        assert_eq!(audit.turn_count, 0);
+        assert_eq!(audit.user_disposition_count, 1);
+        assert_eq!(
+            audit.latest_user_disposition,
+            Some(RunDisposition::NeedsWork)
+        );
+        assert_eq!(audit.content.inline_items, 1);
     }
 
     #[test]
