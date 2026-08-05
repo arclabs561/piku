@@ -13,6 +13,7 @@ pub mod memory;
 pub mod permission;
 pub mod prompt;
 pub mod provider;
+pub mod run_record;
 pub mod session;
 pub mod task;
 #[cfg(test)]
@@ -45,6 +46,11 @@ pub use prompt::build_system_prompt;
 pub use provider::{
     provider_availability, ProviderAvailability, ResolvedProvider, DEFAULT_MODEL_ANTHROPIC,
     DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA, DEFAULT_MODEL_OPENROUTER,
+};
+pub use run_record::{
+    read_run_record, ArtifactRef, ContentRef as RunContentRef, ContextManifest, ContextMessage,
+    ContextSection, ContextTool, PermissionDecision as RunPermissionDecision, RunEvent,
+    RunEventEnvelope, RunRecorder, UsageRecord, RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
