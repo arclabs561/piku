@@ -62,7 +62,7 @@ use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
     now_secs, ConfigRecord, DevelopmentContextRecord, ImprovementHandoffRecord,
     ObserverClaimRecord, ObserverRecord, PlaygroundLedger, ReviewClaimRecord, ReviewRecord,
-    ScenarioContractRecord, SpendRecord, TurnRecord,
+    RunEvidenceRecord, ScenarioContractRecord, SpendRecord, TurnRecord,
 };
 use recursive_observer::RecursiveReview;
 
@@ -1778,6 +1778,15 @@ fn parse_session_path(captured: &str) -> Option<String> {
             let path = path.trim().trim_end_matches(']').trim();
             (!path.is_empty()).then(|| path.to_string())
         })
+}
+
+/// The semantic run record is a sibling of the legacy session directory and
+/// uses the same session id. Derive it from Piku's own exit path rather than
+/// guessing the harness's temporary config root.
+fn run_record_path_for_session(session_path: &Path) -> Option<PathBuf> {
+    let root = session_path.parent()?.parent()?;
+    let stem = session_path.file_stem()?.to_string_lossy();
+    Some(root.join("runs").join(format!("{stem}.jsonl")))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -4280,6 +4289,8 @@ fn run_agentic_session(persona: &Persona) {
     eprintln!("[agentic_user] generating report...");
 
     let mut piku_session_copy = String::new();
+    let mut piku_run_record_copy = String::new();
+    let mut run_evidence_findings = Vec::new();
     if let (Some(source), Some(ledger)) = (&piku_session_source, &ledger) {
         match ledger.copy_piku_session(Path::new(source)) {
             Ok(path) => {
@@ -4312,6 +4323,88 @@ fn run_agentic_session(persona: &Persona) {
         }
     } else {
         eprintln!("[playground] piku did not report a session file on exit");
+    }
+
+    if let Some(source) = piku_session_source.as_deref() {
+        if let Some(run_source) = run_record_path_for_session(Path::new(source)) {
+            match piku_runtime::read_run_record(&run_source) {
+                Ok(events) if events.is_empty() => run_evidence_findings.push(format!(
+                    "[harness:MAJOR] piku's durable run record is empty: {}",
+                    run_source.display()
+                )),
+                Ok(events) => {
+                    let audit = piku_runtime::audit_run_record(&events);
+                    eprintln!(
+                        "[run-evidence] turns {}/{}, tools {}/{}, permissions {}, context {} selected/{} excluded, findings {}",
+                        audit.completed_turn_count,
+                        audit.turn_count,
+                        audit.tool_calls_completed,
+                        audit.tool_calls_started,
+                        audit.tool_calls_with_permission_decision,
+                        audit.context.messages_selected,
+                        audit.context.messages_excluded,
+                        audit.findings.len(),
+                    );
+                    run_evidence_findings.extend(
+                        audit
+                            .findings
+                            .iter()
+                            .filter(|finding| {
+                                finding.severity == piku_runtime::AuditSeverity::Error
+                            })
+                            .map(|finding| {
+                                format!(
+                                    "[run-evidence:MAJOR] {} — {} (sequences {:?})",
+                                    finding.code, finding.message, finding.sequences
+                                )
+                            }),
+                    );
+                    if let Some(ledger) = &ledger {
+                        match ledger.copy_piku_run(&run_source) {
+                            Ok(path) => {
+                                piku_run_record_copy = path.display().to_string();
+                                eprintln!(
+                                    "[playground] piku run evidence: {}",
+                                    path.display()
+                                );
+                                if let Err(error) =
+                                    ledger.append_run_evidence(&RunEvidenceRecord {
+                                        schema_version: 1,
+                                        kind: "run_evidence",
+                                        run_id: ledger.run_id(),
+                                        timestamp_secs: now_secs(),
+                                        run_record_path: &piku_run_record_copy,
+                                        audit: &audit,
+                                    })
+                                {
+                                    run_evidence_findings.push(format!(
+                                        "[harness:MAJOR] could not append run evidence record: {error}"
+                                    ));
+                                }
+                            }
+                            Err(error) => run_evidence_findings.push(format!(
+                                "[harness:MAJOR] could not freeze piku run evidence from {}: {error}",
+                                run_source.display()
+                            )),
+                        }
+                    }
+                }
+                Err(error) => run_evidence_findings.push(format!(
+                    "[harness:MAJOR] could not read piku's durable run record at {}: {error}",
+                    run_source.display()
+                )),
+            }
+        } else {
+            run_evidence_findings.push(
+                "[harness:MAJOR] could not derive piku's durable run record from its session path"
+                    .to_string(),
+            );
+        }
+    } else {
+        run_evidence_findings.push(
+            "[harness:MAJOR] piku reported no session path, so its durable run evidence could not be located"
+                .to_string(),
+        );
     }
 
     print_report(persona, &entries);
@@ -4389,6 +4482,7 @@ fn run_agentic_session(persona: &Persona) {
     // never ran. Both stop the review from becoming a product judgment, but
     // only the first says anything about review quality.
     let mut harness_findings = review_failures;
+    harness_findings.extend(run_evidence_findings);
     // Claims that cited turns which did not happen are a fact about the
     // review, not about piku, so they are named and cannot reach the handoff
     // as product findings.
@@ -4536,6 +4630,7 @@ fn run_agentic_session(persona: &Persona) {
                 scenario_goal: &scenario_goal,
                 scenario_results: &scenario_results,
                 piku_session_path: &piku_session_copy,
+                piku_run_record_path: &piku_run_record_copy,
                 verified_findings: &verified_findings,
                 hypotheses: &hypotheses,
                 next_action,
@@ -4559,6 +4654,7 @@ fn run_agentic_session(persona: &Persona) {
             next_action,
             development_context_path: &development_context_path,
             piku_session_path: &piku_session_copy,
+            piku_run_record_path: &piku_run_record_copy,
         }) {
             eprintln!("[playground] could not append improvement handoff: {error}");
         }
@@ -5064,6 +5160,15 @@ fn the_session_path_is_read_from_pikus_exit_line() {
     assert_eq!(parse_session_path("no session line here\n"), None);
     // A status line without a path is not a path.
     assert_eq!(parse_session_path("[session saved → ]\n"), None);
+}
+
+#[test]
+fn the_run_record_path_is_derived_from_the_reported_session() {
+    assert_eq!(
+        run_record_path_for_session(Path::new("/tmp/piku/sessions/session-42.json")),
+        Some(PathBuf::from("/tmp/piku/runs/session-42.jsonl"))
+    );
+    assert_eq!(run_record_path_for_session(Path::new("session.json")), None);
 }
 
 #[test]

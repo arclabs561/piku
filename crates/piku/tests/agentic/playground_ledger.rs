@@ -152,6 +152,19 @@ pub struct SpendRecord<'a> {
     pub acceptance_wall_ms: u64,
 }
 
+/// Deterministic audit of the semantic evidence Piku retained for this run.
+/// This sits beside judge records because it is an independent measurement,
+/// not another opinion about the terminal transcript.
+#[derive(Serialize)]
+pub struct RunEvidenceRecord<'a> {
+    pub schema_version: u8,
+    pub kind: &'static str,
+    pub run_id: &'a str,
+    pub timestamp_secs: u64,
+    pub run_record_path: &'a str,
+    pub audit: &'a piku_runtime::RunAudit,
+}
+
 /// A bounded second-order review of the judge and the observed piku behavior.
 #[derive(Serialize)]
 pub struct ObserverRecord<'a> {
@@ -189,6 +202,8 @@ pub struct ImprovementHandoffRecord<'a> {
     /// called with arguments and results, and per-turn usage. Empty when piku
     /// reported no session on exit.
     pub piku_session_path: &'a str,
+    /// Frozen copy of the semantic event record and any referenced artifacts.
+    pub piku_run_record_path: &'a str,
 }
 
 /// Deterministic context for the engineer who closes the evaluation loop.
@@ -209,6 +224,7 @@ pub struct DevelopmentContextRecord<'a> {
     /// Copy of piku's own session file, so the engineer can read what piku
     /// sent and called rather than only what the terminal showed.
     pub piku_session_path: &'a str,
+    pub piku_run_record_path: &'a str,
     pub verified_findings: &'a [String],
     pub hypotheses: &'a [String],
     pub next_action: &'a str,
@@ -276,6 +292,10 @@ impl PlaygroundLedger {
         self.append(record)
     }
 
+    pub fn append_run_evidence(&self, record: &RunEvidenceRecord<'_>) -> std::io::Result<()> {
+        self.append(record)
+    }
+
     /// Keep piku's own session file with the run that produced it.
     ///
     /// piku writes into a shared sessions directory that later runs add to and
@@ -308,6 +328,39 @@ impl PlaygroundLedger {
         fs::create_dir_all(&directory)?;
         let destination = directory.join(format!("{}.json", self.run_id));
         fs::copy(source, &destination)?;
+        Ok(destination)
+    }
+
+    /// Freeze the JSONL record and its flat artifact directory as one bundle.
+    /// Keeping the original file names preserves run-relative artifact paths.
+    pub fn copy_piku_run(&self, source: &Path) -> std::io::Result<PathBuf> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("piku-runs")
+            .join(&self.run_id);
+        fs::create_dir_all(&directory)?;
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("run record path has no file name"))?;
+        let destination = directory.join(file_name);
+        fs::copy(source, &destination)?;
+
+        let artifacts = source.with_extension("artifacts");
+        if artifacts.is_dir() {
+            let artifact_name = artifacts
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("artifact path has no file name"))?;
+            let artifact_destination = directory.join(artifact_name);
+            fs::create_dir_all(&artifact_destination)?;
+            for entry in fs::read_dir(artifacts)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    fs::copy(entry.path(), artifact_destination.join(entry.file_name()))?;
+                }
+            }
+        }
         Ok(destination)
     }
 
@@ -369,6 +422,32 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_bundle_copy_preserves_relative_artifact_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_dir = directory.path().join("runtime/runs");
+        let artifact_dir = source_dir.join("session-1.artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let source = source_dir.join("session-1.jsonl");
+        fs::write(&source, "record\n").unwrap();
+        fs::write(artifact_dir.join("00000001-tool-result.txt"), "evidence").unwrap();
+        let ledger = PlaygroundLedger::open_at(directory.path().join("ledger.jsonl")).unwrap();
+
+        let copied = ledger.copy_piku_run(&source).unwrap();
+
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "record\n");
+        assert_eq!(
+            fs::read_to_string(
+                copied
+                    .parent()
+                    .unwrap()
+                    .join("session-1.artifacts/00000001-tool-result.txt")
+            )
+            .unwrap(),
+            "evidence"
+        );
+    }
 
     /// Two runs sharing a ledger must leave lines that each parse. Records are
     /// written as one call for this reason; the earlier two-call form could
@@ -562,6 +641,7 @@ mod tests {
                 next_action: "reproduce_verified_findings_then_fix",
                 development_context_path: "development-context/example.json",
                 piku_session_path: "piku-sessions/example.json",
+                piku_run_record_path: "piku-runs/example/session.jsonl",
             })
             .unwrap();
         let context_path = ledger
@@ -573,6 +653,7 @@ mod tests {
                 scenario_goal: "return 1-based line numbers",
                 scenario_results: &["fail: cargo test --quiet".to_string()],
                 piku_session_path: "piku-sessions/example.json",
+                piku_run_record_path: "piku-runs/example/session.jsonl",
                 verified_findings: &verified,
                 hypotheses: &hypotheses,
                 next_action: "fix_piku_for_failed_scenario_acceptance",
