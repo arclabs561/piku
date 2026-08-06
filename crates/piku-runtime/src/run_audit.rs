@@ -213,7 +213,7 @@ impl<'a> Auditor<'a> {
             RunEvent::TurnCompleted { usage, .. } => {
                 self.on_turn_completed(turn_id, envelope, usage);
             }
-            RunEvent::Warning { .. } => {}
+            RunEvent::Warning { .. } | RunEvent::ChildRunRef { .. } => {}
             RunEvent::UserDisposition { .. } => unreachable!("scope checked above"),
         }
     }
@@ -413,11 +413,14 @@ impl<'a> Auditor<'a> {
         }
         self.audit.tool_effect_count += effects.len();
         for effect in effects {
-            let (path, content_change) = match effect {
+            let Some((path, content_change)) = (match effect {
                 ToolEffect::FileWrite {
                     path,
                     content_change,
-                } => (path, content_change),
+                } => Some((path, content_change)),
+                ToolEffect::ShellCommand { .. } => None,
+            }) else {
+                continue;
             };
             match content_change {
                 ContentChange::Created => self.audit.files_created += 1,
@@ -602,6 +605,7 @@ fn event_name(event: &RunEvent) -> &'static str {
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
+        RunEvent::ChildRunRef { .. } => "child_run_ref",
     }
 }
 

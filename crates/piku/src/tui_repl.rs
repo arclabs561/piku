@@ -1082,11 +1082,13 @@ async fn run_tui_repl_core(
         let id = crate::new_session_id();
         (id.clone(), Session::new(id))
     };
-    let task_registry = TaskRegistry::with_persistence(
+    let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    let task_registry = TaskRegistry::with_persistence_run_path(
         &session_id,
         &sessions_dir,
         config.runs_dir(),
         config.agent_links_dir(),
+        Some(run_path.clone()),
     );
     // Wire a notification channel so background agent completions inject
     // a user-role message into the parent's interjection stream.

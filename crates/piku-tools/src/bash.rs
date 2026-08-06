@@ -6,7 +6,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::{
-    Destructiveness, ToolResult, VerificationIndeterminate, VerificationRecord, VerificationStatus,
+    Destructiveness, ToolEffect, ToolResult, VerificationIndeterminate, VerificationRecord,
+    VerificationStatus,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -162,7 +163,11 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                 "bash: command timed out after {}ms: {}",
                 p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
                 p.command
-            )),
+            ))
+            .with_effect(ToolEffect::ShellCommand {
+                command: p.command.clone(),
+                exit_code: None,
+            }),
             p.purpose,
             verification_description,
             VerificationStatus::Indeterminate {
@@ -170,7 +175,12 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
             },
         ),
         Ok(Err(e)) => attach_verification(
-            ToolResult::error(format!("bash: spawn failed: {e}")),
+            ToolResult::error(format!("bash: spawn failed: {e}")).with_effect(
+                ToolEffect::ShellCommand {
+                    command: p.command.clone(),
+                    exit_code: None,
+                },
+            ),
             p.purpose,
             verification_description,
             VerificationStatus::Indeterminate {
@@ -203,7 +213,11 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                     out.push_str(&stderr);
                 }
                 ToolResult::ok(out)
-            };
+            }
+            .with_effect(ToolEffect::ShellCommand {
+                command: p.command.clone(),
+                exit_code: output.status.code(),
+            });
             attach_verification(
                 result,
                 p.purpose,

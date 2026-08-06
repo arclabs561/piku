@@ -298,7 +298,7 @@ mod edit_file {
 
 #[cfg(test)]
 mod bash {
-    use crate::{bash, VerificationIndeterminate, VerificationStatus};
+    use crate::{bash, ToolEffect, VerificationIndeterminate, VerificationStatus};
 
     #[tokio::test]
     async fn bounds_a_huge_stream_and_says_so() {
@@ -329,6 +329,13 @@ mod bash {
         let result = bash::execute(serde_json::json!({ "command": "echo hello" })).await;
         assert!(!result.is_error, "{}", result.output);
         assert!(result.output.contains("hello"));
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::ShellCommand {
+                command: "echo hello".to_string(),
+                exit_code: Some(0),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -336,6 +343,13 @@ mod bash {
         let result = bash::execute(serde_json::json!({ "command": "exit 1" })).await;
         assert!(result.is_error);
         assert!(result.output.contains("exit code 1"));
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::ShellCommand {
+                command: "exit 1".to_string(),
+                exit_code: Some(1),
+            }]
+        );
     }
 
     #[tokio::test]

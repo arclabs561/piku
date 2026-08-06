@@ -27,6 +27,7 @@ struct ForkContinuityMetric {
     child_result_returned_to_parent: bool,
     spawn_join_recorded: bool,
     child_execution_durable: bool,
+    typed_child_run_ref_in_parent_record: bool,
 }
 
 #[derive(Default)]
@@ -240,11 +241,12 @@ async fn run_case(fork: bool) -> ForkContinuityMetric {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("root-run.jsonl");
     let parent_session_id = format!("fork-eval-{fork}");
-    let registry = TaskRegistry::with_persistence(
+    let registry = TaskRegistry::with_persistence_run_path(
         &parent_session_id,
         directory.path().join("sessions"),
         directory.path().join("runs"),
         directory.path().join("links"),
+        Some(path.clone()),
     );
     let provider = ForkRoutingProvider::new(registry.clone(), fork);
     let mut session = piku_runtime::Session::new(parent_session_id.clone());
@@ -311,7 +313,7 @@ async fn run_case(fork: bool) -> ForkContinuityMetric {
         )
     });
     let child_execution_durable = child_execution_is_durable(&registry, &parent_session_id);
-
+    let typed_child_run_ref_in_parent_record = typed_child_run_ref_present(&events, &registry);
     ForkContinuityMetric {
         parent_marker_in_child_request: child_request.contains(PARENT_MARKER),
         child_result_returned_to_parent: join_returned_child_marker
@@ -319,7 +321,32 @@ async fn run_case(fork: bool) -> ForkContinuityMetric {
         spawn_join_recorded: recorded_tool_pair(&events, "spawn_agent", "root-spawn")
             && recorded_tool_pair(&events, "agent_join", "root-join"),
         child_execution_durable,
+        typed_child_run_ref_in_parent_record,
     }
+}
+
+/// Whether the parent run record carries a typed `ChildRunRef` pointing at the
+/// spawned child session. This is the durable evidence a workbench follows;
+/// `agent_join` prose alone does not survive reopening the run from disk.
+fn typed_child_run_ref_present(
+    events: &[piku_runtime::RunEventEnvelope],
+    registry: &TaskRegistry,
+) -> bool {
+    let child_session_id = registry
+        .all()
+        .into_iter()
+        .next()
+        .and_then(|entry| entry.evidence)
+        .map(|evidence| evidence.child_session_id);
+    child_session_id.is_some_and(|child_id| {
+        events.iter().any(|envelope| {
+            matches!(
+                &envelope.event,
+                RunEvent::ChildRunRef { relationship, child_session_id, .. }
+                    if relationship == "spawn_agent" && *child_session_id == child_id
+            )
+        })
+    })
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -336,6 +363,7 @@ async fn fork_context_continuity_is_measured_against_a_no_fork_control() {
             child_result_returned_to_parent: true,
             spawn_join_recorded: true,
             child_execution_durable: true,
+            typed_child_run_ref_in_parent_record: true,
         }
     );
     assert_eq!(
@@ -345,6 +373,7 @@ async fn fork_context_continuity_is_measured_against_a_no_fork_control() {
             child_result_returned_to_parent: true,
             spawn_join_recorded: true,
             child_execution_durable: true,
+            typed_child_run_ref_in_parent_record: true,
         }
     );
 }

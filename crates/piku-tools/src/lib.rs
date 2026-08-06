@@ -73,6 +73,10 @@ pub enum ToolEffect {
         path: PathBuf,
         content_change: ContentChange,
     },
+    ShellCommand {
+        command: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

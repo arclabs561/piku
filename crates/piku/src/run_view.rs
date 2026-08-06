@@ -158,6 +158,9 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                                 path.display()
                             );
                         }
+                        piku_runtime::RunToolEffect::ShellCommand { command, exit_code } => {
+                            let _ = writeln!(output, "    ↳ shell exit={exit_code:?} `{command}`");
+                        }
                     }
                 }
                 if let Some(verification) = verification {
@@ -185,6 +188,19 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                     output,
                     "  ◆ user {disposition:?} · {}",
                     content_preview(note, 160)
+                );
+            }
+            RunEvent::ChildRunRef {
+                relationship,
+                child_session_id,
+                task_id,
+                run_record_ref,
+                ..
+            } => {
+                let _ = writeln!(
+                    output,
+                    "  ⇄ {relationship} → child session {child_session_id} (task {task_id}) · run {}",
+                    run_record_ref.display()
                 );
             }
         }
@@ -331,6 +347,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
+        RunEvent::ChildRunRef { .. } => "child_run_ref",
     }
 }
 
@@ -388,7 +405,8 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         | RunEvent::ToolStarted { .. }
         | RunEvent::PermissionDecision { .. }
         | RunEvent::TurnCompleted { .. }
-        | RunEvent::Warning { .. } => None,
+        | RunEvent::Warning { .. }
+        | RunEvent::ChildRunRef { .. } => None,
         RunEvent::UserDisposition { note, .. } => Some(note),
     }
 }

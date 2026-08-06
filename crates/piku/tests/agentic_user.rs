@@ -4559,7 +4559,7 @@ fn run_agentic_session(persona: &Persona) {
                     result.label,
                     safe_truncate(result.evidence.trim(), 400)
                 )),
-                scenario::Outcome::Inconclusive => harness_findings.push(format!(
+                scenario::Outcome::VerifierUnavailable | scenario::Outcome::VerifierTimedOut => harness_findings.push(format!(
                     "[harness:MAJOR] acceptance check could not be carried out: {} — {}; the run proves nothing about this property",
                     result.label,
                     safe_truncate(result.evidence.trim(), 400)

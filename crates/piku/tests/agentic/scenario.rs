@@ -97,8 +97,10 @@ pub enum Outcome {
     Passed,
     /// The asserted property does not hold. This is a product claim.
     Failed,
-    /// The check could not be carried out. This is a harness fact.
-    Inconclusive,
+    /// The verifier could not be started or polled. This is a harness fact.
+    VerifierUnavailable,
+    /// The verifier exceeded its time budget. This is a harness fact.
+    VerifierTimedOut,
 }
 
 impl Outcome {
@@ -107,7 +109,8 @@ impl Outcome {
         match self {
             Self::Passed => "pass",
             Self::Failed => "fail",
-            Self::Inconclusive => "inconclusive",
+            Self::VerifierUnavailable => "verifier-unavailable",
+            Self::VerifierTimedOut => "verifier-timeout",
         }
     }
 }
@@ -336,7 +339,7 @@ pub fn verify(scenario: Scenario, workspace: &Path) -> Vec<VerificationResult> {
                         outcome: if error.kind() == std::io::ErrorKind::NotFound {
                             Outcome::Failed
                         } else {
-                            Outcome::Inconclusive
+                            Outcome::VerifierUnavailable
                         },
                         evidence: format!("could not read file: {error}"),
                     },
@@ -390,7 +393,7 @@ fn run_bounded_command(
             // The verifier never ran, so it says nothing about the product.
             return VerificationResult {
                 label,
-                outcome: Outcome::Inconclusive,
+                outcome: Outcome::VerifierUnavailable,
                 evidence: format!("could not start command: {error}"),
             };
         }
@@ -426,7 +429,7 @@ fn run_bounded_command(
                 // A verifier that ran out of time proves nothing either way.
                 return VerificationResult {
                     label,
-                    outcome: Outcome::Inconclusive,
+                    outcome: Outcome::VerifierTimedOut,
                     evidence: format!("timed out after {timeout_secs}s"),
                 };
             }
@@ -435,7 +438,7 @@ fn run_bounded_command(
                 let _ = child.wait();
                 return VerificationResult {
                     label,
-                    outcome: Outcome::Inconclusive,
+                    outcome: Outcome::VerifierUnavailable,
                     evidence: format!("could not poll command: {error}"),
                 };
             }
@@ -547,11 +550,11 @@ mod tests {
             one_clause(command("piku-no-such-program-exists", &[], 5)),
             directory.path(),
         );
-        assert_eq!(results[0].outcome, Outcome::Inconclusive);
+        assert_eq!(results[0].outcome, Outcome::VerifierUnavailable);
         assert!(results[0].evidence.contains("could not start"));
 
         let results = verify(one_clause(command("sleep", &["5"], 1)), directory.path());
-        assert_eq!(results[0].outcome, Outcome::Inconclusive);
+        assert_eq!(results[0].outcome, Outcome::VerifierTimedOut);
         assert!(results[0].evidence.contains("timed out"));
 
         // A command that ran and failed is still a product claim.

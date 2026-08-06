@@ -189,13 +189,28 @@ pub enum RunEvent {
         disposition: RunDisposition,
         note: ContentRef,
     },
+    /// A typed pointer from a parent run to a durable child run, recorded in the
+    /// turn that performed the spawn.
+    ///
+    /// This replaces parsing `agent_join` prose: a child relationship is
+    /// real evidence only when the durable record carries it. References are
+    /// relative to the parent run record's directory so the workbench can
+    /// resolve them without scanning ambient local directories.
+    ChildRunRef {
+        relationship: String,
+        child_session_id: String,
+        task_id: String,
+        run_record_ref: PathBuf,
+        session_ref: PathBuf,
+    },
 }
 
 impl RunEvent {
     fn scope_kind(&self) -> EventScopeKind {
         match self {
             Self::UserDisposition { .. } => EventScopeKind::Run,
-            Self::TurnStarted { .. }
+            Self::ChildRunRef { .. }
+            | Self::TurnStarted { .. }
             | Self::ContextBuilt { .. }
             | Self::CompactionApplied { .. }
             | Self::AssistantMessage { .. }
@@ -223,6 +238,10 @@ pub enum ToolEffect {
     FileWrite {
         path: PathBuf,
         content_change: ContentChange,
+    },
+    ShellCommand {
+        command: String,
+        exit_code: Option<i32>,
     },
 }
 
@@ -268,6 +287,9 @@ impl From<piku_tools::ToolEffect> for ToolEffect {
                 path,
                 content_change: content_change.into(),
             },
+            piku_tools::ToolEffect::ShellCommand { command, exit_code } => {
+                Self::ShellCommand { command, exit_code }
+            }
         }
     }
 }
@@ -548,7 +570,8 @@ impl RunRecorder {
             | RunEvent::ToolStarted { .. }
             | RunEvent::PermissionDecision { .. }
             | RunEvent::TurnCompleted { .. }
-            | RunEvent::Warning { .. } => None,
+            | RunEvent::Warning { .. }
+            | RunEvent::ChildRunRef { .. } => None,
         };
         if let Some((label, content)) = target {
             self.materialize_content(sequence, label, content)?;

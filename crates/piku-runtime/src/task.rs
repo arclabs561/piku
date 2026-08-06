@@ -340,6 +340,8 @@ struct SubagentPersistence {
     sessions_dir: std::path::PathBuf,
     runs_dir: std::path::PathBuf,
     links_dir: std::path::PathBuf,
+    /// Parent run record, used to compute run-relative child references.
+    parent_run_path: Option<std::path::PathBuf>,
 }
 
 struct RegistryInner {
@@ -380,14 +382,66 @@ impl TaskRegistry {
         runs_dir: impl Into<std::path::PathBuf>,
         links_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        Self::with_persistence_run_path(parent_session_id, sessions_dir, runs_dir, links_dir, None)
+    }
+
+    /// Like [`with_persistence`], but records the parent run record so child
+    /// references can be expressed relative to it.
+    #[must_use]
+    pub fn with_persistence_run_path(
+        parent_session_id: impl Into<String>,
+        sessions_dir: impl Into<std::path::PathBuf>,
+        runs_dir: impl Into<std::path::PathBuf>,
+        links_dir: impl Into<std::path::PathBuf>,
+        parent_run_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let registry = Self::new();
         registry.inner().persistence = Some(SubagentPersistence {
             parent_session_id: parent_session_id.into(),
             sessions_dir: sessions_dir.into(),
             runs_dir: runs_dir.into(),
             links_dir: links_dir.into(),
+            parent_run_path,
         });
         registry
+    }
+
+    /// Compute child run-record and session references relative to the parent
+    /// run record, if persistence and a parent run path are configured.
+    #[must_use]
+    ///
+    /// References stay inside the config tree: the child run lives under
+    /// `runs_dir` and the session under `sessions_dir`. We fail closed (return
+    /// `None`) if either path escapes that expected layout, so the durable
+    /// record never names a path outside the run directory graph.
+    pub fn child_refs_relative_to_parent(
+        &self,
+        child_session_id: &str,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let inner = self.inner();
+        let persistence = inner.persistence.as_ref()?;
+        let parent_run_path = persistence.parent_run_path.as_ref()?;
+        let parent_dir = parent_run_path.parent()?;
+        let run_record_ref = persistence
+            .runs_dir
+            .join(format!("{child_session_id}.jsonl"));
+        let session_ref = persistence
+            .sessions_dir
+            .join(format!("{child_session_id}.json"));
+        let rel_run = relative_within(parent_dir, &run_record_ref)?;
+        let rel_session = relative_within(parent_dir, &session_ref)?;
+        if rel_run.is_absolute()
+            || rel_session.is_absolute()
+            || rel_run
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || rel_session
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        Some((rel_run, rel_session))
     }
 
     fn inner(&self) -> MutexGuard<'_, RegistryInner> {
@@ -657,4 +711,25 @@ mod worktree_guard_tests {
         // Clean up by hand so we don't leak.
         remove_worktree_and_branch(repo.path(), &wt_path, &branch);
     }
+}
+
+/// Compute `target` relative to `base` when both share an ancestry, or `None`
+/// if `target` is not nested under `base`. Used to keep durable child
+/// references inside the run-record graph instead of leaking absolute paths.
+fn relative_within(base: &std::path::Path, target: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    if target_components.len() < base_components.len() {
+        return None;
+    }
+    for (base_part, target_part) in base_components.iter().zip(&target_components) {
+        if base_part != target_part {
+            return None;
+        }
+    }
+    let mut relative = std::path::PathBuf::new();
+    for part in &target_components[base_components.len()..] {
+        relative.push(part.as_os_str());
+    }
+    Some(relative)
 }

@@ -763,19 +763,25 @@ async fn run_turn_inner(
                 unpack_tool_result(r, &mut tool_effects, &mut verification)
             } else if let Some(registry) = task_registry {
                 match tool_name.as_str() {
-                    "spawn_agent" => execute_spawn_agent(
-                        params,
-                        registry,
-                        provider,
-                        model,
-                        system_prompt,
-                        &tool_defs,
-                        depth,
-                        &session.id,
-                        &session.messages,
-                        custom_agents,
-                        hook_registry,
-                    ),
+                    "spawn_agent" => {
+                        let (hint, is_error, child_ref) = execute_spawn_agent(
+                            params,
+                            registry,
+                            provider,
+                            model,
+                            system_prompt,
+                            &tool_defs,
+                            depth,
+                            &session.id,
+                            &session.messages,
+                            custom_agents,
+                            hook_registry,
+                        );
+                        if let Some(child_ref) = child_ref {
+                            sink.on_run_event(&child_ref);
+                        }
+                        (hint, is_error)
+                    }
                     "agent_status" => execute_agent_status(params, registry),
                     "agent_join" => execute_agent_join(params, registry).await,
                     _ => {
@@ -1454,8 +1460,9 @@ fn message_role_name(role: &MessageRole) -> &'static str {
 
 // Execute `spawn_agent`: fork a background tokio task running `run_turn_inner`
 // with a fresh session and a budget cap. Returns immediately with the task_id.
-// The current implementation always uses spawn_local. The `background` field
-// changes the response hint but does not make execution synchronous.
+// The current implementation always uses spawn_local. A non-background spawn
+// is still asynchronous, so its response must point callers to agent_join
+// rather than implying that execution completed inline.
 fn execute_spawn_agent(
     params: &serde_json::Value,
     registry: &TaskRegistry,
@@ -1468,17 +1475,18 @@ fn execute_spawn_agent(
     parent_session_messages: &[crate::session::ConversationMessage],
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
-) -> (String, bool) {
+) -> (String, bool, Option<crate::run_record::RunEvent>) {
     if depth >= MAX_SPAWN_DEPTH {
         return (
             format!("spawn_agent refused: maximum recursion depth ({MAX_SPAWN_DEPTH}) reached"),
             true,
+            None,
         );
     }
 
     let p = match piku_tools::spawn_agent::validate_spawn_agent(params.clone()) {
         Ok(v) => v,
-        Err(e) => return (format!("spawn_agent: {e}"), true),
+        Err(e) => return (format!("spawn_agent: {e}"), true, None),
     };
 
     // Worktree isolation: create a temp git worktree if requested
@@ -1492,7 +1500,7 @@ fn execute_spawn_agent(
                     let cwd = wt_path.clone();
                     (Some(wt_path), Some(branch), Some(cwd))
                 }
-                Err(e) => return (format!("worktree creation failed: {e}"), true),
+                Err(e) => return (format!("worktree creation failed: {e}"), true, None),
             }
         } else {
             (None, None, None)
@@ -1725,7 +1733,10 @@ fn execute_spawn_agent(
     };
 
     let hint = if p.background {
-        format!("spawned agent {} ({}){type_info}", p.name, task_id)
+        format!(
+            "spawned background agent {} ({}){type_info}",
+            p.name, task_id
+        )
     } else {
         format!(
             "spawned agent {} ({}){type_info} — use agent_join({}) to wait for result",
@@ -1765,7 +1776,25 @@ fn execute_spawn_agent(
         hooks_owned,
     ));
 
-    (hint, false)
+    // Build a typed parent→child run pointer for the durable parent record.
+    // This is the evidence the static browser follows; parsing `agent_join`
+    // prose is not sufficient because the relationship must survive reopening
+    // the run from disk. The caller emits it through the parent sink.
+    let child_ref = registry.evidence(&task_id).and_then(|evidence| {
+        registry
+            .child_refs_relative_to_parent(&evidence.child_session_id)
+            .map(
+                |(run_record_ref, session_ref)| crate::run_record::RunEvent::ChildRunRef {
+                    relationship: "spawn_agent".to_string(),
+                    child_session_id: evidence.child_session_id.clone(),
+                    task_id: task_id.to_string(),
+                    run_record_ref,
+                    session_ref,
+                },
+            )
+    });
+
+    (hint, false, child_ref)
 }
 
 async fn run_subagent_task(
