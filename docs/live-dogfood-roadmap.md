@@ -4,7 +4,7 @@ Status: active operational evidence loop
 
 Created: 2026-06-20
 
-Last reviewed: 2026-08-03
+Last reviewed: 2026-08-06
 
 Scope: deterministic agent coverage, live-model dogfood, terminal playground
 evidence, and promotion of findings into product changes. Broader product
@@ -37,6 +37,12 @@ Implemented:
   revision.
 - Runs record model attribution, elapsed-time components, review spend, and a
   deterministic development-context handoff.
+- Verifier startup failures, timeouts, and product predicate failures are
+  distinct outcomes and cannot share a product-fix disposition.
+- Review claims cite validated evidence IDs, and configured mutation denials
+  outrank safe classification and per-turn allow-all state.
+- Tool effects include durable file-write evidence and typed shell-command
+  execution outcomes in the run record.
 
 Fresh remote check on 2026-08-03: the `live-llm.yml` workflow has no recorded
 runs. Local corpus-backed and terminal-playground ledgers exist, but they do not
@@ -95,7 +101,7 @@ and made task acceptance authoritative.
 
 ## Active operational priorities
 
-### 1. Preserve pass, fail, and inconclusive evidence
+### 1. Preserve pass, fail, and inconclusive evidence — complete
 
 The evaluator currently maps any scenario-verifier `passed: false`, including
 spawn and timeout failures, to the same engineering next action as a failed
@@ -113,7 +119,7 @@ Gate:
 - Injected verifier spawn and timeout failures cannot produce a product-failure
   disposition, while an actual predicate failure still does.
 
-### 2. Finish evidence-addressed review
+### 2. Finish evidence-addressed review — complete
 
 Current review validation requires a nonempty, in-range run-level
 `evidence_turns` list. Review bodies and recursive observations are still opaque
@@ -134,7 +140,7 @@ Gate:
 - A fabricated turn, unsupported claim count, or missing evidence ID produces an
   invalid review record and cannot change the engineering next action.
 
-### 3. Make mutation authority an executable invariant
+### 3. Make mutation authority an executable invariant — complete
 
 The current permission path allows `Safe` calls before configuration rules and
 lets a prior per-turn allow-all precede deny rules. New unprotected files,
@@ -156,7 +162,7 @@ Gate:
   Markdown-memory, and attempt writes, including after per-turn allow-all.
 - Writable launch and child turns cannot silently widen the declared lease.
 
-### 4. Make tool effects dependable evidence
+### 4. Make tool effects dependable evidence — in progress
 
 Before optimizing tool discovery, define the result contract that both the agent
 and evaluator can trust:
@@ -301,6 +307,6 @@ Revisit this roadmap when any of the following occurs:
 
 ## Next action
 
-Separate product failure from verifier failure and bind every authoritative
-scenario claim to a direct predicate. The strategic roadmap then begins with the
-non-interactive authority and execution-boundary decisions.
+Complete bounded changed-file inventory and fault-injection coverage for shell
+effects, then finish background-agent ownership, cancellation, and disposition
+guarantees.
