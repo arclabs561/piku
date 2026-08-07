@@ -326,12 +326,6 @@ fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
         }
     }
 
-    let ollama = ProviderSpec::ollama(
-        std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
-    );
-    if ollama_is_available(ollama.ollama_host.as_ref().unwrap()) {
-        return Some(ollama);
-    }
     if has_key("OPENROUTER_API_KEY") {
         return Some(ProviderSpec::openrouter(
             std::env::var("PIKU_AGENTIC_USER_MODEL")
@@ -343,6 +337,12 @@ fn user_agent_provider(freeform: bool) -> Option<ProviderSpec> {
             std::env::var("PIKU_AGENTIC_USER_MODEL")
                 .unwrap_or_else(|_| anthropic_default.to_string()),
         ));
+    }
+    let ollama = ProviderSpec::ollama(
+        std::env::var("PIKU_AGENTIC_USER_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
+    );
+    if ollama_is_available(ollama.ollama_host.as_ref().unwrap()) {
+        return Some(ollama);
     }
     None
 }
@@ -359,12 +359,6 @@ fn piku_provider() -> Option<ProviderSpec> {
         return Some(spec);
     }
 
-    let ollama = ProviderSpec::ollama(
-        std::env::var("PIKU_AGENTIC_PIKU_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
-    );
-    if ollama_is_available(ollama.ollama_host.as_ref().unwrap()) {
-        return Some(ollama);
-    }
     if has_key("OPENROUTER_API_KEY") {
         return Some(ProviderSpec::openrouter(
             std::env::var("PIKU_AGENTIC_PIKU_MODEL")
@@ -376,6 +370,12 @@ fn piku_provider() -> Option<ProviderSpec> {
             std::env::var("PIKU_AGENTIC_PIKU_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
         ));
+    }
+    let ollama = ProviderSpec::ollama(
+        std::env::var("PIKU_AGENTIC_PIKU_MODEL").unwrap_or_else(|_| "gemma4:latest".to_string()),
+    );
+    if ollama_is_available(ollama.ollama_host.as_ref().unwrap()) {
+        return Some(ollama);
     }
     None
 }
