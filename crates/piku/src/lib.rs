@@ -21,6 +21,10 @@ pub mod tui_repl;
 
 use std::env;
 
+/// Crate version, from `Cargo.toml`. Shared by the binary, `--version`, and the
+/// interactive `/version` command so all three report the same string.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // Shared utilities
 // ---------------------------------------------------------------------------

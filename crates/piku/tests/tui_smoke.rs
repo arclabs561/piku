@@ -34,6 +34,19 @@ use std::time::{Duration, Instant};
 
 use serial_test::serial;
 
+// The shared "seeing" model — a vt100 parser that renders the PTY byte stream
+// into the grid a human would see. Same observer the agentic judge loop uses,
+// so these smoke tests and the judge assert on one definition of "the screen".
+#[path = "agentic/screen.rs"]
+mod screen;
+use screen::{ScreenObserver, ScreenSnapshot};
+
+/// The fixed grid these PTY tests render into. The observer and the PTY winsize
+/// are both built from this one constant, so the parsed grid can never disagree
+/// with the size piku actually drew into.
+const TEST_ROWS: u16 = 24;
+const TEST_COLS: u16 = 80;
+
 fn piku_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let profile_dir = exe.parent().unwrap().parent().unwrap();
@@ -55,6 +68,9 @@ struct Pty {
     reader: std::fs::File,
     buf: Vec<u8>,
     eof: bool,
+    /// Persistent renderer: every byte drained from the PTY is also fed here so
+    /// `screen()` returns what the user currently sees, not the raw log.
+    observer: ScreenObserver,
 }
 
 impl Pty {
@@ -96,6 +112,12 @@ impl Pty {
         let writer = proc.get_file_handle().expect("pty writer");
         let reader = proc.get_file_handle().expect("pty reader");
 
+        // Fix the terminal size before piku's first `term_size()` so the layout
+        // it draws and the grid the observer parses are the same shape. piku
+        // reads its dimensions from the PTY ioctl (TIOCGWINSZ), not from
+        // LINES/COLUMNS, so this is the only knob that controls the render.
+        set_winsize(&writer, TEST_ROWS, TEST_COLS);
+
         use nix::fcntl::{fcntl, FcntlArg, OFlag};
         let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
         fcntl(
@@ -110,6 +132,7 @@ impl Pty {
             reader,
             buf: Vec::new(),
             eof: false,
+            observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
         }
     }
 
@@ -117,6 +140,35 @@ impl Pty {
         // Tolerant of closed PTY — writes after child exit return EIO.
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    /// Current rendered screen — what the user sees right now. Drains any
+    /// pending PTY output into the observer first so the snapshot is fresh.
+    fn screen(&mut self) -> ScreenSnapshot {
+        self.drain();
+        self.observer.snapshot()
+    }
+
+    /// Poll until the rendered screen satisfies `pred` or the timeout elapses.
+    /// Returns the last snapshot either way so a failing test can print what
+    /// the user actually saw. This is the screen-level analogue of `wait_for`,
+    /// which only checks the raw byte log.
+    fn wait_until(
+        &mut self,
+        mut pred: impl FnMut(&ScreenSnapshot) -> bool,
+        timeout: Duration,
+    ) -> (bool, ScreenSnapshot) {
+        let start = Instant::now();
+        loop {
+            let snap = self.screen();
+            if pred(&snap) {
+                return (true, snap);
+            }
+            if start.elapsed() >= timeout {
+                return (false, snap);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn drain(&mut self) {
@@ -127,7 +179,10 @@ impl Pty {
                     self.eof = true;
                     break;
                 }
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    self.observer.process(&chunk[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     if e.raw_os_error() == Some(libc::EIO) {
@@ -160,6 +215,18 @@ impl Pty {
         while start.elapsed() < dur {
             self.drain();
             std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Drive piku to a clean exit and wait for EOF. Called explicitly by tests
+    /// that leave piku in a state where `Drop`'s lone Ctrl-D would be ignored
+    /// (e.g. mid-turn), so the test cannot hang waiting on a still-running process.
+    fn exit_cleanly(&mut self) {
+        self.send(b"exit\r");
+        let start = std::time::Instant::now();
+        while !self.eof && start.elapsed() < Duration::from_secs(3) {
+            self.drain();
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -527,12 +594,14 @@ fn sigterm_restores_terminal_before_exit() {
     )
     .unwrap();
 
+    set_winsize(&writer, TEST_ROWS, TEST_COLS);
     let mut pty = Pty {
         _proc: proc,
         writer,
         reader,
         buf: Vec::new(),
         eof: false,
+        observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
     };
 
     // Wait for piku to finish startup — prompt glyph is a reliable marker
@@ -623,12 +692,14 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
     )
     .unwrap();
 
+    set_winsize(&writer, TEST_ROWS, TEST_COLS);
     let mut pty = Pty {
         _proc: proc,
         writer,
         reader,
         buf: Vec::new(),
         eof: false,
+        observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
     };
 
     let ready = pty.wait_for("❯", Duration::from_secs(5));
@@ -650,4 +721,192 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
         !pty.eof,
         "piku exited on Ctrl-C (should only cancel turn):\n{out}"
     );
+}
+
+// ── PTY window size ───────────────────────────────────────────────────────────
+
+/// Set a PTY's window size via `ioctl(TIOCSWINSZ)`.
+///
+/// piku reads its dimensions from the PTY ioctl (`TIOCGWINSZ`), not from the
+/// `LINES`/`COLUMNS` environment, so this is what makes the render deterministic.
+/// Called once at spawn from the same `(TEST_ROWS, TEST_COLS)` the observer is
+/// built with, so the grid piku draws and the grid the parser models agree.
+#[allow(unsafe_code)]
+fn set_winsize(file: &std::fs::File, rows: u16, cols: u16) {
+    use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "macos")]
+    const TIOCSWINSZ: libc::c_ulong = 0x8008_7467;
+    #[cfg(target_os = "linux")]
+    const TIOCSWINSZ: libc::c_ulong = 0x5414;
+
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ writes a fixed-layout `struct winsize` to a valid PTY fd.
+    unsafe {
+        libc::ioctl(file.as_raw_fd(), TIOCSWINSZ, &ws);
+    }
+}
+
+// ===========================================================================
+// Rendered-screen TUI QA — assert on what a human SEES
+// ---------------------------------------------------------------------------
+// These tests drive the real piku binary over a PTY and assert on the rendered
+// grid (`pty.screen()`), not the raw byte log. The renderer is the same vt100
+// observer the agentic judge loop uses (`agentic/screen.rs`), so "the screen"
+// has one definition across the suite.
+//
+// Why the rendered screen and not raw bytes: a user experiences the grid a
+// terminal paints, not the escape sequence. vt100 is faithful enough that it
+// *caught* the blank-screen bug these tests now guard against — DECSTBM homes
+// the cursor (`ESC [ r` -> xterm `CursorSet(screen, 0, 0, ...)`), so piku's
+// reset-region-then-erase wiped the whole frame on a real terminal too. See
+// `agentic/screen.rs` for the full rationale.
+//
+// A fake API key means no network call succeeds; we assert only on the
+// presentation that happens before / instead of the LLM response.
+// ===========================================================================
+
+/// Wait for piku's prompt to be rendered and return the ready snapshot.
+fn wait_ready(pty: &mut Pty) -> ScreenSnapshot {
+    let (ok, snap) = pty.wait_until(ScreenSnapshot::is_ready, Duration::from_secs(6));
+    assert!(
+        ok,
+        "prompt never became ready; screen was:\n{}",
+        snap.summary(24)
+    );
+    snap
+}
+
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn header_is_pinned_and_shows_version_on_launch() {
+    // The header the user sees at startup must carry the piku title, the
+    // version, and the provider — and it must survive (not be wiped) once the
+    // prompt is ready. This is the regression guard for "typing piku clears my
+    // screen": if the frame were wiped, none of these would render.
+    let mut pty = Pty::spawn();
+    let snap = wait_ready(&mut pty);
+
+    assert!(
+        snap.shows("piku"),
+        "title should be visible on launch; screen:\n{}",
+        snap.summary(24)
+    );
+    assert!(
+        snap.shows(env!("CARGO_PKG_VERSION")),
+        "version {} should be visible in the header; screen:\n{}",
+        env!("CARGO_PKG_VERSION"),
+        snap.summary(24)
+    );
+    assert!(
+        snap.shows("openrouter"),
+        "provider should be visible in the header; screen:\n{}",
+        snap.summary(24)
+    );
+    pty.exit_cleanly();
+}
+
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn ready_caret_is_green() {
+    // The caret signals "ready for input" and must be green — not the old red
+    // that lingered for a whole prompt after a failed turn.
+    let mut pty = Pty::spawn();
+    let snap = wait_ready(&mut pty);
+
+    let caret = snap
+        .styled_input_row()
+        .and_then(screen::StyledRow::first_glyph_fg);
+    assert_eq!(
+        caret,
+        Some(screen::Color::Green),
+        "ready caret should be green; input row was {:?}",
+        snap.input_row()
+    );
+    pty.exit_cleanly();
+}
+
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn typing_slash_shows_command_autocomplete_menu() {
+    // Typing `/` should surface a live menu of commands on the screen, so the
+    // user does not have to remember them.
+    let mut pty = Pty::spawn();
+    wait_ready(&mut pty);
+
+    pty.send(b"/");
+    let (shown, snap) = pty.wait_until(
+        |s| s.shows("/help") && s.shows("/status"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        shown,
+        "slash autocomplete menu should list commands after typing '/'; screen:\n{}",
+        snap.summary(24)
+    );
+    pty.exit_cleanly();
+}
+
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn version_command_shows_version_in_tui() {
+    // `/version` must print the version into the transcript the user sees.
+    let mut pty = Pty::spawn();
+    wait_ready(&mut pty);
+
+    pty.send(b"/version\r");
+    let want = format!("piku {}", env!("CARGO_PKG_VERSION"));
+    let (shown, snap) = pty.wait_until(|s| s.shows(&want), Duration::from_secs(3));
+    assert!(
+        shown,
+        "/version should show {want:?}; screen:\n{}",
+        snap.summary(24)
+    );
+    pty.exit_cleanly();
+}
+
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn submit_does_not_blank_the_screen() {
+    // The core regression: submitting a prompt used to wipe the frame (DECSTBM
+    // homed the cursor, then the editor erased from row 1 down). After the fix
+    // the submitted text stays on screen and the frame is not blank.
+    let mut pty = Pty::spawn();
+    wait_ready(&mut pty);
+
+    pty.send(b"hello there\r");
+    // With a fake key the turn errors; we only need piku to have processed the
+    // submit and returned to a drawn frame.
+    let (settled, snap) = pty.wait_until(
+        |s| s.shows("hello there") && s.non_empty_rows().len() >= 2,
+        Duration::from_secs(8),
+    );
+    assert!(
+        settled,
+        "submitted input should stay visible and the frame should not blank; screen:\n{}",
+        snap.summary(24)
+    );
+    // The header must still be there — proof the submit did not scroll-wipe it.
+    assert!(
+        snap.shows("piku"),
+        "header should survive a submit; screen:\n{}",
+        snap.summary(24)
+    );
+    pty.exit_cleanly();
 }

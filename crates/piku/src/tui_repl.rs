@@ -239,13 +239,69 @@ fn reset_scroll_region() {
     print!("\x1b[r");
 }
 
+/// Rows reserved for the pinned header at the top of the frame.
+const HEADER_ROWS: u16 = 2;
+
+/// The input caret. Green means "piku is ready for input", which is the only
+/// thing the caret claims; failures are reported in the transcript where they
+/// occur, not by recoloring the editor on the following prompt.
+const READY_PROMPT: &str = "\x1b[32m❯\x1b[0m ";
+
+/// First row of the scrolling conversation region (1-indexed).
+fn scroll_top() -> u16 {
+    HEADER_ROWS + 1
+}
+
+/// Enter the conversation layout and park the cursor at `park`.
+///
+/// The frame is: pinned header (rows `1..=HEADER_ROWS`), scrolling conversation
+/// (`HEADER_ROWS + 1 ..= rows - 2`), footer (`rows - 1`), input row (`rows`).
+/// Only the middle band scrolls, so the header and footer survive an
+/// arbitrarily long transcript instead of being pushed off the top.
+///
+/// `park` is a required argument rather than a caller convention because
+/// DECSTBM homes the cursor as a side effect: the VT100 user guide specifies
+/// that "the cursor is placed in the home position", and xterm implements the
+/// sequence as `set_tb_margins(...)` followed by `CursorSet(screen, 0, 0, ...)`.
+/// A caller that sets the region and then erases from the cursor down is
+/// therefore erasing from row 1 — the entire frame — which is exactly the
+/// "screen goes blank as soon as I type" failure. Taking the destination here
+/// makes that mistake unexpressible instead of merely discouraged.
+///
+/// Deriving the region bounds here (rather than at each call site) is the other
+/// half of the guard: the bounds used to be open-coded, and the copies drifted
+/// — setup used `3` for the top while the per-turn restore used `1`, so the
+/// first turn silently un-pinned the header it had just drawn.
+fn enter_scroll_region(rows: u16, park: u16) {
+    set_scroll_region(scroll_top(), rows.saturating_sub(2));
+    goto(park, 1);
+    let _ = io::stdout().flush();
+}
+
+/// Leave the conversation layout (region becomes the whole screen) and park the
+/// cursor at `park`. `park` is mandatory for the same homing reason as
+/// [`enter_scroll_region`]: the reset form `ESC [ r` homes the cursor too.
+fn leave_scroll_region(park: u16) {
+    reset_scroll_region();
+    goto(park, 1);
+    let _ = io::stdout().flush();
+}
+
 /// Move cursor to (row, col) — 1-indexed.
 fn goto(row: u16, col: u16) {
     print!("\x1b[{row};{col}H");
 }
 
 fn term_size() -> (u16, u16) {
-    terminal::size().unwrap_or((80, 24))
+    // Fall back to a sane default when the terminal reports no size. Some PTY
+    // setups (e.g. freshly spawned pty slaves, CI runners) report (0, 0) via a
+    // successful ioctl rather than failing; an unwrap_or on Err would miss that
+    // and leave piku drawing into a zero-sized grid (no header, no scroll
+    // region). A degenerate size must still resolve to a usable layout.
+    match terminal::size() {
+        Ok((r, c)) if r > 0 && c > 0 => (r, c),
+        _ => (80, 24),
+    }
 }
 
 /// Bound a permission description by terminal bytes without splitting UTF-8.
@@ -286,13 +342,17 @@ const TERM_RESTORE_BYTES: &[u8] = b"\x1b[r\x1b[?25h\n";
 /// async-signal-safe — it runs atexit handlers that may take locks).
 /// `_exit` is the async-signal-safe POSIX call for prompt termination.
 ///
-/// SIGINT is deliberately NOT handled here. Inside raw mode, crossterm
-/// consumes Ctrl-C as a byte and never raises SIGINT. Outside raw mode
-/// (startup / after teardown) the default SIGINT disposition is fine.
+/// SIGINT is handled too, even though raw mode usually keeps it from firing:
+/// crossterm consumes Ctrl-C as a byte while raw mode is on, so the signal is
+/// only raised in the windows where it is *not* on — startup, teardown, a
+/// shell-out via `!cmd`, and any window where a raw-mode guard leaked. Those
+/// are precisely the moments when the default disposition kills the process
+/// with DECSTBM still set, which is what garbles the shell the user gets back.
+/// Restoring first costs nothing in the common case and fixes the uncommon one.
 #[cfg(unix)]
 fn install_terminal_restoring_signal_handlers() {
     use signal_hook_registry::register;
-    for sig in [libc::SIGTERM, libc::SIGHUP] {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // Safety: the closure is async-signal-safe (only write(2) and _exit).
         // register() chains this onto any existing handler — it does not
         // replace — so crossterm's SIGWINCH registration is unaffected even
@@ -734,11 +794,25 @@ pub(crate) fn short_session_id(id: &str) -> String {
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 fn setup_layout(rows: u16, cols: u16, model: &str, provider: &str, session_id: &str) {
+    // Layout: a pinned top header (title + provider/model), a pinned bottom
+    // footer (status), and a scroll region between them that holds the live
+    // conversation. The conversation auto-scrolls within the region, so the
+    // header and footer never move or get wiped — this mirrors how claude /
+    // aider keep a stable frame around a scrolling transcript.
     let scroll_bot = rows.saturating_sub(2);
 
-    // Clear screen, position at top
-    print!("\x1b[2J\x1b[H");
-    set_scroll_region(1, scroll_bot);
+    // Reset scroll region first so the layout below isn't clipped by a
+    // region left over from a previous setup_layout (self-update re-entry).
+    leave_scroll_region(1);
+    // Scroll the shell's existing output up into scrollback rather than
+    // erasing it. `\x1b[2J` — and an equivalent per-row `\x1b[2K` sweep —
+    // destroys whatever the user had on screen when they typed `piku`.
+    // Emitting a screenful of newlines yields the same blank frame to draw
+    // into while every prior line stays recoverable by scrolling up.
+    for _ in 0..rows {
+        println!();
+    }
+    enter_scroll_region(rows, 1);
     draw_footer(
         rows.saturating_sub(1),
         cols,
@@ -759,11 +833,16 @@ fn setup_layout(rows: u16, cols: u16, model: &str, provider: &str, session_id: &
 }
 
 fn teardown_layout(rows: u16) {
-    reset_scroll_region();
+    leave_scroll_region(rows);
     print!("\x1b[?25h"); // always restore cursor on exit
-    goto(rows, 1);
     println!();
     let _ = io::stdout().flush();
+    // Last line of defence for the shell we hand back. Every raw-mode window
+    // is supposed to close itself, but an aborted task or an early `break`
+    // can skip that, and a terminal left in raw mode is the single most
+    // user-hostile way to exit: no echo, no line editing, no Ctrl-C.
+    // `disable_raw_mode` is idempotent, so paying it unconditionally is free.
+    let _ = terminal::disable_raw_mode();
 }
 
 // ── Output sink that writes into the scroll zone ──────────────────────────────
@@ -1180,26 +1259,37 @@ async fn run_tui_repl_core(
     let (cols, rows) = term_size();
     setup_layout(rows, cols, &model, resolved.name(), &session_id);
 
-    // Print a brief welcome (or restart banner) into the scroll zone,
-    // then replay the tail of the session history so context is visible.
+    // Print a brief welcome (or restart banner) into the pinned header
+    // region (rows 1-2), then replay the tail of the session history into the
+    // scroll region so context is visible. The header is drawn once and never
+    // scrolls, so the transcript below it can grow without wiping it.
     {
         let scroll_bot = rows.saturating_sub(2);
-        goto(1, 1); // top of scroll zone
         if post_restart {
+            goto(1, 1);
+            print!("\x1b[2K");
             println!(
                 "\x1b[1;32m↺ restarted with new binary\x1b[0m  \x1b[2msession: {session_id}\x1b[0m\r"
             );
+            goto(2, 1);
+            print!("\x1b[2K\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r");
         } else {
             let mode = if read_only { " · read-only" } else { "" };
+            goto(1, 1);
+            print!("\x1b[2K");
             println!(
-                "\x1b[1mpiku\x1b[0m  \x1b[2m{} · {}{}\x1b[0m\r\n\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r",
+                "\x1b[1mpiku\x1b[0m \x1b[2mv{}\x1b[0m  \x1b[2m{} · {}{}\x1b[0m\r",
+                crate::VERSION,
                 resolved.name(),
                 model,
                 mode,
             );
+            goto(2, 1);
+            print!("\x1b[2K\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit · type / for commands\x1b[0m\r");
         }
 
-        // Replay tail of session history into scroll zone
+        // Replay tail of session history into the scroll region (below header).
+        goto(scroll_top(), 1);
         print_session_tail(&session, scroll_bot);
 
         goto(scroll_bot, 1);
@@ -1212,9 +1302,6 @@ async fn run_tui_repl_core(
     editor.load_history_file(&history_path);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    // Track whether the last turn had an error, to change the prompt glyph.
-    let mut last_turn_error = false;
-
     loop {
         // Check for a newer binary on every iteration — catches the case where
         // `cargo build` was run externally while the REPL was already running.
@@ -1248,25 +1335,29 @@ async fn run_tui_repl_core(
         print!("\x1b[2K"); // clear current line before editor redraws
         let _ = io::stdout().flush();
 
-        // Prompt glyph reflects state: red after error, blue normally.
-        if last_turn_error {
-            editor.set_prompt("\x1b[31m❯\x1b[0m ");
-        } else {
-            editor.set_prompt("\x1b[34m❯\x1b[0m ");
-        }
+        // The caret is the "ready for input" light, so it stays green whenever
+        // piku is ready — which is every time we reach this line. It used to
+        // turn red for the whole next prompt after a failed turn, which read as
+        // "the editor is broken" rather than "that request failed": the error
+        // already announced itself in the transcript, and the caret is not
+        // where a past failure belongs. Errors are reported where they happen;
+        // the caret reports only whether input is accepted right now.
+        editor.set_prompt(READY_PROMPT);
 
         // Use read_line_raw so the editor doesn't emit post-submit
         // cursor movement that conflicts with the DECSTBM layout.
         // We temporarily reset the scroll region so MoveUp/MoveDown
         // in the editor's redraw work without scroll-region clipping.
-        reset_scroll_region();
+        // Park on the input row: leaving the region homes the cursor, and the
+        // editor's first redraw erases from wherever the cursor is down to the
+        // bottom. Homed, that erase eats the header, transcript, and footer.
+        leave_scroll_region(input_row);
         let readline = editor.read_line_raw();
-        // Restore scroll region and re-position cursor.
+        // Restore the region and park in the scroll zone so turn output lands
+        // below the transcript rather than on top of the header.
         let (_cols, rows) = term_size();
-        set_scroll_region(1, rows.saturating_sub(2));
-        // Park cursor in scroll zone bottom so output lands there.
         let scroll_bot = rows.saturating_sub(2);
-        goto(scroll_bot, 1);
+        enter_scroll_region(rows, scroll_bot);
         print!("\x1b[?25h");
         let _ = io::stdout().flush();
 
@@ -1324,12 +1415,15 @@ async fn run_tui_repl_core(
                         println!("\r\n\x1b[2;35m!\x1b[0m \x1b[2m{cmd}\x1b[0m\r");
                         // Run it
                         let _ = io::stdout().flush();
-                        reset_scroll_region();
+                        // The child inherits this terminal, so it must not
+                        // inherit our scroll region; park at the input row
+                        // while it runs, then restore the frame around its
+                        // output.
+                        leave_scroll_region(rows);
                         let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
                         let (_, rows) = term_size();
-                        set_scroll_region(1, rows.saturating_sub(2));
                         let scroll_bot = rows.saturating_sub(2);
-                        goto(scroll_bot, 1);
+                        enter_scroll_region(rows, scroll_bot);
                         match output {
                             Ok(out) => {
                                 let stdout_str = String::from_utf8_lossy(&out.stdout);
@@ -1581,9 +1675,16 @@ async fn run_tui_repl_core(
                 // Stop the keypress reader.
                 cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 keypress_handle.abort();
+                // `abort()` cancels the task at its next await point, so the
+                // task's own `disable_raw_mode()` cleanup may never run. Left
+                // alone, raw mode leaks: the next `read_line_raw` observes
+                // "already raw" and therefore also declines to restore it, so
+                // piku exits leaving the user's shell with no echo and no line
+                // editing. Forcing cooked mode here is idempotent and keeps
+                // the leak from escaping the turn.
+                let _ = terminal::disable_raw_mode();
 
                 total_usage.accumulate(&result.usage);
-                last_turn_error = result.stream_error.is_some();
 
                 if let Some(err) = &result.stream_error {
                     // Print error into scroll zone
@@ -1879,6 +1980,7 @@ fn handle_slash_cmd(
   /tasks         List background agents\r
   /sessions      List saved sessions\r
   /clear         Clear session context\r
+  /version       Show piku version\r
   /exit, /quit   Exit piku\r
 \r
 \x1b[1mKeys:\x1b[0m\r
@@ -1897,6 +1999,9 @@ fn handle_slash_cmd(
                 "\x1b[1mStatus:\x1b[0m  provider={provider_name}  model={current_model}  msgs={}\r",
                 session.messages.len(),
             );
+        }
+        "version" | "v" => {
+            println!("\x1b[1mpiku\x1b[0m {}\r", crate::VERSION);
         }
         "cost" => {
             println!(

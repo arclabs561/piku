@@ -413,6 +413,25 @@ impl InputBuffer {
         self.cursor = self.buffer.len();
     }
 
+    /// Candidates for the current slash-command prefix, used to show a live
+    /// autocomplete menu above the input row. Returns an empty vec when the
+    /// input is not a slash-command prefix (so callers can hide the menu).
+    #[must_use]
+    pub fn slash_completions<'a>(&self, candidates: &[&'a str]) -> Vec<&'a str> {
+        let prefix = &self.buffer[..self.cursor];
+        if self.cursor != self.buffer.len()
+            || prefix.contains(char::is_whitespace)
+            || !prefix.starts_with('/')
+        {
+            return Vec::new();
+        }
+        candidates
+            .iter()
+            .filter(|c| c.starts_with(prefix))
+            .copied()
+            .collect()
+    }
+
     /// Try to complete a slash command prefix. Returns true if anything changed.
     pub fn complete_slash_command(&mut self, candidates: &[&str]) -> bool {
         // Only complete if cursor is at end and input starts with /
@@ -1276,6 +1295,31 @@ impl LineEditor {
             }
         }
 
+        // Live slash-command autocomplete: when the input is a slash prefix that
+        // has matches, append a dim menu line so the user can see available
+        // commands (and what Tab would complete to) as they type.
+        let matches = input.slash_completions(SLASH_CMDS);
+        // Show the menu whenever there is a real choice to make: more than one
+        // candidate, or a single candidate the user has not finished typing.
+        // A fully-typed sole command needs no menu.
+        let show_menu = matches.len() > 1 || (matches.len() == 1 && !matches.contains(&text));
+        if show_menu {
+            const MAX_SHOWN: usize = 6;
+            let menu = matches
+                .iter()
+                .take(MAX_SHOWN)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("  ");
+            let more = if matches.len() > MAX_SHOWN {
+                let extra = matches.len() - MAX_SHOWN;
+                format!("  \x1b[2m+{extra} more\x1b[0m")
+            } else {
+                String::new()
+            };
+            lines.push(format!("\x1b[2m  {menu}\x1b[0m{more}"));
+        }
+
         Rendered {
             lines,
             cursor_row: sat_u16(cursor_row),
@@ -1571,6 +1615,48 @@ mod tests {
         }
         assert!(buf.complete_slash_command(SLASH_CMDS));
         assert_eq!(buf.as_str(), "/help");
+    }
+
+    #[test]
+    fn slash_completions_filters_by_prefix() {
+        let cands = ["/help", "/status", "/sessions", "/version"];
+        let mut buf = InputBuffer::new();
+        for ch in "/s".chars() {
+            buf.insert(ch);
+        }
+        // Only the /s* commands match, in candidate order.
+        assert_eq!(buf.slash_completions(&cands), vec!["/status", "/sessions"]);
+    }
+
+    #[test]
+    fn slash_completions_empty_when_not_a_slash_prefix() {
+        let cands = ["/help", "/status"];
+        // Plain text: no menu.
+        let mut buf = InputBuffer::new();
+        for ch in "hello".chars() {
+            buf.insert(ch);
+        }
+        assert!(buf.slash_completions(&cands).is_empty());
+
+        // Slash with a trailing space is a completed command, not a prefix.
+        let mut buf2 = InputBuffer::new();
+        for ch in "/help ".chars() {
+            buf2.insert(ch);
+        }
+        assert!(buf2.slash_completions(&cands).is_empty());
+    }
+
+    #[test]
+    fn slash_completions_require_cursor_at_end() {
+        let cands = ["/help", "/status"];
+        let mut buf = InputBuffer::new();
+        for ch in "/help".chars() {
+            buf.insert(ch);
+        }
+        // Move the cursor off the end: an in-the-middle edit should not pop a
+        // menu (the user is not extending the prefix).
+        buf.move_left();
+        assert!(buf.slash_completions(&cands).is_empty());
     }
 
     #[test]
