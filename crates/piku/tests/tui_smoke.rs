@@ -842,20 +842,33 @@ fn ready_caret_is_green() {
 #[test]
 #[serial]
 #[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
-fn typing_slash_shows_command_autocomplete_menu() {
-    // Typing `/` should surface a live menu of commands on the screen, so the
-    // user does not have to remember them.
+fn typing_slash_preserves_the_frame() {
+    // A slash prefix used to append an extra menu row while the editor was
+    // anchored on the last terminal row, which scrolled the pinned header out
+    // of view. Guard the invariant rather than the removed menu: after typing
+    // `/`, the header and the footer hint are both still on screen.
     let mut pty = Pty::spawn();
-    wait_ready(&mut pty);
+    let initial = wait_ready(&mut pty);
+    assert!(
+        initial.shows("piku") && initial.shows("/help for commands"),
+        "header and footer should render before typing; screen:\n{}",
+        initial.summary(24)
+    );
 
     pty.send(b"/");
     let (shown, snap) = pty.wait_until(
-        |s| s.shows("/help") && s.shows("/status"),
+        |s| {
+            s.shows("piku")
+                && s.shows(env!("CARGO_PKG_VERSION"))
+                && s.shows("/help for commands")
+                && s.input_row().trim_start().ends_with('/')
+        },
         Duration::from_secs(3),
     );
     assert!(
         shown,
-        "slash autocomplete menu should list commands after typing '/'; screen:\n{}",
+        "typing a slash should echo into the prompt without scrolling away the \
+         header or footer; screen:\n{}",
         snap.summary(24)
     );
     pty.exit_cleanly();

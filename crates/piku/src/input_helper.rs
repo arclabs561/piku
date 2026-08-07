@@ -1295,31 +1295,6 @@ impl LineEditor {
             }
         }
 
-        // Live slash-command autocomplete: when the input is a slash prefix that
-        // has matches, append a dim menu line so the user can see available
-        // commands (and what Tab would complete to) as they type.
-        let matches = input.slash_completions(SLASH_CMDS);
-        // Show the menu whenever there is a real choice to make: more than one
-        // candidate, or a single candidate the user has not finished typing.
-        // A fully-typed sole command needs no menu.
-        let show_menu = matches.len() > 1 || (matches.len() == 1 && !matches.contains(&text));
-        if show_menu {
-            const MAX_SHOWN: usize = 6;
-            let menu = matches
-                .iter()
-                .take(MAX_SHOWN)
-                .copied()
-                .collect::<Vec<_>>()
-                .join("  ");
-            let more = if matches.len() > MAX_SHOWN {
-                let extra = matches.len() - MAX_SHOWN;
-                format!("  \x1b[2m+{extra} more\x1b[0m")
-            } else {
-                String::new()
-            };
-            lines.push(format!("\x1b[2m  {menu}\x1b[0m{more}"));
-        }
-
         Rendered {
             lines,
             cursor_row: sat_u16(cursor_row),
