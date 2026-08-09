@@ -785,7 +785,173 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
+
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ContextResolutionFixture {
+        schema_version: u8,
+        run_id: String,
+        role: String,
+        checkpoint: String,
+        resolver: ResolverFixture,
+        request: ResolutionRequestFixture,
+        capability_profile: CapabilityProfileFixture,
+        status: ResolutionStatusFixture,
+        cache: CacheFixture,
+        started_at: String,
+        finished_at: String,
+        items: Vec<ContextItemFixture>,
+        warnings: Vec<String>,
+        error: Option<ResolutionErrorFixture>,
+        materialized_artifact_refs: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResolverFixture {
+        id: String,
+        version: String,
+        config_sha256: String,
+        code_sha256: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResolutionRequestFixture {
+        output_plane: OutputPlaneFixture,
+        replay_mode: ReplayModeFixture,
+        byte_budget: usize,
+        token_budget: usize,
+        deadline_ms: u64,
+        freshness_policy: FreshnessPolicyFixture,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct CapabilityProfileFixture {
+        id: String,
+        sha256: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ResolutionStatusFixture {
+        Succeeded,
+        Failed,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct CacheFixture {
+        decision: CacheDecisionFixture,
+        key_sha256: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum CacheDecisionFixture {
+        Miss,
+        Hit,
+        Captured,
+        Bypass,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ContextItemFixture {
+        id: String,
+        resolver_id: String,
+        resolver_version: String,
+        output_plane: OutputPlaneFixture,
+        media_type: String,
+        sources: Vec<ContextSourceFixture>,
+        trust: TrustFixture,
+        freshness: FreshnessFixture,
+        sensitivity: SensitivityFixture,
+        priority: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inline_payload: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_ref: Option<String>,
+        byte_size: usize,
+        token_estimate: usize,
+        output_sha256: String,
+        created_at: String,
+        expires_at: Option<String>,
+        warnings: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ContextSourceFixture {
+        r#ref: String,
+        sha256: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OutputPlaneFixture {
+        Instruction,
+        Message,
+        Tool,
+        State,
+        Artifact,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ReplayModeFixture {
+        Exact,
+        Refresh,
+        Fork,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FreshnessPolicyFixture {
+        Captured,
+        Current,
+        MaxAge,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum TrustFixture {
+        Control,
+        OperatorInstruction,
+        HostFact,
+        UntrustedEvidence,
+        DerivedEvidence,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FreshnessFixture {
+        Captured,
+        Current,
+        Stale,
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SensitivityFixture {
+        Public,
+        Workspace,
+        Private,
+        Secret,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResolutionErrorFixture {
+        code: String,
+        message: String,
+    }
 
     fn summary_record<'a>(
         ledger: &'a PlaygroundLedger,
@@ -944,6 +1110,38 @@ mod tests {
             role["context_contract"]["sha256"],
             sha256(canonical_json(&role["context_contract"]["value"]).as_bytes())
         );
+    }
+
+    #[test]
+    fn context_resolution_fixture_round_trips_exact_utf8_payload() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../eval/fixtures/context-resolution.v1.json"
+        ));
+        let resolution: ContextResolutionFixture = serde_json::from_str(source).unwrap();
+        let item = &resolution.items[0];
+        let payload = item.inline_payload.as_ref().unwrap();
+
+        assert_eq!(resolution.schema_version, 1);
+        assert!(matches!(
+            resolution.status,
+            ResolutionStatusFixture::Succeeded
+        ));
+        assert!(matches!(
+            resolution.request.replay_mode,
+            ReplayModeFixture::Exact
+        ));
+        assert!(matches!(
+            resolution.cache.decision,
+            CacheDecisionFixture::Captured
+        ));
+        assert!(item.payload_ref.is_none());
+        assert_eq!(payload.len(), item.byte_size);
+        assert_eq!(sha256(payload.as_bytes()), item.output_sha256);
+
+        let round_trip = serde_json::to_value(&resolution).unwrap();
+        let original: serde_json::Value = serde_json::from_str(source).unwrap();
+        assert_eq!(round_trip, original);
     }
 
     #[test]

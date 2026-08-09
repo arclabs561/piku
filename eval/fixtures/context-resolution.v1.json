@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "role": "judge",
+  "checkpoint": "turn-1",
+  "resolver": {
+    "id": "workspace-revision",
+    "version": "1",
+    "config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "code_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "request": {
+    "output_plane": "message",
+    "replay_mode": "exact",
+    "byte_budget": 1024,
+    "token_budget": 128,
+    "deadline_ms": 1000,
+    "freshness_policy": "captured"
+  },
+  "capability_profile": {
+    "id": "no-authority",
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "status": "succeeded",
+  "cache": {
+    "decision": "captured",
+    "key_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "started_at": "2026-08-09T16:00:00Z",
+  "finished_at": "2026-08-09T16:00:00Z",
+  "items": [
+    {
+      "id": "revision-1",
+      "resolver_id": "workspace-revision",
+      "resolver_version": "1",
+      "output_plane": "message",
+      "media_type": "text/plain; charset=utf-8",
+      "sources": [
+        {
+          "ref": "git:HEAD",
+          "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ],
+      "trust": "host_fact",
+      "freshness": "captured",
+      "sensitivity": "workspace",
+      "priority": 50,
+      "inline_payload": "revision café Δ\n",
+      "byte_size": 18,
+      "token_estimate": 5,
+      "output_sha256": "5fdac83c68be7342f99b71e31931d9c0e133c1400cc26ce12f73b5c99ea37369",
+      "created_at": "2026-08-09T16:00:00Z",
+      "expires_at": null,
+      "warnings": []
+    }
+  ],
+  "warnings": [],
+  "error": null,
+  "materialized_artifact_refs": []
+}
