@@ -3564,6 +3564,53 @@ fn is_verified_finding(record: &serde_json::Value) -> bool {
     record["source"].as_str() == Some("deterministic")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct EvaluationOutcome {
+    run_status: &'static str,
+    failure_class: &'static str,
+    product_verdict: Option<&'static str>,
+}
+
+/// Reduce evidence availability and product observations into one run outcome.
+///
+/// Product support requires every scenario clause to have reached a conclusive
+/// predicate result. A verifier failure, an uncovered clause, or a missing
+/// contract makes the product verdict unknowable. Harness evidence takes
+/// precedence when a run contains both harness and product failures, matching
+/// the existing summary semantics.
+fn evaluation_outcome(
+    has_harness_failure: bool,
+    has_product_failure: bool,
+    scenario_clause_count: usize,
+    conclusive_scenario_checks: usize,
+) -> EvaluationOutcome {
+    if has_harness_failure {
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "playground_harness",
+            product_verdict: None,
+        }
+    } else if scenario_clause_count == 0 || conclusive_scenario_checks != scenario_clause_count {
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "incomplete_coverage",
+            product_verdict: None,
+        }
+    } else if has_product_failure {
+        EvaluationOutcome {
+            run_status: "product_failure",
+            failure_class: "observed_product_behavior",
+            product_verdict: Some("not_supported"),
+        }
+    } else {
+        EvaluationOutcome {
+            run_status: "completed",
+            failure_class: "none",
+            product_verdict: Some("supported"),
+        }
+    }
+}
+
 /// The piku revision a finding was observed against.
 ///
 /// A finding recorded against an older build says nothing about this one: the
@@ -4910,17 +4957,16 @@ fn run_agentic_session(persona: &Persona) {
             || verified_findings
                 .iter()
                 .any(|finding| !finding.starts_with("[harness:"));
-        let (run_status, failure_class, product_verdict) = if has_harness_failure {
-            ("harness_failure", "playground_harness", None)
-        } else if has_product_failure {
-            (
-                "product_failure",
-                "observed_product_behavior",
-                Some("not_supported"),
-            )
-        } else {
-            ("completed", "none", Some("supported"))
-        };
+        let conclusive_scenario_checks = scenario_results
+            .iter()
+            .filter(|result| result.starts_with("pass:") || result.starts_with("fail:"))
+            .count();
+        let outcome = evaluation_outcome(
+            has_harness_failure,
+            has_product_failure,
+            contract.map_or(0, |scenario| scenario.clauses.len()),
+            conclusive_scenario_checks,
+        );
         let scenario_id = contract.map_or("uncontracted-playground", |scenario| scenario.id);
         let task_contract = if scenario_goal.is_empty() {
             scenario_id
@@ -4956,9 +5002,9 @@ fn run_agentic_session(persona: &Persona) {
                     .map_or("", |artifact| artifact.sha256.as_str()),
             },
             task_contract,
-            run_status,
-            failure_class,
-            product_verdict,
+            run_status: outcome.run_status,
+            failure_class: outcome.failure_class,
+            product_verdict: outcome.product_verdict,
             finding_count: verified_findings.len() + hypotheses.len(),
             evidence_ids: &empty_evidence,
             artifact_refs: &artifact_refs,
@@ -5622,6 +5668,74 @@ fn failed_acceptance_check_outranks_screen_findings_in_the_handoff() {
     assert_eq!(
         without_scenario,
         "fix_harness_or_reproduce_verified_findings"
+    );
+}
+
+#[test]
+fn evaluation_outcome_requires_complete_scenario_coverage_for_support() {
+    assert_eq!(
+        evaluation_outcome(false, false, 3, 3),
+        EvaluationOutcome {
+            run_status: "completed",
+            failure_class: "none",
+            product_verdict: Some("supported"),
+        }
+    );
+
+    // Three passing predicates do not prove a four-clause goal. This was the
+    // P0: the unverified clause was written to metrics, then ignored here.
+    assert_eq!(
+        evaluation_outcome(false, false, 4, 3),
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "incomplete_coverage",
+            product_verdict: None,
+        }
+    );
+
+    // An uncontracted exploratory run can produce findings, but cannot support
+    // a product claim because there is no complete acceptance boundary.
+    assert_eq!(
+        evaluation_outcome(false, false, 0, 0),
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "incomplete_coverage",
+            product_verdict: None,
+        }
+    );
+}
+
+#[test]
+fn evaluation_outcome_separates_product_and_harness_failures() {
+    assert_eq!(
+        evaluation_outcome(false, true, 3, 3),
+        EvaluationOutcome {
+            run_status: "product_failure",
+            failure_class: "observed_product_behavior",
+            product_verdict: Some("not_supported"),
+        }
+    );
+
+    // A failed predicate does not authorize a verdict about a wider goal when
+    // another clause remains unverified.
+    assert_eq!(
+        evaluation_outcome(false, true, 4, 3),
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "incomplete_coverage",
+            product_verdict: None,
+        }
+    );
+
+    // Preserve the prior precedence: unreliable evaluation machinery prevents
+    // a product verdict even when the same run also observed a product issue.
+    assert_eq!(
+        evaluation_outcome(true, true, 3, 3),
+        EvaluationOutcome {
+            run_status: "inconclusive",
+            failure_class: "playground_harness",
+            product_verdict: None,
+        }
     );
 }
 
