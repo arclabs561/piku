@@ -996,6 +996,21 @@ textarea:focus-visible {
   font-size: var(--text-body);
   line-height: 1.55;
 }
+.chat-turn-activity:empty {
+  display: none;
+}
+.activity-card.embedded {
+  position: relative;
+  z-index: auto;
+  width: auto;
+  margin: 8px 10px 0;
+  border-color: var(--color-border-muted);
+  background: var(--color-canvas-inset);
+  box-shadow: none;
+}
+.activity-card.embedded .activity-timeline {
+  max-height: 12rem;
+}
 .chat-response p,
 .chat-response ul,
 .chat-response pre,

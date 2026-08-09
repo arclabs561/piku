@@ -288,7 +288,13 @@ async function submitMessage(
   if (!msg) return { ok: false, text: "", error: "empty message" };
   const requestSurface = active;
   if (!options.local) addMsg("user", msg);
-  const activity = createActivity(msg, anchor, kind, options.runOrdinal);
+  const activity = createActivity(
+    msg,
+    anchor,
+    kind,
+    options.runOrdinal,
+    options.activityHost,
+  );
   activity.querySelector(".activity-boundary").textContent =
     kind === "page"
       ? "selected page source"
@@ -614,14 +620,20 @@ async function submitMessage(
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
   };
 }
-function createActivity(goal, anchor, requestKind = "workspace", runOrdinal = null) {
+function createActivity(
+  goal,
+  anchor,
+  requestKind = "workspace",
+  runOrdinal = null,
+  host = null,
+) {
   const card = document.createElement("article"),
     fallback = nextActivityPosition();
   activitySequence += 1;
   card.dataset.runOrdinal = String(
     Number.isInteger(runOrdinal) && runOrdinal > 0 ? runOrdinal : activitySequence,
   );
-  card.className = "activity-card running";
+  card.className = "activity-card running" + (host ? " embedded" : "");
   card.dataset.requestKind = requestKind;
   card.dataset.persistence = "transient";
   card.setAttribute("aria-label", "Execution trace");
@@ -650,8 +662,8 @@ function createActivity(goal, anchor, requestKind = "workspace", runOrdinal = nu
   card
     .querySelector(".activity-close")
     .addEventListener("click", () => card.remove());
-  overlay.append(card);
-  placeActivity(card, anchor || fallback);
+  (host || overlay).append(card);
+  if (!host) placeActivity(card, anchor || fallback);
   return card;
 }
 function setActivityIdentity(card, requestId, status) {
@@ -1558,7 +1570,7 @@ function renderChatTurns(object, state) {
     cell.className = "chat-turn";
     cell.dataset.turnId = turn.id;
     cell.innerHTML =
-      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-response" aria-live="polite"></div>';
+      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
     cell.querySelector(".chat-turn-index").textContent =
       "IN [" + (index + 1) + "]";
     const attempt = Number(turn.attempt) || 0;
@@ -1657,6 +1669,9 @@ async function runChatNotebook(object, state, start, end) {
       const output = object.querySelector(
         '[data-turn-id="' + CSS.escape(turn.id) + '"] .chat-response',
       );
+      const activityHost = object.querySelector(
+        '[data-turn-id="' + CSS.escape(turn.id) + '"] .chat-turn-activity',
+      );
       const result = await submitMessage(
         turn.prompt,
         {
@@ -1676,6 +1691,7 @@ async function runChatNotebook(object, state, start, end) {
             executor: state.executor,
             threadId: state.threadId,
             signal: object.chatAbortController.signal,
+            activityHost,
           };
         })(),
       );

@@ -978,6 +978,8 @@ test("execution traces stay visibly transient and outside workspace persistence"
   await chat.getByRole("button", { name: "send", exact: true }).click();
 
   const trace = page.getByRole("article", { name: "Execution trace" });
+  await expect(chat.locator(".chat-turn-activity", { has: trace })).toBeVisible();
+  await expect(trace).toHaveClass(/embedded/);
   await expect(trace).toContainText("execution trace · transient");
   await expect(trace).toContainText("Request queued");
   await expect(trace).toHaveAttribute("data-persistence", "transient");
