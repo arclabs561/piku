@@ -37,5 +37,14 @@ jobs:
       - name: PTY smoke
         run: ./scripts/ci.sh pty
         timeout-minutes: 5
+      # The hosted runner supplies Node/npm. Dependency installation is the
+      # only network-capable part; the web stage builds and tests offline.
+      - name: Install web dependencies
+        working-directory: crates/piku/web-ui
+        run: npm ci
+      - name: Web bundle freshness
+        run: ./scripts/ci.sh web-bundle
+      - name: Web harness
+        run: ./scripts/ci.sh web-harness
       - name: Build release
         run: ./scripts/ci.sh build

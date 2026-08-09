@@ -12,6 +12,12 @@ scripts:
     ./scripts/ci.sh scripts
 clippy:
     ./scripts/ci.sh clippy
+web:
+    ./scripts/ci.sh web
+web-bundle:
+    ./scripts/ci.sh web-bundle
+web-harness:
+    ./scripts/ci.sh web-harness
 
 # Test the web workspace against an already-running local Piku server.
 web-e2e url="http://127.0.0.1:9090":

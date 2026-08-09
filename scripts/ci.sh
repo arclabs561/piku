@@ -7,7 +7,7 @@
 # locally. Either way the underlying commands are defined HERE and only here, so
 # local-green and CI-green can't drift apart.
 #
-# Usage: scripts/ci.sh {fmt|scripts|clippy|test|pty|build|live|live-random|all}   (default: all)
+# Usage: scripts/ci.sh {fmt|scripts|clippy|test|pty|web-bundle|web-harness|web|build|live|live-random|all}   (default: all)
 set -euo pipefail
 
 # Resolve repo root from this script's location so it works from any cwd.
@@ -81,6 +81,47 @@ pty() {
   return "$status"
 }
 
+web_bundle() (
+  local web_root="$REPO_ROOT/crates/piku/web-ui"
+  local generated_root="$REPO_ROOT/crates/piku/src/web"
+  local scratch
+
+  if [[ ! -d "$web_root/node_modules" ]]; then
+    printf 'web: dependencies are missing; run npm ci in crates/piku/web-ui first\n' >&2
+    exit 1
+  fi
+
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/piku-web-check.XXXXXX")"
+  trap 'rm -rf "$scratch"' EXIT
+
+  (
+    cd "$web_root"
+    ./node_modules/.bin/esbuild app.js --bundle --format=iife \
+      --platform=browser --target=safari17 --outfile="$scratch/app.js" \
+      --loader:.css=css
+  )
+
+  local drift=0
+  local asset
+  for asset in app.js app.css; do
+    if ! cmp -s "$scratch/$asset" "$generated_root/$asset"; then
+      printf 'web: crates/piku/src/web/%s is stale; run npm run build in crates/piku/web-ui\n' "$asset" >&2
+      drift=1
+    fi
+  done
+  (( drift == 0 )) || exit 1
+)
+
+web_harness() {
+  cd "$REPO_ROOT/crates/piku/web-ui"
+  npm run test:harness
+}
+
+web() {
+  web_bundle
+  web_harness
+}
+
 build() {
   cargo build --release -p piku
 }
@@ -152,6 +193,9 @@ case "$stage" in
   clippy) clippy ;;
   test) test_ ;;
   pty) pty ;;
+  web-bundle) web_bundle ;;
+  web-harness) web_harness ;;
+  web) web ;;
   build) build ;;
   live) live ;;
   live-random) live_random ;;
@@ -161,11 +205,13 @@ case "$stage" in
     clippy
     test_
     pty
+    web_bundle
+    web_harness
     build
     echo "all checks passed"
     ;;
   *)
-    echo "usage: $0 {fmt|scripts|clippy|test|pty|build|live|live-random|all}" >&2
+    echo "usage: $0 {fmt|scripts|clippy|test|pty|web-bundle|web-harness|web|build|live|live-random|all}" >&2
     exit 2
     ;;
 esac
