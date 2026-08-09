@@ -91,7 +91,8 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
   assert.match(tracePrompt, /initial empty-to-document creation is setup, not evidence/);
   assert.match(tracePrompt, /aggregate console count alone cannot support a finding/i);
   assert.match(recoveryPrompt, /raw\s+error count or HTTP status[\s\S]*cannot support a product\s+finding/);
-  assert.match(recoveryPrompt, /semantic selected-state predicate[^.]*`true` before reload/i);
+  assert.match(recoveryPrompt, /semantic selected-state predicate[^.]*`true`/i);
+  assert.match(recoveryPrompt, /selection as transient interaction state/i);
   assert.match(recoveryPrompt, /distinctive, non-default canvas position/i);
   assert.match(recoveryPrompt, /deterministic delayed-provider fixture/i);
   assert.match(synthesisPrompt, /aggregate console counts or generic DOM article counts/);
