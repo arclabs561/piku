@@ -718,6 +718,19 @@ textarea:focus-visible {
 .object-output[data-status=error] {
   color: var(--color-danger-fg);
 }
+.file-snapshot {
+  border-bottom: 1px solid var(--color-border-muted);
+  padding: 6px 12px;
+  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+}
+.file-snapshot[data-freshness=current] {
+  color: var(--color-success-fg);
+}
+.file-snapshot[data-freshness=stale] {
+  color: var(--color-attention-fg);
+}
 .change-summary {
   color: var(--color-fg-default);
 }

@@ -1050,17 +1050,30 @@ function enableDrag(object) {
 function parseFileCard(content) {
   try {
     const value = JSON.parse(content || "");
-    if (value?.version === 1)
+    if ([1, 2].includes(value?.version))
       return {
-        version: 1,
+        version: 2,
         path: typeof value.path === "string" ? value.path : "",
         output: typeof value.output === "string" ? value.output : "",
         status: ["idle", "loading", "loaded", "rejected", "failed"].includes(value.status)
           ? value.status
           : "idle",
+        resolvedPath: typeof value.resolvedPath === "string" ? value.resolvedPath : "",
+        revision: Number.isInteger(value.revision) && value.revision > 0 ? value.revision : 0,
+        digest: typeof value.digest === "string" ? value.digest : "",
+        capturedAt: typeof value.capturedAt === "string" ? value.capturedAt : "",
       };
   } catch { /* Legacy file cards stored only the path. */ }
-  return { version: 1, path: content || "", output: "", status: "idle" };
+  return {
+    version: 2,
+    path: content || "",
+    output: "",
+    status: "idle",
+    resolvedPath: "",
+    revision: 0,
+    digest: "",
+    capturedAt: "",
+  };
 }
 function parseChangeCard(content) {
   try {
@@ -1138,35 +1151,52 @@ function createWorkspaceObject(kind, anchor, restore = null) {
     object = objectShell(kind, "file", anchor, restore);
     const body = object.querySelector(".object-body");
     body.innerHTML =
-      '<pre class="object-output" role="region" aria-live="polite">Enter a path or describe a workspace file.</pre><form class="object-form"><input aria-label="File path or description" placeholder="src/main.rs or piku main file" autocomplete="off" spellcheck="false"><button type="submit">open</button></form>';
+      '<div class="file-snapshot" role="status" aria-live="polite" hidden></div><pre class="object-output" role="region" aria-live="polite">Enter a path or describe a workspace file.</pre><form class="object-form"><input aria-label="File path or description" placeholder="src/main.rs or piku main file" autocomplete="off" spellcheck="false"><button type="submit">open</button></form>';
     const output = body.querySelector(".object-output"),
       field = body.querySelector("input"),
+      snapshot = body.querySelector(".file-snapshot"),
+      submit = body.querySelector('button[type="submit"]'),
       state = parseFileCard(restore?.content || "");
+    let freshness = "unknown",
+      freshnessNotice = "",
+      requestGeneration = 0;
     field.value = state.path;
-    output.dataset.status = state.status;
-    output.textContent = state.output || "Enter a path or describe a workspace file.";
+    const renderFile = () => {
+      output.dataset.status = state.status;
+      output.textContent = state.output || "Enter a path or describe a workspace file.";
+      submit.textContent = state.revision > 0 ? "refresh" : "open";
+      snapshot.hidden = state.revision === 0;
+      if (state.revision > 0) {
+        const captured = state.capturedAt.startsWith("unix-ms:")
+          ? new Date(Number(state.capturedAt.slice(8))).toLocaleString()
+          : state.capturedAt || "unknown time";
+        const digest = state.digest ? state.digest.slice(0, 12) : "no digest";
+        snapshot.dataset.freshness = freshness;
+        snapshot.textContent = `revision ${state.revision} · ${freshness} · ${digest} · captured ${captured}${freshnessNotice}`;
+      }
+    };
+    renderFile();
     const persistFile = () => {
       object.dataset.content = JSON.stringify(state);
       saveWorkspaceLayout();
     };
-    body.querySelector("form").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const path = field.value.trim();
-      if (!path) return;
-      state.path = path;
-      if (/^(?:\/|[A-Za-z]:[\\/])/.test(path) || path.split(/[\\/]+/).includes("..")) {
-        state.status = "rejected";
-        state.output = "rejected  path must remain relative to the workspace";
-        output.dataset.status = state.status;
-        output.textContent = state.output;
+    const readFile = async (path, capture) => {
+      const generation = ++requestGeneration,
+        refreshingSnapshot = capture && state.revision > 0;
+      if (capture) {
+        if (!refreshingSnapshot) {
+          state.path = path;
+          state.status = "loading";
+          state.output = "loading " + terminalSafe(path) + "…";
+        }
+        freshness = "checking";
+        freshnessNotice = "";
+        renderFile();
         persistFile();
-        return;
+      } else {
+        freshness = "checking";
+        renderFile();
       }
-      state.status = "loading";
-      state.output = "loading " + terminalSafe(path) + "…";
-      output.dataset.status = state.status;
-      output.textContent = state.output;
-      persistFile();
       try {
         const res = await fetch("/api/terminal/read", {
             method: "POST",
@@ -1174,23 +1204,77 @@ function createWorkspaceObject(kind, anchor, restore = null) {
             body: JSON.stringify({ operation: "read", path }),
           }),
           data = await res.json();
+        if (generation !== requestGeneration) return;
+        if (!capture) {
+          freshness = res.ok && data.content_sha256 === state.digest ? "current" : "stale";
+          freshnessNotice = res.ok ? "" : " · freshness check failed";
+          renderFile();
+          return;
+        }
+        if (!res.ok && refreshingSnapshot) {
+          freshness = "unknown";
+          freshnessNotice = " · refresh failed: " + terminalSafe(data.error || "unknown error");
+          renderFile();
+          return;
+        }
         state.status = res.ok ? "loaded" : "rejected";
         state.output = res.ok
-          ? (data.path ? data.path + "\n\n" : "") +
-            (data.output || "(empty file)")
+          ? (data.path ? data.path + "\n\n" : "") + (data.output || "(empty file)")
           : "rejected  " + data.error;
+        if (res.ok) {
+          state.path = path;
+          state.resolvedPath = data.path || path;
+          state.revision += 1;
+          state.digest = data.content_sha256 || "";
+          state.capturedAt = data.captured_at || "";
+          freshness = "current";
+          freshnessNotice = "";
+        } else {
+          freshness = "unknown";
+        }
       } catch (error) {
+        if (generation !== requestGeneration) return;
+        if (!capture) {
+          freshness = "unknown";
+          freshnessNotice = " · freshness check failed";
+          renderFile();
+          return;
+        }
+        if (refreshingSnapshot) {
+          freshness = "unknown";
+          freshnessNotice = " · refresh failed: " + terminalSafe(error.message);
+          renderFile();
+          return;
+        }
         state.status = "failed";
         state.output = "failed  " + terminalSafe(error.message);
+        freshness = "unknown";
       }
-      output.dataset.status = state.status;
-      output.textContent = state.output;
+      renderFile();
       persistFile();
+    };
+    body.querySelector("form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const path = field.value.trim();
+      if (!path) return;
+      if (/^(?:\/|[A-Za-z]:[\\/])/.test(path) || path.split(/[\\/]+/).includes("..")) {
+        state.status = "rejected";
+        state.output = "rejected  path must remain relative to the workspace";
+        freshness = "unknown";
+        renderFile();
+        persistFile();
+        return;
+      }
+      await readFile(path, true);
     });
     field.addEventListener("change", () => {
-      state.path = field.value;
-      persistFile();
+      if (state.revision === 0) {
+        state.path = field.value;
+        persistFile();
+      }
     });
+    if (restore && state.status === "loaded" && state.digest && state.resolvedPath)
+      void readFile(state.resolvedPath, false);
     if (!restore) field.focus();
   } else if (kind === "note") {
     object = objectShell(kind, "note", anchor, restore);

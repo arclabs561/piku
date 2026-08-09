@@ -388,6 +388,10 @@ struct TerminalReadResponse {
     truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<Sha256Digest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    captured_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1106,6 +1110,8 @@ fn execute_terminal_read(
                 output,
                 truncated,
                 path: None,
+                content_sha256: None,
+                captured_at: None,
             })
         }
         TerminalReadRequest::Read {
@@ -1155,6 +1161,19 @@ fn execute_terminal_read(
                 output,
                 truncated,
                 path: Some(relative.to_string_lossy().into_owned()),
+                content_sha256: Some(Sha256Digest::of_bytes(content.as_bytes())),
+                captured_at: Some(format!(
+                    "unix-ms:{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|error| {
+                            terminal_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("cannot timestamp file capture: {error}"),
+                            )
+                        })?
+                        .as_millis()
+                )),
             })
         }
     }
@@ -3857,6 +3876,14 @@ mod tests {
         .expect("scoped read succeeds");
         assert_eq!(read.output, "     2  two\n     3  three");
         assert!(!read.truncated);
+        assert_eq!(
+            read.content_sha256,
+            Some(Sha256Digest::of_bytes(b"one\ntwo\nthree\nfour\n"))
+        );
+        assert!(read
+            .captured_at
+            .as_deref()
+            .is_some_and(|value| value.starts_with("unix-ms:")));
 
         let list = execute_terminal_read(
             &root,

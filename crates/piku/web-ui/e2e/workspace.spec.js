@@ -1216,6 +1216,57 @@ test("file rejection state survives reload with its input", async ({
   await expect(page.locator('[data-kind="file"] .object-output')).toHaveAttribute("data-status", "rejected");
 });
 
+test("file snapshots detect staleness and refresh explicitly across reload", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  let reads = 0;
+  await page.route("**/api/terminal/read", async (route) => {
+    reads += 1;
+    const current = reads === 1
+      ? { digest: "a".repeat(64), output: "     1  first snapshot", capturedAt: "unix-ms:1000" }
+      : { digest: "b".repeat(64), output: "     1  changed on disk", capturedAt: "unix-ms:2000" };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        path: "src/example.txt",
+        output: current.output,
+        truncated: false,
+        content_sha256: current.digest,
+        captured_at: current.capturedAt,
+      }),
+    });
+  });
+
+  await addObject(page, "file", { x: 120, y: 100 });
+  let file = page.locator('[data-kind="file"]');
+  await file.getByLabel("File path or description").fill("src/example.txt");
+  await file.getByRole("button", { name: "open" }).click();
+  await expect(file.locator(".file-snapshot")).toContainText("revision 1 · current");
+  await expect(file.locator(".object-output")).toContainText("first snapshot");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+
+  await page.reload();
+  file = page.locator('[data-kind="file"]');
+  await expect(file.locator(".file-snapshot")).toContainText("revision 1 · stale");
+  await expect(file.locator(".object-output")).toContainText("first snapshot");
+  await expect(file.locator(".object-output")).not.toContainText("changed on disk");
+
+  await file.getByRole("button", { name: "refresh" }).click();
+  await expect(file.locator(".file-snapshot")).toContainText("revision 2 · current");
+  await expect(file.locator(".object-output")).toContainText("changed on disk");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+
+  await page.reload();
+  await expect(page.locator('[data-kind="file"] .file-snapshot')).toContainText(
+    "revision 2 · current",
+  );
+  await expect(page.locator('[data-kind="file"] .object-output')).toContainText(
+    "changed on disk",
+  );
+});
+
 test("absolute file paths are rejected before a noisy network request", async ({
   page,
   surfaceName: _surfaceName,
