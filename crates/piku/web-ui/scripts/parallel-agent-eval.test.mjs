@@ -3,13 +3,43 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, renderBoundedSynthesisPrompt, renderExplorerPrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest } from "./parallel-agent-eval.mjs";
+import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest } from "./parallel-agent-eval.mjs";
 import { attestedFiles, attestedValue, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptsDir, "..");
 const repoRoot = path.resolve(webUiDir, "../../..");
 const promptManifestReference = { path: "prompt-manifest.json", sha256: "a".repeat(64) };
+const cleanRevision = "b".repeat(40);
+
+function focusEventFixture(hash, { promoted = true, expired = false } = {}) {
+  const scope = { surface: "web", scenario_id: "web-codex-replacement-thesis", perspective: "coding_trace" };
+  const proposal = {
+    schema_version: 1, event_id: "event-proposal", event_kind: "proposal",
+    recorded_at: "2026-08-09T10:00:00.000Z", actor: { kind: "judge", id: "coding-judge" },
+    subject_state_hash: hash, proposal_id: "proposal-layout", source_run_id: "prior-run",
+    scope, evidence_refs: ["prior-run:coding_trace:e1"],
+    question: "Does the evidence view preserve the operator's place after reload?",
+    category: "recovery", suggested_expires_at: "2026-08-12T00:00:00.000Z",
+    task_clause: "Inspect reload recovery",
+  };
+  const promotion = {
+    schema_version: 1, event_id: "event-promotion", event_kind: "promotion",
+    recorded_at: "2026-08-09T10:30:00.000Z", actor: { kind: "operator", id: "operator" },
+    subject_state_hash: hash, promotion_id: "promotion-layout", proposal_id: proposal.proposal_id,
+    scope, activates_at: "2026-08-09T11:00:00.000Z",
+    expires_at: expired ? "2026-08-09T11:59:00.000Z" : "2026-08-10T00:00:00.000Z",
+    max_prompt_bytes: 2048, retest_obligation: "prior-run:coding_trace:obligation:o1",
+  };
+  return promoted ? [proposal, promotion] : [proposal];
+}
+
+async function writeFocusEvents(root, events) {
+  await mkdir(root, { recursive: true });
+  const file = path.join(root, "focus-events.jsonl");
+  await writeFile(file, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  return file;
+}
 
 const coverage = (coding = ["coding_trace:one"], recovery = ["recovery:one"]) => ({
   coding_trace: { status: "assessed", rationale: "trace covered", evidence_ids: coding },
@@ -185,6 +215,115 @@ test("immutable prompt manifest attests every web role and its effective contrac
   assert.match(codingTools, /browser_snapshot/);
   assert.doesNotMatch(codingTools, /OPENROUTER_API_KEY/);
   assert.equal(manifest.effective_config.value.explorers.coding_trace.identity.requestId, `${runId}:coding_trace`);
+});
+
+test("only promoted focus renders, and only for the coding-trace explorer", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-focus-web-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtime = { subject_revision: cleanRevision, subject_dirty: false };
+  const hash = subjectStateHash(runtime);
+  const unpromotedFile = await writeFocusEvents(root, focusEventFixture(hash, { promoted: false }));
+  const unpromoted = await prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: unpromotedFile }, runtime,
+    runDir: path.join(root, "unpromoted"), now: "2026-08-09T12:00:00.000Z",
+  });
+  assert.equal(unpromoted.prompt, "");
+  assert.deepEqual(unpromoted.projection.items, []);
+
+  const promotedFile = await writeFocusEvents(path.join(root, "promoted-input"), focusEventFixture(hash));
+  const promoted = await prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: promotedFile }, runtime,
+    runDir: path.join(root, "promoted"), now: "2026-08-09T12:00:00.000Z",
+  });
+  const variables = {
+    baseUrl: new URL("http://127.0.0.1:9090"), surface: "qa-focus", requestId: "run:focus",
+    playwrightOutputDir: path.join(root, "output"), targetCalls: 48, maxSnapshots: 6,
+  };
+  const codingPrompt = renderRolePrompt("coding_trace", "base", variables, promoted);
+  const recoveryPrompt = renderRolePrompt("recovery", "base", variables, promoted);
+  assert.match(codingPrompt, /Promoted evaluation focus/);
+  assert.match(codingPrompt, /Does the evidence view preserve the operator's place after reload\?/);
+  assert.match(codingPrompt, /untrusted advisory question data/);
+  assert.doesNotMatch(codingPrompt, /Inspect reload recovery/);
+  assert.equal(recoveryPrompt, "base");
+  assert.doesNotMatch(renderBoundedSynthesisPrompt(
+    "synthesis {{PACKETS}} {{MANIFEST}} {{LEDGER}}",
+    { packetPaths: ["/tmp/a.json"], artifactPaths: [], manifestPath: "/tmp/manifest.json" },
+  ), /Does the evidence view preserve/);
+});
+
+test("evaluation focus fails closed for dirty, stale, and expired subjects", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-focus-closed-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtime = { subject_revision: cleanRevision, subject_dirty: false };
+  const hash = subjectStateHash(runtime);
+  const validFile = await writeFocusEvents(path.join(root, "valid-input"), focusEventFixture(hash));
+  await assert.rejects(prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: validFile },
+    runtime: { ...runtime, subject_dirty: true }, runDir: path.join(root, "dirty"),
+    now: "2026-08-09T12:00:00.000Z",
+  }), /clean subject tree/);
+  const staleFile = await writeFocusEvents(
+    path.join(root, "stale-input"), focusEventFixture(`sha256:${"c".repeat(64)}`),
+  );
+  await assert.rejects(prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: staleFile }, runtime,
+    runDir: path.join(root, "stale"), now: "2026-08-09T12:00:00.000Z",
+  }), /stale subject_state_hash/);
+  const expiredFile = await writeFocusEvents(
+    path.join(root, "expired-input"), focusEventFixture(hash, { expired: true }),
+  );
+  await assert.rejects(prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: expiredFile }, runtime,
+    runDir: path.join(root, "expired"), now: "2026-08-09T12:00:00.000Z",
+  }), /expired promotion/);
+  assert.throws(() => subjectStateHash({ subject_revision: "HEAD", subject_dirty: false }), /exact subject revision/);
+});
+
+test("prompt manifest captures the canonical focus projection without exposing it to recovery", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-focus-manifest-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runId = "focus-contract";
+  const runtime = { subject_revision: cleanRevision, subject_dirty: false };
+  const hash = subjectStateHash(runtime);
+  const eventsFile = await writeFocusEvents(path.join(root, "input"), focusEventFixture(hash));
+  const focus = await prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: eventsFile }, runtime, runDir: root,
+    now: "2026-08-09T12:00:00.000Z",
+  });
+  const explorerConfigs = Object.fromEntries(["coding_trace", "recovery"].map((role) => [role, {
+    identity: { surface: `qa-${role}`, requestId: `${runId}:${role}` },
+    model: "gpt-5.6-sol", target_calls: 48, hard_max_calls: 64, max_snapshots: 6, timeout_ms: 600_000,
+  }]));
+  const manifest = await buildPromptManifest({
+    runId, runDir: root, baseUrl: new URL("http://127.0.0.1:9090"), runtime, explorerConfigs,
+    synthesisConfig: { model: "gpt-5.6-sol", timeout_ms: 240_000 }, evaluationFocus: focus,
+  });
+  const baseline = await buildPromptManifest({
+    runId, runDir: root, baseUrl: new URL("http://127.0.0.1:9090"), runtime, explorerConfigs,
+    synthesisConfig: { model: "gpt-5.6-sol", timeout_ms: 240_000 },
+  });
+  const coding = manifest.roles.find((role) => role.role === "coding_trace");
+  const recovery = manifest.roles.find((role) => role.role === "recovery");
+  const baselineCoding = baseline.roles.find((role) => role.role === "coding_trace");
+  const baselineRecovery = baseline.roles.find((role) => role.role === "recovery");
+  assert.deepEqual(coding.context_contract.value.evaluation_focus, focus.attestation);
+  assert.equal(recovery.context_contract.value.evaluation_focus, null);
+  assert.deepEqual(coding.tools, baselineCoding.tools);
+  assert.deepEqual(coding.limits, baselineCoding.limits);
+  assert.deepEqual(coding.prompt_assets, baselineCoding.prompt_assets);
+  assert.deepEqual(recovery, baselineRecovery);
+  assert.deepEqual(
+    manifest.roles.find((role) => role.role === "synthesis"),
+    baseline.roles.find((role) => role.role === "synthesis"),
+  );
+  assert.deepEqual(focus.attestation.promotion_ids, ["promotion-layout"]);
+  assert.deepEqual(focus.attestation.proposal_ids, ["proposal-layout"]);
+  assert.match(focus.attestation.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(focus.attestation.path, "focus.json");
+  const stored = await readFile(path.join(root, "focus.json"), "utf8");
+  assert.equal(stored.endsWith("\n"), true);
+  assert.equal(JSON.parse(stored).subject_state_hash, hash);
 });
 
 test("trace authority fails closed for unsafe, unknown, and malformed events", () => {
