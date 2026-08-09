@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { assertEvaluationEnvelope } from "./evaluation-envelope.mjs";
+
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const ACTOR_KINDS = new Set(["judge", "harness", "operator", "reviewer"]);
 const AUTHORITY_KINDS = new Set(["operator", "reviewer"]);
@@ -98,6 +101,93 @@ export function assertEvaluationFocusEvent(event, context = "evaluation focus ev
   const errors = evaluationFocusEventErrors(event);
   if (errors.length) throw new TypeError(`${context} is invalid: ${errors.join("; ")}`);
   return event;
+}
+
+const QUESTION_MAX_LENGTH = 240;
+const TASK_CLAUSE_MAX_LENGTH = 500;
+
+function boundedText(value, limit) {
+  const text = value.replace(/\s+/gu, " ").trim();
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 1).trimEnd() + "…";
+}
+
+function questionFromTitle(title) {
+  const stem = boundedText(title, QUESTION_MAX_LENGTH - 15)
+    .replace(/[?!.]+$/u, "")
+    .trim();
+  return boundedText(`Can we verify ${stem}?`, QUESTION_MAX_LENGTH);
+}
+
+function stableProposalDigest(record, followup, subjectStateHash, scope) {
+  return createHash("sha256").update(JSON.stringify({
+    source: { run_id: record.run_id, stage_id: record.stage_id },
+    obligation_id: followup.obligation_id,
+    subject_state_hash: subjectStateHash,
+    scope,
+  })).digest("hex");
+}
+
+/** Convert one completed, clean evaluation stage into inert proposal events. */
+export function evaluationStageToFocusProposals(record, options) {
+  if (!isObject(record) || record.schema_version !== 2)
+    throw new TypeError("evaluation stage must use schema_version 2");
+  assertEvaluationEnvelope(record, "evaluation stage");
+  if (!isObject(options)) throw new TypeError("conversion options must be an object");
+  const { sourceRevision, subjectStateHash, allowedTargets, recordedAt, suggestedExpiresAt } = options;
+  if (record.record_kind !== "stage") throw new TypeError("evaluation record must be a stage");
+  if (record.run_status !== "completed") throw new TypeError("evaluation stage must be completed");
+  if (record.subject_dirty !== false) throw new TypeError("evaluation stage subject must be clean");
+  if (!string(sourceRevision)) throw new TypeError("sourceRevision must be a non-empty string");
+  if (record.subject_revision !== sourceRevision)
+    throw new Error("evaluation stage source revision is stale");
+  if (!DIGEST.test(subjectStateHash ?? ""))
+    throw new TypeError("subjectStateHash must be a sha256 digest");
+  if (!date(recordedAt)) throw new TypeError("recordedAt must be an ISO 8601 date-time");
+  if (!date(suggestedExpiresAt))
+    throw new TypeError("suggestedExpiresAt must be an ISO 8601 date-time");
+  if (!Array.isArray(allowedTargets) || allowedTargets.some((scope) => {
+    const errors = [];
+    scopeErrors(scope, "allowedTargets[]", errors);
+    return errors.length > 0;
+  })) throw new TypeError("allowedTargets must contain valid scopes");
+
+  const allowed = new Set(allowedTargets.map(targetKey));
+  const proposals = [];
+  for (const followup of record.followups) {
+    if (followup.kind !== "retest") continue;
+    if (!string(followup.perspective)) continue;
+    const scope = {
+      surface: record.surface,
+      scenario_id: record.scenario_id,
+      perspective: followup.perspective,
+    };
+    if (!allowed.has(targetKey(scope))) continue;
+    const evidenceRefs = [...new Set([
+      ...followup.evidence_ids,
+      ...followup.finding_refs,
+    ])].sort();
+    if (evidenceRefs.length === 0) continue;
+    const digest = stableProposalDigest(record, followup, subjectStateHash, scope);
+    const proposal = {
+      schema_version: 1,
+      event_id: `event-proposal-${digest}`,
+      event_kind: "proposal",
+      recorded_at: recordedAt,
+      actor: { kind: "harness", id: "evaluation-focus-converter" },
+      subject_state_hash: subjectStateHash,
+      proposal_id: `proposal-${digest}`,
+      source_run_id: record.run_id,
+      scope,
+      evidence_refs: evidenceRefs,
+      question: questionFromTitle(followup.title),
+      category: "retest",
+      suggested_expires_at: suggestedExpiresAt,
+      task_clause: boundedText(followup.rationale, TASK_CLAUSE_MAX_LENGTH),
+    };
+    proposals.push(assertEvaluationFocusEvent(proposal, `proposal for ${followup.obligation_id}`));
+  }
+  return proposals.sort((left, right) => left.proposal_id.localeCompare(right.proposal_id));
 }
 
 function targetKey(scope) {
