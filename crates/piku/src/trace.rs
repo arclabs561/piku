@@ -42,18 +42,18 @@ impl TraceWriter {
         }
 
         if let Err(e) = std::fs::create_dir_all(traces_dir) {
-            eprintln!("[piku] trace: could not create traces dir: {e}");
+            tracing::warn!(error = %e, "trace directory could not be created");
             return Self { file: None };
         }
 
         let path = traces_dir.join(format!("{session_id}.jsonl"));
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => {
-                eprintln!("[piku] trace → {}", path.display());
+                tracing::info!(path = %path.display(), "trace recording started");
                 Self { file: Some(f) }
             }
             Err(e) => {
-                eprintln!("[piku] trace: could not open {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "trace file could not be opened");
                 Self { file: None }
             }
         }

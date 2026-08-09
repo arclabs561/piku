@@ -61,7 +61,8 @@ fn piku_clean_env() -> Command {
         .env_remove("GROQ_API_KEY")
         .env_remove("PIKU_BASE_URL")
         .env_remove("OLLAMA_HOST")
-        .env_remove("PIKU_RESTARTED");
+        .env_remove("PIKU_RESTARTED")
+        .env("PIKU_NO_DOTENV", "1");
     cmd
 }
 
@@ -70,6 +71,28 @@ fn stdout(o: &Output) -> String {
 }
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+#[test]
+fn providers_load_allowlisted_key_from_nearest_dotenv() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        "OPENROUTER_API_KEY=test-only-key\nUNRELATED_SECRET=must-not-load\n",
+    )
+    .unwrap();
+    let mut command = piku_clean_env();
+    command.env_remove("PIKU_NO_DOTENV");
+    let out = command
+        .current_dir(project.path())
+        .arg("providers")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("openrouter available"));
+    assert!(!stdout(&out).contains("test-only-key"));
+    assert!(!stderr(&out).contains("test-only-key"));
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +157,7 @@ fn help_exits_zero_and_contains_usage() {
     assert!(out.status.success(), "exit code: {:?}", out.status.code());
 
     let text = stdout(&out);
-    assert!(text.contains("USAGE"), "help should have USAGE section");
+    assert!(text.contains("Usage:"), "help should have Usage section");
     assert!(text.contains("OPTIONS"), "help should have OPTIONS section");
     assert!(text.contains("--model"), "help should document --model");
     assert!(
@@ -142,8 +165,8 @@ fn help_exits_zero_and_contains_usage() {
         "help should document --provider"
     );
     assert!(
-        text.contains("--providers"),
-        "help should document --providers"
+        text.contains("providers"),
+        "help should document providers subcommand"
     );
     assert!(
         text.contains("--read-only"),
@@ -166,10 +189,10 @@ fn help_short_flag_identical_to_long() {
 
 #[test]
 fn providers_flag_exits_zero_without_provider_key() {
-    let out = piku_clean_env().arg("--providers").output().unwrap();
+    let out = piku_clean_env().arg("providers").output().unwrap();
     assert!(
         out.status.success(),
-        "--providers should not require a configured provider. stderr: {}",
+        "providers should not require a configured provider. stderr: {}",
         stderr(&out)
     );
 

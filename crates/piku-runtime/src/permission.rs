@@ -132,7 +132,7 @@ mod authority_tests {
         }
 
         fn denies(&self, tool_name: &str, _params: &serde_json::Value) -> Option<String> {
-            (tool_name == "write_file").then(|| "denied by settings.json rule".to_string())
+            (tool_name == "write_file").then(|| "denied by settings.toml rule".to_string())
         }
     }
 

@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 anyhow = { workspace = true }
 piku-tools = { path = "../piku-tools" }
 piku-runtime = { path = "../piku-runtime" }
@@ -27,19 +28,25 @@ crossterm = { workspace = true }
 syntect = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+clap = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 libc = "0.2"
+portable-pty = "0.9"
+walkdir = { workspace = true }
 signal-hook-registry = "1"
+dotenvy = "0.15"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 async-stream = "0.3"
+tempfile = "3"
 piku-api = { path = "../piku-api" }
 nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
 serial_test = "3"
-tempfile = "3"
 vt100 = "0.16"
 reqwest = { workspace = true, features = ["blocking"] }
-dotenvy = "0.15"
 
 [lints]
 workspace = true

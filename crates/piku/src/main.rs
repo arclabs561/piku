@@ -1,5 +1,7 @@
-use piku::cli::{parse_args, CliAction, InspectFormat};
-use piku::config::PikuConfig;
+use clap::Parser;
+
+use piku::cli::{Cli, Commands, InspectFormat};
+use piku::config::{load_provider_dotenv, PikuConfig};
 use piku::self_update;
 use piku::trace::TraceWriter;
 use piku::tui_repl;
@@ -14,87 +16,96 @@ use piku_runtime::{
 use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION"); // self-update demo
-
-// ---------------------------------------------------------------------------
-// Entry point — fast-path dispatch
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let action = parse_args(&args);
+    piku::telemetry::init();
+    let cwd = env::current_dir().ok();
+    if env::var_os("PIKU_NO_DOTENV").is_none() {
+        match load_provider_dotenv(cwd.as_deref()) {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(count, source = "nearest_dotenv", "provider settings loaded");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "provider dotenv could not be read");
+            }
+        }
+    }
+    let cli = Cli::parse();
 
-    // Extract CLI-level overrides for config loading.
-    let (cli_model, cli_provider) = match &action {
-        CliAction::SingleShot {
-            model,
-            provider_override,
-            ..
+    match &cli.command {
+        Some(Commands::Providers) => {
+            print_providers();
+            return Ok(());
         }
-        | CliAction::Resume {
-            model,
-            provider_override,
-            ..
+        Some(Commands::Inspect {
+            session_id,
+            json,
+            html,
+        }) => {
+            let config = PikuConfig::load(None, None, env::current_dir().ok().as_deref());
+            let format = if *html {
+                InspectFormat::Html
+            } else if *json {
+                InspectFormat::Json
+            } else {
+                InspectFormat::Text
+            };
+            inspect_run(&config, session_id, format)?;
+            return Ok(());
         }
-        | CliAction::Repl {
-            model,
-            provider_override,
-            ..
-        } => (model.as_deref(), provider_override.as_deref()),
-        _ => (None, None),
+        Some(Commands::Conclude {
+            session_id,
+            status,
+            note,
+        }) => {
+            let config = PikuConfig::load(None, None, env::current_dir().ok().as_deref());
+            conclude_run(&config, session_id, status, note)?;
+            return Ok(());
+        }
+        Some(Commands::Web { port }) => {
+            let config = PikuConfig::load(None, None, env::current_dir().ok().as_deref());
+            piku::web::serve(&config, *port).await?;
+            return Ok(());
+        }
+        None => {}
+    }
+
+    let config = PikuConfig::load(
+        cli.provider.as_deref(),
+        cli.model.as_deref(),
+        cwd.as_deref(),
+    );
+
+    let prompt_str = if cli.prompt.is_empty() {
+        None
+    } else {
+        Some(cli.prompt.join(" "))
     };
 
-    let cwd = env::current_dir().ok();
-    let config = PikuConfig::load(cli_provider, cli_model, cwd.as_deref());
-
-    match action {
-        CliAction::Version => println!("piku {VERSION}"),
-        CliAction::Help => print_help(),
-        CliAction::Providers => print_providers(),
-        CliAction::Inspect { session_id, format } => {
-            inspect_run(&config, &session_id, format)?;
-        }
-        CliAction::Conclude {
+    if let Some(session_id) = &cli.resume {
+        run_resume(
             session_id,
-            disposition,
-            note,
-        } => conclude_run(&config, &session_id, disposition, &note)?,
-        CliAction::ArgError(msg) => {
-            eprintln!("error: {msg}");
-            eprintln!("Run `piku --help` for usage.");
-            std::process::exit(1);
-        }
-        CliAction::SingleShot {
-            prompt,
-            print,
-            read_only,
-            ..
-        } => {
-            if !print && !read_only && self_update::was_restarted() {
-                if let Some(session) = try_load_restart_session(&config) {
-                    return run_tui_repl_post_restart(session, &config, read_only).await;
-                }
+            prompt_str.as_deref(),
+            &config,
+            cli.print,
+            cli.read_only,
+        )
+        .await?;
+    } else if let Some(prompt) = prompt_str {
+        if !cli.print && !cli.read_only && self_update::was_restarted() {
+            if let Some(session) = try_load_restart_session(&config) {
+                return run_tui_repl_post_restart(session, &config, cli.read_only).await;
             }
-            run_single_shot(&prompt, None, &config, print, read_only).await?;
         }
-        CliAction::Resume {
-            session_id,
-            prompt,
-            print,
-            read_only,
-            ..
-        } => {
-            run_resume(&session_id, prompt.as_deref(), &config, print, read_only).await?;
-        }
-        CliAction::Repl { read_only, .. } => {
-            if self_update::was_restarted() {
-                if let Some(session) = try_load_restart_session(&config) {
-                    return run_tui_repl_post_restart(session, &config, read_only).await;
-                }
+        run_single_shot(&prompt, None, &config, cli.print, cli.read_only).await?;
+    } else {
+        if self_update::was_restarted() {
+            if let Some(session) = try_load_restart_session(&config) {
+                return run_tui_repl_post_restart(session, &config, cli.read_only).await;
             }
-            tui_repl::run_tui_repl_with_mode(&config, read_only).await?;
         }
+        tui_repl::run_tui_repl_with_mode(&config, cli.read_only).await?;
     }
 
     Ok(())
@@ -124,9 +135,15 @@ fn inspect_run(config: &PikuConfig, session_id: &str, format: InspectFormat) -> 
 fn conclude_run(
     config: &PikuConfig,
     session_id: &str,
-    disposition: piku_runtime::RunDisposition,
+    status: &str,
     note: &str,
 ) -> anyhow::Result<()> {
+    let disposition = match status {
+        "accepted" => piku_runtime::RunDisposition::Accepted,
+        "needs-work" => piku_runtime::RunDisposition::NeedsWork,
+        "abandoned" => piku_runtime::RunDisposition::Abandoned,
+        _ => anyhow::bail!("--status must be accepted, needs-work, or abandoned"),
+    };
     let path = config.runs_dir().join(format!("{session_id}.jsonl"));
     if !path.exists() {
         anyhow::bail!("no durable run record found at {}", path.display());
@@ -142,12 +159,6 @@ fn conclude_run(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Post-restart helpers (self-update seamless resume)
-// ---------------------------------------------------------------------------
-
-/// Load the session indicated by `PIKU_SESSION_ID` (set by `tui_repl` before exec).
-/// Returns None if the env var is missing or the session can't be loaded.
 fn try_load_restart_session(config: &PikuConfig) -> Option<Session> {
     let session_id = std::env::var("PIKU_SESSION_ID").ok()?;
     std::env::remove_var("PIKU_SESSION_ID");
@@ -162,7 +173,6 @@ fn try_load_restart_session(config: &PikuConfig) -> Option<Session> {
     }
 }
 
-/// Enter the TUI REPL with a session that was just restored after a self-rebuild.
 async fn run_tui_repl_post_restart(
     session: Session,
     config: &PikuConfig,
@@ -170,10 +180,6 @@ async fn run_tui_repl_post_restart(
 ) -> anyhow::Result<()> {
     tui_repl::run_tui_repl_post_restart(config, Some(session), read_only).await
 }
-
-// ---------------------------------------------------------------------------
-// Single-shot mode
-// ---------------------------------------------------------------------------
 
 async fn run_resume(
     session_id: &str,
@@ -187,7 +193,6 @@ async fn run_resume(
     let session_path = sessions_dir.join(format!("{session_id}.json"));
 
     if !session_path.exists() {
-        // Try partial match: find any session file whose name contains session_id
         let matches: Vec<_> = std::fs::read_dir(&sessions_dir)?
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(session_id))
@@ -195,9 +200,7 @@ async fn run_resume(
 
         match matches.len() {
             0 => anyhow::bail!(
-                "session '{session_id}' not found in {}\n\
-                 List saved sessions with: ls {}",
-                sessions_dir.display(),
+                "session '{session_id}' not found in {}",
                 sessions_dir.display()
             ),
             1 => {
@@ -243,15 +246,6 @@ async fn run_resume(
     .await
 }
 
-// ---------------------------------------------------------------------------
-// Single-shot mode
-//
-// Runs one prompt to completion. In headless mode (`print = true`, set by
-// `-p`/`--print`) it exits afterward (aider `-m` / `claude -p` / `codex exec`
-// style). Otherwise it drops into the TUI REPL with the same session so the
-// conversation can continue interactively.
-// ---------------------------------------------------------------------------
-
 async fn run_single_shot(
     prompt: &str,
     existing_session: Option<Session>,
@@ -269,7 +263,7 @@ async fn run_single_shot(
     eprintln!("[piku] provider={} model={model}", resolved.name());
 
     let cwd = env::current_dir()?;
-    let date = current_date();
+    let date = piku::current_date();
     let mut system_sections = build_system_prompt(&cwd, &date, &model, &[]);
     if read_only {
         system_sections.push(piku::read_only_system_prompt_section());
@@ -279,12 +273,9 @@ async fn run_single_shot(
         eprintln!("[piku] continuing session {}", s.id);
         (s.id.clone(), s)
     } else {
-        let id = new_session_id();
+        let id = piku::new_session_id();
         (id.clone(), Session::new(id))
     };
-    // A resumed session takes its model from the current config, not from the
-    // file, so say when the transcript being extended was written by something
-    // else. Silently mixing models leaves a record nobody can attribute.
     if let Some((prior_provider, prior_model)) = session.record_provider(resolved.name(), &model) {
         eprintln!(
             "[piku] warning: session was written by {prior_provider}/{prior_model}, continuing with {}/{model}",
@@ -333,7 +324,6 @@ async fn run_single_shot(
         eprintln!("[piku] stream error: {err}");
     }
 
-    // Persist session BEFORE self-update — nothing should be lost on restart
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
@@ -343,44 +333,30 @@ async fn run_single_shot(
         eprintln!("[piku] session saved → {}", session_path.display());
     }
 
-    // Self-update: sink detected a new binary — replace and exec
     if let Some(new_binary) = result.replace_and_exec {
         eprintln!("[piku] rebuilt — restarting with new binary...");
         if let Err(e) = self_update::replace_and_exec(&new_binary) {
             eprintln!("[piku] self-update failed: {e}");
             eprintln!("[piku] continuing with old binary");
         }
-        // replace_and_exec does not return on success
     }
 
-    // Check if this is a post-restart invocation
     if self_update::was_restarted() {
         eprintln!("[piku] restarted after self-rebuild ✓");
     }
 
-    // Headless: stop here. The turn output has already streamed to stdout and
-    // the session is saved; entering the REPL would block on a (likely
-    // non-TTY) stdin, which is exactly what scripts and pipelines don't want.
     if print || read_only {
         return Ok(());
     }
 
-    // Drop into TUI REPL with the same session for continued conversation
-    println!(); // blank line between single-shot output and REPL
+    println!();
     tui_repl::run_tui_repl_with_session(config, Some(session), result.usage).await
 }
-
-// ---------------------------------------------------------------------------
-// Stdout sink
-// ---------------------------------------------------------------------------
 
 struct StdoutSink {
     stdout: io::Stdout,
     trace: TraceWriter,
-    /// Track `tool_id` so `on_tool_end` can log it (the trait doesn't pass it there).
-    /// Maps `tool_name` → most recent `tool_id` (good enough for sequential execution).
     pending_tool_id: std::collections::HashMap<String, String>,
-    /// Streaming markdown renderer.
     md: piku::markdown::StreamingMarkdown,
 }
 
@@ -479,52 +455,6 @@ impl OutputSink for StdoutSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Help
-// ---------------------------------------------------------------------------
-
-fn print_help() {
-    use piku_runtime::{
-        DEFAULT_MODEL_ANTHROPIC, DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA, DEFAULT_MODEL_OPENROUTER,
-    };
-    println!(
-        "piku {VERSION} — terminal AI coding agent
-
-USAGE:
-    piku [OPTIONS] [PROMPT]
-    piku inspect <SESSION_ID> [--json|--html]
-    piku conclude <SESSION_ID> --status <accepted|needs-work|abandoned> --note <TEXT>
-
-OPTIONS:
-    -p, --print          Headless: run the prompt, print the result, and exit
-                         (no interactive REPL). For scripts and pipelines.
-    --read-only          Only read_file, glob, grep, and list_dir may run
-    --model <name>       Override model (default: provider-dependent)
-    --provider <name>    Force provider: openrouter | anthropic | groq | ollama | custom
-    --providers          Show provider status and exit
-    --resume <id>        Resume a previous session by ID (partial match ok)
-    --version            Print version
-    --help               Print this help
-
-PROVIDER SELECTION (opportunistic — first available wins):
-    PIKU_BASE_URL        → custom OpenAI-compatible server
-    OPENROUTER_API_KEY   → openrouter  (default: {DEFAULT_MODEL_OPENROUTER})
-    ANTHROPIC_API_KEY    → anthropic   (default: {DEFAULT_MODEL_ANTHROPIC})
-    GROQ_API_KEY         → groq        (default: {DEFAULT_MODEL_GROQ})
-    OLLAMA_HOST          → ollama      (default: {DEFAULT_MODEL_OLLAMA}, no key needed)
-
-EXAMPLES:
-    piku \"explain src/main.rs\"
-    piku -p \"explain src/main.rs\"                     # headless, exits after
-    piku --model anthropic/claude-opus-4 \"refactor the permission system\"
-    piku --provider anthropic \"what does the agentic loop do?\"
-
-NOTES:
-    Sessions are auto-saved under the Piku config directory (XDG-aware)
-    Per-project context: add a PIKU.md file in your project root"
-    );
-}
-
 fn print_providers() {
     println!("PROVIDERS:");
     for provider in provider_availability() {
@@ -538,16 +468,4 @@ fn print_providers() {
             provider.name, marker, provider.default_model, provider.note
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-fn new_session_id() -> String {
-    piku::new_session_id()
-}
-
-fn current_date() -> String {
-    piku::current_date()
 }

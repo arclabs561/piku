@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Piku evaluation evidence envelope",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "scenario_id": { "type": "string", "minLength": 1 },
+    "surface": { "type": "string", "enum": ["cli", "web"] },
+    "subject_surface": { "type": ["string", "null"] },
+    "perspective": { "type": "string", "minLength": 1 },
+    "subject_model": { "type": ["string", "null"] },
+    "explorer_model": { "type": ["string", "null"] },
+    "judge_model": { "type": ["string", "null"] },
+    "subject_version": { "type": "string", "minLength": 1 },
+    "subject_revision": { "type": "string", "minLength": 1 },
+    "subject_dirty": { "type": "boolean" },
+    "evaluator_runtime": { "type": "string", "minLength": 1 },
+    "evaluator_version": { "type": "string", "minLength": 1 },
+    "evaluation_contract": { "type": "string", "minLength": 1 },
+    "task_contract": { "type": "string", "minLength": 1 },
+    "run_status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "product_failure",
+        "harness_failure",
+        "infrastructure_failure",
+        "timeout",
+        "inconclusive"
+      ]
+    },
+    "failure_class": { "type": "string", "minLength": 1 },
+    "product_verdict": {
+      "type": ["string", "null"],
+      "enum": ["supported", "partial", "not_supported", null]
+    },
+    "finding_count": { "type": ["integer", "null"], "minimum": 0 },
+    "evidence_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "artifact_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "followups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["todo", "idea", "retest"] },
+          "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+          "title": { "type": "string", "minLength": 1 },
+          "rationale": { "type": "string", "minLength": 1 },
+          "perspective": { "type": ["string", "null"] },
+          "evidence_ids": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "required": [
+          "kind",
+          "priority",
+          "title",
+          "rationale",
+          "perspective",
+          "evidence_ids"
+        ]
+      }
+    },
+    "duration_ms": { "type": "integer", "minimum": 0 }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "scenario_id",
+    "surface",
+    "perspective",
+    "task_contract",
+    "run_status",
+    "failure_class",
+    "product_verdict",
+    "finding_count",
+    "evidence_ids",
+    "artifact_refs",
+    "followups",
+    "duration_ms"
+  ]
+}

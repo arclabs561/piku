@@ -1,0 +1,22 @@
+[mcp_servers.playwright]
+command = "npx"
+args = [
+  "--no-install",
+  "playwright-mcp",
+  "--headless",
+  "--isolated",
+  "--browser",
+  "chromium",
+  "--allowed-hosts",
+  "localhost,127.0.0.1",
+  "--allowed-origins",
+  "http://localhost:9090;http://127.0.0.1:9090",
+  "--block-service-workers",
+  "--output-dir",
+  "../../../.artifacts/playwright-agent",
+]
+cwd = "crates/piku/web-ui"
+required = true
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+default_tools_approval_mode = "approve"

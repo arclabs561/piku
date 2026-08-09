@@ -1,6 +1,11 @@
 # Build output
 target/
 *.d
+node_modules/
+.artifacts/
+playwright-report/
+test-results/
+crates/piku/web-ui/.playwright-mcp/
 
 # Rust
 Cargo.lock.bak

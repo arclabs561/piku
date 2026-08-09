@@ -1,0 +1,56 @@
+{
+  "baseline": {
+    "progress_states": ["queued", "running", "completed"],
+    "provenance": {
+      "intent": true,
+      "model": true,
+      "actions": true,
+      "mutations": true,
+      "verification": true
+    },
+    "rerun": {
+      "edited_input_id": "turn-1-revision-2",
+      "result_input_id": "turn-1-revision-2",
+      "prior_result_state": "stale"
+    },
+    "authority": {
+      "conversation": "advisory",
+      "page": "selected-page-write",
+      "workspace": "layout-write",
+      "file": "read-only",
+      "terminal": "inactive-until-approved"
+    },
+    "persistence": {
+      "content": true,
+      "geometry": true,
+      "stacking": true
+    }
+  },
+  "cases": [
+    {
+      "id": "hidden-progress",
+      "mutation": { "path": "progress_states", "value": ["completed"] },
+      "expected": { "dimension": "state_visibility", "result": "absent" }
+    },
+    {
+      "id": "missing-provenance",
+      "mutation": { "path": "provenance.actions", "value": false },
+      "expected": { "dimension": "action_provenance", "result": "absent" }
+    },
+    {
+      "id": "stale-rerun-output",
+      "mutation": { "path": "rerun.result_input_id", "value": "turn-1-revision-1" },
+      "expected": { "dimension": "rerun_semantics", "result": "absent" }
+    },
+    {
+      "id": "ambiguous-authority",
+      "mutation": { "path": "authority.file", "value": null },
+      "expected": { "dimension": "authority_clarity", "result": "absent" }
+    },
+    {
+      "id": "broken-persistence",
+      "mutation": { "path": "persistence.geometry", "value": false },
+      "expected": { "dimension": "recovery", "result": "absent" }
+    }
+  ]
+}

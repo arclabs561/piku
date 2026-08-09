@@ -13,6 +13,36 @@ scripts:
 clippy:
     ./scripts/ci.sh clippy
 
+# Test the web workspace against an already-running local Piku server.
+web-e2e url="http://127.0.0.1:9090":
+    cd crates/piku/web-ui && PIKU_WEB_URL={{url}} npm run test:e2e
+
+# Run a full Codex + Playwright user journey against the rendered workspace.
+# The agent manipulates the page, observes screenshots, challenges its own
+# findings, and leaves a structured report plus JSONL tool evidence.
+web-agent url="http://127.0.0.1:9090":
+    cd crates/piku/web-ui && npm run test:agent -- --url {{url}}
+
+# Explicit alias for discoverability in QA workflows.
+web-qa-agent url="http://127.0.0.1:9090":
+    just web-agent {{url}}
+
+# Run two isolated Codex + Playwright explorers concurrently, then give their
+# raw evidence packets to a fresh synthesis process. Each explorer owns a
+# temporary Piku surface and browser context; all outcomes enter the shared
+# evaluation ledger.
+web-agent-parallel url="http://127.0.0.1:9090":
+    cd crates/piku/web-ui && PIKU_WEB_URL={{url}} npm run test:agent:parallel
+
+# Summarize shared CLI and web live-evaluation evidence.
+eval-summary ledger="target/live-ledger":
+    node scripts/evaluation-summary.mjs {{ledger}}
+
+# Fast contract tests for the shared evaluation ledger and web judge harness.
+eval-harness-test:
+    node --test scripts/evaluation-summary.test.mjs
+    cd crates/piku/web-ui && npm run test:harness
+
 # Run local live LLM smoke tests and write a ledger under target/live-ledger.
 live:
     ./scripts/ci.sh live

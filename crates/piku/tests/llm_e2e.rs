@@ -145,6 +145,15 @@ fn live_ledger_summarizes_trace_file() {
 
     let ledger = std::fs::read_to_string(&ledger_path).unwrap();
     let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+    assert_eq!(row["schema_version"], 1);
+    assert_eq!(row["surface"], "cli");
+    assert_eq!(row["scenario_id"], "live_ledger_summarizes_trace_file");
+    assert_eq!(row["run_status"], "inconclusive");
+    assert!(row["run_id"]
+        .as_str()
+        .is_some_and(|run_id| run_id.starts_with("cli-live_ledger_summarizes_trace_file-")));
+    assert_eq!(row["product_verdict"], serde_json::Value::Null);
+    assert_eq!(row["followups"], serde_json::json!([]));
     assert_eq!(row["suite"], "llm_e2e");
     assert_eq!(row["provider"], "openrouter");
     assert_eq!(row["model"], "test-model");

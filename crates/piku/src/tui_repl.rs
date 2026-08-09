@@ -50,7 +50,7 @@ use piku_tools::{all_tool_definitions, Destructiveness};
 pub struct TuiPrompter {
     /// If true, skip all future prompts and allow everything.
     allow_all: std::sync::atomic::AtomicBool,
-    /// Pre-configured allow/deny rules from settings.json.
+    /// Pre-configured allow/deny rules from settings.toml.
     allow_rules: Vec<String>,
     deny_rules: Vec<String>,
 }
@@ -77,7 +77,7 @@ impl PermissionPrompter for TuiPrompter {
         self.deny_rules
             .iter()
             .find(|pattern| crate::config::matches_tool_pattern(pattern, tool_name, params))
-            .map(|pattern| format!("denied by settings.json rule: {pattern}"))
+            .map(|pattern| format!("denied by settings.toml rule: {pattern}"))
     }
 
     fn decide(&self, req: &PermissionRequest) -> PermissionOutcome {
@@ -2153,7 +2153,7 @@ fn handle_slash_cmd(
         "permissions" | "perms" => {
             if config.allow.is_empty() && config.deny.is_empty() {
                 println!("\x1b[2m[no permission rules configured]\x1b[0m\r");
-                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.json or .piku/settings.json\x1b[0m\r");
+                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.toml or .piku/settings.toml\x1b[0m\r");
             } else {
                 if !config.allow.is_empty() {
                     println!("\x1b[32mAllow:\x1b[0m\r");

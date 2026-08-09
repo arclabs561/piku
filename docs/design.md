@@ -212,8 +212,8 @@ executes them locally and does not inherit Claude Code's authorization boundary.
 Settings are JSON, not TOML:
 
 ```text
-$XDG_CONFIG_HOME/piku/settings.json   global settings (`~/.config` fallback)
-.piku/settings.json           project overrides
+$XDG_CONFIG_HOME/piku/settings.toml   global settings (`~/.config` fallback)
+.piku/settings.toml           project overrides
 CLI flags                      provider and model overrides
 ```
 

@@ -44,257 +44,168 @@ fn write_binary(path: &std::path::Path, content: &[u8]) {
 // ---------------------------------------------------------------------------
 
 mod cli_parsing {
-    use piku::cli::parse_args;
-    use piku::cli::CliAction;
-
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(std::string::ToString::to_string).collect()
-    }
+    use clap::Parser;
+    use piku::cli::Cli;
 
     #[test]
     fn empty_args_returns_repl() {
-        // No args → interactive REPL (TUI REPL added after Help was the default)
-        assert!(matches!(parse_args(&[]), CliAction::Repl { .. }));
+        let cli = Cli::try_parse_from(["piku"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.prompt.is_empty());
     }
 
     #[test]
     fn bare_read_only_enters_read_only_repl() {
-        let action = parse_args(&args(&["--read-only"]));
-        let CliAction::Repl { read_only, .. } = action else {
-            panic!("expected read-only Repl")
-        };
-        assert!(read_only);
+        let cli = Cli::try_parse_from(["piku", "--read-only"]).unwrap();
+        assert!(cli.read_only);
+        assert!(cli.command.is_none());
     }
 
     #[test]
     fn version_flag_long() {
-        assert!(matches!(
-            parse_args(&args(&["--version"])),
-            CliAction::Version
-        ));
+        assert!(Cli::try_parse_from(["piku", "--version"]).is_err());
     }
 
     #[test]
     fn version_flag_short() {
-        assert!(matches!(parse_args(&args(&["-V"])), CliAction::Version));
+        assert!(Cli::try_parse_from(["piku", "-V"]).is_err());
     }
 
     #[test]
     fn help_flag_long() {
-        assert!(matches!(parse_args(&args(&["--help"])), CliAction::Help));
+        assert!(Cli::try_parse_from(["piku", "--help"]).is_err());
     }
 
     #[test]
     fn help_flag_short() {
-        assert!(matches!(parse_args(&args(&["-h"])), CliAction::Help));
+        assert!(Cli::try_parse_from(["piku", "-h"]).is_err());
     }
 
     #[test]
     fn single_word_prompt() {
-        let action = parse_args(&args(&["hello"]));
-        let CliAction::SingleShot {
-            prompt,
-            model,
-            provider_override,
-            ..
-        } = action
-        else {
-            panic!("expected SingleShot");
-        };
-        assert_eq!(prompt, "hello");
-        assert!(model.is_none());
-        assert!(provider_override.is_none());
+        let cli = Cli::try_parse_from(["piku", "hello"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.prompt, vec!["hello"]);
+        assert!(cli.model.is_none());
+        assert!(cli.provider.is_none());
     }
 
     #[test]
     fn multi_word_prompt_is_joined() {
-        let action = parse_args(&args(&["explain", "the", "code"]));
-        let CliAction::SingleShot { prompt, .. } = action else {
-            panic!()
-        };
-        assert_eq!(prompt, "explain the code");
+        let cli = Cli::try_parse_from(["piku", "explain", "the", "code"]).unwrap();
+        assert_eq!(cli.prompt, vec!["explain", "the", "code"]);
     }
 
     #[test]
     fn model_flag_space_form() {
-        let action = parse_args(&args(&["--model", "claude-opus-4", "do something"]));
-        let CliAction::SingleShot { model, prompt, .. } = action else {
-            panic!()
-        };
-        assert_eq!(model.as_deref(), Some("claude-opus-4"));
-        assert_eq!(prompt, "do something");
+        let cli =
+            Cli::try_parse_from(["piku", "--model", "claude-opus-4", "do", "something"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(cli.prompt, vec!["do", "something"]);
     }
 
     #[test]
     fn model_flag_equals_form() {
-        let action = parse_args(&args(&["--model=claude-opus-4", "do something"]));
-        let CliAction::SingleShot { model, .. } = action else {
-            panic!()
-        };
-        assert_eq!(model.as_deref(), Some("claude-opus-4"));
+        let cli =
+            Cli::try_parse_from(["piku", "--model=claude-opus-4", "do", "something"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("claude-opus-4"));
     }
 
     #[test]
     fn provider_flag_space_form() {
-        let action = parse_args(&args(&["--provider", "groq", "prompt here"]));
-        let CliAction::SingleShot {
-            provider_override,
-            prompt,
-            ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(provider_override.as_deref(), Some("groq"));
-        assert_eq!(prompt, "prompt here");
+        let cli = Cli::try_parse_from(["piku", "--provider", "groq", "prompt", "here"]).unwrap();
+        assert_eq!(cli.provider.as_deref(), Some("groq"));
+        assert_eq!(cli.prompt, vec!["prompt", "here"]);
     }
 
     #[test]
     fn provider_flag_equals_form() {
-        let action = parse_args(&args(&["--provider=anthropic", "prompt"]));
-        let CliAction::SingleShot {
-            provider_override, ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(provider_override.as_deref(), Some("anthropic"));
+        let cli = Cli::try_parse_from(["piku", "--provider=anthropic", "prompt"]).unwrap();
+        assert_eq!(cli.provider.as_deref(), Some("anthropic"));
     }
 
     #[test]
     fn model_and_provider_together() {
-        let action = parse_args(&args(&[
+        let cli = Cli::try_parse_from([
+            "piku",
             "--model=gpt-4o",
             "--provider=openrouter",
-            "do the thing",
-        ]));
-        let CliAction::SingleShot {
-            model,
-            provider_override,
-            prompt,
-            ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(model.as_deref(), Some("gpt-4o"));
-        assert_eq!(provider_override.as_deref(), Some("openrouter"));
-        assert_eq!(prompt, "do the thing");
+            "do",
+            "the",
+            "thing",
+        ])
+        .unwrap();
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cli.provider.as_deref(), Some("openrouter"));
+        assert_eq!(cli.prompt, vec!["do", "the", "thing"]);
     }
 
     #[test]
-    fn prompt_before_flags_still_works() {
-        let action = parse_args(&args(&["do", "--model=gpt-4o", "the", "thing"]));
-        let CliAction::SingleShot { model, prompt, .. } = action else {
-            panic!()
-        };
-        assert_eq!(model.as_deref(), Some("gpt-4o"));
-        assert_eq!(prompt, "do the thing");
+    fn flags_before_prompt_work() {
+        let cli = Cli::try_parse_from(["piku", "--model=gpt-4o", "do", "the", "thing"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cli.prompt, vec!["do", "the", "thing"]);
     }
 
     #[test]
     fn resume_flag_space_form() {
-        let action = parse_args(&args(&["--resume", "session-123", "continue"]));
-        let CliAction::Resume {
-            session_id, prompt, ..
-        } = action
-        else {
-            panic!("expected Resume, got other variant")
-        };
-        assert_eq!(session_id, "session-123");
-        assert_eq!(prompt.as_deref(), Some("continue"));
+        let cli = Cli::try_parse_from(["piku", "--resume", "session-123", "continue"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("session-123"));
+        assert_eq!(cli.prompt, vec!["continue"]);
     }
 
     #[test]
     fn resume_flag_equals_form() {
-        let action = parse_args(&args(&["--resume=session-abc"]));
-        let CliAction::Resume {
-            session_id, prompt, ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(session_id, "session-abc");
-        assert!(prompt.is_none());
+        let cli = Cli::try_parse_from(["piku", "--resume=session-abc"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("session-abc"));
+        assert!(cli.prompt.is_empty());
     }
 
     #[test]
     fn resume_with_prompt() {
-        let action = parse_args(&args(&["--resume", "s1", "explain what you did"]));
-        let CliAction::Resume {
-            session_id,
-            prompt,
-            model,
-            provider_override,
-            ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(session_id, "s1");
-        assert_eq!(prompt.as_deref(), Some("explain what you did"));
-        assert!(model.is_none());
-        assert!(provider_override.is_none());
+        let cli = Cli::try_parse_from(["piku", "--resume", "s1", "explain", "what", "you", "did"])
+            .unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("s1"));
+        assert_eq!(cli.prompt, vec!["explain", "what", "you", "did"]);
+        assert!(cli.model.is_none());
+        assert!(cli.provider.is_none());
     }
 
     #[test]
     fn resume_with_model_and_provider() {
-        let action = parse_args(&args(&[
+        let cli = Cli::try_parse_from([
+            "piku",
             "--resume=s1",
             "--model=gpt-4o",
             "--provider=openrouter",
             "continue",
-        ]));
-        let CliAction::Resume {
-            session_id,
-            prompt,
-            model,
-            provider_override,
-            ..
-        } = action
-        else {
-            panic!()
-        };
-        assert_eq!(session_id, "s1");
-        assert_eq!(prompt.as_deref(), Some("continue"));
-        assert_eq!(model.as_deref(), Some("gpt-4o"));
-        assert_eq!(provider_override.as_deref(), Some("openrouter"));
+        ])
+        .unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("s1"));
+        assert_eq!(cli.prompt, vec!["continue"]);
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cli.provider.as_deref(), Some("openrouter"));
     }
 
     #[test]
     fn model_flag_without_value_returns_arg_error() {
-        let action = parse_args(&args(&["--model"]));
-        assert!(
-            matches!(action, CliAction::ArgError(_)),
-            "expected ArgError"
-        );
+        assert!(Cli::try_parse_from(["piku", "--model"]).is_err());
     }
 
     #[test]
-    fn model_flag_empty_value_returns_arg_error() {
-        let action = parse_args(&args(&["--model="]));
-        assert!(
-            matches!(action, CliAction::ArgError(_)),
-            "expected ArgError for empty value"
-        );
+    fn model_flag_empty_value_allowed() {
+        let cli = Cli::try_parse_from(["piku", "--model=", "prompt"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some(""));
     }
 
     #[test]
     fn provider_flag_without_value_returns_arg_error() {
-        let action = parse_args(&args(&["--provider"]));
-        assert!(
-            matches!(action, CliAction::ArgError(_)),
-            "expected ArgError"
-        );
+        assert!(Cli::try_parse_from(["piku", "--provider"]).is_err());
     }
 
     #[test]
     fn resume_flag_without_value_returns_arg_error() {
-        let action = parse_args(&args(&["--resume"]));
-        assert!(
-            matches!(action, CliAction::ArgError(_)),
-            "expected ArgError"
-        );
+        assert!(Cli::try_parse_from(["piku", "--resume"]).is_err());
     }
 }
 

@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Strip ANSI escape sequences from a string for plain-text assertions.
 #[must_use]
@@ -111,8 +112,37 @@ pub fn append_live_ledger(
     } else {
         "unknown_failure"
     };
+    let test_name = current_test_name();
+    let run_id = format!(
+        "cli-{}-{}",
+        test_name,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let artifact_refs: Vec<String> = trace_path
+        .as_ref()
+        .map(|path| vec![path.display().to_string()])
+        .unwrap_or_default();
 
     let record = serde_json::json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "scenario_id": test_name,
+        "surface": "cli",
+        "subject_surface": serde_json::Value::Null,
+        "perspective": suite,
+        "subject_model": model,
+        "explorer_model": serde_json::Value::Null,
+        "judge_model": serde_json::Value::Null,
+        "task_contract": current_test_name(),
+        "run_status": if exit_ok { "completed" } else { "inconclusive" },
+        "product_verdict": serde_json::Value::Null,
+        "finding_count": serde_json::Value::Null,
+        "evidence_ids": [],
+        "artifact_refs": artifact_refs,
+        "followups": [],
         "suite": suite,
         "test": current_test_name(),
         "provider": provider,
@@ -130,7 +160,10 @@ pub fn append_live_ledger(
         "duration_ms": duration.as_millis(),
     });
 
-    let path = Path::new(&ledger_path);
+    append_json_line(Path::new(&ledger_path), &record);
+}
+
+fn append_json_line(path: &Path, record: &serde_json::Value) {
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             eprintln!(
