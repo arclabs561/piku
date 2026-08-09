@@ -95,6 +95,13 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
   assert.match(recoveryPrompt, /distinctive, non-default canvas position/i);
   assert.match(recoveryPrompt, /deterministic delayed-provider fixture/i);
   assert.match(synthesisPrompt, /aggregate console counts or generic DOM article counts/);
+  for (const prompt of [tracePrompt, recoveryPrompt, synthesisPrompt]) {
+    assert.match(prompt, /service-worker blocking/);
+    assert.match(prompt, /navigator\.serviceWorker/);
+    assert.match(prompt, /evaluator noise/);
+    assert.match(prompt, /product impact/);
+    assert.match(prompt, /(?:unrelated|other)\s+`SecurityError`/);
+  }
 });
 
 test("web evaluator records timeout separately from product failure", () => {

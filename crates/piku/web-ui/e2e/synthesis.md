@@ -51,6 +51,11 @@ Do not treat aggregate console counts or generic DOM article counts as product
 findings. Console evidence must identify representative messages, origin,
 timing, and impact. Object-count evidence must distinguish persisted
 `.workspace-object` cards from elements explicitly labeled as transient
-execution traces.
+execution traces. Playwright's service-worker blocking init script can itself
+raise `SecurityError` while reading `navigator.serviceWorker` in an opaque
+sandboxed `about:srcdoc` frame. Preserve an explorer's exact message and origin,
+but treat that exact condition as evaluator noise unless separate current-run
+evidence demonstrates product impact. Do not suppress or reclassify unrelated
+`SecurityError` messages.
 Return only JSON matching the supplied schema, including useful todo, idea, and
 retest followups for future runs.

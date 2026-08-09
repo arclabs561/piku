@@ -53,7 +53,12 @@ is runtime provenance, not an authored or persisted workspace card; do not count
 it as object proliferation. If console errors exist, record representative exact
 messages, source URL/origin, timing, and observed product impact. Separate host
 page errors from sandboxed `about:srcdoc` preview errors and intentional rejected
-requests. An aggregate console count alone cannot support a finding.
+requests. When Playwright runs with service-worker blocking, its own init script
+can raise `SecurityError` while reading `navigator.serviceWorker` in an opaque
+sandboxed `about:srcdoc` frame. Preserve the exact message and origin as harness
+provenance, but classify that exact condition as evaluator noise unless separate
+evidence shows product impact. Do not generalize this exception to other
+`SecurityError` messages. An aggregate console count alone cannot support a finding.
 
 Delete the surface through the UI and close the browser before returning. Return
 only JSON matching the supplied schema. Include concrete todo, idea, or retest
