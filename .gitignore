@@ -28,10 +28,12 @@ Thumbs.db
 # Test fixtures
 tests/fixture/tmp/
 
-# Project docs (docs/ tracked; design + adr are working/personal, kept local-only)
+# Project docs (public designs tracked; ADR working ledger remains local-only)
 !docs/
 docs/adr/
-docs/design/
+!docs/design/
+!docs/design/*.md
+docs/design/sources/
 
 # Legacy dirs — explicitly excluded so they can never creep back in
 /src/
@@ -45,4 +47,3 @@ __pycache__/
 archive/
 .omx/
 .clawd-agents/
-Cargo.lock
