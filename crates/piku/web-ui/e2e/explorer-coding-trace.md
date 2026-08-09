@@ -6,8 +6,13 @@ and result. Do not inspect repository source or run shell commands.
 Use the exact surface `{{SURFACE}}`, request ID `{{REQUEST_ID}}`, and write
 screenshots only below `{{RUN_DIR}}`. Create the surface through the UI and use
 only four cards: note, chat, change, and page preview. Attach the note explicitly
-to chat without submitting it. Perform one page-source change, inspect its source
-diff, then use its rerun control once. Record only observed evidence, with IDs
+to chat without submitting it. First use the change card to create a small seeded
+page containing a heading, one styled control, and an unrelated layout element.
+Then edit the same card's instruction and submit a narrow heading-only change.
+Inspect the second run's source diff and rendered result, then use its rerun
+control once. Attribute preservation only from the seeded-to-edited diff; the
+initial empty-to-document creation is setup, not evidence of broad rewriting.
+Record only observed evidence, with IDs
 prefixed `coding_trace:`. Do not add a file card or make a separate chat request.
 Stay below {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 

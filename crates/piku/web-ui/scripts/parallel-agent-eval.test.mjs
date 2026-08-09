@@ -32,7 +32,7 @@ test("explorers receive distinct surfaces and request IDs", () => {
 });
 
 test("explorers get working budgets inside a separate hard runaway limit", () => {
-  assert.equal(explorerCallBudget("coding_trace", {}), 40);
+  assert.equal(explorerCallBudget("coding_trace", {}), 48);
   assert.equal(explorerCallBudget("recovery", {}), 48);
   assert.equal(explorerCallBudget("recovery", { PIKU_EXPLORER_MAX_CALLS: "50" }), 50);
   assert.equal(explorerCallBudget("recovery", { PIKU_RECOVERY_MAX_CALLS: "44" }), 44);
