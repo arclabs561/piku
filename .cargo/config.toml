@@ -1,0 +1,5 @@
+[build]
+# Keep final binaries in ./target, where Piku's self-update and dogfood tools
+# expect them, while moving high-churn intermediates out of macOS Documents.
+# Cargo 1.91+ expands both template variables portably on every platform.
+build-dir = "{cargo-cache-home}/build/{workspace-path-hash}"

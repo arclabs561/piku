@@ -9,6 +9,9 @@ on:
     branches: [main]
 env:
   CARGO_TERM_COLOR: always
+  # Keep hosted-runner intermediates in the workspace so rust-cache retains
+  # its established target-directory behavior. Local builds use .cargo/config.
+  CARGO_BUILD_BUILD_DIR: target
 jobs:
   check:
     runs-on: ubuntu-latest
