@@ -1276,7 +1276,7 @@ function parseChatNotebook(content) {
       });
       return {
         version: 4,
-        executor: value.version >= 3 && ["codex", "provider"].includes(value.executor)
+        executor: value.version >= 3 && ["codex", "provider", "evaluation_fixture"].includes(value.executor)
           ? value.executor
           : "provider",
         threadId: value.version >= 4 && typeof value.threadId === "string"

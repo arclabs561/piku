@@ -265,6 +265,7 @@ pub(super) struct AppState {
     pub(super) terminal_slots: Arc<tokio::sync::Semaphore>,
     model_slots: Arc<Semaphore>,
     codex_root: Arc<PathBuf>,
+    evaluation_fixtures: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -292,6 +293,7 @@ struct ChatRequest {
 #[serde(rename_all = "snake_case")]
 enum ChatExecutor {
     Codex,
+    EvaluationFixture,
     #[default]
     Provider,
 }
@@ -410,6 +412,8 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         terminal_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         model_slots: Arc::new(Semaphore::new(MODEL_REQUEST_SLOTS)),
         codex_root: Arc::new(config.config_dir.join("_codex")),
+        evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
+            .is_some_and(|value| value == "1"),
     });
 
     let app = Router::new()
@@ -435,6 +439,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         storage = %state.surfaces.read().await.root.display(),
         terminal = "pty",
         loopback_only = true,
+        evaluation_fixtures = state.evaluation_fixtures,
         "web surface listening"
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -455,24 +460,34 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
                 .unwrap_or_else(|| resolved.default_model.clone())
         },
     );
+    let mut executors = vec![
+        ExecutorStatus {
+            id: "codex",
+            available: codex.available && codex.authenticated,
+            isolated: codex.isolated,
+            model: codex.model.to_string(),
+            detail: codex.detail,
+        },
+        ExecutorStatus {
+            id: "provider",
+            available: provider.is_ok(),
+            isolated: true,
+            model: provider_model,
+            detail: "Piku provider loop · explicit provider credentials".to_string(),
+        },
+    ];
+    if state.evaluation_fixtures {
+        executors.push(ExecutorStatus {
+            id: "evaluation_fixture",
+            available: true,
+            isolated: true,
+            model: "deterministic-cancellation".to_string(),
+            detail: "Evaluation-only executor · waits for explicit user cancellation".to_string(),
+        });
+    }
     Json(ExecutorCatalog {
         default: "codex",
-        executors: vec![
-            ExecutorStatus {
-                id: "codex",
-                available: codex.available && codex.authenticated,
-                isolated: codex.isolated,
-                model: codex.model.to_string(),
-                detail: codex.detail,
-            },
-            ExecutorStatus {
-                id: "provider",
-                available: provider.is_ok(),
-                isolated: true,
-                model: provider_model,
-                detail: "Piku provider loop · explicit provider credentials".to_string(),
-            },
-        ],
+        executors,
     })
 }
 
@@ -1183,6 +1198,17 @@ async fn chat_handler(
         .map_err(str::to_string)
         .and_then(|()| validate_chat_notebook_input(req.context.as_deref(), &req.history))
         .and_then(|()| validate_codex_thread_id(req.executor, req.thread_id.as_deref()))
+        .and_then(|()| {
+            if req.executor == ChatExecutor::EvaluationFixture && !state.evaluation_fixtures {
+                Err("evaluation fixture executor is disabled".to_string())
+            } else if req.executor == ChatExecutor::EvaluationFixture
+                && req.kind != RequestKind::Chat
+            {
+                Err("evaluation fixture executor only supports chat requests".to_string())
+            } else {
+                Ok(())
+            }
+        })
         .err();
     let accepted = request_error.is_none() && {
         let mut surfaces = state.surfaces.write().await;
@@ -1292,30 +1318,60 @@ async fn run_chat_request(
     thread_id: Option<String>,
     tx: mpsc::Sender<String>,
 ) {
-    if executor == ChatExecutor::Codex {
-        run_codex_chat_request(
-            state,
-            surface_name,
-            message,
-            target_id,
-            context,
-            history,
-            thread_id,
-            tx,
-        )
-        .await;
-        return;
+    match executor {
+        ChatExecutor::Codex => {
+            run_codex_chat_request(
+                state,
+                surface_name,
+                message,
+                target_id,
+                context,
+                history,
+                thread_id,
+                tx,
+            )
+            .await;
+        }
+        ChatExecutor::EvaluationFixture => {
+            run_evaluation_fixture_request(surface_name, tx).await;
+        }
+        ChatExecutor::Provider => {
+            run_provider_chat_request(
+                state,
+                surface_name,
+                message,
+                target_id,
+                context,
+                history,
+                tx,
+            )
+            .await;
+        }
     }
-    run_provider_chat_request(
-        state,
-        surface_name,
-        message,
-        target_id,
-        context,
-        history,
-        tx,
-    )
-    .await;
+}
+
+async fn run_evaluation_fixture_request(surface_name: String, tx: mpsc::Sender<String>) {
+    let request_id = crate::new_session_id();
+    emit(
+        &tx,
+        &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"evaluation_fixture"}),
+    );
+    emit(
+        &tx,
+        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"evaluation fixture","model":"deterministic-cancellation","executor":"evaluation_fixture","sandbox":"no external process","configuration":"opt-in","message":"Waiting for explicit user cancellation","request_kind":"chat"}),
+    );
+    emit(
+        &tx,
+        &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":"Fixture active; cancel this turn to continue the evaluation."}),
+    );
+    tx.closed().await;
+    tracing::info!(
+        request_id,
+        surface = %surface_name,
+        kind = "chat",
+        executor = "evaluation_fixture",
+        "evaluation fixture cancelled after client disconnected"
+    );
 }
 
 async fn run_codex_chat_request(

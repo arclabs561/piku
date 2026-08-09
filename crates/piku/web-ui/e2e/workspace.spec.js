@@ -795,6 +795,10 @@ test("a running chat exposes user-owned cancellation", async ({
   request,
   surfaceName,
 }) => {
+  const catalog = await (await request.get("/api/executors")).json();
+  const fixtureEnabled = catalog.executors.some(
+    (executor) => executor.id === "evaluation_fixture" && executor.available,
+  );
   const saved = await request.put(
     `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
     {
@@ -810,7 +814,7 @@ test("a running chat exposes user-owned cancellation", async ({
             height: 544,
             content: JSON.stringify({
               version: 4,
-              executor: "codex",
+              executor: fixtureEnabled ? "evaluation_fixture" : "codex",
               threadId: "",
               model: "",
               context: "",
@@ -833,24 +837,34 @@ test("a running chat exposes user-owned cancellation", async ({
   );
   expect(saved.ok()).toBeTruthy();
 
-  let release;
-  const gate = new Promise((resolve) => {
-    release = resolve;
-  });
-  await page.route("**/api/chat", async (route) => {
-    await gate;
-    await route.abort().catch(() => {});
-  });
+  let release = () => {};
+  if (!fixtureEnabled) {
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/api/chat", async (route) => {
+      await gate;
+      await route.abort().catch(() => {});
+    });
+  }
   await page.reload();
   const chat = page.locator('[data-object-id="cancel-thread"]');
   await chat.getByRole("button", { name: "run all", exact: true }).click();
   const stop = chat.getByRole("button", { name: "stop", exact: true });
   await expect(stop).toBeEnabled();
+  if (fixtureEnabled) {
+    const activity = page.getByRole("article", { name: "Execution trace" });
+    await expect(activity).toContainText("Request accepted");
+    await expect(activity).toContainText("Waiting for explicit user cancellation");
+    await expect(chat.locator(".chat-response")).toContainText("Fixture active");
+  }
   await stop.click();
   release();
   await expect(stop).toBeDisabled();
   await expect(chat.locator(".chat-turn-status")).toContainText("cancelled");
-  await expect(chat.locator(".chat-response")).toContainText("Cancelled");
+  await expect(chat.locator(".chat-response")).toContainText(
+    fixtureEnabled ? "Fixture active" : "Cancelled",
+  );
   await page.reload();
   const restored = page.locator('[data-object-id="cancel-thread"]');
   await expect(restored.locator(".chat-turn-status"))
