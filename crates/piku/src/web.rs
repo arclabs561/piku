@@ -1692,21 +1692,24 @@ async fn run_codex_chat_request(
         state.surfaces.write().await.running.remove(&surface_name);
         return;
     }
-    let run = codex::run_chat(
-        &state.workspace_root,
-        &state.codex_root,
-        &message,
-        context.as_deref(),
-        &history,
-        thread_id.as_deref(),
-        |event| match event {
-            codex::CodexEvent::Started {
-                model,
-                thread_id,
-                turn_id: native_turn_id,
-                input,
-            } => {
-                append_codex_run_event(
+    let (result, browser_disconnected) = {
+        let (cancellation, cancellation_rx) = codex::cancellation_channel();
+        let run = codex::run_chat_cancellable(
+            &state.workspace_root,
+            &state.codex_root,
+            &message,
+            context.as_deref(),
+            &history,
+            thread_id.as_deref(),
+            cancellation_rx,
+            |event| match event {
+                codex::CodexEvent::Started {
+                    model,
+                    thread_id,
+                    turn_id: native_turn_id,
+                    input,
+                } => {
+                    append_codex_run_event(
                     &mut recorder,
                     &turn_id,
                     RunEvent::ContextUnavailable {
@@ -1717,32 +1720,69 @@ async fn run_codex_chat_request(
                     &mut activity_sink,
                     &mut record_error,
                 );
-                debug_assert_eq!(
-                    input,
-                    codex::compose_input(&message, context.as_deref(), &history)
-                );
-                emit(
+                    debug_assert_eq!(
+                        input,
+                        codex::compose_input(&message, context.as_deref(), &history)
+                    );
+                    emit(
+                        &event_tx,
+                        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
+                    );
+                }
+                codex::CodexEvent::Delta(text) => emit_lossy(
                     &event_tx,
-                    &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
-                );
-            }
-            codex::CodexEvent::Delta(text) => emit_lossy(
-                &event_tx,
-                &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":text}),
-            ),
-        },
-    );
-    let result = tokio::select! {
-        result = run => Some(result),
-        () = tx.closed() => None,
+                    &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":text}),
+                ),
+            },
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => (result, false),
+            () = tx.closed() => {
+                cancellation.request();
+                (run.as_mut().await, true)
+            },
+        }
     };
     let elapsed = started.elapsed().as_secs_f32();
-    let Some(result) = result else {
+    if browser_disconnected {
+        if let Err(error) = &result {
+            if !error.partial_output().is_empty() {
+                append_codex_run_event(
+                    &mut recorder,
+                    &turn_id,
+                    RunEvent::AssistantMessage {
+                        content: RunContentRef::Inline {
+                            text: error.partial_output().to_string(),
+                        },
+                    },
+                    &mut activity_sink,
+                    &mut record_error,
+                );
+            }
+            if !error.is_interrupted() {
+                tracing::warn!(
+                    request_id,
+                    kind = "chat",
+                    executor = "codex",
+                    %error,
+                    "Codex ended before interruption was confirmed"
+                );
+            }
+        }
         append_codex_run_event(
             &mut recorder,
             &turn_id,
             RunEvent::TurnCancelled {
-                reason: "browser disconnected before the Codex turn completed".to_string(),
+                reason: if result
+                    .as_ref()
+                    .is_err_and(codex::CodexFailure::is_interrupted)
+                {
+                    "browser disconnected; Codex acknowledged interruption".to_string()
+                } else {
+                    "browser disconnected; Codex interruption fell back to process shutdown"
+                        .to_string()
+                },
             },
             &mut activity_sink,
             &mut record_error,
@@ -1765,7 +1805,7 @@ async fn run_codex_chat_request(
         );
         state.surfaces.write().await.running.remove(&surface_name);
         return;
-    };
+    }
     if let Some(error) = record_error {
         emit(
             &tx,

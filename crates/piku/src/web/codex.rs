@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::watch;
 
 use super::ChatMessage;
 
@@ -23,6 +25,24 @@ const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "TERM",
     "TMPDIR",
 ];
+const INTERRUPT_RESPONSE_ID: u64 = 4;
+const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+pub(super) struct CodexCancellation {
+    sender: watch::Sender<bool>,
+}
+
+impl CodexCancellation {
+    pub(super) fn request(&self) {
+        self.sender.send_replace(true);
+    }
+}
+
+pub(super) fn cancellation_channel() -> (CodexCancellation, watch::Receiver<bool>) {
+    let (sender, receiver) = watch::channel(false);
+    (CodexCancellation { sender }, receiver)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(super) struct CodexReadiness {
@@ -67,6 +87,7 @@ pub(super) struct CodexResult {
 pub(super) struct CodexFailure {
     message: String,
     partial_output: String,
+    interrupted: bool,
 }
 
 impl CodexFailure {
@@ -74,11 +95,32 @@ impl CodexFailure {
         Self {
             message: message.into(),
             partial_output,
+            interrupted: false,
+        }
+    }
+
+    fn interrupted(partial_output: String) -> Self {
+        Self {
+            message: "Codex turn was interrupted".into(),
+            partial_output,
+            interrupted: true,
+        }
+    }
+
+    fn interruption_failed(message: impl Into<String>, partial_output: String) -> Self {
+        Self {
+            message: message.into(),
+            partial_output,
+            interrupted: true,
         }
     }
 
     pub(super) fn partial_output(&self) -> &str {
         &self.partial_output
+    }
+
+    pub(super) fn is_interrupted(&self) -> bool {
+        self.interrupted
     }
 }
 
@@ -114,13 +156,40 @@ pub(super) fn readiness() -> CodexReadiness {
     }
 }
 
-pub(super) async fn run_chat<F>(
+pub(super) async fn run_chat_cancellable<F>(
     workspace_root: &Path,
     codex_root: &Path,
     message: &str,
     context: Option<&str>,
     history: &[ChatMessage],
     thread_id: Option<&str>,
+    cancellation: watch::Receiver<bool>,
+    on_event: F,
+) -> Result<CodexResult, CodexFailure>
+where
+    F: FnMut(CodexEvent),
+{
+    run_chat_inner(
+        workspace_root,
+        codex_root,
+        message,
+        context,
+        history,
+        thread_id,
+        Some(cancellation),
+        on_event,
+    )
+    .await
+}
+
+async fn run_chat_inner<F>(
+    workspace_root: &Path,
+    codex_root: &Path,
+    message: &str,
+    context: Option<&str>,
+    history: &[ChatMessage],
+    thread_id: Option<&str>,
+    mut cancellation: Option<watch::Receiver<bool>>,
     mut on_event: F,
 ) -> Result<CodexResult, CodexFailure>
 where
@@ -145,10 +214,65 @@ where
     let mut output = String::new();
     let mut usage = None;
     loop {
-        let message = server
-            .read_message()
-            .await
-            .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?;
+        if cancellation
+            .as_ref()
+            .is_some_and(|receiver| *receiver.borrow())
+        {
+            let result = server.interrupt_turn(&thread, &turn_id).await;
+            server.stop().await;
+            return match result {
+                Ok(()) => Err(CodexFailure::interrupted(output)),
+                Err(error) => Err(CodexFailure::interruption_failed(
+                    format!("Codex interruption did not complete cleanly: {error}"),
+                    output,
+                )),
+            };
+        }
+        let message = if cancellation.is_some() {
+            enum NextMessage {
+                Message(anyhow::Result<Value>),
+                Cancel,
+                CancellationClosed,
+            }
+            let next = {
+                let receiver = cancellation.as_mut().expect("checked above");
+                tokio::select! {
+                    message = server.read_message() => NextMessage::Message(message),
+                    changed = receiver.changed() => {
+                        if changed.is_ok() && *receiver.borrow() {
+                            NextMessage::Cancel
+                        } else {
+                            NextMessage::CancellationClosed
+                        }
+                    }
+                }
+            };
+            match next {
+                NextMessage::Message(message) => {
+                    message.map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
+                }
+                NextMessage::Cancel => {
+                    let result = server.interrupt_turn(&thread, &turn_id).await;
+                    server.stop().await;
+                    return match result {
+                        Ok(()) => Err(CodexFailure::interrupted(output)),
+                        Err(error) => Err(CodexFailure::interruption_failed(
+                            format!("Codex interruption did not complete cleanly: {error}"),
+                            output,
+                        )),
+                    };
+                }
+                NextMessage::CancellationClosed => {
+                    cancellation = None;
+                    continue;
+                }
+            }
+        } else {
+            server
+                .read_message()
+                .await
+                .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
+        };
         if message.get("id").is_some() && message.get("method").is_some() {
             return Err(CodexFailure::new(
                 "Codex requested an interactive action outside Piku's read-only contract",
@@ -201,6 +325,7 @@ where
             Ok(false)
         }
         StreamEvent::Completed => Ok(true),
+        StreamEvent::Interrupted => Err(CodexFailure::interrupted(std::mem::take(output))),
         StreamEvent::Failed(reason) => Err(CodexFailure::new(reason, std::mem::take(output))),
     }
 }
@@ -353,6 +478,22 @@ impl CodexServer {
             .ok_or_else(|| protocol_error(&response, "turn/start failed"))
     }
 
+    async fn interrupt_turn(&mut self, thread_id: &str, turn_id: &str) -> anyhow::Result<()> {
+        self.send(interrupt_request(thread_id, turn_id)).await?;
+        with_interrupt_timeout(INTERRUPT_GRACE, self.await_interrupted()).await?;
+        Ok(())
+    }
+
+    async fn await_interrupted(&mut self) -> anyhow::Result<()> {
+        let mut tracker = InterruptTracker::default();
+        loop {
+            let message = self.read_message().await?;
+            if tracker.observe(&message)? {
+                return Ok(());
+            }
+        }
+    }
+
     async fn send(&mut self, value: Value) -> anyhow::Result<()> {
         let mut bytes = serde_json::to_vec(&value)?;
         bytes.push(b'\n');
@@ -396,6 +537,7 @@ enum StreamEvent {
     Usage(CodexUsage),
     Delta(String),
     Completed,
+    Interrupted,
     Failed(String),
     Ignore,
 }
@@ -428,7 +570,9 @@ fn parse_stream_event(message: &Value) -> StreamEvent {
             let status = message
                 .pointer("/params/turn/status")
                 .and_then(Value::as_str);
-            if status.is_some_and(|value| value != "completed") {
+            if status == Some("interrupted") {
+                StreamEvent::Interrupted
+            } else if status.is_some_and(|value| value != "completed") {
                 let reason = message
                     .pointer("/params/turn/error/message")
                     .and_then(Value::as_str)
@@ -440,6 +584,50 @@ fn parse_stream_event(message: &Value) -> StreamEvent {
         }
         _ => StreamEvent::Ignore,
     }
+}
+
+fn interrupt_request(thread_id: &str, turn_id: &str) -> Value {
+    json!({"method":"turn/interrupt","id":INTERRUPT_RESPONSE_ID,"params":{
+        "threadId":thread_id,
+        "turnId":turn_id
+    }})
+}
+
+#[derive(Default)]
+struct InterruptTracker {
+    acknowledged: bool,
+    interrupted: bool,
+}
+
+impl InterruptTracker {
+    fn observe(&mut self, message: &Value) -> anyhow::Result<bool> {
+        if message.get("id").and_then(Value::as_u64) == Some(INTERRUPT_RESPONSE_ID) {
+            if message.get("error").is_some() {
+                return Err(protocol_error(message, "turn/interrupt failed"));
+            }
+            self.acknowledged = true;
+            return Ok(self.interrupted);
+        }
+        if message.get("id").is_some() && message.get("method").is_some() {
+            return Err(anyhow!(
+                "Codex requested an unauthorized interactive action"
+            ));
+        }
+        if parse_stream_event(message) == StreamEvent::Interrupted {
+            self.interrupted = true;
+            return Ok(self.acknowledged);
+        }
+        Ok(false)
+    }
+}
+
+async fn with_interrupt_timeout<F>(duration: Duration, future: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::time::timeout(duration, future)
+        .await
+        .map_err(|_| anyhow!("timed out waiting for Codex interruption"))?
 }
 
 fn protocol_error(message: &Value, fallback: &str) -> anyhow::Error {
@@ -512,6 +700,12 @@ mod tests {
     #[test]
     fn parses_stream_delta_and_failure() {
         assert_eq!(
+            parse_stream_event(
+                &json!({"method":"turn/completed","params":{"turn":{"status":"interrupted"}}})
+            ),
+            StreamEvent::Interrupted
+        );
+        assert_eq!(
             parse_stream_event(&json!({
                 "method":"thread/tokenUsage/updated",
                 "params":{"tokenUsage":{"last":{"inputTokens":12,"outputTokens":7}}}
@@ -580,6 +774,74 @@ mod tests {
         assert_eq!(failure.partial_output(), "partial answer");
         assert_eq!(observed, ["partial ", "answer"]);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn interrupt_request_has_app_server_shape() {
+        assert_eq!(
+            interrupt_request("thread-1", "turn-2"),
+            json!({
+                "method": "turn/interrupt",
+                "id": 4,
+                "params": {"threadId": "thread-1", "turnId": "turn-2"}
+            })
+        );
+    }
+
+    #[test]
+    fn interruption_requires_ack_and_terminal_state_in_either_order() {
+        let mut tracker = InterruptTracker::default();
+        assert!(!tracker.observe(&json!({"id":4,"result":{}})).unwrap());
+        assert!(tracker
+            .observe(&json!({
+                "method":"turn/completed",
+                "params":{"turn":{"status":"interrupted"}}
+            }))
+            .unwrap());
+
+        let mut terminal_first = InterruptTracker::default();
+        assert!(!terminal_first
+            .observe(&json!({
+                "method":"turn/completed",
+                "params":{"turn":{"status":"interrupted"}}
+            }))
+            .unwrap());
+        assert!(terminal_first.observe(&json!({"id":4,"result":{}})).unwrap());
+    }
+
+    #[test]
+    fn interruption_refuses_interactive_requests() {
+        let mut tracker = InterruptTracker::default();
+        let error = tracker
+            .observe(&json!({"id":91,"method":"item/tool/call","params":{}}))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unauthorized interactive action"));
+    }
+
+    #[tokio::test]
+    async fn interruption_timeout_is_a_bounded_fallback_seam() {
+        let pending = std::future::pending::<anyhow::Result<()>>();
+        let error = with_interrupt_timeout(Duration::from_millis(1), pending)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn interrupted_failure_is_distinct_and_keeps_partial_output() {
+        let mut output = "partial".to_string();
+        let mut usage = None;
+        let failure = apply_stream_event(
+            StreamEvent::Interrupted,
+            &mut output,
+            &mut usage,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(failure.is_interrupted());
+        assert_eq!(failure.partial_output(), "partial");
     }
 
     #[test]
