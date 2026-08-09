@@ -417,6 +417,7 @@ async function submitMessage(
             );
           } else if (event.kind === "text_delta") {
             narration += event.text;
+            const visibleProposal = visibleNarration(narration).trim();
             if (objectOutput)
               objectOutput.textContent = visibleNarration(narration);
             if (kind === "chat" || !narration.includes("```html"))
@@ -433,8 +434,17 @@ async function submitMessage(
               activity,
               "progress",
               kind === "chat" ? "Response streaming" : "Proposal streaming",
-              visibleNarration(narration).trim(),
+              visibleProposal ||
+                (kind === "page" ? "Receiving exact source operations…" : "Receiving typed workspace operations…"),
               "running",
+            );
+          } else if (event.kind === "page_proposal") {
+            setActivityEvent(
+              activity,
+              "progress",
+              "Source proposal accepted",
+              event.message,
+              "proposed",
             );
           } else if (event.kind === "page_snapshot") {
             pageSnapshot = event.html;
@@ -845,7 +855,9 @@ function openCreationMenu(event) {
 }
 function objectShell(kind, title, anchor, restore) {
   const object = document.createElement("article");
+  const titleId = "workspace-object-title-" + crypto.randomUUID();
   object.className = "workspace-object " + kind + "-object";
+  object.setAttribute("aria-labelledby", titleId);
   object.dataset.kind = kind;
   object.dataset.objectId =
     (restore && restore.id) || "object-" + crypto.randomUUID();
@@ -857,7 +869,7 @@ function objectShell(kind, title, anchor, restore) {
   object.dataset.layoutHeight = String(restore?.height || "");
   object.tabIndex = -1;
   object.innerHTML =
-    '<header class="object-handle"><strong>' +
+    '<header class="object-handle"><strong id="' + titleId + '">' +
     esc(object.dataset.title) +
     '</strong><span class="object-kind">' +
     esc(kind) +

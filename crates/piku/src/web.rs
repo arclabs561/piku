@@ -1931,6 +1931,7 @@ async fn run_canvas_request(
         let canvas_html = canvas_update
             .expect("successful canvas update was checked")
             .expect("successful canvas update contains source");
+        let proposal_summary = canvas_proposal_summary(&existing_html, &reply);
         let mut surfaces = state.surfaces.write().await;
         let dir = surface_dir(&surfaces.root, &surface_name);
         let entry = surfaces
@@ -1957,6 +1958,10 @@ async fn run_canvas_request(
         }
         *entry = candidate;
         surfaces.active.clone_from(&surface_name);
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"page_proposal","message":proposal_summary}),
+        );
         emit(
             &tx,
             &serde_json::json!({"kind":"page_snapshot","html":canvas_html,"target_id":target_id}),
@@ -2319,6 +2324,46 @@ fn narration(text: &str) -> String {
     .to_string()
 }
 
+fn canvas_proposal_summary(existing_html: &str, reply: &str) -> String {
+    fn inline(value: &str) -> String {
+        let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = compact.chars();
+        let bounded = chars.by_ref().take(96).collect::<String>();
+        if chars.next().is_some() {
+            format!("{bounded}…")
+        } else {
+            bounded
+        }
+    }
+
+    if existing_html.trim().is_empty() {
+        let html = extract_canvas_html(reply);
+        return format!(
+            "Accepted a new document ({} characters)",
+            html.chars().count()
+        );
+    }
+    match extract_canvas_patches(reply) {
+        Ok(patches) if !patches.is_empty() => {
+            let first = &patches[0];
+            let suffix = if patches.len() == 1 {
+                String::new()
+            } else {
+                format!("; {} more", patches.len() - 1)
+            };
+            format!(
+                "Accepted {} exact source patch{}: “{}” → “{}”{}",
+                patches.len(),
+                if patches.len() == 1 { "" } else { "es" },
+                inline(&first.search),
+                inline(&first.replace),
+                suffix,
+            )
+        }
+        _ => "Accepted a validated source update".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Agent output sink
 // ---------------------------------------------------------------------------
@@ -2460,11 +2505,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        apply_canvas_reply, apply_workspace_operations, canvas_system_prompt, chat_system_prompt,
-        compact_canvas_turn, emit, emit_lossy, execute_terminal_read, extract_canvas_html,
-        extract_partial_canvas_html, extract_workspace_operations, has_chat_target,
-        has_page_edit_target, has_sensitive_path_component, is_allowed_host, is_same_local_origin,
-        render_home, resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
+        apply_canvas_reply, apply_workspace_operations, canvas_proposal_summary,
+        canvas_system_prompt, chat_system_prompt, compact_canvas_turn, emit, emit_lossy,
+        execute_terminal_read, extract_canvas_html, extract_partial_canvas_html,
+        extract_workspace_operations, has_chat_target, has_page_edit_target,
+        has_sensitive_path_component, is_allowed_host, is_same_local_origin, render_home,
+        resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
         validate_chat_notebook_input, validate_request_message, validate_run_id,
         validate_workspace_objects, workspace_input, CanvasState, ChatMessage, TerminalReadRequest,
         WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN,
@@ -2627,6 +2673,28 @@ mod tests {
 
         assert!(updated.contains("background:#fafafa"));
         assert!(updated.contains("<h1>Test</h1><button>Run</button>"));
+    }
+
+    #[test]
+    fn canvas_proposal_summary_exposes_bounded_exact_patch_intent() {
+        let long = "x".repeat(140);
+        let reply = format!(
+            "```html_patch\n{{\"search\":\"{long}\",\"replace\":\"Focused heading\"}}\n```"
+        );
+        let summary = canvas_proposal_summary("<main>existing</main>", &reply);
+
+        assert!(summary.starts_with("Accepted 1 exact source patch:"));
+        assert!(summary.contains("→ “Focused heading”"));
+        assert!(summary.contains('…'));
+        assert!(summary.chars().count() < 180);
+    }
+
+    #[test]
+    fn canvas_proposal_summary_describes_initial_document_size() {
+        assert_eq!(
+            canvas_proposal_summary("", "```html\n<main>first page</main>\n```"),
+            "Accepted a new document (23 characters)"
+        );
     }
 
     #[test]

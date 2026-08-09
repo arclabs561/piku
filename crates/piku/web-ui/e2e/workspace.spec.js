@@ -95,6 +95,24 @@ test("empty workspace guidance describes the complete extensible surface", async
   expect(hint).toContain("any workspace element");
 });
 
+test("authored workspace cards keep visible accessible names after reload", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  await addObject(page, "note", { x: 80, y: 100 });
+  await addObject(page, "chat", { x: 800, y: 100 });
+  await addObject(page, "change workspace or page", { x: 80, y: 600 });
+
+  const names = ["note", "chat", "change"];
+  for (const name of names)
+    await expect(page.getByRole("article", { name, exact: true })).toHaveCount(1);
+
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  await page.reload();
+  for (const name of names)
+    await expect(page.getByRole("article", { name, exact: true })).toHaveCount(1);
+});
+
 test("notes drag and persist through the server", async ({
   page,
   request,
@@ -252,6 +270,10 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
       },
       { kind: "text_delta", text: "Proposing the evidence panel." },
       {
+        kind: "page_proposal",
+        message: 'Accepted 1 exact source patch: “Old heading” → “Evidence panel”',
+      },
+      {
         kind: "page_snapshot",
         target_id: request.target_id,
         html: "<!doctype html><html><body><main>Evidence panel</main></body></html>",
@@ -301,11 +323,14 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
     "Request accepted",
     "Model running",
     "Planning a source patch",
-    "Proposal streaming",
+    "Source proposal accepted",
     "Page source updated",
     "Host verification",
     "Page source updated",
   ]);
+  await expect(activity.locator('[data-event="progress"] .activity-event-detail')).toHaveText(
+    'Accepted 1 exact source patch: “Old heading” → “Evidence panel”',
+  );
   await expect(activity.locator('[data-event="mutation"]')).toHaveAttribute(
     "data-state",
     "changed",
