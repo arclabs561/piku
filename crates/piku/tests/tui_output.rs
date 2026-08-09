@@ -99,7 +99,7 @@ fn user_message_echoed_before_run_turn() {
         .expect("Agent turn comment must exist in tui_repl.rs");
 
     let run_turn_pos = src[agent_turn_pos..]
-        .find("let result: TurnResult = run_turn")
+        .find("let result = run_turn_with_registry")
         .map(|p| agent_turn_pos + p)
         .expect("run_turn call must exist after agent turn comment");
 
@@ -126,7 +126,7 @@ fn user_message_echo_includes_input_variable() {
         .find("── Agent turn")
         .expect("Agent turn comment must exist");
     let run_turn_pos = src[agent_turn_pos..]
-        .find("let result: TurnResult = run_turn")
+        .find("let result = run_turn_with_registry")
         .map(|p| agent_turn_pos + p)
         .expect("run_turn call must exist");
 

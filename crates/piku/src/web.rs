@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
-    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RecordingSink, RunEvent,
-    RunRecorder, Session, TurnResult,
+    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RunEvent, RunHandle,
+    Session, TurnResult,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -72,16 +72,16 @@ fn surface_name(name: &str) -> String {
     }
 }
 
-fn open_web_run_record(
+fn open_web_run(
     config: &PikuConfig,
-    session_id: &str,
+    session: Session,
     request_id: &str,
     request_kind: &str,
-) -> std::io::Result<(RunRecorder, String)> {
-    let path = config.runs_dir().join(format!("{session_id}.jsonl"));
-    let recorder = RunRecorder::open(path, session_id)?;
+) -> std::io::Result<(RunHandle, String)> {
+    let path = config.runs_dir().join(format!("{}.jsonl", session.id));
+    let run = RunHandle::open(session, path)?;
     let turn_id = format!("web-{request_kind}-{request_id}");
-    Ok((recorder, turn_id))
+    Ok((run, turn_id))
 }
 
 fn emit_run_record_started(
@@ -1593,13 +1593,7 @@ async fn run_provider_chat_request(
         session = Session::new(request_id.clone());
     }
     session.record_provider(&provider_name, &model);
-    let run_id = session.id.clone();
-    let (mut recorder, turn_id) = match open_web_run_record(
-        &state.config,
-        &run_id,
-        &request_id,
-        "chat",
-    ) {
+    let (mut run, turn_id) = match open_web_run(&state.config, session, &request_id, "chat") {
         Ok(record) => record,
         Err(error) => {
             emit(
@@ -1610,6 +1604,7 @@ async fn run_provider_chat_request(
             return;
         }
     };
+    let run_id = run.id().to_string();
     emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
     tracing::info!(request_id, surface = %surface_name, kind = "chat", executor = "provider", %model, "request accepted");
     emit(
@@ -1625,23 +1620,25 @@ async fn run_provider_chat_request(
     };
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), None);
     let (result, record_error) = {
-        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let mut turn = run.begin_turn(&mut sink, turn_id);
+        let (session, recording_sink) = turn.parts();
         let result = run_turn(
             &input,
-            &mut session,
+            session,
             resolved.as_provider(),
             &model,
             &chat_system_prompt(),
             Vec::new(),
             &AllowAll,
-            &mut recording_sink,
+            recording_sink,
             Some(2),
             None,
         )
         .await;
-        let record_error = recording_sink.take_record_error();
+        let record_error = turn.finish().err();
         (result, record_error)
     };
+    let session = run.into_session();
     let elapsed = sink.started.elapsed().as_secs_f32();
     let reply = sink.output.trim().to_string();
     if let Some(error) = record_error {
@@ -1758,13 +1755,7 @@ async fn run_workspace_request(
         session = Session::new(request_id.clone());
     }
     session.record_provider(&provider_name, &model);
-    let run_id = session.id.clone();
-    let (mut recorder, turn_id) = match open_web_run_record(
-        &state.config,
-        &run_id,
-        &request_id,
-        "workspace",
-    ) {
+    let (mut run, turn_id) = match open_web_run(&state.config, session, &request_id, "workspace") {
         Ok(record) => record,
         Err(error) => {
             emit(
@@ -1775,6 +1766,7 @@ async fn run_workspace_request(
             return;
         }
     };
+    let run_id = run.id().to_string();
     emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
     tracing::info!(request_id, surface = %surface_name, kind = "workspace", %model, objects = existing_objects.len(), "request accepted");
     emit(
@@ -1784,23 +1776,25 @@ async fn run_workspace_request(
     let input = workspace_input(&message, &existing_objects);
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), None);
     let (result, record_error) = {
-        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let mut turn = run.begin_turn(&mut sink, turn_id);
+        let (session, recording_sink) = turn.parts();
         let result = run_turn(
             &input,
-            &mut session,
+            session,
             resolved.as_provider(),
             &model,
             &workspace_system_prompt(),
             Vec::new(),
             &AllowAll,
-            &mut recording_sink,
+            recording_sink,
             Some(2),
             None,
         )
         .await;
-        let record_error = recording_sink.take_record_error();
+        let record_error = turn.finish().err();
         (result, record_error)
     };
+    let session = run.into_session();
     let elapsed = sink.started.elapsed().as_secs_f32();
     if let Some(error) = record_error {
         emit(
@@ -2052,13 +2046,7 @@ async fn run_canvas_request(
     }
     session.record_provider(&provider_name, &model);
 
-    let run_id = session.id.clone();
-    let (mut recorder, turn_id) = match open_web_run_record(
-        &state.config,
-        &run_id,
-        &request_id,
-        "page",
-    ) {
+    let (mut run, turn_id) = match open_web_run(&state.config, session, &request_id, "page") {
         Ok(record) => record,
         Err(error) => {
             emit(
@@ -2069,6 +2057,7 @@ async fn run_canvas_request(
             return;
         }
     };
+    let run_id = run.id().to_string();
     emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
 
     tracing::info!(request_id, surface = %surface_name, kind = "page", %model, instruction_chars = message.chars().count(), "request accepted");
@@ -2080,23 +2069,25 @@ async fn run_canvas_request(
     let input = canvas_input(&message, &existing_html);
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), Some(existing_html.clone()));
     let (result, record_error): (TurnResult, _) = {
-        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let mut turn = run.begin_turn(&mut sink, turn_id);
+        let (session, recording_sink) = turn.parts();
         let result = run_turn(
             &input,
-            &mut session,
+            session,
             resolved.as_provider(),
             &model,
             &canvas_system_prompt(),
             Vec::new(),
             &AllowAll,
-            &mut recording_sink,
+            recording_sink,
             Some(2),
             None,
         )
         .await;
-        let record_error = recording_sink.take_record_error();
+        let record_error = turn.finish().err();
         (result, record_error)
     };
+    let mut session = run.into_session();
 
     let reply = sink.output.clone();
     let canvas_update = apply_canvas_reply(&existing_html, &reply);
@@ -2795,7 +2786,7 @@ mod tests {
         canvas_system_prompt, chat_system_prompt, compact_canvas_turn, emit, emit_lossy,
         execute_terminal_read, extract_canvas_html, extract_partial_canvas_html,
         extract_workspace_operations, has_chat_target, has_page_edit_target,
-        has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run_record,
+        has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run,
         render_home, resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
         validate_chat_notebook_input, validate_request_message, validate_run_id,
         validate_workspace_objects, workspace_input, CanvasState, ChatMessage, TerminalReadRequest,
@@ -3391,18 +3382,21 @@ mod tests {
         let root = temp_dir("piku-web-run-record");
         let mut config = crate::config::PikuConfig::load(None, None, Some(&root));
         config.config_dir.clone_from(&root);
-        let (mut recorder, turn_id) =
-            open_web_run_record(&config, "session-1", "request-2", "chat")
-                .expect("web run record opens");
-
-        recorder
-            .append(
-                &turn_id,
-                RunEvent::Warning {
-                    message: "recorded".to_string(),
-                },
-            )
-            .expect("event records");
+        let (mut run, turn_id) = open_web_run(
+            &config,
+            Session::new("session-1".to_string()),
+            "request-2",
+            "chat",
+        )
+        .expect("web run record opens");
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let mut sink = WebSink::new("request-2".to_string(), tx, None);
+        let mut turn = run.begin_turn(&mut sink, turn_id.clone());
+        let (_, recording_sink) = turn.parts();
+        recording_sink.on_run_event(&RunEvent::Warning {
+            message: "recorded".to_string(),
+        });
+        turn.finish().expect("event records");
 
         assert_eq!(turn_id, "web-chat-request-2");
         let events =

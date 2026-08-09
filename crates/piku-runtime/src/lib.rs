@@ -14,6 +14,7 @@ pub mod permission;
 pub mod prompt;
 pub mod provider;
 pub mod run_audit;
+pub mod run_handle;
 pub mod run_record;
 pub mod session;
 pub mod task;
@@ -51,6 +52,7 @@ pub use provider::{
 pub use run_audit::{
     audit_run_record, AuditSeverity, ContentAudit, ContextAudit, RunAudit, RunAuditFinding,
 };
+pub use run_handle::{RunHandle, RunTurn};
 pub use run_record::{
     read_run_record, ArtifactRef, ContentChange as RunContentChange, ContentRef as RunContentRef,
     ContextManifest, ContextMessage, ContextSection, ContextTool, EventScope as RunEventScope,

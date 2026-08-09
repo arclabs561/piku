@@ -1188,6 +1188,7 @@ async fn run_tui_repl_core(
             resolved.name()
         );
     }
+    let mut run = piku_runtime::RunHandle::open(session, &run_path)?;
 
     let mut total_usage = initial_usage;
 
@@ -1218,8 +1219,8 @@ async fn run_tui_repl_core(
         );
         if newer {
             // Persist session (may be empty — that's fine)
-            if !session.messages.is_empty() {
-                let _ = session.save(&session_path);
+            if !run.session().messages.is_empty() {
+                let _ = run.session().save(&session_path);
             }
             // No TUI layout yet — just print a plain status line and exec.
             eprintln!("[piku] newer binary detected — restarting...");
@@ -1290,7 +1291,7 @@ async fn run_tui_repl_core(
 
         // Replay tail of session history into the scroll region (below header).
         goto(scroll_top(), 1);
-        print_session_tail(&session, scroll_bot);
+        print_session_tail(run.session(), scroll_bot);
 
         goto(scroll_bot, 1);
         let _ = io::stdout().flush();
@@ -1315,7 +1316,7 @@ async fn run_tui_repl_core(
                 )
             };
             if newer {
-                let _ = session.save(&session_path);
+                let _ = run.session().save(&session_path);
                 let (_, rows) = term_size();
                 let scroll_bot = rows.saturating_sub(2);
                 goto(scroll_bot, 1);
@@ -1476,7 +1477,7 @@ async fn run_tui_repl_core(
                     let current_model_name = model.clone();
                     let should_exit = handle_slash_cmd(
                         &full_input,
-                        &mut session,
+                        run.session_mut(),
                         &total_usage,
                         &current_model_name,
                         resolved.name(),
@@ -1543,9 +1544,7 @@ async fn run_tui_repl_core(
                 // next one.
                 sink.trace
                     .session_config(resolved.name(), &model, read_only);
-                let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
-                let turn_id = format!("turn-{}", session.messages.len());
-                let mut recorder = piku_runtime::RunRecorder::open(&run_path, &session_id)?;
+                let turn_id = format!("turn-{}", run.session().messages.len());
 
                 // Show a ticking thinking indicator on the input row.
                 // A background task updates it every second with elapsed time.
@@ -1645,32 +1644,35 @@ async fn run_tui_repl_core(
                     }
                 });
 
-                let mut recording_sink =
-                    piku_runtime::RecordingSink::new(&mut sink, &mut recorder, turn_id);
-                let result: TurnResult = run_turn_with_registry(
-                    &full_input,
-                    &mut session,
-                    resolved.as_provider(),
-                    &model,
-                    &system_sections,
-                    tool_defs,
-                    &prompter,
-                    &mut recording_sink,
-                    config.max_turns,
-                    Some(&mut notif_rx),
-                    &task_registry,
-                    0,
-                    &custom_agents,
-                    Some(&hook_registry),
-                    Some(&cancel_flag),
-                )
-                .await;
-                if let Some(error) = recording_sink.take_record_error() {
-                    return Err(anyhow::anyhow!(
-                        "could not persist run record {}: {error}",
-                        run_path.display()
-                    ));
-                }
+                let result: TurnResult = {
+                    let mut turn = run.begin_turn(&mut sink, turn_id);
+                    let (session, recording_sink) = turn.parts();
+                    let result = run_turn_with_registry(
+                        &full_input,
+                        session,
+                        resolved.as_provider(),
+                        &model,
+                        &system_sections,
+                        tool_defs,
+                        &prompter,
+                        recording_sink,
+                        config.max_turns,
+                        Some(&mut notif_rx),
+                        &task_registry,
+                        0,
+                        &custom_agents,
+                        Some(&hook_registry),
+                        Some(&cancel_flag),
+                    )
+                    .await;
+                    turn.finish().map_err(|error| {
+                        anyhow::anyhow!(
+                            "could not persist run record {}: {error}",
+                            run_path.display()
+                        )
+                    })?;
+                    result
+                };
 
                 // Stop the keypress reader.
                 cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1718,7 +1720,7 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 // Persist session
-                if let Err(e) = session.save(&session_path) {
+                if let Err(e) = run.session().save(&session_path) {
                     eprintln!("\x1b[33m[warn]\x1b[0m could not save session: {e}");
                 }
 
@@ -1786,9 +1788,9 @@ async fn run_tui_repl_core(
     let (_, rows) = term_size();
     teardown_layout(rows);
 
-    if let Err(e) = session.save(&session_path) {
+    if let Err(e) = run.session().save(&session_path) {
         eprintln!("\x1b[33m[warn]\x1b[0m could not save session: {e}");
-    } else if !session.messages.is_empty() {
+    } else if !run.session().messages.is_empty() {
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
     }
 
@@ -1801,8 +1803,8 @@ async fn run_tui_repl_core(
     }
 
     // Session-end memory extraction: distill atomic facts from the conversation.
-    if !read_only && session.messages.len() > 2 {
-        let transcript = piku_runtime::build_extraction_transcript(&session.messages);
+    if !read_only && run.session().messages.len() > 2 {
+        let transcript = piku_runtime::build_extraction_transcript(&run.session().messages);
         if !transcript.trim().is_empty() {
             let store_path = piku_runtime::default_store_path(&cwd);
             let mut store = piku_runtime::MemoryStore::load(&store_path);

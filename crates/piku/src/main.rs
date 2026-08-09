@@ -10,7 +10,7 @@ use std::env;
 use std::io::{self, Write};
 
 use piku_runtime::{
-    build_system_prompt, run_turn, AllowAll, OutputSink, RecordingSink, RunRecorder, Session,
+    build_system_prompt, run_turn, AllowAll, OutputSink, RunHandle, RunRecorder, Session,
     TurnResult,
 };
 use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
@@ -297,28 +297,32 @@ async fn run_single_shot(
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
     let turn_id = format!("turn-{}", session.messages.len());
-    let mut recorder = RunRecorder::open(&run_path, &session_id)?;
-    let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
-
-    let result: TurnResult = run_turn(
-        prompt,
-        &mut session,
-        resolved.as_provider(),
-        &model,
-        &system_sections,
-        tool_defs,
-        &prompter,
-        &mut recording_sink,
-        None,
-        None,
-    )
-    .await;
-    if let Some(error) = recording_sink.take_record_error() {
-        anyhow::bail!(
-            "could not persist run record {}: {error}",
-            run_path.display()
-        );
-    }
+    let mut run = RunHandle::open(session, &run_path)?;
+    let result: TurnResult = {
+        let mut turn = run.begin_turn(&mut sink, turn_id);
+        let (session, recording_sink) = turn.parts();
+        let result = run_turn(
+            prompt,
+            session,
+            resolved.as_provider(),
+            &model,
+            &system_sections,
+            tool_defs,
+            &prompter,
+            recording_sink,
+            None,
+            None,
+        )
+        .await;
+        turn.finish().map_err(|error| {
+            anyhow::anyhow!(
+                "could not persist run record {}: {error}",
+                run_path.display()
+            )
+        })?;
+        result
+    };
+    let session = run.into_session();
 
     if let Some(err) = &result.stream_error {
         eprintln!("[piku] stream error: {err}");
