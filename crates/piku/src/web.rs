@@ -16,9 +16,9 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
     render_captured_attachments, resolve_captured_attachments, run_turn, AllowAll,
-    CapturedAttachment, ContentBlock, ContextBudget, ConversationMessage, MessageRole,
-    RunContentRef, RunEvent, RunHandle, RunRecorder, Session, Sha256Digest, SourceReference,
-    TurnResult, UsageRecord,
+    CapturedAttachment, ContentBlock, ContextBudget, ContextSourceSummary, ConversationMessage,
+    MessageRole, RunContentRef, RunEvent, RunHandle, RunRecorder, Session, Sha256Digest,
+    SourceReference, TurnResult, UsageRecord,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -875,13 +875,19 @@ fn validate_chat_notebook_input(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct ResolvedChatContext {
+    text: Option<String>,
+    sources: Vec<ContextSourceSummary>,
+}
+
 fn resolve_chat_context(
     canvas: &CanvasState,
     surface: &str,
     target_id: Option<&str>,
     operator_context: Option<&str>,
     source_ids: &[String],
-) -> Result<Option<String>, String> {
+) -> Result<ResolvedChatContext, String> {
     if source_ids.len() > MAX_WORKSPACE_OBJECTS {
         return Err(format!(
             "chat context exceeds {MAX_WORKSPACE_OBJECTS} source objects"
@@ -891,7 +897,10 @@ fn resolve_chat_context(
         .filter(|value| !value.trim().is_empty())
         .map(str::trim);
     if source_ids.is_empty() {
-        return Ok(operator_context.map(str::to_string));
+        return Ok(ResolvedChatContext {
+            text: operator_context.map(str::to_string),
+            sources: Vec::new(),
+        });
     }
 
     let operator_bytes = operator_context.map_or(0, str::len);
@@ -956,6 +965,16 @@ fn resolve_chat_context(
     }
     let items = resolve_captured_attachments(&attachments, budget)
         .map_err(|error| format!("cannot resolve chat context: {error}"))?;
+    let source_summaries = items
+        .iter()
+        .map(|item| ContextSourceSummary {
+            id: item.id.clone(),
+            sources: item.sources.clone(),
+            output_sha256: item.output_sha256.clone(),
+            byte_size: item.byte_size,
+            trust: item.trust,
+        })
+        .collect();
     let rendered = render_captured_attachments(&items, budget)
         .map_err(|error| format!("cannot render chat context: {error}"))?;
     let combined = operator_context.map_or_else(
@@ -972,7 +991,10 @@ fn resolve_chat_context(
             "combined chat context exceeds {MAX_CHAT_CONTEXT_CHARS} bytes"
         ));
     }
-    Ok(Some(combined))
+    Ok(ResolvedChatContext {
+        text: Some(combined),
+        sources: source_summaries,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1384,10 @@ async fn chat_handler(
             }
         })
         .err();
-    let mut resolved_context = req.context.clone();
+    let mut resolved_context = ResolvedChatContext {
+        text: req.context.clone(),
+        sources: Vec::new(),
+    };
     if request_error.is_none() {
         if req.kind != RequestKind::Chat && !req.context_source_ids.is_empty() {
             request_error = Some("only chat requests accept context source IDs".to_string());
@@ -1402,7 +1427,8 @@ async fn chat_handler(
                 req.message,
                 req.kind,
                 req.target_id,
-                resolved_context,
+                resolved_context.text,
+                resolved_context.sources,
                 req.history,
                 req.executor,
                 req.thread_id,
@@ -1455,6 +1481,7 @@ async fn run_model_request(
     kind: RequestKind,
     target_id: Option<String>,
     context: Option<String>,
+    context_sources: Vec<ContextSourceSummary>,
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
@@ -1470,6 +1497,7 @@ async fn run_model_request(
                 message,
                 target_id,
                 context,
+                context_sources,
                 history,
                 executor,
                 thread_id,
@@ -1488,6 +1516,7 @@ async fn run_chat_request(
     message: String,
     target_id: Option<String>,
     context: Option<String>,
+    context_sources: Vec<ContextSourceSummary>,
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
@@ -1501,6 +1530,7 @@ async fn run_chat_request(
                 message,
                 target_id,
                 context,
+                context_sources,
                 history,
                 thread_id,
                 tx,
@@ -1517,6 +1547,7 @@ async fn run_chat_request(
                 message,
                 target_id,
                 context,
+                context_sources,
                 history,
                 tx,
             )
@@ -1555,6 +1586,7 @@ async fn run_codex_chat_request(
     message: String,
     target_id: Option<String>,
     context: Option<String>,
+    context_sources: Vec<ContextSourceSummary>,
     history: Vec<ChatMessage>,
     thread_id: Option<String>,
     tx: mpsc::Sender<String>,
@@ -1622,6 +1654,17 @@ async fn run_codex_chat_request(
         &mut activity_sink,
         &mut record_error,
     );
+    if !context_sources.is_empty() {
+        append_codex_run_event(
+            &mut recorder,
+            &turn_id,
+            RunEvent::ContextSourcesResolved {
+                sources: context_sources,
+            },
+            &mut activity_sink,
+            &mut record_error,
+        );
+    }
     if let Some(error) = record_error.take() {
         emit(
             &tx,
@@ -1822,6 +1865,7 @@ async fn run_provider_chat_request(
     message: String,
     target_id: Option<String>,
     context: Option<String>,
+    context_sources: Vec<ContextSourceSummary>,
     history: Vec<ChatMessage>,
     tx: mpsc::Sender<String>,
 ) {
@@ -1920,6 +1964,13 @@ async fn run_provider_chat_request(
     let (result, record_error) = {
         let mut turn = run.begin_turn(&mut sink, turn_id);
         let (session, recording_sink) = turn.parts();
+        if !context_sources.is_empty() {
+            recording_sink
+                .queue_after_turn_started(RunEvent::ContextSourcesResolved {
+                    sources: context_sources,
+                })
+                .expect("context provenance is a non-start turn event");
+        }
         let result = run_turn(
             &input,
             session,
@@ -2945,6 +2996,14 @@ impl OutputSink for WebSink {
                     manifest.tools.iter().filter(|item| item.selected).count(),
                 ),
             }),
+            RunEvent::ContextSourcesResolved { sources } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "context:sources",
+                "phase": "context",
+                "state": "verified",
+                "label": "Workspace evidence resolved",
+                "detail": format!("{} sources · {} bytes · payloads omitted from provenance record", sources.len(), sources.iter().map(|source| source.byte_size).sum::<usize>()),
+            }),
             RunEvent::ContextUnavailable { reason } => serde_json::json!({
                 "kind": "activity_event",
                 "event_id": "context:unavailable",
@@ -3120,6 +3179,7 @@ mod tests {
     };
     use piku_runtime::{
         read_run_record, ContentBlock, ConversationMessage, OutputSink, RunEvent, Session,
+        Sha256Digest,
     };
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -3426,15 +3486,30 @@ mod tests {
             Some("operator note"),
             &["note-1".to_string(), "page-1".to_string()],
         )
-        .unwrap()
         .unwrap();
+        let text = context.text.unwrap();
 
-        assert!(context.contains("Operator-authored context:\noperator note"));
-        assert!(context.contains("saved note"));
-        assert!(context.contains("<main>saved page</main>"));
-        assert!(!context.contains("browser copy must not be authoritative"));
-        assert!(context.contains("untrusted workspace evidence"));
-        assert!(!context.contains("surface:scratch/object"));
+        assert!(text.contains("Operator-authored context:\noperator note"));
+        assert!(text.contains("saved note"));
+        assert!(text.contains("<main>saved page</main>"));
+        assert!(!text.contains("browser copy must not be authoritative"));
+        assert!(text.contains("untrusted workspace evidence"));
+        assert!(!text.contains("surface:scratch/object"));
+        assert_eq!(context.sources.len(), 2);
+        assert_eq!(context.sources[0].id, "note-1");
+        assert_eq!(
+            context.sources[0].sources[0].sha256,
+            Sha256Digest::of_bytes(b"saved note")
+        );
+        assert_eq!(
+            context.sources[0].output_sha256,
+            Sha256Digest::of_bytes(b"saved note")
+        );
+        assert_eq!(context.sources[1].id, "page-1");
+        assert_eq!(
+            context.sources[1].sources[0].sha256,
+            Sha256Digest::of_bytes(b"<main>saved page</main>")
+        );
     }
 
     #[test]

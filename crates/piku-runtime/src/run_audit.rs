@@ -235,7 +235,9 @@ impl<'a> Auditor<'a> {
             RunEvent::TurnCancelled { .. } => {
                 self.on_turn_terminal(turn_id, envelope, TurnOutcome::Cancelled, None);
             }
-            RunEvent::Warning { .. } | RunEvent::ChildRunRef { .. } => {}
+            RunEvent::ContextSourcesResolved { .. }
+            | RunEvent::Warning { .. }
+            | RunEvent::ChildRunRef { .. } => {}
             RunEvent::UserDisposition { .. } => unreachable!("scope checked above"),
         }
     }
@@ -643,6 +645,7 @@ fn event_name(event: &RunEvent) -> &'static str {
     match event {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
+        RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
         RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
@@ -661,7 +664,10 @@ fn event_name(event: &RunEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_record::{ContextManifest, PermissionDecision, RUN_RECORD_SCHEMA_VERSION};
+    use crate::run_record::{
+        ContextManifest, ContextSourceSummary, PermissionDecision, RUN_RECORD_SCHEMA_VERSION,
+    };
+    use crate::{Sha256Digest, SourceReference, Trust};
 
     fn envelope(sequence: u64, event: RunEvent) -> RunEventEnvelope {
         RunEventEnvelope {
@@ -764,6 +770,46 @@ mod tests {
         assert_eq!(audit.content.inline_items, 2);
         assert_eq!(audit.usage.input_tokens, 12);
         assert!(audit.findings.is_empty());
+    }
+
+    #[test]
+    fn resolved_sources_are_not_counted_as_runtime_context_builds() {
+        let events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("test".into()),
+                    model: "model".into(),
+                    input: inline("inspect"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextSourcesResolved {
+                    sources: vec![ContextSourceSummary {
+                        id: "note-1".into(),
+                        sources: vec![SourceReference {
+                            reference: "surface:scratch/object:note-1".into(),
+                            sha256: Sha256Digest::of_bytes(b"note"),
+                        }],
+                        output_sha256: Sha256Digest::of_bytes(b"note"),
+                        byte_size: 4,
+                        trust: Trust::UntrustedEvidence,
+                    }],
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::TurnCompleted {
+                    usage: None,
+                    stop_reason: Some("complete".into()),
+                },
+            ),
+        ];
+
+        let audit = audit_run_record(&events);
+        assert_eq!(audit.context_build_count, 0);
+        assert_eq!(audit.event_count, 3);
     }
 
     #[test]

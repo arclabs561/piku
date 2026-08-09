@@ -117,6 +117,32 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                     manifest.tools.len()
                 );
             }
+            RunEvent::ContextSourcesResolved { sources } => {
+                let bytes: usize = sources.iter().map(|source| source.byte_size).sum();
+                let _ = writeln!(
+                    output,
+                    "  ◇ {} context sources resolved · {bytes} bytes",
+                    sources.len()
+                );
+                for source in sources {
+                    let _ = writeln!(
+                        output,
+                        "    ↳ {} · {:?} · {} bytes · sha256:{}",
+                        source.id,
+                        source.trust,
+                        source.byte_size,
+                        source.output_sha256.as_str()
+                    );
+                    for reference in &source.sources {
+                        let _ = writeln!(
+                            output,
+                            "      {} · sha256:{}",
+                            reference.reference,
+                            reference.sha256.as_str()
+                        );
+                    }
+                }
+            }
             RunEvent::ContextUnavailable { reason } => {
                 let _ = writeln!(output, "  ◇ context unavailable · {reason}");
             }
@@ -352,6 +378,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
     match event {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
+        RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
         RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
@@ -418,6 +445,7 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         RunEvent::AssistantMessage { content } => Some(content),
         RunEvent::ToolCompleted { result, .. } => Some(result),
         RunEvent::ContextBuilt { .. }
+        | RunEvent::ContextSourcesResolved { .. }
         | RunEvent::ContextUnavailable { .. }
         | RunEvent::ToolStarted { .. }
         | RunEvent::PermissionDecision { .. }
@@ -460,8 +488,9 @@ fn escape_html(text: &str) -> String {
 mod tests {
     use super::*;
     use piku_runtime::{
-        ArtifactRef, RunContentChange, RunContentRef, RunToolEffect, UsageRecord,
-        VerificationRecord, VerificationStatus, RUN_RECORD_SCHEMA_VERSION,
+        ArtifactRef, ContextSourceSummary, RunContentChange, RunContentRef, RunToolEffect,
+        Sha256Digest, SourceReference, Trust, UsageRecord, VerificationRecord, VerificationStatus,
+        RUN_RECORD_SCHEMA_VERSION,
     };
 
     fn event(event: RunEvent) -> RunEventEnvelope {
@@ -498,6 +527,28 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
         })]);
         assert!(output.contains("12↑ 7↓ · end_turn"));
+    }
+
+    #[test]
+    fn text_projection_surfaces_context_provenance_without_payload() {
+        let output = render_text(&[event(RunEvent::ContextSourcesResolved {
+            sources: vec![ContextSourceSummary {
+                id: "note-1".into(),
+                sources: vec![SourceReference {
+                    reference: "surface:scratch/object:note-1".into(),
+                    sha256: Sha256Digest::of_bytes(b"private source bytes"),
+                }],
+                output_sha256: Sha256Digest::of_bytes(b"resolved bytes"),
+                byte_size: 14,
+                trust: Trust::UntrustedEvidence,
+            }],
+        })]);
+
+        assert!(output.contains("1 context sources resolved · 14 bytes"));
+        assert!(output.contains("note-1 · UntrustedEvidence · 14 bytes · sha256:"));
+        assert!(output.contains("surface:scratch/object:note-1 · sha256:"));
+        assert!(!output.contains("private source bytes"));
+        assert!(!output.contains("resolved bytes"));
     }
 
     #[test]

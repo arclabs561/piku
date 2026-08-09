@@ -87,7 +87,10 @@ impl<'a> RunTurn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{read_run_record, PostToolAction, RunEvent, TokenUsage};
+    use crate::{
+        read_run_record, ContextSourceSummary, PostToolAction, RunContentRef, RunEvent,
+        Sha256Digest, SourceReference, TokenUsage, Trust,
+    };
     use tempfile::tempdir;
 
     #[derive(Default)]
@@ -141,5 +144,48 @@ mod tests {
             .err()
             .expect("empty identity should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn queued_context_provenance_immediately_follows_turn_start() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        let mut handle = RunHandle::open(Session::new("run-1".into()), &path).unwrap();
+        let mut sink = Sink;
+        let mut turn = handle.begin_turn(&mut sink, "turn-1");
+        let (_, recording_sink) = turn.parts();
+        recording_sink
+            .queue_after_turn_started(RunEvent::ContextSourcesResolved {
+                sources: vec![ContextSourceSummary {
+                    id: "note-1".into(),
+                    sources: vec![SourceReference {
+                        reference: "surface:scratch/object:note-1".into(),
+                        sha256: Sha256Digest::of_bytes(b"note"),
+                    }],
+                    output_sha256: Sha256Digest::of_bytes(b"note"),
+                    byte_size: 4,
+                    trust: Trust::UntrustedEvidence,
+                }],
+            })
+            .unwrap();
+        recording_sink.on_run_event(&RunEvent::TurnStarted {
+            provider: Some("test".into()),
+            model: "model".into(),
+            input: RunContentRef::Inline {
+                text: "prompt".into(),
+            },
+        });
+        recording_sink.on_run_event(&RunEvent::Warning {
+            message: "later".into(),
+        });
+        turn.finish().unwrap();
+
+        let events = read_run_record(path).unwrap();
+        assert!(matches!(events[0].event, RunEvent::TurnStarted { .. }));
+        assert!(matches!(
+            events[1].event,
+            RunEvent::ContextSourcesResolved { .. }
+        ));
+        assert!(matches!(events[2].event, RunEvent::Warning { .. }));
     }
 }

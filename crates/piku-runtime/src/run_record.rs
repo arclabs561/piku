@@ -11,15 +11,16 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{OutputSink, PostToolAction};
+use crate::{OutputSink, PostToolAction, Sha256Digest, SourceReference, Trust};
 use piku_api::TokenUsage;
 
 /// Current on-disk schema for [`RunEventEnvelope`].
 ///
 /// Version 2 made run-vs-turn scope explicit. Version 3 adds typed failed and
 /// cancelled terminals and permits completion when token usage was not
-/// reported. The reader remains compatible with earlier records.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 3;
+/// reported. Version 4 records payload-free summaries of explicitly resolved
+/// context sources. The reader remains compatible with earlier records.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 4;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -152,6 +153,9 @@ pub enum RunEvent {
     ContextBuilt {
         manifest: ContextManifest,
     },
+    ContextSourcesResolved {
+        sources: Vec<ContextSourceSummary>,
+    },
     ContextUnavailable {
         reason: String,
     },
@@ -224,6 +228,7 @@ impl RunEvent {
             Self::ChildRunRef { .. }
             | Self::TurnStarted { .. }
             | Self::ContextBuilt { .. }
+            | Self::ContextSourcesResolved { .. }
             | Self::ContextUnavailable { .. }
             | Self::CompactionApplied { .. }
             | Self::AssistantMessage { .. }
@@ -236,6 +241,17 @@ impl RunEvent {
             | Self::Warning { .. } => EventScopeKind::Turn,
         }
     }
+}
+
+/// Durable provenance for one resolved context item, without its payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSourceSummary {
+    pub id: String,
+    pub sources: Vec<SourceReference>,
+    pub output_sha256: Sha256Digest,
+    pub byte_size: usize,
+    pub trust: Trust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +447,7 @@ pub struct RecordingSink<'a> {
     recorder: &'a mut RunRecorder,
     turn_id: String,
     record_error: Option<io::Error>,
+    after_turn_started: Vec<RunEvent>,
 }
 
 impl<'a> RecordingSink<'a> {
@@ -444,11 +461,36 @@ impl<'a> RecordingSink<'a> {
             recorder,
             turn_id: turn_id.into(),
             record_error: None,
+            after_turn_started: Vec::new(),
         }
     }
 
+    /// Queue semantic events that must immediately follow `TurnStarted`.
+    ///
+    /// This lets a surface resolve evidence before the runtime owns the turn
+    /// start while preserving one authoritative event ordering boundary.
+    pub fn queue_after_turn_started(&mut self, event: RunEvent) -> io::Result<()> {
+        if event.scope_kind() != EventScopeKind::Turn
+            || matches!(event, RunEvent::TurnStarted { .. })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "queued event must be a non-start turn event",
+            ));
+        }
+        self.after_turn_started.push(event);
+        Ok(())
+    }
+
     pub fn take_record_error(&mut self) -> Option<io::Error> {
-        self.record_error.take()
+        self.record_error.take().or_else(|| {
+            (!self.after_turn_started.is_empty()).then(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "turn ended before queued provenance could follow TurnStarted",
+                )
+            })
+        })
     }
 }
 
@@ -491,6 +533,15 @@ impl OutputSink for RecordingSink<'_> {
         if self.record_error.is_none() {
             if let Err(error) = self.recorder.append(&self.turn_id, event.clone()) {
                 self.record_error = Some(error);
+            }
+        }
+        if matches!(event, RunEvent::TurnStarted { .. }) && self.record_error.is_none() {
+            for queued in std::mem::take(&mut self.after_turn_started) {
+                self.inner.on_run_event(&queued);
+                if let Err(error) = self.recorder.append(&self.turn_id, queued) {
+                    self.record_error = Some(error);
+                    break;
+                }
             }
         }
     }
@@ -582,6 +633,7 @@ impl RunRecorder {
             RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
             RunEvent::UserDisposition { note, .. } => Some(("disposition", note)),
             RunEvent::ContextBuilt { .. }
+            | RunEvent::ContextSourcesResolved { .. }
             | RunEvent::ContextUnavailable { .. }
             | RunEvent::ToolStarted { .. }
             | RunEvent::PermissionDecision { .. }
@@ -757,6 +809,44 @@ mod tests {
         }
     }
 
+    fn source_summary() -> ContextSourceSummary {
+        ContextSourceSummary {
+            id: "note-1".into(),
+            sources: vec![SourceReference {
+                reference: "surface:scratch/object:note-1".into(),
+                sha256: Sha256Digest::of_bytes(b"source bytes"),
+            }],
+            output_sha256: Sha256Digest::of_bytes(b"resolved bytes"),
+            byte_size: 14,
+            trust: Trust::UntrustedEvidence,
+        }
+    }
+
+    #[test]
+    fn context_source_summary_roundtrips_without_payload() {
+        let event = RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence: 0,
+            recorded_at_ms: 0,
+            session_id: "session-1".into(),
+            scope: EventScope::Turn {
+                turn_id: "turn-0".into(),
+            },
+            event: RunEvent::ContextSourcesResolved {
+                sources: vec![source_summary()],
+            },
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("source bytes"));
+        assert!(!encoded.contains("resolved bytes"));
+        assert!(!encoded.contains("payload"));
+        assert_eq!(
+            serde_json::from_str::<RunEventEnvelope>(&encoded).unwrap(),
+            event
+        );
+    }
+
     #[test]
     fn appends_and_resumes_a_valid_record() {
         let path = test_path("resume");
@@ -811,6 +901,25 @@ mod tests {
                 }),
                 ..
             }
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_v3_typed_terminal_event() {
+        let path = test_path("v3-terminal");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":3,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"turn_failed","class":"provider","message":"unavailable"}
+"#,
+        )
+        .unwrap();
+
+        let events = read_run_record(&path).unwrap();
+        assert!(matches!(
+            &events[0].event,
+            RunEvent::TurnFailed { class, message }
+                if class == "provider" && message == "unavailable"
         ));
         fs::remove_file(path).unwrap();
     }
@@ -932,7 +1041,7 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values[0]["schema_version"], 1);
-        assert_eq!(values[1]["schema_version"], 3);
+        assert_eq!(values[1]["schema_version"], 4);
         assert_eq!(values[1]["scope"], "turn");
         fs::remove_file(path).unwrap();
     }
