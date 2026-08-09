@@ -19,15 +19,15 @@ function commandOutput(command, args, cwd) {
   }
 }
 
-export function evaluationRuntimeMetadata(repoRoot) {
+export function evaluationRuntimeMetadata(repoRoot, runCommand = commandOutput) {
   const cargo = readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
   const subjectVersion = cargo.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/)?.[1] || "unknown";
   return {
     subject_version: subjectVersion,
-    subject_revision: commandOutput("git", ["rev-parse", "HEAD"], repoRoot),
-    subject_dirty: Boolean(commandOutput("git", ["status", "--porcelain=v1"], repoRoot)),
+    subject_revision: runCommand("git", ["rev-parse", "HEAD"], repoRoot),
+    subject_dirty: Boolean(runCommand("git", ["status", "--porcelain=v1"], repoRoot)),
     evaluator_runtime: "codex-cli",
-    evaluator_version: commandOutput("codex", ["--version"], repoRoot),
+    evaluator_version: runCommand("codex", ["--version"], repoRoot),
     explorer_model: resolvedCodexModel(),
     evaluation_contract: "piku-evaluation-v2",
   };

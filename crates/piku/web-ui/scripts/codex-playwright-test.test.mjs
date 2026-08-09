@@ -304,11 +304,23 @@ test("evaluation amendments retain their target and causal basis", () => {
 });
 
 test("live evaluation metadata records exact subject and evaluator versions", () => {
-  const runtime = evaluationRuntimeMetadata(repoRoot);
+  const commands = [];
+  const runtime = evaluationRuntimeMetadata(repoRoot, (command, args, cwd) => {
+    commands.push({ command, args, cwd });
+    if (command === "git" && args[0] === "rev-parse") return "a".repeat(40);
+    if (command === "git" && args[0] === "status") return "";
+    if (command === "codex") return "codex-cli 0.146.0";
+    throw new Error(`unexpected command: ${command}`);
+  });
   assert.equal(runtime.subject_version, "0.1.0");
-  assert.match(runtime.subject_revision, /^[0-9a-f]{40}$/);
-  assert.equal(typeof runtime.subject_dirty, "boolean");
-  assert.match(runtime.evaluator_version, /^codex-cli \d+/);
+  assert.equal(runtime.subject_revision, "a".repeat(40));
+  assert.equal(runtime.subject_dirty, false);
+  assert.equal(runtime.evaluator_version, "codex-cli 0.146.0");
   assert.equal(runtime.explorer_model, "gpt-5.6-sol");
   assert.equal(runtime.evaluation_contract, "piku-evaluation-v2");
+  assert.deepEqual(commands, [
+    { command: "git", args: ["rev-parse", "HEAD"], cwd: repoRoot },
+    { command: "git", args: ["status", "--porcelain=v1"], cwd: repoRoot },
+    { command: "codex", args: ["--version"], cwd: repoRoot },
+  ]);
 });
