@@ -1,6 +1,6 @@
 # Design: operator-steered evaluation context
 
-Status: proposed
+Status: partially implemented
 
 ## Problem
 
@@ -167,19 +167,21 @@ remains the sole promotion authority.
 
 ## Implementation plan
 
-1. Add a shared run-manifest schema and hash the effective prompts, schemas,
-   config, tool profiles, and focus projection. Use it in CLI and web runners.
-2. Add versioned annotation, proposal, promotion, and retirement records with a
-   pure validator and byte-stable projection tests.
-3. Add the external CLI workflow. Support annotations and authored proposals,
-   but keep prompt injection disabled.
-4. Enable bounded promoted-focus injection for one evaluator perspective. Run
-   paired evaluations with and without focus and inspect evidence quality, not
-   only scores.
-5. Expand to other perspectives only if focus improves relevant discovery
-   without increasing unsupported historical claims.
-6. Consider the proposal-only agent tool after the CLI ledger has real use. Add
-   a web projection later as a view over the same records, not a second store.
+1. Implemented: the web runner hashes its effective prompts, schemas, tool
+   profiles, budgets, and optional focus projection in an immutable manifest.
+2. Partly implemented: proposal, promotion, and retirement events have a pure
+   validator and byte-stable projection. Annotation records remain deferred.
+3. Implemented: a successful validated web synthesis deterministically emits
+   evidence-linked `retest` proposals as a separate inert JSONL artifact. It
+   never emits promotions.
+4. Implemented: bounded promoted focus may reach only `coding_trace`;
+   `recovery` and synthesis remain blinded controls. Focus requires an exact
+   clean subject revision and is attested in the run manifest.
+5. Next: add the external operator CLI for inspect, append, promote, retire, and
+   projection. Then run focused/blinded pairs and compare evidence quality,
+   novelty, and unsupported historical claims rather than aggregate scores.
+6. Expand to other perspectives or add a proposal-only agent tool only after
+   the operator workflow and paired evidence show that focus helps.
 
 ## Decision gates
 
