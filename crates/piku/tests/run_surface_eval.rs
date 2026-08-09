@@ -121,10 +121,10 @@ fn build_fixture(directory: &std::path::Path) -> std::path::PathBuf {
         .append(
             "turn-0",
             RunEvent::TurnCompleted {
-                usage: UsageRecord {
+                usage: Some(UsageRecord {
                     input_tokens: 20,
                     output_tokens: 10,
-                },
+                }),
                 stop_reason: Some("end_turn".to_string()),
             },
         )

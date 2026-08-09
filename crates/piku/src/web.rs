@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
-    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RunEvent, RunHandle,
-    Session, TurnResult,
+    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RunContentRef, RunEvent,
+    RunHandle, RunRecorder, Session, TurnResult, UsageRecord,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -102,6 +102,21 @@ fn emit_run_record_started(
             "url": format!("/run/{run_id}"),
         }),
     );
+}
+
+fn append_codex_run_event(
+    recorder: &mut RunRecorder,
+    turn_id: &str,
+    event: RunEvent,
+    activity_sink: &mut WebSink,
+    record_error: &mut Option<std::io::Error>,
+) {
+    activity_sink.on_run_event(&event);
+    if record_error.is_none() {
+        if let Err(error) = recorder.append(turn_id, event) {
+            *record_error = Some(error);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1448,8 +1463,46 @@ async fn run_codex_chat_request(
         config = "isolated",
         "request accepted"
     );
+    let run_id = request_id.clone();
+    let turn_id = format!("web-chat-{request_id}");
+    let run_path = state.config.runs_dir().join(format!("{run_id}.jsonl"));
+    let mut recorder = match RunRecorder::open(&run_path, &run_id) {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot open durable Codex run record: {error}")}),
+            );
+            state.surfaces.write().await.running.remove(&surface_name);
+            return;
+        }
+    };
+    emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
     let started = Instant::now();
     let event_tx = tx.clone();
+    let mut activity_sink = WebSink::new(request_id.clone(), tx.clone(), None);
+    let mut record_error = None;
+    append_codex_run_event(
+        &mut recorder,
+        &turn_id,
+        RunEvent::TurnStarted {
+            provider: Some("codex app-server".to_string()),
+            model: "resolved by Codex after thread start".to_string(),
+            input: RunContentRef::Inline {
+                text: codex::compose_input(&message, context.as_deref(), &history),
+            },
+        },
+        &mut activity_sink,
+        &mut record_error,
+    );
+    if let Some(error) = record_error.take() {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable Codex run record: {error}")}),
+        );
+        state.surfaces.write().await.running.remove(&surface_name);
+        return;
+    }
     let run = codex::run_chat(
         &state.workspace_root,
         &state.codex_root,
@@ -1458,10 +1511,32 @@ async fn run_codex_chat_request(
         &history,
         thread_id.as_deref(),
         |event| match event {
-            codex::CodexEvent::Started { model, thread_id } => emit(
-                &event_tx,
-                &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
-            ),
+            codex::CodexEvent::Started {
+                model,
+                thread_id,
+                turn_id: native_turn_id,
+                input,
+            } => {
+                append_codex_run_event(
+                    &mut recorder,
+                    &turn_id,
+                    RunEvent::ContextUnavailable {
+                        reason: format!(
+                            "Codex {model} owns native thread context; Piku observed thread {thread_id} turn {native_turn_id} but not its resolved context manifest"
+                        ),
+                    },
+                    &mut activity_sink,
+                    &mut record_error,
+                );
+                debug_assert_eq!(
+                    input,
+                    codex::compose_input(&message, context.as_deref(), &history)
+                );
+                emit(
+                    &event_tx,
+                    &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
+                );
+            }
             codex::CodexEvent::Delta(text) => emit_lossy(
                 &event_tx,
                 &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":text}),
@@ -1474,6 +1549,24 @@ async fn run_codex_chat_request(
     };
     let elapsed = started.elapsed().as_secs_f32();
     let Some(result) = result else {
+        append_codex_run_event(
+            &mut recorder,
+            &turn_id,
+            RunEvent::TurnCancelled {
+                reason: "browser disconnected before the Codex turn completed".to_string(),
+            },
+            &mut activity_sink,
+            &mut record_error,
+        );
+        if let Some(error) = record_error {
+            tracing::error!(
+                request_id,
+                kind = "chat",
+                executor = "codex",
+                %error,
+                "failed to persist cancellation in durable run record"
+            );
+        }
         tracing::info!(
             request_id,
             kind = "chat",
@@ -1484,11 +1577,51 @@ async fn run_codex_chat_request(
         state.surfaces.write().await.running.remove(&surface_name);
         return;
     };
+    if let Some(error) = record_error {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable Codex run record: {error}")}),
+        );
+        state.surfaces.write().await.running.remove(&surface_name);
+        return;
+    }
     match result {
         Ok(result) => {
+            append_codex_run_event(
+                &mut recorder,
+                &turn_id,
+                RunEvent::AssistantMessage {
+                    content: RunContentRef::Inline {
+                        text: result.output.clone(),
+                    },
+                },
+                &mut activity_sink,
+                &mut record_error,
+            );
+            append_codex_run_event(
+                &mut recorder,
+                &turn_id,
+                RunEvent::TurnCompleted {
+                    usage: result.usage.map(|usage| UsageRecord {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                    }),
+                    stop_reason: Some("codex completed".to_string()),
+                },
+                &mut activity_sink,
+                &mut record_error,
+            );
+            if let Some(error) = record_error {
+                emit(
+                    &tx,
+                    &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable Codex run record: {error}")}),
+                );
+                state.surfaces.write().await.running.remove(&surface_name);
+                return;
+            }
             emit(
                 &tx,
-                &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Answer complete; canvas unchanged","elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","model":result.model,"thread_id":result.thread_id,"verification":{"actor":"Piku host","checks":[{"name":"workspace mutation boundary","outcome":"passed","detail":"saved workspace state was not changed"}]}}),
+                &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Answer complete; canvas unchanged","elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"workspace mutation boundary","outcome":"passed","detail":"saved workspace state was not changed"}]}}),
             );
             tracing::info!(
                 request_id,
@@ -1501,6 +1634,31 @@ async fn run_codex_chat_request(
             );
         }
         Err(error) => {
+            append_codex_run_event(
+                &mut recorder,
+                &turn_id,
+                RunEvent::TurnFailed {
+                    class: "codex_app_server".to_string(),
+                    message: error.to_string(),
+                },
+                &mut activity_sink,
+                &mut record_error,
+            );
+            if let Some(record_error) = record_error {
+                tracing::error!(
+                    request_id,
+                    kind = "chat",
+                    executor = "codex",
+                    %record_error,
+                    "failed to persist terminal failure in durable run record"
+                );
+                emit(
+                    &tx,
+                    &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("Codex failed and its durable failure record could not be completed: {record_error}"),"elapsed_seconds":elapsed,"executor":"codex"}),
+                );
+                state.surfaces.write().await.running.remove(&surface_name);
+                return;
+            }
             tracing::error!(
                 request_id,
                 kind = "chat",
@@ -2647,6 +2805,14 @@ impl OutputSink for WebSink {
                     manifest.tools.iter().filter(|item| item.selected).count(),
                 ),
             }),
+            RunEvent::ContextUnavailable { reason } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "context:unavailable",
+                "phase": "context",
+                "state": "changed",
+                "label": "Context details unavailable",
+                "detail": reason,
+            }),
             RunEvent::CompactionApplied {
                 before_messages,
                 after_messages,
@@ -2709,7 +2875,26 @@ impl OutputSink for WebSink {
                 "phase": "turn",
                 "state": "done",
                 "label": "Turn recorded",
-                "detail": format!("{} in · {} out · {}", usage.input_tokens, usage.output_tokens, stop_reason.as_deref().unwrap_or("complete")),
+                "detail": usage.as_ref().map_or_else(
+                    || format!("tokens not reported · {}", stop_reason.as_deref().unwrap_or("complete")),
+                    |usage| format!("{} in · {} out · {}", usage.input_tokens, usage.output_tokens, stop_reason.as_deref().unwrap_or("complete")),
+                ),
+            }),
+            RunEvent::TurnFailed { class, message } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "turn:failed",
+                "phase": "turn",
+                "state": "error",
+                "label": format!("Turn failed · {class}"),
+                "detail": message,
+            }),
+            RunEvent::TurnCancelled { reason } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "turn:cancelled",
+                "phase": "turn",
+                "state": "error",
+                "label": "Turn cancelled",
+                "detail": reason,
             }),
             RunEvent::Warning { message } => serde_json::json!({
                 "kind": "activity_event",
@@ -3413,10 +3598,10 @@ mod tests {
         let mut sink = WebSink::new("request-1".to_string(), tx, None);
 
         sink.on_run_event(&RunEvent::TurnCompleted {
-            usage: piku_runtime::UsageRecord {
+            usage: Some(piku_runtime::UsageRecord {
                 input_tokens: 12,
                 output_tokens: 7,
-            },
+            }),
             stop_reason: Some("end_turn".to_string()),
         });
 

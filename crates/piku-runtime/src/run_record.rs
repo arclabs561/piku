@@ -16,9 +16,10 @@ use piku_api::TokenUsage;
 
 /// Current on-disk schema for [`RunEventEnvelope`].
 ///
-/// Version 2 makes run-vs-turn scope explicit. The reader remains compatible
-/// with version 1 records, where `turn_id` implied turn scope.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 2;
+/// Version 2 made run-vs-turn scope explicit. Version 3 adds typed failed and
+/// cancelled terminals and permits completion when token usage was not
+/// reported. The reader remains compatible with earlier records.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 3;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -151,6 +152,9 @@ pub enum RunEvent {
     ContextBuilt {
         manifest: ContextManifest,
     },
+    ContextUnavailable {
+        reason: String,
+    },
     CompactionApplied {
         before_messages: usize,
         after_messages: usize,
@@ -179,8 +183,16 @@ pub enum RunEvent {
         verification: Option<VerificationRecord>,
     },
     TurnCompleted {
-        usage: UsageRecord,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageRecord>,
         stop_reason: Option<String>,
+    },
+    TurnFailed {
+        class: String,
+        message: String,
+    },
+    TurnCancelled {
+        reason: String,
     },
     Warning {
         message: String,
@@ -212,12 +224,15 @@ impl RunEvent {
             Self::ChildRunRef { .. }
             | Self::TurnStarted { .. }
             | Self::ContextBuilt { .. }
+            | Self::ContextUnavailable { .. }
             | Self::CompactionApplied { .. }
             | Self::AssistantMessage { .. }
             | Self::ToolStarted { .. }
             | Self::PermissionDecision { .. }
             | Self::ToolCompleted { .. }
             | Self::TurnCompleted { .. }
+            | Self::TurnFailed { .. }
+            | Self::TurnCancelled { .. }
             | Self::Warning { .. } => EventScopeKind::Turn,
         }
     }
@@ -567,9 +582,12 @@ impl RunRecorder {
             RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
             RunEvent::UserDisposition { note, .. } => Some(("disposition", note)),
             RunEvent::ContextBuilt { .. }
+            | RunEvent::ContextUnavailable { .. }
             | RunEvent::ToolStarted { .. }
             | RunEvent::PermissionDecision { .. }
             | RunEvent::TurnCompleted { .. }
+            | RunEvent::TurnFailed { .. }
+            | RunEvent::TurnCancelled { .. }
             | RunEvent::Warning { .. }
             | RunEvent::ChildRunRef { .. } => None,
         };
@@ -753,10 +771,10 @@ mod tests {
                     .append(
                         "turn-1",
                         RunEvent::TurnCompleted {
-                            usage: UsageRecord {
+                            usage: Some(UsageRecord {
                                 input_tokens: 11,
                                 output_tokens: 7,
-                            },
+                            }),
                             stop_reason: Some("end_turn".into()),
                         },
                     )
@@ -770,6 +788,30 @@ mod tests {
         assert_eq!(events[0].sequence, 0);
         assert_eq!(events[1].sequence, 1);
         assert_eq!(events[0].session_id, "session-1");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_v2_completion_usage_as_reported_usage() {
+        let path = test_path("v2-completion");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"sequence":0,"recorded_at_ms":0,"session_id":"session-1","scope":"turn","turn_id":"turn-0","event":"turn_completed","usage":{"input_tokens":11,"output_tokens":7},"stop_reason":"end_turn"}
+"#,
+        )
+        .unwrap();
+
+        let events = read_run_record(&path).unwrap();
+        assert!(matches!(
+            &events[0].event,
+            RunEvent::TurnCompleted {
+                usage: Some(UsageRecord {
+                    input_tokens: 11,
+                    output_tokens: 7
+                }),
+                ..
+            }
+        ));
         fs::remove_file(path).unwrap();
     }
 
@@ -890,7 +932,7 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values[0]["schema_version"], 1);
-        assert_eq!(values[1]["schema_version"], 2);
+        assert_eq!(values[1]["schema_version"], 3);
         assert_eq!(values[1]["scope"], "turn");
         fs::remove_file(path).unwrap();
     }

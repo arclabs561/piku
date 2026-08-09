@@ -47,9 +47,11 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
     );
     let _ = writeln!(
         output,
-        "{} / {} turns complete · {} / {} tools complete · {} permission decisions",
+        "{} / {} turns completed · {} failed · {} cancelled · {} / {} tools complete · {} permission decisions",
         audit.completed_turn_count,
         audit.turn_count,
+        audit.failed_turn_count,
+        audit.cancelled_turn_count,
         audit.tool_calls_completed,
         audit.tool_calls_started,
         audit.tool_calls_with_permission_decision
@@ -115,6 +117,9 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                     manifest.tools.len()
                 );
             }
+            RunEvent::ContextUnavailable { reason } => {
+                let _ = writeln!(output, "  ◇ context unavailable · {reason}");
+            }
             RunEvent::CompactionApplied {
                 before_messages,
                 after_messages,
@@ -172,13 +177,21 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                 }
             }
             RunEvent::TurnCompleted { usage, stop_reason } => {
+                let accounting = usage.as_ref().map_or_else(
+                    || "tokens not reported".to_string(),
+                    |usage| format!("{}↑ {}↓", usage.input_tokens, usage.output_tokens),
+                );
                 let _ = writeln!(
                     output,
-                    "  ■ {}↑ {}↓ · {}",
-                    usage.input_tokens,
-                    usage.output_tokens,
+                    "  ■ {accounting} · {}",
                     stop_reason.as_deref().unwrap_or("unknown")
                 );
+            }
+            RunEvent::TurnFailed { class, message } => {
+                let _ = writeln!(output, "  × failed [{class}] · {message}");
+            }
+            RunEvent::TurnCancelled { reason } => {
+                let _ = writeln!(output, "  ◼ cancelled · {reason}");
             }
             RunEvent::Warning { message } => {
                 let _ = writeln!(output, "  ! {message}");
@@ -278,8 +291,8 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const searchBySequence=new Map(documentData.search_index.map(e=>[e.sequence,e]));const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
 const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>searchBySequence.get(e.sequence)?.search_text??'';const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
-function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓ · ${{e.stop_reason??'unknown'}}`;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
-function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed'],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
+function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'context_unavailable':return e.reason;case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage?`${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓`:'tokens not reported'}} · ${{e.stop_reason??'unknown'}}`;case'turn_failed':return `${{e.class}} · ${{e.message}}`;case'turn_cancelled':return e.reason;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
+function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed · '+audit.failed_turn_count+' failed · '+audit.cancelled_turn_count+' cancelled'],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
 function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;const scope=scopeLabel(e);if(!seen.has(scope)){{seen.add(scope);const b=document.createElement('button');b.textContent=scope;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['scope',scope],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','scope','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
@@ -339,12 +352,15 @@ fn event_kind(event: &RunEvent) -> &'static str {
     match event {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
+        RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::PermissionDecision { .. } => "permission_decision",
         RunEvent::ToolCompleted { .. } => "tool_completed",
         RunEvent::TurnCompleted { .. } => "turn_completed",
+        RunEvent::TurnFailed { .. } => "turn_failed",
+        RunEvent::TurnCancelled { .. } => "turn_cancelled",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
         RunEvent::ChildRunRef { .. } => "child_run_ref",
@@ -402,9 +418,12 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         RunEvent::AssistantMessage { content } => Some(content),
         RunEvent::ToolCompleted { result, .. } => Some(result),
         RunEvent::ContextBuilt { .. }
+        | RunEvent::ContextUnavailable { .. }
         | RunEvent::ToolStarted { .. }
         | RunEvent::PermissionDecision { .. }
         | RunEvent::TurnCompleted { .. }
+        | RunEvent::TurnFailed { .. }
+        | RunEvent::TurnCancelled { .. }
         | RunEvent::Warning { .. }
         | RunEvent::ChildRunRef { .. } => None,
         RunEvent::UserDisposition { note, .. } => Some(note),
@@ -472,13 +491,34 @@ mod tests {
     #[test]
     fn text_projection_surfaces_outcome_and_usage() {
         let output = render_text(&[event(RunEvent::TurnCompleted {
-            usage: UsageRecord {
+            usage: Some(UsageRecord {
                 input_tokens: 12,
                 output_tokens: 7,
-            },
+            }),
             stop_reason: Some("end_turn".to_string()),
         })]);
         assert!(output.contains("12↑ 7↓ · end_turn"));
+    }
+
+    #[test]
+    fn projections_do_not_invent_usage_or_success_for_other_terminal_states() {
+        let output = render_text(&[
+            event(RunEvent::TurnCompleted {
+                usage: None,
+                stop_reason: Some("completed".to_string()),
+            }),
+            event(RunEvent::TurnFailed {
+                class: "executor".to_string(),
+                message: "rejected".to_string(),
+            }),
+            event(RunEvent::TurnCancelled {
+                reason: "disconnected".to_string(),
+            }),
+        ]);
+
+        assert!(output.contains("tokens not reported · completed"));
+        assert!(output.contains("failed [executor] · rejected"));
+        assert!(output.contains("cancelled · disconnected"));
     }
 
     #[test]
@@ -529,10 +569,10 @@ mod tests {
     #[test]
     fn json_projection_keeps_metrics_beside_raw_events() {
         let json = render_json(&[event(RunEvent::TurnCompleted {
-            usage: UsageRecord {
+            usage: Some(UsageRecord {
                 input_tokens: 12,
                 output_tokens: 7,
-            },
+            }),
             stop_reason: Some("end_turn".to_string()),
         })])
         .unwrap();

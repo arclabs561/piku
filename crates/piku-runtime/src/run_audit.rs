@@ -19,6 +19,10 @@ pub struct RunAudit {
     pub event_count: usize,
     pub turn_count: usize,
     pub completed_turn_count: usize,
+    #[serde(default)]
+    pub failed_turn_count: usize,
+    #[serde(default)]
+    pub cancelled_turn_count: usize,
     pub context_build_count: usize,
     pub compaction_count: usize,
     pub tool_calls_started: usize,
@@ -99,6 +103,13 @@ struct ToolState<'a> {
     completed: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+enum TurnOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 /// Audit a record without consulting a model or presentation surface.
 #[must_use]
 pub fn audit_run_record(events: &[RunEventEnvelope]) -> RunAudit {
@@ -122,6 +133,8 @@ impl<'a> Auditor<'a> {
                 event_count,
                 turn_count: 0,
                 completed_turn_count: 0,
+                failed_turn_count: 0,
+                cancelled_turn_count: 0,
                 context_build_count: 0,
                 compaction_count: 0,
                 tool_calls_started: 0,
@@ -181,6 +194,9 @@ impl<'a> Auditor<'a> {
         match &envelope.event {
             RunEvent::TurnStarted { input, .. } => self.on_turn_started(turn_id, envelope, input),
             RunEvent::ContextBuilt { manifest } => self.on_context(turn_id, manifest),
+            RunEvent::ContextUnavailable { reason } => {
+                self.on_context_unavailable(turn_id, envelope, reason);
+            }
             RunEvent::CompactionApplied { summary, .. } => {
                 self.audit.compaction_count += 1;
                 audit_content(&mut self.audit.content, summary);
@@ -211,7 +227,13 @@ impl<'a> Auditor<'a> {
                 );
             }
             RunEvent::TurnCompleted { usage, .. } => {
-                self.on_turn_completed(turn_id, envelope, usage);
+                self.on_turn_terminal(turn_id, envelope, TurnOutcome::Completed, usage.as_ref());
+            }
+            RunEvent::TurnFailed { .. } => {
+                self.on_turn_terminal(turn_id, envelope, TurnOutcome::Failed, None);
+            }
+            RunEvent::TurnCancelled { .. } => {
+                self.on_turn_terminal(turn_id, envelope, TurnOutcome::Cancelled, None);
             }
             RunEvent::Warning { .. } | RunEvent::ChildRunRef { .. } => {}
             RunEvent::UserDisposition { .. } => unreachable!("scope checked above"),
@@ -310,6 +332,23 @@ impl<'a> Auditor<'a> {
                 &mut self.audit.context.tools_selected,
                 &mut self.audit.context.tools_excluded,
                 &mut self.audit.context.empty_disposition_reasons,
+            );
+        }
+    }
+
+    fn on_context_unavailable(
+        &mut self,
+        turn_id: &'a str,
+        envelope: &'a RunEventEnvelope,
+        reason: &str,
+    ) {
+        self.turns.entry(turn_id).or_default().context_builds += 1;
+        if reason.trim().is_empty() {
+            self.add_finding(
+                AuditSeverity::Warning,
+                "empty_context_unavailable_reason",
+                format!("turn {turn_id} marks context unavailable without a reason"),
+                vec![envelope.sequence],
             );
         }
     }
@@ -457,11 +496,12 @@ impl<'a> Auditor<'a> {
         }
     }
 
-    fn on_turn_completed(
+    fn on_turn_terminal(
         &mut self,
         turn_id: &'a str,
         envelope: &'a RunEventEnvelope,
-        usage: &UsageRecord,
+        outcome: TurnOutcome,
+        usage: Option<&UsageRecord>,
     ) {
         let previous = self
             .turns
@@ -477,18 +517,24 @@ impl<'a> Auditor<'a> {
                 vec![previous, envelope.sequence],
             );
         } else {
-            self.audit.completed_turn_count += 1;
+            match outcome {
+                TurnOutcome::Completed => self.audit.completed_turn_count += 1,
+                TurnOutcome::Failed => self.audit.failed_turn_count += 1,
+                TurnOutcome::Cancelled => self.audit.cancelled_turn_count += 1,
+            }
         }
-        self.audit.usage.input_tokens = self
-            .audit
-            .usage
-            .input_tokens
-            .saturating_add(usage.input_tokens);
-        self.audit.usage.output_tokens = self
-            .audit
-            .usage
-            .output_tokens
-            .saturating_add(usage.output_tokens);
+        if let Some(usage) = usage {
+            self.audit.usage.input_tokens = self
+                .audit
+                .usage
+                .input_tokens
+                .saturating_add(usage.input_tokens);
+            self.audit.usage.output_tokens = self
+                .audit
+                .usage
+                .output_tokens
+                .saturating_add(usage.output_tokens);
+        }
     }
 
     fn finish(mut self) -> RunAudit {
@@ -597,12 +643,15 @@ fn event_name(event: &RunEvent) -> &'static str {
     match event {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
+        RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::PermissionDecision { .. } => "permission_decision",
         RunEvent::ToolCompleted { .. } => "tool_completed",
         RunEvent::TurnCompleted { .. } => "turn_completed",
+        RunEvent::TurnFailed { .. } => "turn_failed",
+        RunEvent::TurnCancelled { .. } => "turn_cancelled",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
         RunEvent::ChildRunRef { .. } => "child_run_ref",
@@ -696,10 +745,10 @@ mod tests {
             envelope(
                 5,
                 RunEvent::TurnCompleted {
-                    usage: UsageRecord {
+                    usage: Some(UsageRecord {
                         input_tokens: 12,
                         output_tokens: 4,
-                    },
+                    }),
                     stop_reason: Some("end_turn".to_string()),
                 },
             ),
@@ -803,7 +852,7 @@ mod tests {
         events.push(envelope(
             8,
             RunEvent::TurnCompleted {
-                usage: UsageRecord::default(),
+                usage: Some(UsageRecord::default()),
                 stop_reason: Some("end_turn".to_string()),
             },
         ));
@@ -898,7 +947,7 @@ mod tests {
             envelope(
                 4,
                 RunEvent::TurnCompleted {
-                    usage: UsageRecord::default(),
+                    usage: Some(UsageRecord::default()),
                     stop_reason: Some("end_turn".to_string()),
                 },
             ),
@@ -909,5 +958,97 @@ mod tests {
         assert!(audit.is_structurally_complete());
         assert_eq!(audit.tool_calls_with_permission_decision, 0);
         assert!(audit.findings.is_empty());
+    }
+
+    #[test]
+    fn distinguishes_failed_and_cancelled_turns_from_completed_turns() {
+        let failed = audit_run_record(&[
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".to_string()),
+                    model: "resolved by Codex".to_string(),
+                    input: inline("inspect"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextUnavailable {
+                    reason: "native executor owns context assembly".to_string(),
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::TurnFailed {
+                    class: "executor".to_string(),
+                    message: "turn rejected".to_string(),
+                },
+            ),
+        ]);
+
+        assert!(failed.is_structurally_complete());
+        assert_eq!(failed.completed_turn_count, 0);
+        assert_eq!(failed.failed_turn_count, 1);
+        assert_eq!(failed.cancelled_turn_count, 0);
+        assert_eq!(failed.usage, UsageRecord::default());
+
+        let cancelled = audit_run_record(&[
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".to_string()),
+                    model: "resolved by Codex".to_string(),
+                    input: inline("inspect"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextUnavailable {
+                    reason: "native executor owns context assembly".to_string(),
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::TurnCancelled {
+                    reason: "browser disconnected".to_string(),
+                },
+            ),
+        ]);
+
+        assert!(cancelled.is_structurally_complete());
+        assert_eq!(cancelled.completed_turn_count, 0);
+        assert_eq!(cancelled.failed_turn_count, 0);
+        assert_eq!(cancelled.cancelled_turn_count, 1);
+    }
+
+    #[test]
+    fn completed_turn_can_report_usage_as_unavailable_without_inventing_zeroes() {
+        let audit = audit_run_record(&[
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".to_string()),
+                    model: "resolved by Codex".to_string(),
+                    input: inline("inspect"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextUnavailable {
+                    reason: "native executor owns context assembly".to_string(),
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::TurnCompleted {
+                    usage: None,
+                    stop_reason: Some("completed".to_string()),
+                },
+            ),
+        ]);
+
+        assert!(audit.is_structurally_complete());
+        assert_eq!(audit.completed_turn_count, 1);
+        assert_eq!(audit.usage, UsageRecord::default());
     }
 }

@@ -892,10 +892,10 @@ async fn run_turn_inner(
         "end_turn"
     };
     sink.on_run_event(&crate::run_record::RunEvent::TurnCompleted {
-        usage: crate::run_record::UsageRecord {
+        usage: Some(crate::run_record::UsageRecord {
             input_tokens: u64::from(tracker.cumulative.input_tokens),
             output_tokens: u64::from(tracker.cumulative.output_tokens),
-        },
+        }),
         stop_reason: Some(completion_reason.to_string()),
     });
 

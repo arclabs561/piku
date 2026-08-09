@@ -34,8 +34,19 @@ pub(super) struct CodexReadiness {
 
 #[derive(Debug)]
 pub(super) enum CodexEvent {
-    Started { model: String, thread_id: String },
+    Started {
+        model: String,
+        thread_id: String,
+        turn_id: String,
+        input: String,
+    },
     Delta(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CodexUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Debug)]
@@ -43,6 +54,8 @@ pub(super) struct CodexResult {
     pub output: String,
     pub model: String,
     pub thread_id: String,
+    pub turn_id: String,
+    pub usage: Option<CodexUsage>,
 }
 
 pub(super) fn readiness() -> CodexReadiness {
@@ -82,14 +95,17 @@ where
     } else {
         server.start_thread(workspace_root).await?
     };
+    let input = compose_input(message, context, history);
+    let turn_id = server.start_turn(&thread, &input).await?;
     on_event(CodexEvent::Started {
         model: model.clone(),
         thread_id: thread.clone(),
+        turn_id: turn_id.clone(),
+        input,
     });
-    let input = compose_input(message, context, history);
-    server.start_turn(&thread, &input).await?;
 
     let mut output = String::new();
+    let mut usage = None;
     loop {
         let message = server.read_message().await?;
         if message.get("id").is_some() && message.get("method").is_some() {
@@ -103,6 +119,7 @@ where
                 on_event(CodexEvent::Delta(delta));
             }
             StreamEvent::TurnStarted => {}
+            StreamEvent::Usage(value) => usage = Some(value),
             StreamEvent::Completed => break,
             StreamEvent::Failed(reason) => return Err(anyhow!(reason)),
             StreamEvent::Ignore => {}
@@ -116,10 +133,16 @@ where
         output,
         model,
         thread_id: thread,
+        turn_id,
+        usage,
     })
 }
 
-fn compose_input(message: &str, context: Option<&str>, history: &[ChatMessage]) -> String {
+pub(super) fn compose_input(
+    message: &str,
+    context: Option<&str>,
+    history: &[ChatMessage],
+) -> String {
     let mut input = String::new();
     if !history.is_empty() {
         input.push_str("Conversation so far:\n");
@@ -253,13 +276,14 @@ impl CodexServer {
         Ok((resumed_id, model))
     }
 
-    async fn start_turn(&mut self, thread_id: &str, input: &str) -> anyhow::Result<()> {
+    async fn start_turn(&mut self, thread_id: &str, input: &str) -> anyhow::Result<String> {
         self.send(json!({"method":"turn/start","id":3,"params":{"threadId":thread_id,"input":[{"type":"text","text":input}]}})).await?;
         let response = self.expect_response(3).await?;
-        if response.get("result").is_none() {
-            return Err(protocol_error(&response, "turn/start failed"));
-        }
-        Ok(())
+        response
+            .pointer("/result/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| protocol_error(&response, "turn/start failed"))
     }
 
     async fn send(&mut self, value: Value) -> anyhow::Result<()> {
@@ -302,6 +326,7 @@ impl CodexServer {
 #[derive(Debug, PartialEq)]
 enum StreamEvent {
     TurnStarted,
+    Usage(CodexUsage),
     Delta(String),
     Completed,
     Failed(String),
@@ -311,6 +336,21 @@ enum StreamEvent {
 fn parse_stream_event(message: &Value) -> StreamEvent {
     match message.get("method").and_then(Value::as_str) {
         Some("turn/started") => StreamEvent::TurnStarted,
+        Some("thread/tokenUsage/updated") => {
+            let input_tokens = message
+                .pointer("/params/tokenUsage/last/inputTokens")
+                .and_then(Value::as_u64);
+            let output_tokens = message
+                .pointer("/params/tokenUsage/last/outputTokens")
+                .and_then(Value::as_u64);
+            match (input_tokens, output_tokens) {
+                (Some(input_tokens), Some(output_tokens)) => StreamEvent::Usage(CodexUsage {
+                    input_tokens,
+                    output_tokens,
+                }),
+                _ => StreamEvent::Ignore,
+            }
+        }
         Some("item/agentMessage/delta") => message
             .pointer("/params/delta")
             .and_then(Value::as_str)
@@ -405,6 +445,16 @@ mod tests {
     #[test]
     fn parses_stream_delta_and_failure() {
         assert_eq!(
+            parse_stream_event(&json!({
+                "method":"thread/tokenUsage/updated",
+                "params":{"tokenUsage":{"last":{"inputTokens":12,"outputTokens":7}}}
+            })),
+            StreamEvent::Usage(CodexUsage {
+                input_tokens: 12,
+                output_tokens: 7,
+            })
+        );
+        assert_eq!(
             parse_stream_event(
                 &json!({"method":"item/agentMessage/delta","params":{"delta":"hello"}})
             ),
@@ -415,6 +465,13 @@ mod tests {
                 &json!({"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"nope"}}}})
             ),
             StreamEvent::Failed("nope".into())
+        );
+        assert_eq!(
+            parse_stream_event(&json!({
+                "method":"thread/tokenUsage/updated",
+                "params":{"tokenUsage":{"last":{"inputTokens":12}}}
+            })),
+            StreamEvent::Ignore
         );
     }
 
