@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -37,7 +37,7 @@ function focusEventFixture(hash, { promoted = true, expired = false } = {}) {
 async function writeFocusEvents(root, events) {
   await mkdir(root, { recursive: true });
   const file = path.join(root, "focus-events.jsonl");
-  await writeFile(file, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  await writeFile(file, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
   return file;
 }
 
@@ -278,6 +278,21 @@ test("evaluation focus fails closed for dirty, stale, and expired subjects", asy
     runDir: path.join(root, "expired"), now: "2026-08-09T12:00:00.000Z",
   }), /expired promotion/);
   assert.throws(() => subjectStateHash({ subject_revision: "HEAD", subject_dirty: false }), /exact subject revision/);
+});
+
+test("evaluation focus authority must be private and outside the evaluated workspace", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-focus-authority-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtime = { subject_revision: cleanRevision, subject_dirty: false };
+  const external = await writeFocusEvents(root, focusEventFixture(subjectStateHash(runtime)));
+  await chmod(external, 0o644);
+  await assert.rejects(prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: external }, runtime, runDir: path.join(root, "run"),
+  }), /must not be accessible by group or other users/);
+  await assert.rejects(prepareEvaluationFocus({
+    environment: { PIKU_EVAL_FOCUS_EVENTS: path.join(repoRoot, "scripts", "evaluation-focus.mjs") },
+    runtime, runDir: path.join(root, "inside"),
+  }), /must be outside the evaluated workspace/);
 });
 
 test("prompt manifest captures the canonical focus projection without exposing it to recovery", async (t) => {

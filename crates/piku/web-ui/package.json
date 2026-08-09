@@ -7,7 +7,8 @@
     "test:e2e:headed": "node ./node_modules/@playwright/test/cli.js test --headed",
     "test:harness": "node --test scripts/*.test.mjs",
     "test:agent": "node scripts/codex-playwright-test.mjs",
-    "test:agent:parallel": "node scripts/parallel-agent-eval.mjs"
+    "test:agent:parallel": "node scripts/parallel-agent-eval.mjs",
+    "test:agent:focus-pair": "node scripts/focus-pair-eval.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",

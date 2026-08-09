@@ -236,6 +236,20 @@ function parseFocusEvents(contents, sourcePath) {
   });
 }
 
+async function operatorFocusSource(configured) {
+  const sourcePath = await realpath(path.resolve(configured));
+  const relative = path.relative(repoRoot, sourcePath);
+  if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)))
+    throw new Error("evaluation focus authority file must be outside the evaluated workspace");
+  const metadata = await stat(sourcePath);
+  if (!metadata.isFile()) throw new Error("evaluation focus authority path must be a regular file");
+  if ((metadata.mode & 0o077) !== 0)
+    throw new Error("evaluation focus authority file must not be accessible by group or other users");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid())
+    throw new Error("evaluation focus authority file must be owned by the current OS user");
+  return sourcePath;
+}
+
 export function renderEvaluationFocus(projection) {
   if (!projection || projection.items.length === 0) return "";
   const questions = projection.items.map((item) => ({
@@ -261,7 +275,7 @@ export async function prepareEvaluationFocus({
   if (typeof configured !== "string" || configured.trim().length === 0)
     throw new Error("PIKU_EVAL_FOCUS_EVENTS must name a JSONL file");
   const stateHash = subjectStateHash(runtime);
-  const sourcePath = path.resolve(configured);
+  const sourcePath = await operatorFocusSource(configured);
   const events = parseFocusEvents(await readFile(sourcePath, "utf8"), sourcePath);
   const projection = projectEvaluationFocus(events, {
     subjectStateHash: stateHash,

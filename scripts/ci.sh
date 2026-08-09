@@ -30,6 +30,7 @@ scripts() {
   done
   ./scripts/github-corpus-prompt-selftest.sh
   ./scripts/github-corpus-run-selftest.sh
+  node --test scripts/evaluation-focus.test.mjs scripts/evaluation-focus-cli.test.mjs scripts/codex-app-server-probe.test.mjs
 }
 
 # `-D warnings` makes clippy a real gate, not advisory. The workspace opts into

@@ -40,13 +40,28 @@ web-qa-agent url="http://127.0.0.1:9090":
 web-agent-parallel url="http://127.0.0.1:9090":
     cd crates/piku/web-ui && PIKU_WEB_URL={{url}} npm run test:agent:parallel
 
+# Run a same-revision blinded/focused pair sequentially. The focus ledger must
+# be a private operator-owned file outside this workspace.
+web-agent-focus-pair focus pair_ordinal="0" url="http://127.0.0.1:9090":
+    cd crates/piku/web-ui && PIKU_WEB_URL={{url}} PIKU_EVAL_FOCUS_EVENTS={{focus}} PIKU_EVAL_PAIR_ORDINAL={{pair_ordinal}} npm run test:agent:focus-pair
+
+# Verify the installed Codex app-server enforces Piku's intended read/write
+# sandbox boundary without invoking a model.
+codex-sandbox-probe:
+    node scripts/codex-app-server-probe.mjs
+
+# Inspect or mutate the private append-only focus ledger through its single
+# authoritative validator. Remaining arguments are passed to the Node CLI.
+eval-focus *args:
+    node scripts/evaluation-focus-cli.mjs {{args}}
+
 # Summarize shared CLI and web live-evaluation evidence.
 eval-summary ledger="target/live-ledger":
     node scripts/evaluation-summary.mjs {{ledger}}
 
 # Fast contract tests for the shared evaluation ledger and web judge harness.
 eval-harness-test:
-    node --test scripts/evaluation-summary.test.mjs
+    node --test scripts/evaluation-summary.test.mjs scripts/evaluation-focus.test.mjs scripts/evaluation-focus-cli.test.mjs scripts/codex-app-server-probe.test.mjs
     cd crates/piku/web-ui && npm run test:harness
 
 # Run local live LLM smoke tests and write a ledger under target/live-ledger.
