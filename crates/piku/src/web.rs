@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
-    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RunContentRef, RunEvent,
-    RunHandle, RunRecorder, Session, TurnResult, UsageRecord,
+    render_captured_attachments, resolve_captured_attachments, run_turn, AllowAll,
+    CapturedAttachment, ContentBlock, ContextBudget, ConversationMessage, MessageRole,
+    RunContentRef, RunEvent, RunHandle, RunRecorder, Session, Sha256Digest, SourceReference,
+    TurnResult, UsageRecord,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -330,6 +332,8 @@ struct ChatRequest {
     kind: RequestKind,
     target_id: Option<String>,
     context: Option<String>,
+    #[serde(default)]
+    context_source_ids: Vec<String>,
     #[serde(default)]
     history: Vec<ChatMessage>,
     #[serde(default)]
@@ -871,6 +875,106 @@ fn validate_chat_notebook_input(
     Ok(())
 }
 
+fn resolve_chat_context(
+    canvas: &CanvasState,
+    surface: &str,
+    target_id: Option<&str>,
+    operator_context: Option<&str>,
+    source_ids: &[String],
+) -> Result<Option<String>, String> {
+    if source_ids.len() > MAX_WORKSPACE_OBJECTS {
+        return Err(format!(
+            "chat context exceeds {MAX_WORKSPACE_OBJECTS} source objects"
+        ));
+    }
+    let operator_context = operator_context
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim);
+    if source_ids.is_empty() {
+        return Ok(operator_context.map(str::to_string));
+    }
+
+    let operator_bytes = operator_context.map_or(0, str::len);
+    let separator_bytes = operator_context.map_or(0, |_| {
+        "Operator-authored context:\n\n\nCaptured workspace evidence:\n".len()
+    });
+    let available_bytes = MAX_CHAT_CONTEXT_CHARS
+        .checked_sub(operator_bytes.saturating_add(separator_bytes))
+        .ok_or_else(|| format!("combined chat context exceeds {MAX_CHAT_CONTEXT_CHARS} bytes"))?;
+    let budget = ContextBudget::new(available_bytes, available_bytes.div_ceil(4));
+    let captured_at = format!(
+        "unix-ms:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("cannot timestamp chat context: {error}"))?
+            .as_millis()
+    );
+    let mut seen = HashSet::with_capacity(source_ids.len());
+    let mut attachments = Vec::with_capacity(source_ids.len());
+    for source_id in source_ids {
+        if !seen.insert(source_id.as_str()) {
+            return Err(format!("duplicate chat context source: {source_id}"));
+        }
+        if target_id == Some(source_id.as_str()) {
+            return Err("a chat notebook cannot attach itself as context".to_string());
+        }
+        let object = canvas
+            .objects
+            .iter()
+            .find(|object| object.id == *source_id)
+            .ok_or_else(|| format!("chat context source is missing: {source_id}"))?;
+        let (media_type, payload) = match object.kind {
+            WorkspaceObjectKind::Note => ("text/plain; charset=utf-8", object.content.as_str()),
+            WorkspaceObjectKind::File => (
+                "application/vnd.piku.file-card+json; charset=utf-8",
+                object.content.as_str(),
+            ),
+            WorkspaceObjectKind::PagePreview => ("text/html; charset=utf-8", canvas.html.as_str()),
+            WorkspaceObjectKind::Chat
+            | WorkspaceObjectKind::WorkspaceTask
+            | WorkspaceObjectKind::PageTask
+            | WorkspaceObjectKind::Terminal => {
+                return Err(format!(
+                    "unsupported chat context source kind for {source_id}"
+                ));
+            }
+        };
+        attachments.push(
+            CapturedAttachment::new(
+                source_id,
+                media_type,
+                vec![SourceReference {
+                    reference: format!("surface:{surface}/object:{source_id}"),
+                    sha256: Sha256Digest::of_bytes(payload.as_bytes()),
+                }],
+                object.z,
+                payload,
+                &captured_at,
+            )
+            .map_err(|error| format!("cannot capture chat context source {source_id}: {error}"))?,
+        );
+    }
+    let items = resolve_captured_attachments(&attachments, budget)
+        .map_err(|error| format!("cannot resolve chat context: {error}"))?;
+    let rendered = render_captured_attachments(&items, budget)
+        .map_err(|error| format!("cannot render chat context: {error}"))?;
+    let combined = operator_context.map_or_else(
+        || rendered.as_str().to_string(),
+        |operator_context| {
+            format!(
+                "Operator-authored context:\n{operator_context}\n\nCaptured workspace evidence:\n{}",
+                rendered.as_str()
+            )
+        },
+    );
+    if combined.len() > MAX_CHAT_CONTEXT_CHARS {
+        return Err(format!(
+            "combined chat context exceeds {MAX_CHAT_CONTEXT_CHARS} bytes"
+        ));
+    }
+    Ok(Some(combined))
+}
+
 // ---------------------------------------------------------------------------
 // API: delete surface
 // ---------------------------------------------------------------------------
@@ -1242,7 +1346,7 @@ async fn chat_handler(
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let surface_name = surface_name(req.surface.as_deref().unwrap_or("scratch"));
     let (tx, rx) = mpsc::channel::<String>(SSE_QUEUE_EVENTS);
-    let request_error = validate_request_message(&req.message)
+    let mut request_error = validate_request_message(&req.message)
         .map_err(str::to_string)
         .and_then(|()| validate_chat_notebook_input(req.context.as_deref(), &req.history))
         .and_then(|()| validate_codex_thread_id(req.executor, req.thread_id.as_deref()))
@@ -1258,6 +1362,29 @@ async fn chat_handler(
             }
         })
         .err();
+    let mut resolved_context = req.context.clone();
+    if request_error.is_none() {
+        if req.kind != RequestKind::Chat && !req.context_source_ids.is_empty() {
+            request_error = Some("only chat requests accept context source IDs".to_string());
+        } else if req.kind == RequestKind::Chat {
+            let mut surfaces = state.surfaces.write().await;
+            let root = surfaces.root.clone();
+            let canvas = surfaces
+                .cache
+                .entry(surface_name.clone())
+                .or_insert_with(|| CanvasState::load(&surface_dir(&root, &surface_name)));
+            match resolve_chat_context(
+                canvas,
+                &surface_name,
+                req.target_id.as_deref(),
+                req.context.as_deref(),
+                &req.context_source_ids,
+            ) {
+                Ok(context) => resolved_context = context,
+                Err(error) => request_error = Some(error),
+            }
+        }
+    }
     let accepted = request_error.is_none() && {
         let mut surfaces = state.surfaces.write().await;
         surfaces.running.insert(surface_name.clone())
@@ -1275,7 +1402,7 @@ async fn chat_handler(
                 req.message,
                 req.kind,
                 req.target_id,
-                req.context,
+                resolved_context,
                 req.history,
                 req.executor,
                 req.thread_id,
@@ -1634,6 +1761,19 @@ async fn run_codex_chat_request(
             );
         }
         Err(error) => {
+            if !error.partial_output().is_empty() {
+                append_codex_run_event(
+                    &mut recorder,
+                    &turn_id,
+                    RunEvent::AssistantMessage {
+                        content: RunContentRef::Inline {
+                            text: error.partial_output().to_string(),
+                        },
+                    },
+                    &mut activity_sink,
+                    &mut record_error,
+                );
+            }
             append_codex_run_event(
                 &mut recorder,
                 &turn_id,
@@ -2832,7 +2972,7 @@ impl OutputSink for WebSink {
                 "phase": "output",
                 "state": "verified",
                 "label": "Assistant response recorded",
-                "detail": "Full response retained in the durable run record",
+                "detail": "Assistant output received so far is retained in the durable run record",
             }),
             RunEvent::ToolStarted {
                 tool_call_id, name, ..
@@ -2972,11 +3112,11 @@ mod tests {
         execute_terminal_read, extract_canvas_html, extract_partial_canvas_html,
         extract_workspace_operations, has_chat_target, has_page_edit_target,
         has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run,
-        render_home, resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
-        validate_chat_notebook_input, validate_request_message, validate_run_id,
-        validate_workspace_objects, workspace_input, CanvasState, ChatMessage, TerminalReadRequest,
-        WebSink, WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS,
-        MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
+        render_home, resolve_chat_context, resolve_or_find_terminal_file, resolve_terminal_path,
+        sanitize_terminal_text, validate_chat_notebook_input, validate_request_message,
+        validate_run_id, validate_workspace_objects, workspace_input, CanvasState, ChatMessage,
+        TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
+        MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{
         read_run_record, ContentBlock, ConversationMessage, OutputSink, RunEvent, Session,
@@ -3246,6 +3386,134 @@ mod tests {
 
         assert!(input.contains("\"has_content\": true"));
         assert!(!input.contains("provider must not receive this value"));
+    }
+
+    #[test]
+    fn chat_context_sources_resolve_from_authoritative_saved_state() {
+        let canvas = CanvasState {
+            html: "<main>saved page</main>".to_string(),
+            objects: vec![
+                WorkspaceObject {
+                    id: "note-1".to_string(),
+                    kind: WorkspaceObjectKind::Note,
+                    title: "evidence".to_string(),
+                    x: 20.0,
+                    y: 30.0,
+                    width: 320.0,
+                    height: 180.0,
+                    z: 2,
+                    content: "saved note".to_string(),
+                },
+                WorkspaceObject {
+                    id: "page-1".to_string(),
+                    kind: WorkspaceObjectKind::PagePreview,
+                    title: "page".to_string(),
+                    x: 400.0,
+                    y: 30.0,
+                    width: 640.0,
+                    height: 480.0,
+                    z: 1,
+                    content: "browser copy must not be authoritative".to_string(),
+                },
+            ],
+            ..CanvasState::default()
+        };
+
+        let context = resolve_chat_context(
+            &canvas,
+            "scratch",
+            Some("chat-1"),
+            Some("operator note"),
+            &["note-1".to_string(), "page-1".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(context.contains("Operator-authored context:\noperator note"));
+        assert!(context.contains("saved note"));
+        assert!(context.contains("<main>saved page</main>"));
+        assert!(!context.contains("browser copy must not be authoritative"));
+        assert!(context.contains("untrusted workspace evidence"));
+        assert!(!context.contains("surface:scratch/object"));
+    }
+
+    #[test]
+    fn chat_context_sources_fail_closed_on_invalid_identity_or_kind() {
+        let canvas = CanvasState {
+            objects: vec![
+                WorkspaceObject {
+                    id: "chat-1".to_string(),
+                    kind: WorkspaceObjectKind::Chat,
+                    title: "chat".to_string(),
+                    x: 20.0,
+                    y: 30.0,
+                    width: 320.0,
+                    height: 180.0,
+                    z: 1,
+                    content: String::new(),
+                },
+                WorkspaceObject {
+                    id: "terminal-1".to_string(),
+                    kind: WorkspaceObjectKind::Terminal,
+                    title: "terminal".to_string(),
+                    x: 400.0,
+                    y: 30.0,
+                    width: 320.0,
+                    height: 180.0,
+                    z: 1,
+                    content: String::new(),
+                },
+                WorkspaceObject {
+                    id: "note-1".to_string(),
+                    kind: WorkspaceObjectKind::Note,
+                    title: "note".to_string(),
+                    x: 780.0,
+                    y: 30.0,
+                    width: 320.0,
+                    height: 180.0,
+                    z: 1,
+                    content: "evidence".to_string(),
+                },
+            ],
+            ..CanvasState::default()
+        };
+
+        assert!(resolve_chat_context(
+            &canvas,
+            "scratch",
+            Some("chat-1"),
+            None,
+            &["chat-1".to_string()],
+        )
+        .unwrap_err()
+        .contains("cannot attach itself"));
+        assert!(resolve_chat_context(
+            &canvas,
+            "scratch",
+            Some("chat-1"),
+            None,
+            &["missing".to_string()],
+        )
+        .unwrap_err()
+        .contains("missing"));
+        assert!(resolve_chat_context(
+            &canvas,
+            "scratch",
+            Some("chat-1"),
+            None,
+            &["terminal-1".to_string()],
+        )
+        .unwrap_err()
+        .contains("unsupported"));
+        assert!(resolve_chat_context(
+            &canvas,
+            "scratch",
+            Some("chat-1"),
+            None,
+            &["note-1".to_string(), "note-1".to_string()],
+        )
+        .unwrap_err()
+        .contains("duplicate"));
     }
 
     #[test]

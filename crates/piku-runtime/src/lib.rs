@@ -7,6 +7,7 @@
 pub mod agent_loop;
 pub mod agents;
 pub mod compact;
+pub mod context;
 pub mod embed_memory;
 pub mod hooks;
 pub mod memory;
@@ -30,6 +31,13 @@ pub use agents::{
 };
 pub use compact::{
     apply_compact_summary, compact_session, should_compact, CompactionConfig, CompactionResult,
+};
+pub use context::{
+    render_captured_attachments, resolve_captured_attachments, CacheDecision, CapabilityProfile,
+    CapturedAttachment, ContextBudget, ContextError, ContextItem, ContextPayload,
+    ContextResolution, Freshness, FreshnessPolicy, OutputPlane, RenderedContext, ReplayMode,
+    ResolutionCache, ResolutionError, ResolutionRequest, ResolutionStatus, ResolverIdentity,
+    Sensitivity, Sha256Digest, SourceReference, Trust, CONTEXT_RESOLUTION_SCHEMA_VERSION,
 };
 pub use embed_memory::{
     build_extraction_transcript, default_store_path, embed_text, embed_text_with_config,

@@ -333,6 +333,7 @@ async function submitMessage(
         kind,
         target_id: targetId,
         context: options.context || null,
+        context_source_ids: options.contextSourceIds || [],
         history: options.history || [],
         executor: options.executor || "provider",
         thread_id: options.threadId || null,
@@ -1439,27 +1440,13 @@ function renderChatExecutor(object, state) {
   status.dataset.available = executor?.available ? "true" : "false";
 }
 
-function contextSourceText(object) {
-  const kind = object.dataset.kind,
-    title = object.dataset.title || kind;
-  if (kind === "page_preview")
-    return `SOURCE ${title} (${object.dataset.objectId})\n${currentPageHtml}`;
-  if (kind === "file") {
-    const state = parseFileCard(object.dataset.content || "");
-    return `SOURCE ${title} (${object.dataset.objectId})\npath: ${state.path}\nstatus: ${state.status}\n${state.output}`;
-  }
-  return `SOURCE ${title} (${object.dataset.objectId})\n${object.dataset.content || ""}`;
-}
-
 function selectedChatContext(object, state) {
   const selected = state.sources
     .map((id) => overlay.querySelector(`[data-object-id="${CSS.escape(id)}"]`))
     .filter(Boolean);
-  const pieces = [];
-  if (state.context.trim()) pieces.push(state.context.trim());
-  for (const source of selected) pieces.push(contextSourceText(source));
   return {
-    text: pieces.join("\n\n").slice(0, 24_000),
+    text: state.context.trim().slice(0, 24_000),
+    ids: selected.map((source) => source.dataset.objectId),
     labels: selected.map((source) => `${source.dataset.kind}:${source.dataset.title || source.dataset.objectId}`),
   };
 }
@@ -1734,6 +1721,7 @@ async function runChatNotebook(object, state, start, end) {
           return {
             local: true,
             context: context.text,
+            contextSourceIds: context.ids,
             contextSources: context.labels,
             history: state.threadId ? [] : history,
             executor: state.executor,

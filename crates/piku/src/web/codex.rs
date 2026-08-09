@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -58,6 +59,43 @@ pub(super) struct CodexResult {
     pub usage: Option<CodexUsage>,
 }
 
+/// A native Codex turn failure plus any assistant text received before it.
+///
+/// The partial output is kept separate from the display message so logging the
+/// error cannot accidentally duplicate conversation content.
+#[derive(Debug)]
+pub(super) struct CodexFailure {
+    message: String,
+    partial_output: String,
+}
+
+impl CodexFailure {
+    fn new(message: impl Into<String>, partial_output: String) -> Self {
+        Self {
+            message: message.into(),
+            partial_output,
+        }
+    }
+
+    pub(super) fn partial_output(&self) -> &str {
+        &self.partial_output
+    }
+}
+
+impl fmt::Display for CodexFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for CodexFailure {}
+
+impl From<anyhow::Error> for CodexFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(error.to_string(), String::new())
+    }
+}
+
 pub(super) fn readiness() -> CodexReadiness {
     let available = command_exists("codex");
     let authenticated = codex_auth_path().is_some_and(|path| path.is_file());
@@ -84,7 +122,7 @@ pub(super) async fn run_chat<F>(
     history: &[ChatMessage],
     thread_id: Option<&str>,
     mut on_event: F,
-) -> anyhow::Result<CodexResult>
+) -> Result<CodexResult, CodexFailure>
 where
     F: FnMut(CodexEvent),
 {
@@ -107,27 +145,31 @@ where
     let mut output = String::new();
     let mut usage = None;
     loop {
-        let message = server.read_message().await?;
+        let message = server
+            .read_message()
+            .await
+            .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?;
         if message.get("id").is_some() && message.get("method").is_some() {
-            return Err(anyhow!(
-                "Codex requested an interactive action outside Piku's read-only contract"
+            return Err(CodexFailure::new(
+                "Codex requested an interactive action outside Piku's read-only contract",
+                output,
             ));
         }
-        match parse_stream_event(&message) {
-            StreamEvent::Delta(delta) => {
-                output.push_str(&delta);
-                on_event(CodexEvent::Delta(delta));
-            }
-            StreamEvent::TurnStarted => {}
-            StreamEvent::Usage(value) => usage = Some(value),
-            StreamEvent::Completed => break,
-            StreamEvent::Failed(reason) => return Err(anyhow!(reason)),
-            StreamEvent::Ignore => {}
+        if apply_stream_event(
+            parse_stream_event(&message),
+            &mut output,
+            &mut usage,
+            &mut on_event,
+        )? {
+            break;
         }
     }
     server.stop().await;
     if output.trim().is_empty() {
-        return Err(anyhow!("Codex returned an empty response"));
+        return Err(CodexFailure::new(
+            "Codex returned an empty response",
+            output,
+        ));
     }
     Ok(CodexResult {
         output,
@@ -136,6 +178,31 @@ where
         turn_id,
         usage,
     })
+}
+
+fn apply_stream_event<F>(
+    event: StreamEvent,
+    output: &mut String,
+    usage: &mut Option<CodexUsage>,
+    on_event: &mut F,
+) -> Result<bool, CodexFailure>
+where
+    F: FnMut(CodexEvent),
+{
+    match event {
+        StreamEvent::Delta(delta) => {
+            output.push_str(&delta);
+            on_event(CodexEvent::Delta(delta));
+            Ok(false)
+        }
+        StreamEvent::TurnStarted | StreamEvent::Ignore => Ok(false),
+        StreamEvent::Usage(value) => {
+            *usage = Some(value);
+            Ok(false)
+        }
+        StreamEvent::Completed => Ok(true),
+        StreamEvent::Failed(reason) => Err(CodexFailure::new(reason, std::mem::take(output))),
+    }
 }
 
 pub(super) fn compose_input(
@@ -473,6 +540,46 @@ mod tests {
             })),
             StreamEvent::Ignore
         );
+    }
+
+    #[test]
+    fn preserves_streamed_assistant_text_in_typed_failure() {
+        let mut output = String::new();
+        let mut usage = None;
+        let mut observed = Vec::new();
+        let mut on_event = |event| {
+            if let CodexEvent::Delta(delta) = event {
+                observed.push(delta);
+            }
+        };
+
+        assert!(!apply_stream_event(
+            StreamEvent::Delta("partial ".into()),
+            &mut output,
+            &mut usage,
+            &mut on_event,
+        )
+        .unwrap());
+        assert!(!apply_stream_event(
+            StreamEvent::Delta("answer".into()),
+            &mut output,
+            &mut usage,
+            &mut on_event,
+        )
+        .unwrap());
+
+        let failure = apply_stream_event(
+            StreamEvent::Failed("provider failed".into()),
+            &mut output,
+            &mut usage,
+            &mut on_event,
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.to_string(), "provider failed");
+        assert_eq!(failure.partial_output(), "partial answer");
+        assert_eq!(observed, ["partial ", "answer"]);
+        assert!(output.is_empty());
     }
 
     #[test]

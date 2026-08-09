@@ -912,8 +912,9 @@ test("chat cards attach selected workspace context explicitly", async ({
     const request = route.request().postDataJSON();
     requests.push(request);
     expect(request.surface).toBe(surfaceName);
-    expect(request.context).toContain("SOURCE note");
-    expect(request.context).toContain("durable context from the board");
+    expect(request.context).toBe("Only use attached evidence.");
+    expect(request.context).not.toContain("SOURCE");
+    expect(JSON.stringify(request)).not.toContain("durable context from the board");
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
@@ -926,15 +927,30 @@ test("chat cards attach selected workspace context explicitly", async ({
     });
   });
   await addObject(page, "note", { x: 60, y: 80 });
+  const note = page.locator('[data-kind="note"]');
+  const noteId = await note.getAttribute("data-object-id");
+  expect(noteId).toMatch(/^object-/);
   await page.getByRole("textbox", { name: "Note", exact: true }).fill("durable context from the board");
   await addObject(page, "chat", { x: 680, y: 80 });
   const chat = page.locator('[data-kind="chat"]');
+  // The two existing cards cover the visible canvas. Dispatching on the canvas
+  // itself exercises its creation handler without turning a card click into a
+  // drag/focus gesture.
+  await page.locator("#canvas").dispatchEvent("click", { clientX: 900, clientY: 500 });
+  await expect(page.locator(".create-menu")).toBeVisible();
+  await page.getByRole("button", { name: "page preview", exact: true }).click();
+  const pagePreviewId = await page.locator('[data-kind="page_preview"]').getAttribute("data-object-id");
+  expect(pagePreviewId).toMatch(/^object-/);
   await chat.locator(".chat-context summary").click();
+  await chat.getByLabel("Chat context").fill("Only use attached evidence.");
   await chat.getByLabel(/note · note/).check();
+  await chat.getByLabel(/page_preview · page preview/).check();
   await chat.getByLabel("New chat turn").fill("use the attached note");
   await chat.getByRole("button", { name: "send", exact: true }).click();
   await expect(chat.locator(".chat-response")).toContainText("context received");
   await expect(page.locator('.activity-card [data-event="context"]')).toContainText("note:note");
+  expect(requests[0].context_source_ids).toEqual([noteId, pagePreviewId]);
+  expect(requests[0]).not.toHaveProperty("context_source_labels");
 
   const contextDisclosure = chat.locator(".chat-context");
   await contextDisclosure.locator("summary").click();
@@ -948,8 +964,9 @@ test("chat cards attach selected workspace context explicitly", async ({
   await expect(attachedNote).toBeChecked();
   await expect(attachedNote.locator("xpath=..")).toBeVisible();
   await expect(attachedNote.locator("xpath=..")).toContainText("note · note");
-  expect(requests[1].context).toContain("SOURCE note");
-  expect(requests[1].context).toContain("durable context from the board");
+  expect(requests[1].context).toBe("Only use attached evidence.");
+  expect(requests[1].context_source_ids).toEqual([noteId, pagePreviewId]);
+  expect(JSON.stringify(requests[1])).not.toContain("durable context from the board");
 });
 
 test("execution traces stay visibly transient and outside workspace persistence", async ({
