@@ -52,6 +52,7 @@ for (const row of originals) {
     original_product_verdict: row.product_verdict,
     product_verdict: row.product_verdict,
     finding_count: row.finding_count,
+    finding_refs: [...(row.finding_refs || [])],
     evidence_ids: [...row.evidence_ids],
     eligibility: { evidence: true, findings: true, verdict: true },
     disposition: { evidence: "original", findings: "original", verdict: "original" },
@@ -163,29 +164,31 @@ const productVerdicts = Object.fromEntries(
 const priorityRank = { high: 0, medium: 1, low: 2 };
 const rawFollowups = originals
   .flatMap((row) =>
-    (Array.isArray(row.followups) ? row.followups : []).map((followup) => ({
+    (Array.isArray(row.followups) ? row.followups : []).map((followup, followupIndex) => ({
       ...followup,
       source_run: row.run_id ?? null,
+      source_stage: row.stage_id ?? null,
       source_surface: row.surface ?? "legacy",
+      ledger_sequence: rowOrder.get(row),
+      followup_index: followupIndex,
     })),
   );
 const groupedFollowups = new Map();
 for (const followup of rawFollowups) {
-  const evidence = [...(followup.evidence_ids || [])].sort();
-  const identity = evidence.length
-    ? `${followup.kind}|${followup.perspective || "all"}|${evidence.join("\u001f")}`
-    : `${followup.kind}|${followup.perspective || "all"}|${followup.title.toLowerCase().replaceAll(/[^a-z0-9]+/g, " ").trim()}`;
+  const identity = followup.obligation_id ??
+    `legacy:${followup.ledger_sequence}:${followup.followup_index}`;
   const existing = groupedFollowups.get(identity);
   if (!existing) {
     groupedFollowups.set(identity, {
       ...followup,
+      obligation_id: followup.obligation_id ?? null,
       occurrences: 1,
-      sources: [{ run: followup.source_run, surface: followup.source_surface }],
+      sources: [{ run: followup.source_run, stage: followup.source_stage, surface: followup.source_surface }],
     });
     continue;
   }
   existing.occurrences += 1;
-  existing.sources.push({ run: followup.source_run, surface: followup.source_surface });
+  existing.sources.push({ run: followup.source_run, stage: followup.source_stage, surface: followup.source_surface });
   if ((priorityRank[followup.priority] ?? 3) < (priorityRank[existing.priority] ?? 3)) {
     const { occurrences, sources } = existing;
     Object.assign(existing, followup, { occurrences, sources });

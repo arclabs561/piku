@@ -477,7 +477,8 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
   }
   const runtime = validated.manifest.runtime || null;
   const record = evaluationRecord({
-    runId, runStatus, failureClass, durationMs: Date.now() - started,
+    runId, stageId: `synthesis-${path.basename(attemptDir)}`, runStatus, failureClass,
+    durationMs: Date.now() - started, report,
     artifactRefs: [
       path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath),
       path.relative(repoRoot, validated.promptManifest.manifestPath),
@@ -485,12 +486,10 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
     runtime,
   });
   record.perspective = "synthesis";
-  record.stage_id = `synthesis-${path.basename(attemptDir)}`;
   record.judge_model = model;
   record.product_verdict = report?.verdict === "inconclusive" ? null : report?.verdict ?? null;
   record.finding_count = report?.findings.length ?? null;
   record.evidence_ids = report?.evidence_ids ?? [];
-  record.followups = report?.followups ?? [];
   record.prompt_manifest = {
     path: path.relative(repoRoot, validated.promptManifest.manifestPath),
     sha256: validated.promptManifest.reference.sha256,
@@ -534,11 +533,33 @@ function validateCausalAssessment(causalAssessment, known, verdictEvidence = nul
     throw new Error("causal validity evidence is absent from verdict evidence");
 }
 
+function validateReportIdentities(report) {
+  const findingIds = new Set();
+  for (const finding of report.findings) {
+    if (!/^f[1-9][0-9]*$/.test(finding.id)) throw new Error("finding ID must match fN");
+    if (findingIds.has(finding.id)) throw new Error(`report contains duplicate finding ID: ${finding.id}`);
+    findingIds.add(finding.id);
+  }
+  const obligationIds = new Set();
+  for (const followup of report.followups) {
+    if (!/^o[1-9][0-9]*$/.test(followup.id)) throw new Error("followup ID must match oN");
+    if (obligationIds.has(followup.id)) throw new Error(`report contains duplicate followup ID: ${followup.id}`);
+    obligationIds.add(followup.id);
+    const unknown = followup.finding_ids.filter((id) => !findingIds.has(id));
+    if (unknown.length) throw new Error(`followup ${followup.id} cites unknown finding IDs: ${unknown.join(", ")}`);
+    if (followup.evidence_ids.length === 0 && followup.finding_ids.length === 0)
+      throw new Error(`followup ${followup.id} lacks an evidence or finding basis`);
+  }
+}
+
 export function validateExplorerReport(report) {
+  validateReportIdentities(report);
   const known = new Set(report.evidence.map((item) => item.id));
   if (known.size !== report.evidence.length) throw new Error("explorer report contains duplicate evidence IDs");
   if (report.findings.flatMap((item) => item.evidence_ids).some((id) => !known.has(id)))
     throw new Error("explorer finding cites unknown evidence");
+  if (report.followups.flatMap((item) => item.evidence_ids).some((id) => !known.has(id)))
+    throw new Error("explorer followup cites unknown evidence");
   validateCausalAssessment(report.causal_assessment, known);
   for (const item of report.evidence.filter((candidate) => candidate.kind === "screenshot")) {
     if (typeof item.artifact !== "string" || item.artifact.length === 0)
@@ -551,6 +572,7 @@ export function validateExplorerReport(report) {
 }
 
 export function validateSynthesis(report, packets) {
+  validateReportIdentities(report);
   const evidence = packets.flatMap((packet) => packet.evidence);
   const known = new Map(evidence.map((item) => [item.id, item]));
   if (known.size !== evidence.length) throw new Error("explorer packets contain duplicate evidence IDs");
@@ -887,7 +909,7 @@ export async function main() {
     await writeFile(path.join(synthesisDir, "validation-error.txt"), `${error.message}\n`, "utf8");
   }
   const record = evaluationRecord({
-    runId, runStatus, failureClass, durationMs: Date.now() - started,
+    runId, runStatus, failureClass, durationMs: Date.now() - started, report,
     artifactRefs: [
       path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath),
       path.relative(repoRoot, path.join(runDir, promptManifest.path)),
@@ -899,7 +921,6 @@ export async function main() {
   record.product_verdict = report?.verdict === "inconclusive" ? null : report?.verdict ?? null;
   record.finding_count = report?.findings.length ?? null;
   record.evidence_ids = report?.evidence_ids ?? [];
-  record.followups = report?.followups ?? [];
   record.prompt_manifest = {
     path: path.relative(repoRoot, path.join(runDir, promptManifest.path)),
     sha256: promptManifest.sha256,

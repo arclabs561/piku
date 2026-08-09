@@ -117,6 +117,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "id": { "type": "string", "pattern": "^f[1-9][0-9]*$" },
           "severity": {
             "type": "string",
             "enum": ["critical", "high", "medium", "low"]
@@ -130,6 +131,7 @@
           "suggested_fix": { "type": "string" }
         },
         "required": [
+          "id",
           "severity",
           "title",
           "evidence",
@@ -145,6 +147,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "id": { "type": "string", "pattern": "^o[1-9][0-9]*$" },
           "kind": { "type": "string", "enum": ["todo", "idea", "retest"] },
           "priority": { "type": "string", "enum": ["high", "medium", "low"] },
           "title": { "type": "string" },
@@ -153,15 +156,23 @@
           "evidence_ids": {
             "type": "array",
             "items": { "type": "string" }
-          }
+          },
+          "finding_ids": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^f[1-9][0-9]*$" }
+          },
+          "retest_of": { "type": ["string", "null"], "minLength": 1 }
         },
         "required": [
+          "id",
           "kind",
           "priority",
           "title",
           "rationale",
           "perspective",
-          "evidence_ids"
+          "evidence_ids",
+          "finding_ids",
+          "retest_of"
         ]
       }
     },

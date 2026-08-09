@@ -64,4 +64,8 @@ but treat that exact condition as evaluator noise unless separate current-run
 evidence demonstrates product impact. Do not suppress or reclassify unrelated
 `SecurityError` messages.
 Return only JSON matching the supplied schema, including useful todo, idea, and
-retest followups for future runs.
+retest followups for future runs. Number findings locally as `f1`, `f2`, and so
+on, and followups as `o1`, `o2`, and so on. Every followup must cite at least one
+current evidence ID or local finding ID. Use `retest_of` only for an exact prior
+fully scoped obligation ID present in the historical ledger; otherwise use null.
+Never infer obligation identity from similar prose or overlapping evidence.

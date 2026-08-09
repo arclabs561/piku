@@ -10,6 +10,7 @@ import {
   evaluationAmendment,
   evaluationRecord,
   evaluationRuntimeMetadata,
+  projectReportIdentity,
 } from "./evaluation-ledger.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +43,12 @@ test("agent QA contract evaluates the product thesis, not only UI mechanics", as
   assert.match(prompt, /status.*evaluation journey/s);
   assert.match(prompt, /product_thesis\.verdict.*product/s);
   assert.match(runner, /supported thesis verdict contradicts dimension evidence/);
+  assert.match(prompt, /Number findings locally as `f1`/);
+  assert.match(prompt, /`retest_of` only to an exact prior fully scoped obligation ID/);
+  const parsedSchema = JSON.parse(schema);
+  assert.equal(parsedSchema.properties.findings.items.properties.id.pattern, "^f[1-9][0-9]*$");
+  for (const field of ["id", "finding_ids", "evidence_ids", "retest_of"])
+    assert.ok(parsedSchema.properties.followups.items.required.includes(field));
 });
 
 test("parallel evaluation separates causal mechanisms from verdicts", async () => {
@@ -140,9 +147,103 @@ test("web records satisfy the shared CLI and web envelope", async () => {
   for (const field of schema.required) {
     assert.ok(Object.hasOwn(record, field), `missing shared field: ${field}`);
   }
-  assert.equal(record.schema_version, schema.properties.schema_version.const);
+  assert.ok(schema.properties.schema_version.enum.includes(record.schema_version));
   assert.ok(schema.properties.surface.enum.includes(record.surface));
   assert.ok(schema.properties.run_status.enum.includes(record.run_status));
+});
+
+test("v2 report identities are scoped by run and stage without prose matching", () => {
+  const report = {
+    findings: [
+      { id: "f1", title: "same prose" },
+      { id: "f2", title: "same prose" },
+    ],
+    followups: [
+      {
+        id: "o1", kind: "retest", priority: "high", title: "same prose",
+        rationale: "same rationale", perspective: null, evidence_ids: [],
+        finding_ids: ["f2"], retest_of: "prior:stage:obligation:o7",
+      },
+    ],
+  };
+  const projected = projectReportIdentity(report, "run-a", "synthesis");
+  assert.deepEqual(projected.findingRefs, [
+    "run-a:synthesis:finding:f1",
+    "run-a:synthesis:finding:f2",
+  ]);
+  assert.deepEqual(projected.followups[0], {
+    obligation_id: "run-a:synthesis:obligation:o1",
+    kind: "retest",
+    priority: "high",
+    title: "same prose",
+    rationale: "same rationale",
+    perspective: null,
+    evidence_ids: [],
+    finding_refs: ["run-a:synthesis:finding:f2"],
+    retest_of: "prior:stage:obligation:o7",
+  });
+});
+
+test("single-agent reports become valid v2 scoped ledger records", () => {
+  const report = {
+    product_thesis: { verdict: "partial" },
+    findings: [{ id: "f1", title: "Attribution gap" }],
+    followups: [{
+      id: "o1", kind: "retest", priority: "high", title: "Retest attribution",
+      rationale: "Fresh evidence is needed", perspective: "trust",
+      evidence_ids: [], finding_ids: ["f1"], retest_of: null,
+    }],
+  };
+  const record = evaluationRecord({
+    runId: "single-run", surface: "qa-single", runStatus: "product_failure",
+    failureClass: "high_impact_finding", durationMs: 12, report,
+  });
+  assert.equal(record.schema_version, 2);
+  assert.deepEqual(record.finding_refs, ["single-run:qa-single:finding:f1"]);
+  assert.equal(record.followups[0].obligation_id, "single-run:qa-single:obligation:o1");
+  assert.deepEqual(record.followups[0].finding_refs, record.finding_refs);
+  assert.doesNotThrow(() => assertEvaluationEnvelope(record));
+});
+
+test("v2 report identities require explicit basis and valid local references", () => {
+  const base = {
+    findings: [{ id: "f1" }],
+    followups: [{
+      id: "o1", kind: "todo", priority: "high", title: "t", rationale: "r",
+      perspective: null, evidence_ids: [], finding_ids: [], retest_of: null,
+    }],
+  };
+  assert.throws(() => projectReportIdentity(base, "run", "stage"), /must cite evidence_ids or finding_ids/);
+  base.followups[0].finding_ids = ["f2"];
+  assert.throws(() => projectReportIdentity(base, "run", "stage"), /unknown finding ID f2/);
+});
+
+test("shared validator reads v1 records and enforces v2 obligation integrity", () => {
+  const current = evaluationRecord({
+    runId: "run-v2", runStatus: "completed", failureClass: "none", durationMs: 1,
+  });
+  const legacy = structuredClone(current);
+  legacy.schema_version = 1;
+  delete legacy.finding_refs;
+  assert.doesNotThrow(() => assertEvaluationEnvelope(legacy));
+
+  const invalid = structuredClone(current);
+  invalid.followups = [{
+    obligation_id: "run-v2:synthesis:obligation:o1", kind: "todo", priority: "high",
+    title: "t", rationale: "r", perspective: null, evidence_ids: [],
+    finding_refs: [], retest_of: null,
+  }];
+  assert.throws(() => assertEvaluationEnvelope(invalid), /must cite evidence_ids or finding_refs/);
+  invalid.followups[0].finding_refs = ["run-v2:synthesis:finding:f9"];
+  assert.throws(() => assertEvaluationEnvelope(invalid), /unknown top-level finding ref/);
+
+  const duplicate = structuredClone(current);
+  duplicate.followups = [1, 2].map(() => ({
+    obligation_id: "run-v2:synthesis:obligation:o1", kind: "todo", priority: "high",
+    title: "t", rationale: "r", perspective: null, evidence_ids: ["e1"],
+    finding_refs: [], retest_of: null,
+  }));
+  assert.throws(() => assertEvaluationEnvelope(duplicate), /obligation_id values must be unique/);
 });
 
 test("ledger rejects invalid records before creating or appending a file", async () => {
@@ -189,7 +290,7 @@ test("evaluation amendments retain their target and causal basis", () => {
   assert.equal(record.target_stage_id, target.stage_id);
   assert.notEqual(record.stage_id, target.stage_id);
   assert.equal(record.event_id, "amendment-event-1");
-  assert.equal(record.contract_version, "piku-evaluation-amendment-v1");
+  assert.equal(record.contract_version, "piku-evaluation-amendment-v2");
   assert.equal(record.product_verdict, null);
   assert.deepEqual(record.basis_refs, ["audit.json"]);
   assert.throws(
@@ -209,5 +310,5 @@ test("live evaluation metadata records exact subject and evaluator versions", ()
   assert.equal(typeof runtime.subject_dirty, "boolean");
   assert.match(runtime.evaluator_version, /^codex-cli \d+/);
   assert.equal(runtime.explorer_model, "gpt-5.6-sol");
-  assert.equal(runtime.evaluation_contract, "piku-evaluation-v1");
+  assert.equal(runtime.evaluation_contract, "piku-evaluation-v2");
 });

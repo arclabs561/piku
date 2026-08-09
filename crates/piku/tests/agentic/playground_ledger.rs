@@ -1,5 +1,6 @@
 //! Append-only evidence records for opt-in terminal playground runs.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,8 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-pub const EVALUATION_CONTRACT: &str = "piku-evaluation-envelope-v1";
+pub const EVALUATION_CONTRACT: &str = "piku-evaluation-envelope-v2";
 pub const EVALUATOR_VERSION: &str = concat!("agentic-playground-rust/", env!("CARGO_PKG_VERSION"));
+pub const EVALUATION_STAGE_ID: &str = "summary";
 
 #[derive(Debug, Serialize)]
 pub struct PromptManifest {
@@ -355,6 +357,8 @@ pub struct ImprovementHandoffRecord<'a> {
     pub run_id: &'a str,
     pub timestamp_secs: u64,
     pub persona: &'a str,
+    /// Stable origin-scoped identifier used by shared-envelope projections.
+    pub evidence_id: &'a str,
     pub verified_findings: &'a [String],
     pub hypotheses: &'a [String],
     pub next_action: &'static str,
@@ -398,6 +402,7 @@ pub struct EvaluationSummaryRecord<'a> {
     pub product_verdict: Option<&'a str>,
     pub finding_count: usize,
     pub evidence_ids: &'a [String],
+    pub finding_refs: &'a [String],
     pub artifact_refs: &'a [String],
     pub followups: &'a [EvaluationFollowup],
     pub duration_ms: u64,
@@ -411,38 +416,102 @@ pub struct PromptManifestReference<'a> {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct EvaluationFollowup {
+    pub obligation_id: String,
     pub kind: &'static str,
     pub priority: &'static str,
     pub title: String,
     pub rationale: String,
     pub perspective: Option<String>,
     pub evidence_ids: Vec<String>,
+    pub finding_refs: Vec<String>,
+    pub retest_of: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedFinding {
+    pub finding_ref: String,
+    pub rationale: String,
+    pub evidence_ids: Vec<String>,
 }
 
 #[must_use]
 pub fn evaluation_followups(
+    run_id: &str,
+    stage_id: &str,
     persona: &str,
-    verified_findings: &[String],
+    evidence_id: &str,
+    findings: &[ProjectedFinding],
     hypotheses: &[String],
 ) -> Vec<EvaluationFollowup> {
-    let mut followups = Vec::with_capacity(verified_findings.len() + hypotheses.len());
-    followups.extend(verified_findings.iter().map(|finding| EvaluationFollowup {
-        kind: "todo",
-        priority: "high",
-        title: bounded_title(finding, "Address verified finding"),
-        rationale: finding.clone(),
-        perspective: Some(persona.to_string()),
-        evidence_ids: Vec::new(),
-    }));
-    followups.extend(hypotheses.iter().map(|hypothesis| EvaluationFollowup {
-        kind: "retest",
-        priority: "medium",
-        title: bounded_title(hypothesis, "Reproduce hypothesis"),
-        rationale: hypothesis.clone(),
-        perspective: Some(persona.to_string()),
-        evidence_ids: Vec::new(),
-    }));
+    let mut followups = Vec::with_capacity(findings.len() + hypotheses.len());
+    for finding in findings {
+        let obligation_id = scoped_obligation_ref(run_id, stage_id, followups.len() + 1);
+        followups.push(EvaluationFollowup {
+            obligation_id,
+            kind: "todo",
+            priority: "high",
+            title: bounded_title(&finding.rationale, "Address verified finding"),
+            rationale: finding.rationale.clone(),
+            perspective: Some(persona.to_string()),
+            evidence_ids: finding.evidence_ids.clone(),
+            finding_refs: vec![finding.finding_ref.clone()],
+            retest_of: None,
+        });
+    }
+    let mut seen_hypotheses = HashSet::new();
+    for hypothesis in hypotheses {
+        if !seen_hypotheses.insert(hypothesis) {
+            continue;
+        }
+        let obligation_id = scoped_obligation_ref(run_id, stage_id, followups.len() + 1);
+        followups.push(EvaluationFollowup {
+            obligation_id,
+            kind: "retest",
+            priority: "medium",
+            title: bounded_title(hypothesis, "Reproduce hypothesis"),
+            rationale: hypothesis.clone(),
+            perspective: Some(persona.to_string()),
+            evidence_ids: vec![evidence_id.to_string()],
+            finding_refs: Vec::new(),
+            // This run creates a new retest obligation. There is no predecessor
+            // unless a prior obligation was explicitly carried into this run.
+            retest_of: None,
+        });
+    }
     followups
+}
+
+#[must_use]
+pub fn project_verified_findings(
+    run_id: &str,
+    stage_id: &str,
+    evidence_id: &str,
+    verified_findings: &[String],
+) -> Vec<ProjectedFinding> {
+    let mut seen = HashSet::new();
+    verified_findings
+        .iter()
+        .filter(|finding| seen.insert((*finding).clone()))
+        .enumerate()
+        .map(|(index, finding)| ProjectedFinding {
+            finding_ref: scoped_finding_ref(run_id, stage_id, index + 1),
+            rationale: finding.clone(),
+            evidence_ids: vec![evidence_id.to_string()],
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn improvement_handoff_evidence_id(run_id: &str) -> String {
+    format!("tui:{run_id}:improvement-handoff")
+}
+
+fn scoped_finding_ref(run_id: &str, stage_id: &str, local_id: usize) -> String {
+    format!("{run_id}:{stage_id}:finding:f{local_id}")
+}
+
+fn scoped_obligation_ref(run_id: &str, stage_id: &str, local_id: usize) -> String {
+    format!("{run_id}:{stage_id}:obligation:o{local_id}")
 }
 
 fn bounded_title(value: &str, fallback: &str) -> String {
@@ -955,11 +1024,13 @@ mod tests {
 
     fn summary_record<'a>(
         ledger: &'a PlaygroundLedger,
+        evidence_ids: &'a [String],
+        finding_refs: &'a [String],
         artifacts: &'a [String],
         followups: &'a [EvaluationFollowup],
     ) -> EvaluationSummaryRecord<'a> {
         EvaluationSummaryRecord {
-            schema_version: 1,
+            schema_version: 2,
             run_id: ledger.run_id(),
             record_kind: "stage",
             stage_id: "summary",
@@ -984,8 +1055,9 @@ mod tests {
             run_status: "product_failure",
             failure_class: "observed_product_behavior",
             product_verdict: Some("not_supported"),
-            finding_count: 2,
-            evidence_ids: &[],
+            finding_count: finding_refs.len(),
+            evidence_ids,
+            finding_refs,
             artifact_refs: artifacts,
             followups,
             duration_ms: 42,
@@ -999,9 +1071,34 @@ mod tests {
         let ledger = PlaygroundLedger::open_at(detailed_path.clone()).unwrap();
         let verified = vec!["[scenario:fixture] acceptance failed".to_string()];
         let hypotheses = vec!["[unreviewed] rerun after fixing output".to_string()];
-        let followups = evaluation_followups("confident_dev", &verified, &hypotheses);
+        let evidence_id = improvement_handoff_evidence_id(ledger.run_id());
+        let evidence_ids = vec![evidence_id.clone()];
+        let projected_findings = project_verified_findings(
+            ledger.run_id(),
+            EVALUATION_STAGE_ID,
+            &evidence_id,
+            &verified,
+        );
+        let finding_refs = projected_findings
+            .iter()
+            .map(|finding| finding.finding_ref.clone())
+            .collect::<Vec<_>>();
+        let followups = evaluation_followups(
+            ledger.run_id(),
+            EVALUATION_STAGE_ID,
+            "confident_dev",
+            &evidence_id,
+            &projected_findings,
+            &hypotheses,
+        );
         let artifacts = vec![detailed_path.display().to_string()];
-        let summary = summary_record(&ledger, &artifacts, &followups);
+        let summary = summary_record(
+            &ledger,
+            &evidence_ids,
+            &finding_refs,
+            &artifacts,
+            &followups,
+        );
         let shared_path = directory.path().join("live-ledger/playground.jsonl");
 
         append_json_line(&shared_path, &summary).unwrap();
@@ -1009,6 +1106,7 @@ mod tests {
         let lines = fs::read_to_string(shared_path).unwrap();
         assert_eq!(lines.lines().count(), 1);
         let row: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(row["schema_version"], 2);
         assert_eq!(row["record_kind"], "stage");
         assert_eq!(row["stage_id"], "summary");
         assert_eq!(row["run_status"], "product_failure");
@@ -1021,8 +1119,65 @@ mod tests {
         );
         assert_eq!(row["followups"][0]["kind"], "todo");
         assert_eq!(row["followups"][1]["kind"], "retest");
+        assert_eq!(row["finding_count"], 1);
+        assert_eq!(row["finding_refs"][0], finding_refs[0]);
+        assert_eq!(row["evidence_ids"][0], evidence_id);
+        assert_eq!(row["followups"][0]["finding_refs"][0], finding_refs[0]);
+        assert_eq!(
+            row["followups"][0]["obligation_id"],
+            format!("{}:summary:obligation:o1", ledger.run_id())
+        );
+        assert_eq!(row["followups"][0]["retest_of"], serde_json::Value::Null);
+        assert_eq!(
+            row["followups"][1]["obligation_id"],
+            format!("{}:summary:obligation:o2", ledger.run_id())
+        );
+        assert_eq!(row["followups"][1]["retest_of"], serde_json::Value::Null);
+        assert_eq!(row["followups"][1]["finding_refs"], serde_json::json!([]));
+        assert_eq!(row["followups"][0]["evidence_ids"][0], evidence_id);
+        assert_ne!(
+            row["followups"][0]["obligation_id"],
+            row["followups"][1]["obligation_id"]
+        );
         assert_eq!(followups[0].rationale, verified[0]);
         assert_eq!(followups[1].rationale, hypotheses[0]);
+    }
+
+    #[test]
+    fn projected_ids_are_stable_scoped_and_deduplicated() {
+        let findings = vec!["same verified finding".to_string(); 2];
+        let hypotheses = vec!["same hypothesis".to_string(); 2];
+        let evidence_id = improvement_handoff_evidence_id("run-a");
+        let projected =
+            project_verified_findings("run-a", EVALUATION_STAGE_ID, &evidence_id, &findings);
+        let refs = projected
+            .iter()
+            .map(|finding| finding.finding_ref.clone())
+            .collect::<Vec<_>>();
+        let followups = evaluation_followups(
+            "run-a",
+            EVALUATION_STAGE_ID,
+            "tester",
+            &evidence_id,
+            &projected,
+            &hypotheses,
+        );
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(followups.len(), 2);
+        assert_eq!(followups[0].finding_refs, refs);
+        assert_eq!(followups[0].evidence_ids, vec![evidence_id.clone()]);
+        assert_eq!(followups[1].evidence_ids, vec![evidence_id.clone()]);
+        assert_eq!(refs, vec!["run-a:summary:finding:f1"]);
+        assert_eq!(followups[0].obligation_id, "run-a:summary:obligation:o1");
+        assert_eq!(followups[1].obligation_id, "run-a:summary:obligation:o2");
+        assert!(followups[1].retest_of.is_none());
+        let other_run =
+            project_verified_findings("run-b", EVALUATION_STAGE_ID, &evidence_id, &findings);
+        assert_ne!(
+            vec![other_run[0].finding_ref.clone()],
+            followups[0].finding_refs
+        );
     }
 
     fn prompt_manifest(run_id: &str, prompt: &str) -> PromptManifest {
@@ -1419,6 +1574,7 @@ mod tests {
                 run_id: ledger.run_id(),
                 timestamp_secs: 1,
                 persona: "tester",
+                evidence_id: "tui:run:improvement-handoff",
                 verified_findings: &verified,
                 hypotheses: &hypotheses,
                 next_action: "reproduce_verified_findings_then_fix",

@@ -1,4 +1,5 @@
-export const EVALUATION_SCHEMA_VERSION = 1;
+export const EVALUATION_SCHEMA_VERSION = 2;
+const READABLE_SCHEMA_VERSIONS = new Set([1, EVALUATION_SCHEMA_VERSION]);
 
 const RUN_STATUSES = new Set([
   "completed",
@@ -14,6 +15,8 @@ const AMENDMENT_ACTIONS = new Set(["invalidate", "qualify", "supersede", "reinst
 const SURFACES = new Set(["cli", "tui", "web"]);
 const FOLLOWUP_KINDS = new Set(["todo", "idea", "retest"]);
 const PRIORITIES = new Set(["high", "medium", "low"]);
+const FINDING_REF = /^[^:]+:[^:]+:finding:f[1-9][0-9]*$/;
+const OBLIGATION_REF = /^[^:]+:[^:]+:obligation:o[1-9][0-9]*$/;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -32,13 +35,18 @@ function stringArray(value, allowEmptyStrings = false) {
     typeof item === "string" && (allowEmptyStrings || item.length > 0));
 }
 
-function validateFollowup(followup, index, errors) {
+function validateFollowup(followup, index, errors, schemaVersion) {
   const prefix = `followups[${index}]`;
   if (!isObject(followup)) {
     errors.push(`${prefix} must be an object`);
     return;
   }
   const expected = new Set(["kind", "priority", "title", "rationale", "perspective", "evidence_ids"]);
+  if (schemaVersion >= 2) {
+    expected.add("obligation_id");
+    expected.add("finding_refs");
+    expected.add("retest_of");
+  }
   for (const field of expected) {
     if (!Object.hasOwn(followup, field)) errors.push(`${prefix}.${field} is required`);
   }
@@ -51,6 +59,20 @@ function validateFollowup(followup, index, errors) {
   if (!nonEmptyString(followup.rationale)) errors.push(`${prefix}.rationale must be a non-empty string`);
   if (!nullableString(followup.perspective)) errors.push(`${prefix}.perspective must be a string or null`);
   if (!stringArray(followup.evidence_ids)) errors.push(`${prefix}.evidence_ids must contain non-empty strings`);
+  if (schemaVersion >= 2) {
+    if (!nonEmptyString(followup.obligation_id))
+      errors.push(`${prefix}.obligation_id must be a non-empty string`);
+    else if (!OBLIGATION_REF.test(followup.obligation_id))
+      errors.push(`${prefix}.obligation_id must be a scoped obligation reference`);
+    if (!stringArray(followup.finding_refs))
+      errors.push(`${prefix}.finding_refs must contain non-empty strings`);
+    if (!nullableString(followup.retest_of))
+      errors.push(`${prefix}.retest_of must be a string or null`);
+    else if (followup.retest_of !== null && !OBLIGATION_REF.test(followup.retest_of))
+      errors.push(`${prefix}.retest_of must be a scoped obligation reference or null`);
+    if (followup.evidence_ids?.length === 0 && followup.finding_refs?.length === 0)
+      errors.push(`${prefix} must cite evidence_ids or finding_refs`);
+  }
 }
 
 function validateAmendment(record, errors) {
@@ -104,8 +126,8 @@ export function evaluationEnvelopeErrors(record) {
   for (const field of requiredStrings) {
     if (!nonEmptyString(record[field])) errors.push(`${field} must be a non-empty string`);
   }
-  if (record.schema_version !== EVALUATION_SCHEMA_VERSION)
-    errors.push(`schema_version must equal ${EVALUATION_SCHEMA_VERSION}`);
+  if (!READABLE_SCHEMA_VERSIONS.has(record.schema_version))
+    errors.push(`schema_version must be 1 or ${EVALUATION_SCHEMA_VERSION}`);
   if (!SURFACES.has(record.surface)) errors.push("surface must be cli, tui, or web");
   if (!RUN_STATUSES.has(record.run_status)) errors.push("run_status is invalid");
   if (!PRODUCT_VERDICTS.has(record.product_verdict)) errors.push("product_verdict is invalid");
@@ -114,7 +136,24 @@ export function evaluationEnvelopeErrors(record) {
   if (!stringArray(record.evidence_ids)) errors.push("evidence_ids must contain non-empty strings");
   if (!stringArray(record.artifact_refs)) errors.push("artifact_refs must contain non-empty strings");
   if (!Array.isArray(record.followups)) errors.push("followups must be an array");
-  else record.followups.forEach((followup, index) => validateFollowup(followup, index, errors));
+  else record.followups.forEach((followup, index) => validateFollowup(followup, index, errors, record.schema_version));
+  if (record.schema_version >= 2) {
+    if (!stringArray(record.finding_refs)) errors.push("finding_refs must contain non-empty strings");
+    else if (record.finding_refs.some((reference) => !FINDING_REF.test(reference)))
+      errors.push("finding_refs must contain scoped finding references");
+    const findingRefs = new Set(record.finding_refs || []);
+    if (findingRefs.size !== (record.finding_refs || []).length)
+      errors.push("finding_refs must be unique");
+    const obligations = record.followups?.map((followup) => followup.obligation_id) || [];
+    if (new Set(obligations).size !== obligations.length)
+      errors.push("followup obligation_id values must be unique");
+    for (const [index, followup] of (record.followups || []).entries()) {
+      for (const findingRef of followup.finding_refs || []) {
+        if (!findingRefs.has(findingRef))
+          errors.push(`followups[${index}].finding_refs cites an unknown top-level finding ref`);
+      }
+    }
+  }
   if (!(Number.isInteger(record.duration_ms) && record.duration_ms >= 0))
     errors.push("duration_ms must be a non-negative integer");
 

@@ -132,12 +132,13 @@ test("cross-surface summary preserves prioritized judge followups", async () => 
     assert.equal(summary.legacy_records, 0);
     assert.equal(summary.quarantined_records, 0);
     assert.deepEqual(summary.product_verdicts, { partial: 1, unjudged: 2 });
-    assert.equal(summary.followup_count, 2);
+    assert.equal(summary.followup_count, 3);
     assert.equal(summary.raw_followup_count, 3);
     assert.equal(summary.followups[0].title, "Retest provenance");
     assert.equal(summary.followups[0].source_run, "web-1");
-    assert.equal(summary.followups[0].occurrences, 2);
-    assert.equal(summary.followups[1].title, "Try another model");
+    assert.equal(summary.followups[0].occurrences, 1);
+    assert.equal(summary.followups[1].title, "Run provenance again");
+    assert.equal(summary.followups[2].title, "Try another model");
     assert.match(await readFile(path.join(directory, "runs.jsonl"), "utf8"), /web-1/);
   } finally {
     await rm(directory, { recursive: true });
@@ -173,6 +174,47 @@ test("summary separates legacy rows and quarantines invalid versioned rows", asy
     assert.match(summary.quarantine[2].source, /mixed\.jsonl:5$/);
     assert.match(summary.quarantine[3].source, /mixed\.jsonl:6$/);
     assert.ok(summary.quarantine[3].errors.some((error) => error.includes("stage_id is required")));
+  } finally {
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("v2 summary preserves explicit obligation and retest lineage", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "piku-eval-v2-lineage-"));
+  try {
+    const first = envelope({
+      schema_version: 2,
+      run_id: "run-1",
+      finding_refs: ["run-1:result:finding:f1"],
+      followups: [{
+        obligation_id: "run-1:result:obligation:o1",
+        kind: "todo", priority: "high", title: "Same title", rationale: "First",
+        perspective: null, evidence_ids: [],
+        finding_refs: ["run-1:result:finding:f1"], retest_of: null,
+      }],
+    });
+    const second = envelope({
+      schema_version: 2,
+      run_id: "run-2",
+      finding_refs: [],
+      followups: [{
+        obligation_id: "run-2:result:obligation:o1",
+        kind: "retest", priority: "high", title: "Same title", rationale: "Second",
+        perspective: null, evidence_ids: ["e2"], finding_refs: [],
+        retest_of: "run-1:result:obligation:o1",
+      }],
+    });
+    await writeFile(path.join(directory, "runs.jsonl"),
+      `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`);
+    const result = spawnSync(process.execPath, [path.resolve("scripts/evaluation-summary.mjs"), directory], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.followup_count, 2);
+    const retest = summary.followups.find((item) => item.retest_of !== null);
+    assert.equal(retest.obligation_id, "run-2:result:obligation:o1");
+    assert.equal(retest.retest_of, "run-1:result:obligation:o1");
   } finally {
     await rm(directory, { recursive: true });
   }

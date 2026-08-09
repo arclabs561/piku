@@ -4,7 +4,7 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "enum": [1, 2] },
     "run_id": { "type": "string", "minLength": 1 },
     "record_kind": { "type": "string", "enum": ["run", "stage", "amendment"] },
     "stage_id": { "type": "string", "minLength": 1 },
@@ -39,6 +39,11 @@
       "enum": ["supported", "partial", "not_supported", null]
     },
     "finding_count": { "type": ["integer", "null"], "minimum": 0 },
+    "finding_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[^:]+:[^:]+:finding:f[1-9][0-9]*$" }
+    },
     "evidence_ids": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
@@ -61,6 +66,15 @@
           "evidence_ids": {
             "type": "array",
             "items": { "type": "string", "minLength": 1 }
+          },
+          "obligation_id": { "type": "string", "pattern": "^[^:]+:[^:]+:obligation:o[1-9][0-9]*$" },
+          "finding_refs": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[^:]+:[^:]+:finding:f[1-9][0-9]*$" }
+          },
+          "retest_of": {
+            "type": ["string", "null"],
+            "pattern": "^[^:]+:[^:]+:obligation:o[1-9][0-9]*$"
           }
         },
         "required": [
@@ -126,6 +140,26 @@
     "duration_ms"
   ],
   "allOf": [
+    {
+      "if": { "properties": { "schema_version": { "const": 2 } } },
+      "then": {
+        "required": ["finding_refs"],
+        "properties": {
+          "followups": {
+            "items": {
+              "anyOf": [
+                { "properties": { "evidence_ids": { "minItems": 1 } } },
+                { "properties": { "finding_refs": { "minItems": 1 } } }
+              ],
+              "required": [
+                "kind", "priority", "title", "rationale", "perspective",
+                "evidence_ids", "obligation_id", "finding_refs", "retest_of"
+              ]
+            }
+          }
+        }
+      }
+    },
     {
       "if": { "properties": { "record_kind": { "const": "amendment" } } },
       "then": {

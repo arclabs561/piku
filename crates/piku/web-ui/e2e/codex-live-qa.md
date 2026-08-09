@@ -128,6 +128,11 @@ Use `todo` for a concrete harness or evaluation action, `idea` for an unproven
 hypothesis, and `retest` for a prior capability that needs fresh evidence. Give
 each a priority, rationale, suggested perspective, and the evidence IDs that
 motivated it. Do not disguise an unsupported finding as a todo.
+Number findings locally as `f1`, `f2`, and so on, and followups as `o1`, `o2`,
+and so on. Every followup must cite at least one concrete evidence ID or local
+finding ID. Set `retest_of` only to an exact prior fully scoped obligation ID
+when that lineage is known; otherwise use null. Similar prose or overlapping
+evidence does not establish identity.
 
 Delete the temporary surface through the visible UI and close the headless
 browser. Cleanup failure belongs in REFLECT evidence. Return only the JSON

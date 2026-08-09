@@ -67,7 +67,7 @@ test("synthesis rejects a supported verdict that contains a high finding", () =>
     evidence_ids: ["coding_trace:one", "recovery:one"],
     causal_assessment: causal(),
     coverage: coverage(),
-    findings: [{ severity: "high", title: "contradiction", modality: "persistence", evidence_ids: ["coding_trace:one"] }],
+    findings: [{ id: "f1", severity: "high", title: "contradiction", modality: "persistence", evidence_ids: ["coding_trace:one"] }],
     followups: [],
   };
   assert.throws(() => validateSynthesis(report, packets), /cannot contain a high-severity/);
@@ -200,6 +200,7 @@ test("explorer causal citations and producer provenance fail closed", () => {
   const base = {
     evidence: [{ id: "coding_trace:one", kind: "predicate", artifact: null, artifact_metadata: null }],
     findings: [],
+    followups: [],
     causal_assessment: {
       hypotheses: [{ id: "h1", disposition: "supported", evidence_ids: [] }],
       validity: { status: "valid", compromised_by: [], evidence_ids: [] },
@@ -244,11 +245,11 @@ test("synthesis findings require modality evidence and verdict coverage", () => 
     evidence_ids: ["coding_trace:dom", "recovery:state"],
     causal_assessment: causal(["coding_trace:dom", "recovery:state"]),
     coverage: coverage(["coding_trace:dom"], ["recovery:state"]),
-    findings: [{ severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:dom"] }],
+    findings: [{ id: "f1", severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:dom"] }],
     followups: [],
   };
   assert.throws(() => validateSynthesis(report, packets), /lacks visual-appropriate evidence/);
-  report.findings[0] = { severity: "medium", title: "state loss", modality: "persistence", evidence_ids: ["recovery:state"] };
+  report.findings[0] = { id: "f1", severity: "medium", title: "state loss", modality: "persistence", evidence_ids: ["recovery:state"] };
   report.evidence_ids = ["coding_trace:dom"];
   assert.throws(() => validateSynthesis(report, packets), /absent from verdict evidence/);
 });
@@ -263,7 +264,7 @@ test("visual findings require an attested PNG screenshot", () => {
     evidence_ids: ["coding_trace:screen", "recovery:state"],
     causal_assessment: causal(["coding_trace:screen", "recovery:state"]),
     coverage: coverage(["coding_trace:screen"], ["recovery:state"]),
-    findings: [{ severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:screen"] }],
+    findings: [{ id: "f1", severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:screen"] }],
     followups: [],
   };
   assert.throws(() => validateSynthesis(report, packets), /unattested screenshot/);
@@ -280,8 +281,8 @@ test("synthesis accepts cited, attested, modality-appropriate evidence from both
     causal_assessment: causal(["coding_trace:screen", "recovery:state"]),
     coverage: coverage(["coding_trace:screen"], ["recovery:state"]),
     findings: [
-      { severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:screen"] },
-      { severity: "medium", title: "state loss", modality: "persistence", evidence_ids: ["recovery:state"] },
+      { id: "f1", severity: "medium", title: "visual overlap", modality: "visual", evidence_ids: ["coding_trace:screen"] },
+      { id: "f2", severity: "medium", title: "state loss", modality: "persistence", evidence_ids: ["recovery:state"] },
     ],
     followups: [],
   };
@@ -392,6 +393,7 @@ async function writeResumeFixture(root, runId, statuses = { coding_trace: "compl
       request_id: `${runId}:${role}`,
       evidence: [{ id: evidenceId, kind: "predicate", artifact: null, artifact_metadata: null }],
       findings: [],
+      followups: [],
       causal_assessment: {
         hypotheses: [{ id: "h1", disposition: "supported", evidence_ids: [evidenceId] }],
         validity: { status: "valid", compromised_by: [], evidence_ids: [evidenceId] },

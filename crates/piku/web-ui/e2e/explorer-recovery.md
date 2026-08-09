@@ -95,5 +95,9 @@ classification cannot support a product finding.
 Delete the surface through the UI and close the browser before returning. Return
 only JSON matching the supplied schema. Include concrete todo, idea, or retest
 followups that would help a later run; do not turn speculation into a finding.
+Number findings locally as `f1`, `f2`, and so on, and followups as `o1`, `o2`,
+and so on. A followup must cite at least one current `evidence_id` or local
+`finding_id`. Set `retest_of` to a prior fully scoped obligation ID only when
+that exact lineage is known; otherwise use null. Similar wording is not identity.
 Set every `artifact_metadata` to null; the harness attests artifact bytes after
 your report is validated.

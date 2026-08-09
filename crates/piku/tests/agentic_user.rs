@@ -60,12 +60,13 @@ mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    evaluation_followups, now_secs, AttentionMetrics, AttestedValue, ConfigRecord, ControlMetrics,
-    DevelopmentContextRecord, EvaluationSummaryRecord, EvidenceMetrics, ImprovementHandoffRecord,
-    ObserverClaimRecord, ObserverRecord, OutcomeMetrics, PlaygroundLedger, PrincipleMetricsRecord,
-    PromptManifest, PromptManifestEvaluator, PromptManifestReference, PromptManifestRole,
-    PromptManifestSubject, ReviewClaimRecord, ReviewRecord, RunEvidenceRecord,
-    ScenarioContractRecord, SpendRecord, TurnRecord, EVALUATION_CONTRACT, EVALUATOR_VERSION,
+    evaluation_followups, improvement_handoff_evidence_id, now_secs, project_verified_findings,
+    AttentionMetrics, AttestedValue, ConfigRecord, ControlMetrics, DevelopmentContextRecord,
+    EvaluationSummaryRecord, EvidenceMetrics, ImprovementHandoffRecord, ObserverClaimRecord,
+    ObserverRecord, OutcomeMetrics, PlaygroundLedger, PrincipleMetricsRecord, PromptManifest,
+    PromptManifestEvaluator, PromptManifestReference, PromptManifestRole, PromptManifestSubject,
+    ReviewClaimRecord, ReviewRecord, RunEvidenceRecord, ScenarioContractRecord, SpendRecord,
+    TurnRecord, EVALUATION_CONTRACT, EVALUATION_STAGE_ID, EVALUATOR_VERSION,
 };
 use recursive_observer::RecursiveReview;
 
@@ -4920,12 +4921,14 @@ fn run_agentic_session(persona: &Persona) {
         if !development_context_path.is_empty() {
             eprintln!("[playground] development context: {development_context_path}");
         }
+        let handoff_evidence_id = improvement_handoff_evidence_id(ledger.run_id());
         if let Err(error) = ledger.append_improvement_handoff(&ImprovementHandoffRecord {
             schema_version: 1,
             kind: "improvement_handoff",
             run_id: ledger.run_id(),
             timestamp_secs: now_secs(),
             persona: persona.name,
+            evidence_id: &handoff_evidence_id,
             verified_findings: &verified_findings,
             hypotheses: &hypotheses,
             next_action,
@@ -4936,7 +4939,24 @@ fn run_agentic_session(persona: &Persona) {
             eprintln!("[playground] could not append improvement handoff: {error}");
         }
 
-        let followups = evaluation_followups(persona.name, &verified_findings, &hypotheses);
+        let projected_findings = project_verified_findings(
+            ledger.run_id(),
+            EVALUATION_STAGE_ID,
+            &handoff_evidence_id,
+            &verified_findings,
+        );
+        let followups = evaluation_followups(
+            ledger.run_id(),
+            EVALUATION_STAGE_ID,
+            persona.name,
+            &handoff_evidence_id,
+            &projected_findings,
+            &hypotheses,
+        );
+        let finding_refs = projected_findings
+            .iter()
+            .map(|finding| finding.finding_ref.clone())
+            .collect::<Vec<_>>();
         let artifact_refs = [
             ledger.path().display().to_string(),
             prompt_manifest_artifact
@@ -4973,12 +4993,12 @@ fn run_agentic_session(persona: &Persona) {
         } else {
             &scenario_goal
         };
-        let empty_evidence = Vec::new();
+        let evidence_ids = vec![handoff_evidence_id];
         let summary = EvaluationSummaryRecord {
-            schema_version: 1,
+            schema_version: 2,
             run_id: ledger.run_id(),
             record_kind: "stage",
-            stage_id: "summary",
+            stage_id: EVALUATION_STAGE_ID,
             scenario_id,
             surface: "tui",
             subject_surface: "tui",
@@ -5005,8 +5025,9 @@ fn run_agentic_session(persona: &Persona) {
             run_status: outcome.run_status,
             failure_class: outcome.failure_class,
             product_verdict: outcome.product_verdict,
-            finding_count: verified_findings.len() + hypotheses.len(),
-            evidence_ids: &empty_evidence,
+            finding_count: finding_refs.len(),
+            evidence_ids: &evidence_ids,
+            finding_refs: &finding_refs,
             artifact_refs: &artifact_refs,
             followups: &followups,
             duration_ms: u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX),

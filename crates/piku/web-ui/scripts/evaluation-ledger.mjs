@@ -29,13 +29,14 @@ export function evaluationRuntimeMetadata(repoRoot) {
     evaluator_runtime: "codex-cli",
     evaluator_version: commandOutput("codex", ["--version"], repoRoot),
     explorer_model: resolvedCodexModel(),
-    evaluation_contract: "piku-evaluation-v1",
+    evaluation_contract: "piku-evaluation-v2",
   };
 }
 
 export function evaluationRecord({
   runId,
   surface = null,
+  stageId = surface ?? "synthesis",
   runStatus,
   failureClass,
   durationMs,
@@ -43,11 +44,12 @@ export function evaluationRecord({
   artifactRefs = [],
   runtime = {},
 }) {
+  const identity = projectReportIdentity(report, runId, stageId);
   return {
     schema_version: EVALUATION_SCHEMA_VERSION,
     run_id: runId,
     record_kind: "stage",
-    stage_id: surface ?? "synthesis",
+    stage_id: stageId,
     scenario_id: "web-codex-replacement-thesis",
     surface: "web",
     subject_surface: surface,
@@ -60,11 +62,63 @@ export function evaluationRecord({
     failure_class: failureClass,
     product_verdict: report?.product_thesis?.verdict ?? null,
     finding_count: report?.findings?.length ?? null,
+    finding_refs: identity.findingRefs,
     evidence_ids: [],
     artifact_refs: artifactRefs,
-    followups: report?.followups ?? [],
+    followups: identity.followups,
     duration_ms: durationMs,
     ...runtime,
+  };
+}
+
+function localId(value, prefix, index, label) {
+  const id = value ?? `${prefix}${index + 1}`;
+  if (!new RegExp(`^${prefix}[1-9][0-9]*$`).test(id))
+    throw new TypeError(`${label} ID must match ${prefix}N`);
+  return id;
+}
+
+export function projectReportIdentity(report, runId, stageId) {
+  if (runId.includes(":") || stageId.includes(":"))
+    throw new TypeError("run and stage IDs used for scoped report identity must not contain colons");
+  if (!report) return { findingRefs: [], followups: [] };
+  const findingIds = (report.findings || []).map((finding, index) =>
+    localId(finding.id, "f", index, "finding"));
+  if (new Set(findingIds).size !== findingIds.length)
+    throw new TypeError("report finding IDs must be unique");
+  const findingByLocalId = new Map(findingIds.map((id) => [
+    id, `${runId}:${stageId}:finding:${id}`,
+  ]));
+  const obligationIds = (report.followups || []).map((followup, index) =>
+    localId(followup.id, "o", index, "followup"));
+  if (new Set(obligationIds).size !== obligationIds.length)
+    throw new TypeError("report followup IDs must be unique");
+  const followups = (report.followups || []).map((followup, index) => {
+    const findingRefs = (followup.finding_ids || []).map((id) => {
+      const scoped = findingByLocalId.get(id);
+      if (!scoped) throw new TypeError(`followup ${obligationIds[index]} cites unknown finding ID ${id}`);
+      return scoped;
+    });
+    if ((followup.evidence_ids || []).length === 0 && findingRefs.length === 0)
+      throw new TypeError(`followup ${obligationIds[index]} must cite evidence_ids or finding_ids`);
+    if (followup.retest_of !== null && followup.retest_of !== undefined &&
+        !/^[^:]+:[^:]+:obligation:o[1-9][0-9]*$/.test(followup.retest_of))
+      throw new TypeError(`followup ${obligationIds[index]} retest_of must be a scoped obligation ID or null`);
+    return {
+      obligation_id: `${runId}:${stageId}:obligation:${obligationIds[index]}`,
+      kind: followup.kind,
+      priority: followup.priority,
+      title: followup.title,
+      rationale: followup.rationale,
+      perspective: followup.perspective,
+      evidence_ids: followup.evidence_ids || [],
+      finding_refs: findingRefs,
+      retest_of: followup.retest_of ?? null,
+    };
+  });
+  return {
+    findingRefs: [...findingByLocalId.values()],
+    followups,
   };
 }
 
@@ -81,7 +135,7 @@ export function evaluationAmendment({
   toolVersion,
   eventId = randomUUID(),
   recordedAt = new Date().toISOString(),
-  contractVersion = "piku-evaluation-amendment-v1",
+  contractVersion = "piku-evaluation-amendment-v2",
 }) {
   if (!targetRecord || targetRecord.record_kind === "amendment")
     throw new TypeError("an amendment must target an original run or stage record");
@@ -107,6 +161,7 @@ export function evaluationAmendment({
     failure_class: "none",
     product_verdict: null,
     finding_count: null,
+    finding_refs: [],
     evidence_ids: [],
     artifact_refs: basisRefs,
     followups: [],
