@@ -16,8 +16,10 @@ console or network failures once, near the end. Record evidence with IDs prefixe
 {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
 Give every screenshot call a unique filename and never overwrite or recapture a
-filename, including after reload or while correcting evidence. Screenshot
-provenance is rejected when more than one producer writes the same path.
+filename, including after reload or while correcting evidence. Pass the full
+absolute filename below `{{RUN_DIR}}` to every screenshot call; relative paths
+do not survive the isolated browser process. Screenshot provenance is rejected
+when more than one producer writes the same path.
 
 Before acting, state at least one falsifiable mechanism hypothesis in the
 structured report: what persistence or recovery mechanism should preserve

@@ -290,6 +290,8 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   const recoveryPrompt = await readFile(path.join(webUiDir, "e2e", "explorer-recovery.md"), "utf8");
   assert.match(recoveryPrompt, /dedicated,\s+non-destructive `browser_evaluate`/);
   assert.match(recoveryPrompt, /Do not combine verification, surface deletion/);
+  assert.match(recoveryPrompt, /full\s+absolute filename below `\{\{RUN_DIR\}\}`/);
+  assert.match(recoveryPrompt, /never overwrite or recapture/);
 });
 
 test("Codex response schemas avoid unsupported composition keywords", async () => {
