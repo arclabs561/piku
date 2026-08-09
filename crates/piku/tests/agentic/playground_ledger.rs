@@ -6,9 +6,111 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 pub const EVALUATION_CONTRACT: &str = "piku-evaluation-envelope-v1";
 pub const EVALUATOR_VERSION: &str = concat!("agentic-playground-rust/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Serialize)]
+pub struct PromptManifest {
+    pub schema_version: u8,
+    pub run_id: String,
+    pub surface: &'static str,
+    pub subject: PromptManifestSubject,
+    pub evaluator: PromptManifestEvaluator,
+    pub roles: Vec<PromptManifestRole>,
+    pub effective_config: AttestedValue,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptManifestSubject {
+    pub version: &'static str,
+    pub revision: String,
+    pub dirty: bool,
+    pub model: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptManifestEvaluator {
+    pub runtime: &'static str,
+    pub version: &'static str,
+    pub contract: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptManifestRole {
+    pub role: &'static str,
+    pub provider: String,
+    pub model: String,
+    pub prompt_assets: Vec<PromptAsset>,
+    pub context_contract: AttestedValue,
+    pub tools: AttestedValue,
+    pub limits: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptAsset {
+    pub kind: &'static str,
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttestedValue {
+    pub sha256: String,
+    pub value: serde_json::Value,
+}
+
+impl AttestedValue {
+    #[must_use]
+    pub fn new(value: serde_json::Value) -> Self {
+        Self {
+            sha256: sha256(canonical_json(&value).as_bytes()),
+            value,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PromptManifestArtifact {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("JSON object key serializes"),
+                        canonical_json(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        _ => serde_json::to_string(value).expect("JSON value serializes"),
+    }
+}
 
 /// A reviewable terminal-playground turn. Provider labels deliberately exclude
 /// credentials; terminal text is bounded by the caller before persistence.
@@ -289,6 +391,7 @@ pub struct EvaluationSummaryRecord<'a> {
     pub evaluator_runtime: &'static str,
     pub evaluator_version: &'static str,
     pub evaluation_contract: &'static str,
+    pub prompt_manifest: PromptManifestReference<'a>,
     pub task_contract: &'a str,
     pub run_status: &'a str,
     pub failure_class: &'a str,
@@ -298,6 +401,12 @@ pub struct EvaluationSummaryRecord<'a> {
     pub artifact_refs: &'a [String],
     pub followups: &'a [EvaluationFollowup],
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptManifestReference<'a> {
+    pub path: &'a str,
+    pub sha256: &'a str,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -423,6 +532,64 @@ impl PlaygroundLedger {
 
     pub fn append_config(&self, record: &ConfigRecord<'_>) -> std::io::Result<()> {
         self.append(record)
+    }
+
+    /// Freeze evaluator identity before the first model call.
+    ///
+    /// The file is create-only. Mutable run state and summaries may reference
+    /// it, but neither a later review nor a resumed stage may rewrite it.
+    pub fn write_prompt_manifest(
+        &self,
+        manifest: &PromptManifest,
+    ) -> std::io::Result<PromptManifestArtifact> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("prompt-manifests");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.json", self.run_id));
+        let mut bytes = serde_json::to_vec_pretty(manifest).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(PromptManifestArtifact {
+            path,
+            sha256: sha256(&bytes),
+        })
+    }
+
+    pub fn write_prompt_asset(
+        &self,
+        role: &str,
+        kind: &'static str,
+        contents: &str,
+    ) -> std::io::Result<PromptAsset> {
+        let directory = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("prompt-manifests")
+            .join(format!("{}.assets", self.run_id));
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{role}-{kind}.txt"));
+        let bytes = contents.as_bytes();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(PromptAsset {
+            kind,
+            path: path.display().to_string(),
+            sha256: sha256(bytes),
+            size_bytes: bytes.len(),
+        })
     }
 
     pub fn append_scenario_contract(
@@ -643,6 +810,10 @@ mod tests {
             evaluator_runtime: "rust-agentic-playground",
             evaluator_version: EVALUATOR_VERSION,
             evaluation_contract: EVALUATION_CONTRACT,
+            prompt_manifest: PromptManifestReference {
+                path: "prompt-manifests/run.json",
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            },
             task_contract: "repair the fixture",
             run_status: "product_failure",
             failure_class: "observed_product_behavior",
@@ -678,10 +849,101 @@ mod tests {
         assert_eq!(row["subject_revision"].as_str().unwrap().len(), 40);
         assert_eq!(row["subject_dirty"], true);
         assert_eq!(row["artifact_refs"][0], artifacts[0]);
+        assert_eq!(
+            row["prompt_manifest"]["sha256"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
         assert_eq!(row["followups"][0]["kind"], "todo");
         assert_eq!(row["followups"][1]["kind"], "retest");
         assert_eq!(followups[0].rationale, verified[0]);
         assert_eq!(followups[1].rationale, hypotheses[0]);
+    }
+
+    fn prompt_manifest(run_id: &str, prompt: &str) -> PromptManifest {
+        PromptManifest {
+            schema_version: 1,
+            run_id: run_id.to_string(),
+            surface: "tui",
+            subject: PromptManifestSubject {
+                version: "0.1.0",
+                revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                dirty: false,
+                model: "subject-model".to_string(),
+            },
+            evaluator: PromptManifestEvaluator {
+                runtime: "test",
+                version: "test/1",
+                contract: EVALUATION_CONTRACT,
+            },
+            roles: vec![PromptManifestRole {
+                role: "judge",
+                provider: "test".to_string(),
+                model: "judge-model".to_string(),
+                prompt_assets: vec![PromptAsset {
+                    kind: "system",
+                    path: "prompt.txt".to_string(),
+                    sha256: sha256(prompt.as_bytes()),
+                    size_bytes: prompt.len(),
+                }],
+                context_contract: AttestedValue::new(
+                    serde_json::json!({ "source_refs": ["evidence"], "bounds": {} }),
+                ),
+                tools: AttestedValue::new(serde_json::json!({ "names": [], "authority": "none" })),
+                limits: serde_json::json!({ "max_output_tokens": 10 }),
+            }],
+            effective_config: AttestedValue::new(serde_json::json!({ "mode": "test" })),
+        }
+    }
+
+    #[test]
+    fn prompt_manifest_is_create_only_and_content_addressed() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = PlaygroundLedger::open_at(directory.path().join("ledger.jsonl")).unwrap();
+        let first = ledger
+            .write_prompt_manifest(&prompt_manifest(ledger.run_id(), "first"))
+            .unwrap();
+        let bytes = fs::read(&first.path).unwrap();
+
+        assert_eq!(first.sha256.len(), 64);
+        assert_eq!(sha256(&bytes), first.sha256);
+        assert!(ledger
+            .write_prompt_manifest(&prompt_manifest(ledger.run_id(), "changed"))
+            .is_err());
+        assert_eq!(fs::read(&first.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn prompt_asset_digest_changes_with_prompt_bytes() {
+        assert_ne!(sha256(b"first"), sha256(b"changed"));
+    }
+
+    #[test]
+    fn tui_prompt_manifest_matches_shared_required_shape() {
+        let manifest = prompt_manifest("run-1", "prompt");
+        let value = serde_json::to_value(&manifest).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../eval/evaluation-prompt-manifest.schema.json"
+        )))
+        .unwrap();
+        for field in schema["required"].as_array().unwrap() {
+            assert!(value.get(field.as_str().unwrap()).is_some(), "{field}");
+        }
+        let role = &value["roles"][0];
+        for field in schema["properties"]["roles"]["items"]["required"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(role.get(field.as_str().unwrap()).is_some(), "{field}");
+        }
+        assert_eq!(
+            value["effective_config"]["sha256"],
+            sha256(canonical_json(&value["effective_config"]["value"]).as_bytes())
+        );
+        assert_eq!(
+            role["context_contract"]["sha256"],
+            sha256(canonical_json(&role["context_contract"]["value"]).as_bytes())
+        );
     }
 
     #[test]

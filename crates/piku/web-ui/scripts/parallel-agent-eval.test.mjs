@@ -3,10 +3,13 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, renderBoundedSynthesisPrompt, renderExplorerPrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest } from "./parallel-agent-eval.mjs";
+import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, renderBoundedSynthesisPrompt, renderExplorerPrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest } from "./parallel-agent-eval.mjs";
+import { attestedFiles, attestedValue, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptsDir, "..");
+const repoRoot = path.resolve(webUiDir, "../../..");
+const promptManifestReference = { path: "prompt-manifest.json", sha256: "a".repeat(64) };
 
 const coverage = (coding = ["coding_trace:one"], recovery = ["recovery:one"]) => ({
   coding_trace: { status: "assessed", rationale: "trace covered", evidence_ids: coding },
@@ -156,6 +159,32 @@ test("explorer prompt and Playwright MCP use the exact same output directory", (
   const configuredOutput = configured[configured.indexOf("--output-dir") + 1];
   assert.equal(prompt, `write=${configuredOutput}`);
   assert.equal(configuredOutput, path.resolve(outputDir));
+});
+
+test("immutable prompt manifest attests every web role and its effective contract", async () => {
+  const runId = "run-contract";
+  const explorerConfigs = Object.fromEntries(["coding_trace", "recovery"].map((role) => [role, {
+    identity: { surface: `qa-${role}`, requestId: `${runId}:${role}` },
+    model: "gpt-5.6-sol", target_calls: 48, hard_max_calls: 64, max_snapshots: 6, timeout_ms: 600_000,
+  }]));
+  const manifest = await buildPromptManifest({
+    runId,
+    runDir: "/tmp/piku-contract-run",
+    baseUrl: new URL("http://127.0.0.1:9090"),
+    runtime: { evaluator_runtime: "codex-cli", evaluator_version: "fixture", evaluator_contract: "parallel" },
+    explorerConfigs,
+    synthesisConfig: { model: "gpt-5.6-sol", timeout_ms: 240_000 },
+  });
+  assert.equal(manifest.surface, "web");
+  assert.deepEqual(manifest.roles.map((role) => role.role), ["coding_trace", "recovery", "synthesis"]);
+  for (const role of manifest.roles) {
+    assert.deepEqual(role.prompt_assets.map((asset) => asset.kind), ["prompt_template", "output_schema"]);
+    assert.match(role.tools.sha256, /^[a-f0-9]{64}$/);
+  }
+  const codingTools = JSON.stringify(manifest.roles[0].tools.value);
+  assert.match(codingTools, /browser_snapshot/);
+  assert.doesNotMatch(codingTools, /OPENROUTER_API_KEY/);
+  assert.equal(manifest.effective_config.value.explorers.coding_trace.identity.requestId, `${runId}:coding_trace`);
 });
 
 test("trace authority fails closed for unsafe, unknown, and malformed events", () => {
@@ -327,11 +356,12 @@ test("run manifest indexes role evidence and screenshots", async (t) => {
     }),
   );
   const runtime = { subject_version: "0.1.0", subject_revision: "abc123" };
-  const manifest = await writeRunManifest(root, "run-1", [{ role: "recovery", runStatus: "completed" }], null, runtime);
+  const manifest = await writeRunManifest(root, "run-1", [{ role: "recovery", runStatus: "completed" }], null, runtime, promptManifestReference);
   assert.deepEqual(manifest.explorers.recovery.screenshots, ["recovery/artifacts/attested.png"]);
   assert.equal(manifest.explorers.recovery.events, "recovery/events.jsonl");
   assert.deepEqual(manifest.explorers.recovery.viewport, { width: 1440, height: 1000 });
   assert.deepEqual(manifest.runtime, runtime);
+  assert.deepEqual(manifest.prompt_manifest, promptManifestReference);
 });
 
 test("run manifest safely indexes an absolute screenshot below the run", async (t) => {
@@ -347,7 +377,7 @@ test("run manifest safely indexes an absolute screenshot below the run", async (
       { kind: "screenshot", artifact: "/outside/untrusted.png" },
     ],
   }));
-  const manifest = await writeRunManifest(root, "run-absolute", [{ role: "recovery", runStatus: "harness_failure" }]);
+  const manifest = await writeRunManifest(root, "run-absolute", [{ role: "recovery", runStatus: "harness_failure" }], null, null, promptManifestReference);
   assert.deepEqual(manifest.explorers.recovery.screenshots, ["recovery/playwright-output/after.png"]);
 });
 
@@ -370,8 +400,46 @@ async function writeResumeFixture(root, runId, statuses = { coding_trace: "compl
     await writeFile(path.join(roleDir, "events.jsonl"), `${JSON.stringify({ type: "thread.started" })}\n`);
     explorers[role] = { status: statuses[role], evidence: `${role}/evidence.json`, events: `${role}/events.jsonl` };
   }
+  const [promptAsset] = await attestedFiles(repoRoot, [
+    { id: "explorer", filePath: path.join(webUiDir, "e2e", "explorer-coding-trace.md") },
+  ]);
+  const [schemaAsset] = await attestedFiles(repoRoot, [
+    { id: "explorer", filePath: path.join(webUiDir, "e2e", "explorer-report.schema.json") },
+  ]);
+  const role = (name) => ({
+    role: name,
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    prompt_assets: [
+      { kind: "prompt_template", path: promptAsset.path, sha256: promptAsset.sha256, size_bytes: promptAsset.size_bytes },
+      { kind: "output_schema", path: schemaAsset.path, sha256: schemaAsset.sha256, size_bytes: schemaAsset.size_bytes },
+    ],
+    context_contract: attestedValue({ authority: "fixture" }),
+    tools: attestedValue(name === "synthesis" ? {
+      executable: "codex",
+      argv: [
+        "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only",
+        "--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="high"', "--config",
+        'approval_policy="never"', "--output-schema", path.join(webUiDir, "e2e", "synthesis-report.schema.json"),
+        "--output-last-message", "{{REPORT_PATH:synthesis}}", "--cd", repoRoot,
+      ],
+      prompt_slot: "{{PROMPT:synthesis}}",
+      environment_keys: [],
+    } : { executable: "codex" }),
+    limits: { timeout_ms: 240_000 },
+  });
+  const promptManifest = await writePromptManifest(root, {
+    schema_version: 1,
+    run_id: runId,
+    surface: "web",
+    subject: { revision: "fixture" },
+    evaluator: { runtime: "codex-cli" },
+    roles: [role("coding_trace"), role("recovery"), role("synthesis")],
+    effective_config: attestedValue({ synthesis: { model: "gpt-5.6-sol", timeout_ms: 240_000 } }),
+  });
   await writeFile(path.join(root, "manifest.json"), JSON.stringify({
-    run_id: runId, explorers, synthesis: { status: "timeout", report: null, events: "synthesis/events.jsonl" },
+    run_id: runId, prompt_manifest: promptManifest, explorers,
+    synthesis: { status: "timeout", report: null, events: "synthesis/events.jsonl" },
   }));
 }
 

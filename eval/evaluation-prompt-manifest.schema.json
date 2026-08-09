@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://piku.local/schemas/evaluation-prompt-manifest.schema.json",
+  "title": "Piku immutable evaluation prompt manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "surface", "subject", "evaluator", "roles", "effective_config"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "surface": { "type": "string", "minLength": 1 },
+    "subject": { "type": "object" },
+    "evaluator": { "type": "object" },
+    "roles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "provider", "model", "prompt_assets", "context_contract", "tools", "limits"],
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "prompt_assets": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "path", "sha256", "size_bytes"],
+              "properties": {
+                "kind": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                "size_bytes": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "context_contract": { "$ref": "#/$defs/attestedValue" },
+          "tools": { "$ref": "#/$defs/attestedValue" },
+          "limits": { "type": "object" }
+        }
+      }
+    },
+    "effective_config": { "$ref": "#/$defs/attestedValue" }
+  },
+  "$defs": {
+    "attestedValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "value"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "value": {}
+      }
+    }
+  }
+}

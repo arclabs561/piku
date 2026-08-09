@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { appendEvaluationRecord, evaluationRecord, evaluationRuntimeMetadata } from "./evaluation-ledger.mjs";
+import { attestedFiles, attestedValue, verifyPromptManifest, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 import { codexExecArgs, codexJudgeEnvironment, resolvedCodexModel } from "./codex-exec.mjs";
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
 
@@ -207,6 +208,128 @@ export function renderExplorerPrompt(template, { baseUrl, surface, requestId, pl
     .replaceAll("{{MAX_SNAPSHOTS}}", String(maxSnapshots));
 }
 
+function invocationArgs({ schemaPath, reportPath, prompt, model, playwright = false, playwrightOutputDir = null }) {
+  const args = codexExecArgs({
+    schemaPath, reportPath, prompt, playwright, playwrightCwd: webUiDir, cwd: repoRoot, model,
+  });
+  return playwright ? withPlaywrightAuthority(args, playwrightOutputDir) : args;
+}
+
+function synthesisInvocationContract(model) {
+  const sentinel = "{{PROMPT:synthesis}}";
+  const args = invocationArgs({
+    schemaPath: path.join(webUiDir, "e2e", "synthesis-report.schema.json"),
+    reportPath: "{{REPORT_PATH:synthesis}}",
+    prompt: sentinel,
+    model,
+  });
+  return { argv: args.slice(0, -1), prompt_slot: sentinel };
+}
+
+export async function buildPromptManifest({
+  runId, runDir, baseUrl, runtime, explorerConfigs, synthesisConfig,
+}) {
+  const explorerSchema = path.join(webUiDir, "e2e", "explorer-report.schema.json");
+  const synthesisSchema = path.join(webUiDir, "e2e", "synthesis-report.schema.json");
+  const promptTemplates = await attestedFiles(repoRoot, [
+    ...roles.map((role) => ({
+      id: `explorer:${role}`,
+      filePath: path.join(webUiDir, "e2e", `explorer-${role.replaceAll("_", "-")}.md`),
+    })),
+    { id: "synthesis", filePath: path.join(webUiDir, "e2e", "synthesis.md") },
+  ]);
+  const outputSchemas = await attestedFiles(repoRoot, [
+    { id: "explorer", filePath: explorerSchema },
+    { id: "synthesis", filePath: synthesisSchema },
+  ]);
+  const fileAsset = (kind, item) => ({
+    kind, path: item.path, sha256: item.sha256, size_bytes: item.size_bytes,
+  });
+  const environmentKeys = Object.keys(codexJudgeEnvironment()).sort();
+  const evaluatorRoles = roles.map((role) => {
+    const config = explorerConfigs[role];
+    const roleDir = path.join(runDir, role);
+    const sentinel = `{{PROMPT:${role}}}`;
+    const args = invocationArgs({
+      schemaPath: explorerSchema,
+      reportPath: path.join(roleDir, "evidence.json"),
+      prompt: sentinel,
+      model: config.model,
+      playwright: true,
+      playwrightOutputDir: path.join(roleDir, "playwright-output"),
+    });
+    return {
+      role,
+      provider: "codex",
+      model: config.model,
+      prompt_assets: [
+        fileAsset("prompt_template", promptTemplates.find((item) => item.id === `explorer:${role}`)),
+        fileAsset("output_schema", outputSchemas.find((item) => item.id === "explorer")),
+      ],
+      context_contract: attestedValue({
+        base_url: baseUrl.toString(),
+        surface: config.identity.surface,
+        request_id: config.identity.requestId,
+        playwright_output_dir: path.join(roleDir, "playwright-output"),
+        target_calls: config.target_calls,
+        max_snapshots: config.max_snapshots,
+      }),
+      tools: attestedValue({
+        executable: "codex",
+        argv: args.slice(0, -1),
+        prompt_slot: sentinel,
+        playwright_enabled_tools: PLAYWRIGHT_TOOLS,
+        environment_keys: environmentKeys,
+      }),
+      limits: {
+        target_calls: config.target_calls,
+        hard_max_calls: config.hard_max_calls,
+        max_snapshots: config.max_snapshots,
+        timeout_ms: config.timeout_ms,
+      },
+    };
+  });
+  evaluatorRoles.push({
+    role: "synthesis",
+    provider: "codex",
+    model: synthesisConfig.model,
+    prompt_assets: [
+      fileAsset("prompt_template", promptTemplates.find((item) => item.id === "synthesis")),
+      fileAsset("output_schema", outputSchemas.find((item) => item.id === "synthesis")),
+    ],
+    context_contract: attestedValue({
+      authority: "validated explorer packets, their attested artifacts, and the operational run manifest",
+      ledger: "not provided",
+      product_strings: "untrusted data",
+    }),
+    tools: attestedValue({
+      executable: "codex",
+      ...synthesisInvocationContract(synthesisConfig.model),
+      environment_keys: environmentKeys,
+    }),
+    limits: { timeout_ms: synthesisConfig.timeout_ms },
+  });
+  const runConfiguration = {
+    base_url: baseUrl.toString(),
+    runtime,
+    explorers: explorerConfigs,
+    synthesis: synthesisConfig,
+  };
+  return {
+    schema_version: 1,
+    run_id: runId,
+    surface: "web",
+    subject: runtime,
+    evaluator: {
+      runtime: runtime.evaluator_runtime,
+      version: runtime.evaluator_version,
+      contract: runtime.evaluator_contract,
+    },
+    roles: evaluatorRoles,
+    effective_config: attestedValue(runConfiguration),
+  };
+}
+
 async function verifyStoredExplorerArtifacts(report, roleDir, outputDir, eventTrace) {
   const producerEvents = new Map();
   for (const line of eventTrace.split("\n").filter(Boolean)) {
@@ -246,6 +369,7 @@ export async function loadValidatedExplorerRun(runDir, runId) {
   const manifestPath = path.join(runDir, "manifest.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   if (manifest.run_id !== runId) throw new Error("resume manifest run ID does not match requested run");
+  const promptManifest = await verifyPromptManifest(runDir, runId, manifest.prompt_manifest, repoRoot);
   const packets = [];
   const packetPaths = [];
   const artifactPaths = [];
@@ -272,7 +396,7 @@ export async function loadValidatedExplorerRun(runDir, runId) {
     packets.push(report);
     packetPaths.push(reportPath);
   }
-  return { manifest, manifestPath, packets, packetPaths, artifactPaths };
+  return { manifest, manifestPath, promptManifest, packets, packetPaths, artifactPaths };
 }
 
 export async function nextSynthesisAttemptDir(runDir) {
@@ -318,14 +442,22 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
   const template = await readFile(path.join(webUiDir, "e2e", "synthesis.md"), "utf8");
   const prompt = renderBoundedSynthesisPrompt(template, validated);
   const started = Date.now();
-  const model = process.env.PIKU_SYNTHESIS_MODEL || resolvedCodexModel();
+  const synthesisConfig = validated.promptManifest.manifest.effective_config.value.synthesis;
+  const model = synthesisConfig.model;
+  const synthesisRole = validated.promptManifest.manifest.roles.find((role) => role.role === "synthesis");
+  const recordedContract = {
+    argv: synthesisRole.tools.value.argv,
+    prompt_slot: synthesisRole.tools.value.prompt_slot,
+  };
+  if (JSON.stringify(recordedContract) !== JSON.stringify(synthesisInvocationContract(model)))
+    throw new Error("current synthesis tool contract differs from the immutable prompt manifest");
   const outcome = await runCodex({
     label: `synthesis-resume-${path.basename(attemptDir)}`,
     prompt,
     schemaPath: path.join(webUiDir, "e2e", "synthesis-report.schema.json"),
     reportPath,
     eventsPath,
-    timeoutMs: Number(process.env.PIKU_SYNTHESIS_TIMEOUT_MS || 240_000),
+    timeoutMs: synthesisConfig.timeout_ms,
     model,
   });
   let report = null;
@@ -344,7 +476,14 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
     await writeFile(path.join(attemptDir, "validation-error.txt"), `${error.message}\n`, "utf8");
   }
   const runtime = validated.manifest.runtime || null;
-  const record = evaluationRecord({ runId, runStatus, failureClass, durationMs: Date.now() - started, artifactRefs: [path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath)], runtime });
+  const record = evaluationRecord({
+    runId, runStatus, failureClass, durationMs: Date.now() - started,
+    artifactRefs: [
+      path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath),
+      path.relative(repoRoot, validated.promptManifest.manifestPath),
+    ],
+    runtime,
+  });
   record.perspective = "synthesis";
   record.stage_id = `synthesis-${path.basename(attemptDir)}`;
   record.judge_model = model;
@@ -352,6 +491,10 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
   record.finding_count = report?.findings.length ?? null;
   record.evidence_ids = report?.evidence_ids ?? [];
   record.followups = report?.followups ?? [];
+  record.prompt_manifest = {
+    path: path.relative(repoRoot, validated.promptManifest.manifestPath),
+    sha256: validated.promptManifest.reference.sha256,
+  };
   await appendEvaluationRecord(ledgerPath, record);
   const attempts = validated.manifest.synthesis.attempts || [];
   attempts.push({
@@ -532,7 +675,8 @@ export async function cleanupSurface(baseUrl, surface) {
   await deleteSurface(baseUrl, surface);
 }
 
-export async function writeRunManifest(runDir, runId, explorers, synthesis = null, metadata = null) {
+export async function writeRunManifest(runDir, runId, explorers, synthesis = null, metadata = null, promptManifest = null) {
+  if (!promptManifest) throw new Error("run manifest requires an immutable prompt manifest reference");
   const roles = {};
   for (const explorer of explorers) {
     const roleDir = path.join(runDir, explorer.role);
@@ -567,6 +711,7 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
   const manifest = {
     schema_version: 1,
     run_id: runId,
+    prompt_manifest: promptManifest,
     runtime: metadata,
     explorers: roles,
     synthesis: synthesis
@@ -577,9 +722,8 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
   return manifest;
 }
 
-async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCalls, hardMaxCalls, maxSnapshots, timeoutMs, runtime }) {
+async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCalls, hardMaxCalls, maxSnapshots, timeoutMs, runtime, identity, model, promptManifest }) {
   const started = Date.now();
-  const identity = explorerIdentity(runId, role);
   const roleDir = path.join(runDir, role);
   const reportPath = path.join(roleDir, "evidence.json");
   const eventsPath = path.join(roleDir, "events.jsonl");
@@ -603,6 +747,7 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
       prompt,
       schemaPath: path.join(webUiDir, "e2e", "explorer-report.schema.json"),
       reportPath, eventsPath, timeoutMs, maxCalls: hardMaxCalls, maxSnapshots, playwright: true, playwrightOutputDir,
+      model,
     });
     if (outcome.reason === "timeout") {
       runStatus = "timeout";
@@ -634,11 +779,15 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
     try { await cleanupSurface(baseUrl, identity.surface); }
     catch { if (runStatus === "completed") { runStatus = "harness_failure"; failureClass = "cleanup_failure"; } }
   }
-  const refs = [path.relative(repoRoot, eventsPath)];
+  const refs = [path.relative(repoRoot, eventsPath), path.relative(repoRoot, path.join(runDir, promptManifest.path))];
   if (report) refs.push(path.relative(repoRoot, reportPath));
   const record = evaluationRecord({ runId, surface: identity.surface, runStatus, failureClass, durationMs: Date.now() - started, report, artifactRefs: refs, runtime });
   record.perspective = role;
-  record.explorer_model = resolvedCodexModel();
+  record.explorer_model = model;
+  record.prompt_manifest = {
+    path: path.relative(repoRoot, path.join(runDir, promptManifest.path)),
+    sha256: promptManifest.sha256,
+  };
   record.evidence_ids = report?.evidence.map((item) => item.id) ?? [];
   await appendEvaluationRecord(ledgerPath, record);
   return { role, report, reportPath, runStatus };
@@ -666,27 +815,47 @@ export async function main() {
   const ledgerPath = process.env.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl");
   const maxSnapshots = Number(process.env.PIKU_EXPLORER_MAX_SNAPSHOTS || 6);
   const timeoutMs = Number(process.env.PIKU_EXPLORER_TIMEOUT_MS || 600_000);
+  const explorerModel = resolvedCodexModel();
+  const synthesisConfig = {
+    model: process.env.PIKU_SYNTHESIS_MODEL || explorerModel,
+    timeout_ms: Number(process.env.PIKU_SYNTHESIS_TIMEOUT_MS || 240_000),
+  };
+  const explorerConfigs = Object.fromEntries(roles.map((role) => [role, {
+    identity: explorerIdentity(runId, role),
+    model: explorerModel,
+    target_calls: explorerCallBudget(role),
+    hard_max_calls: explorerHardCallLimit(),
+    max_snapshots: maxSnapshots,
+    timeout_ms: timeoutMs,
+  }]));
   const runtime = {
     ...evaluationRuntimeMetadata(repoRoot),
     viewport: { width: 1440, height: 1000 },
-    explorer_target_calls: Object.fromEntries(roles.map((role) => [role, explorerCallBudget(role)])),
+    explorer_target_calls: Object.fromEntries(roles.map((role) => [role, explorerConfigs[role].target_calls])),
     explorer_hard_max_calls: explorerHardCallLimit(),
     explorer_max_snapshots: maxSnapshots,
     explorer_timeout_ms: timeoutMs,
   };
+  const promptManifestDocument = await buildPromptManifest({
+    runId, runDir, baseUrl, runtime, explorerConfigs, synthesisConfig,
+  });
+  const promptManifest = await writePromptManifest(runDir, promptManifestDocument);
   const results = await Promise.all(roles.map((role) => runExplorer({
     role,
     runId,
     runDir,
     baseUrl,
     ledgerPath,
-    targetCalls: explorerCallBudget(role),
-    hardMaxCalls: explorerHardCallLimit(),
+    targetCalls: explorerConfigs[role].target_calls,
+    hardMaxCalls: explorerConfigs[role].hard_max_calls,
     maxSnapshots,
     timeoutMs,
     runtime,
+    identity: explorerConfigs[role].identity,
+    model: explorerConfigs[role].model,
+    promptManifest,
   })));
-  await writeRunManifest(runDir, runId, results, null, runtime);
+  await writeRunManifest(runDir, runId, results, null, runtime, promptManifest);
   if (results.some((result) => result.runStatus !== "completed")) {
     console.error("At least one explorer failed; synthesis was not run.");
     process.exitCode = 1;
@@ -700,8 +869,8 @@ export async function main() {
   const template = await readFile(path.join(webUiDir, "e2e", "synthesis.md"), "utf8");
   const prompt = renderBoundedSynthesisPrompt(template, validated);
   const started = Date.now();
-  const synthesisModel = process.env.PIKU_SYNTHESIS_MODEL || resolvedCodexModel();
-  const outcome = await runCodex({ label: "synthesis", prompt, schemaPath: path.join(webUiDir, "e2e", "synthesis-report.schema.json"), reportPath, eventsPath, timeoutMs: Number(process.env.PIKU_SYNTHESIS_TIMEOUT_MS || 240_000), model: synthesisModel });
+  const synthesisModel = synthesisConfig.model;
+  const outcome = await runCodex({ label: "synthesis", prompt, schemaPath: path.join(webUiDir, "e2e", "synthesis-report.schema.json"), reportPath, eventsPath, timeoutMs: synthesisConfig.timeout_ms, model: synthesisModel });
   let report = null;
   let runStatus = "harness_failure";
   let failureClass = "synthesis_exit";
@@ -717,15 +886,26 @@ export async function main() {
     failureClass = "invalid_synthesis";
     await writeFile(path.join(synthesisDir, "validation-error.txt"), `${error.message}\n`, "utf8");
   }
-  const record = evaluationRecord({ runId, runStatus, failureClass, durationMs: Date.now() - started, artifactRefs: [path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath)], runtime });
+  const record = evaluationRecord({
+    runId, runStatus, failureClass, durationMs: Date.now() - started,
+    artifactRefs: [
+      path.relative(repoRoot, reportPath), path.relative(repoRoot, eventsPath),
+      path.relative(repoRoot, path.join(runDir, promptManifest.path)),
+    ],
+    runtime,
+  });
   record.perspective = "synthesis";
   record.judge_model = synthesisModel;
   record.product_verdict = report?.verdict === "inconclusive" ? null : report?.verdict ?? null;
   record.finding_count = report?.findings.length ?? null;
   record.evidence_ids = report?.evidence_ids ?? [];
   record.followups = report?.followups ?? [];
+  record.prompt_manifest = {
+    path: path.relative(repoRoot, path.join(runDir, promptManifest.path)),
+    sha256: promptManifest.sha256,
+  };
   await appendEvaluationRecord(ledgerPath, record);
-  await writeRunManifest(runDir, runId, results, { runStatus, report }, runtime);
+  await writeRunManifest(runDir, runId, results, { runStatus, report }, runtime, promptManifest);
   if (runStatus !== "completed") process.exitCode = 1;
   else console.error(`Parallel evaluation complete: ${runDir}`);
 }

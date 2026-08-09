@@ -37,6 +37,7 @@ signal-hook-registry = "1"
 dotenvy = "0.15"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 async-stream = "0.3"

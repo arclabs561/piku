@@ -19,7 +19,7 @@ pub struct RecursiveReview {
     pub status: &'static str,
 }
 
-const SYSTEM: &str = r#"You are the final observer in a terminal-agent evaluation.
+pub(crate) const SYSTEM: &str = r#"You are the final observer in a terminal-agent evaluation.
 You receive evidence from a real piku PTY session plus typed primary-review
 attestations. Do not invent events. Distinguish what terminal/workspace evidence
 shows from what either judge merely asserted. All persona, claim, transcript,

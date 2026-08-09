@@ -60,11 +60,12 @@ mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    evaluation_followups, now_secs, AttentionMetrics, ConfigRecord, ControlMetrics,
+    evaluation_followups, now_secs, AttentionMetrics, AttestedValue, ConfigRecord, ControlMetrics,
     DevelopmentContextRecord, EvaluationSummaryRecord, EvidenceMetrics, ImprovementHandoffRecord,
     ObserverClaimRecord, ObserverRecord, OutcomeMetrics, PlaygroundLedger, PrincipleMetricsRecord,
-    ReviewClaimRecord, ReviewRecord, RunEvidenceRecord, ScenarioContractRecord, SpendRecord,
-    TurnRecord, EVALUATION_CONTRACT, EVALUATOR_VERSION,
+    PromptManifest, PromptManifestEvaluator, PromptManifestReference, PromptManifestRole,
+    PromptManifestSubject, ReviewClaimRecord, ReviewRecord, RunEvidenceRecord,
+    ScenarioContractRecord, SpendRecord, TurnRecord, EVALUATION_CONTRACT, EVALUATOR_VERSION,
 };
 use recursive_observer::RecursiveReview;
 
@@ -3319,6 +3320,35 @@ fn source_claim_ids(entries: &[CritiqueEntry]) -> HashSet<String> {
         .collect()
 }
 
+const META_JUDGE_SYSTEM: &str = "\
+You are a meta-evaluator for an agentic test harness. You receive the full trace \
+of a test session where an LLM user-agent interacted with piku (a terminal AI coding agent). \
+The user-agent filed bug reports about piku's behavior.
+
+Your job:
+1. For each BUG filed by the user-agent, judge whether it is VALID (real issue), \
+   HALLUCINATED (the user-agent misunderstood the output), or INCONCLUSIVE (not enough evidence).
+2. For each deterministic CHECK, confirm it is correctly evaluated.
+3. Rate the overall session: did piku perform well for the given scenario? \
+   Were the user-agent's expectations reasonable?
+4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
+   behave unexpectedly in ways the user-agent missed?
+
+Every entry in \"bugs\" must name one existing BUG's \"claim_id\" and cite \
+the turns it rests on in its own \"evidence_turns\". Cite only turn numbers \
+that appear in the evidence above. Each claim_id may occur once. \
+A claim you cannot tie to a specific turn does not belong in \"bugs\"; put it \
+in \"missed\" instead.
+
+Return only JSON with this exact schema:
+{\
+  \"bugs\": [{\"claim_id\": \"user-bug-1-1\", \"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\", \"evidence_turns\": [1]}],\
+  \"checks\": [{\"description\": \"string\", \"verdict\": \"CORRECT|INCORRECT\", \"reason\": \"string\"}],\
+  \"overall\": \"string\",\
+  \"missed\": [\"string\"],\
+  \"evidence_turns\": [1]\
+}";
+
 /// Meta-judge: after the agentic test completes, send all collected evidence
 /// to an LLM for a second-opinion analysis. Evaluates whether:
 /// 1. The user-agent's findings about piku are valid (not hallucinated)
@@ -3395,40 +3425,11 @@ fn meta_judge(llm: &LlmClient, persona: &Persona, entries: &[CritiqueEntry]) -> 
         evidence.push('\n');
     }
 
-    let system = "\
-You are a meta-evaluator for an agentic test harness. You receive the full trace \
-of a test session where an LLM user-agent interacted with piku (a terminal AI coding agent). \
-The user-agent filed bug reports about piku's behavior.
-
-Your job:
-1. For each BUG filed by the user-agent, judge whether it is VALID (real issue), \
-   HALLUCINATED (the user-agent misunderstood the output), or INCONCLUSIVE (not enough evidence).
-2. For each deterministic CHECK, confirm it is correctly evaluated.
-3. Rate the overall session: did piku perform well for the given scenario? \
-   Were the user-agent's expectations reasonable?
-4. Note any behavioral patterns: did piku crash, hang, produce garbage, or \
-   behave unexpectedly in ways the user-agent missed?
-
-Every entry in \"bugs\" must name one existing BUG's \"claim_id\" and cite \
-the turns it rests on in its own \"evidence_turns\". Cite only turn numbers \
-that appear in the evidence above. Each claim_id may occur once. \
-A claim you cannot tie to a specific turn does not belong in \"bugs\"; put it \
-in \"missed\" instead.
-
-Return only JSON with this exact schema:
-{\
-  \"bugs\": [{\"claim_id\": \"user-bug-1-1\", \"description\": \"string\", \"verdict\": \"VALID|HALLUCINATED|INCONCLUSIVE\", \"reason\": \"string\", \"evidence_turns\": [1]}],\
-  \"checks\": [{\"description\": \"string\", \"verdict\": \"CORRECT|INCORRECT\", \"reason\": \"string\"}],\
-  \"overall\": \"string\",\
-  \"missed\": [\"string\"],\
-  \"evidence_turns\": [1]\
-}";
-
     eprintln!(
         "[meta-judge] running analysis ({} chars evidence)...",
         evidence.len()
     );
-    let outcome = llm.call_json(system, &evidence);
+    let outcome = llm.call_json(META_JUDGE_SYSTEM, &evidence);
     let Some(parsed) = outcome.value() else {
         eprintln!(
             "[meta-judge] unavailable ({}): {}",
@@ -3746,6 +3747,7 @@ fn run_agentic_session(persona: &Persona) {
     // is which keeps a sampling difference from reading as a regression.
     let run_role = std::env::var("PIKU_AGENTIC_RUN_ROLE").unwrap_or_else(|_| "adhoc".to_string());
     let revision = piku_revision();
+    let subject_dirty = piku_worktree_dirty();
     if let Some(ledger) = &ledger {
         eprintln!(
             "[playground] run={} role={run_role} piku={revision}",
@@ -3780,6 +3782,97 @@ fn run_agentic_session(persona: &Persona) {
             eprintln!("[playground] could not append config record: {error}");
         }
     }
+
+    let prompt_manifest_artifact = ledger.as_ref().map(|ledger| {
+        let write_asset = |role, kind, contents| {
+            ledger
+                .write_prompt_asset(role, kind, contents)
+                .unwrap_or_else(|error| {
+                    panic!("could not freeze {role} {kind} prompt before evaluation: {error}")
+                })
+        };
+        let role = |role, provider: &ProviderSpec, prompt_assets, context_contract, limits| {
+            PromptManifestRole {
+                role,
+                provider: provider.label.to_string(),
+                model: provider.model.clone(),
+                prompt_assets,
+                context_contract: AttestedValue::new(context_contract),
+                tools: AttestedValue::new(serde_json::json!({
+                    "names": [],
+                    "authority": "direct-provider-json-no-agent-tools"
+                })),
+                limits,
+            }
+        };
+        let manifest = PromptManifest {
+            schema_version: 1,
+            run_id: ledger.run_id().to_string(),
+            surface: "tui",
+            subject: PromptManifestSubject {
+                version: env!("CARGO_PKG_VERSION"),
+                revision: revision.clone(),
+                dirty: subject_dirty,
+                model: piku_spec.model.clone(),
+            },
+            evaluator: PromptManifestEvaluator {
+                runtime: "rust-agentic-playground",
+                version: EVALUATOR_VERSION,
+                contract: EVALUATION_CONTRACT,
+            },
+            roles: vec![
+                role(
+                    "user_agent",
+                    &ua_llm.spec,
+                    vec![write_asset("user-agent", "system", USER_AGENT_SYSTEM)],
+                    serde_json::json!({
+                        "source_refs": ["persona", "phase", "conversation_memory", "prior_verified_findings", "deterministic_checks", "workspace_diff", "rendered_screen"],
+                        "bounds": { "rendered_screen_chars": 8000 }
+                    }),
+                    serde_json::json!({ "max_output_tokens": ua_llm.max_tokens, "turn_limit": phase_turn_limit() }),
+                ),
+                role(
+                    "judge",
+                    &judge_llm.spec,
+                    vec![write_asset("judge", "system", META_JUDGE_SYSTEM)],
+                    serde_json::json!({
+                        "source_refs": ["frozen_turn_evidence", "source_claim_ids"],
+                        "bounds": { "response_preview_chars_per_turn": 4000, "workspace_diff_chars_per_turn": 1500 }
+                    }),
+                    serde_json::json!({ "max_output_tokens": judge_llm.max_tokens }),
+                ),
+                role(
+                    "observer",
+                    &judge_llm.spec,
+                    vec![write_asset("observer", "system", recursive_observer::SYSTEM)],
+                    serde_json::json!({
+                        "source_refs": ["primary_claims", "cited_turn_projection"],
+                        "bounds": { "max_turns": 12, "viewport_chars_per_turn": 1500, "workspace_chars_per_turn": 1500 },
+                        "independence": "same-model-correlated-countercheck"
+                    }),
+                    serde_json::json!({ "max_output_tokens": judge_llm.max_tokens }),
+                ),
+            ],
+            effective_config: AttestedValue::new(serde_json::json!({
+                "run_role": run_role,
+                "scenario_id": scenario::for_persona(persona.name).map_or("none", |contract| contract.id),
+                "terminal": { "rows": 40, "cols": 120 },
+                "permission_response": PermissionResponse::from_env().label(),
+                "fast_mode": std::env::var("PIKU_AGENTIC_FAST").as_deref() == Ok("1")
+            })),
+        };
+        match ledger.write_prompt_manifest(&manifest) {
+            Ok(artifact) => {
+                eprintln!(
+                    "[playground] prompt manifest: {} ({})",
+                    artifact.path.display(),
+                    artifact.sha256
+                );
+                artifact
+            }
+            Err(error) => panic!("could not freeze prompt manifest before evaluation: {error}"),
+        }
+    });
 
     // The scenario contract is the run's product oracle: a goal the persona is
     // driving piku toward plus executable acceptance checks over the workspace.
@@ -4799,6 +4892,10 @@ fn run_agentic_session(persona: &Persona) {
         let followups = evaluation_followups(persona.name, &verified_findings, &hypotheses);
         let artifact_refs = [
             ledger.path().display().to_string(),
+            prompt_manifest_artifact
+                .as_ref()
+                .map(|artifact| artifact.path.display().to_string())
+                .unwrap_or_default(),
             development_context_path,
             piku_session_copy.clone(),
             piku_run_record_copy.clone(),
@@ -4845,10 +4942,19 @@ fn run_agentic_session(persona: &Persona) {
             judge_model: &judge_llm.spec.model,
             subject_version: env!("CARGO_PKG_VERSION"),
             subject_revision: &revision,
-            subject_dirty: piku_worktree_dirty(),
+            subject_dirty,
             evaluator_runtime: "rust-agentic-playground",
             evaluator_version: EVALUATOR_VERSION,
             evaluation_contract: EVALUATION_CONTRACT,
+            prompt_manifest: PromptManifestReference {
+                path: prompt_manifest_artifact
+                    .as_ref()
+                    .and_then(|artifact| artifact.path.to_str())
+                    .unwrap_or(""),
+                sha256: prompt_manifest_artifact
+                    .as_ref()
+                    .map_or("", |artifact| artifact.sha256.as_str()),
+            },
             task_contract,
             run_status,
             failure_class,

@@ -49,6 +49,7 @@ clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
