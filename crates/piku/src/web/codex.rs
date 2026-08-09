@@ -806,7 +806,9 @@ mod tests {
                 "params":{"turn":{"status":"interrupted"}}
             }))
             .unwrap());
-        assert!(terminal_first.observe(&json!({"id":4,"result":{}})).unwrap());
+        assert!(terminal_first
+            .observe(&json!({"id":4,"result":{}}))
+            .unwrap());
     }
 
     #[test]
