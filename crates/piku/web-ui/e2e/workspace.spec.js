@@ -868,8 +868,10 @@ test("chat cards attach selected workspace context explicitly", async ({
   page,
   surfaceName,
 }) => {
+  const requests = [];
   await page.route("**/api/chat", async (route) => {
     const request = route.request().postDataJSON();
+    requests.push(request);
     expect(request.surface).toBe(surfaceName);
     expect(request.context).toContain("SOURCE note");
     expect(request.context).toContain("durable context from the board");
@@ -894,6 +896,118 @@ test("chat cards attach selected workspace context explicitly", async ({
   await chat.getByRole("button", { name: "send", exact: true }).click();
   await expect(chat.locator(".chat-response")).toContainText("context received");
   await expect(page.locator('.activity-card [data-event="context"]')).toContainText("note:note");
+
+  const contextDisclosure = chat.locator(".chat-context");
+  await contextDisclosure.locator("summary").click();
+  await expect(contextDisclosure).not.toHaveAttribute("open", "");
+  await chat.getByLabel("User turn").fill("use the attached note again");
+  await chat.getByRole("button", { name: "run", exact: true }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  await contextDisclosure.locator("summary").click();
+  await expect(contextDisclosure).toHaveAttribute("open", "");
+  const attachedNote = chat.getByLabel(/note · note/);
+  await expect(attachedNote).toBeChecked();
+  await expect(attachedNote.locator("xpath=..")).toBeVisible();
+  await expect(attachedNote.locator("xpath=..")).toContainText("note · note");
+  expect(requests[1].context).toContain("SOURCE note");
+  expect(requests[1].context).toContain("durable context from the board");
+});
+
+test("execution traces stay visibly transient and outside workspace persistence", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  await page.route("**/api/chat", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        { kind: "request_accepted", surface: surfaceName, request_id: "trace-contract" },
+        { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Answering", request_kind: "chat" },
+        { kind: "text_delta", text: "trace complete" },
+        { kind: "completed", surface: surfaceName, message: "done", iterations: 1, elapsed_seconds: 0.1, canvas_changed: false, request_kind: "chat" },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  await addObject(page, "chat", { x: 160, y: 100 });
+  const chat = page.locator('[data-kind="chat"]');
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  await chat.getByLabel("New chat turn").fill("show the transient trace");
+  await chat.getByRole("button", { name: "send", exact: true }).click();
+
+  const trace = page.getByRole("article", { name: "Execution trace" });
+  await expect(trace).toContainText("execution trace · transient");
+  await expect(trace).toContainText("Request queued");
+  await expect(trace).toHaveAttribute("data-persistence", "transient");
+  await expect(page.locator("#object-picker option")).toHaveCount(2);
+
+  const whileQueued = await (
+    await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)
+  ).json();
+  expect(whileQueued.objects).toHaveLength(1);
+  expect(whileQueued.objects[0]).toMatchObject({ kind: "chat" });
+
+  await expect(chat.locator(".chat-response")).toContainText("trace complete");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  const completed = await (
+    await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)
+  ).json();
+  expect(completed.objects).toHaveLength(1);
+  expect(completed.objects.some((object) => object.kind === "activity")).toBeFalsy();
+});
+
+test("workspace state crosses browser contexts while viewport state does not", async ({
+  browser,
+  page,
+  surfaceName,
+}) => {
+  await page.route("**/api/chat", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        { kind: "request_accepted", surface: surfaceName },
+        { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Answering", request_kind: "chat" },
+        { kind: "text_delta", text: "durable cross-context answer" },
+        { kind: "completed", surface: surfaceName, message: "done", iterations: 1, elapsed_seconds: 0.1, canvas_changed: false, request_kind: "chat" },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  await addObject(page, "terminal", { x: 120, y: 110 });
+  await addObject(page, "chat", { x: 900, y: 540 });
+  const chat = page.locator('[data-kind="chat"]');
+  await chat.getByLabel("New chat turn").fill("persist this thread");
+  await chat.getByRole("button", { name: "send", exact: true }).click();
+  await expect(chat.locator(".chat-response")).toContainText("durable cross-context answer");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+
+  await page.locator("#canvas").evaluate((canvas) => canvas.scrollTo(0, 240));
+  await expect.poll(() => page.locator("#canvas").evaluate((canvas) => canvas.scrollTop)).toBeGreaterThan(0);
+  await page.waitForTimeout(180);
+
+  const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const freshPage = await freshContext.newPage();
+  try {
+    await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+    await expect(freshPage.locator('[data-kind="terminal"]')).toHaveCount(1);
+    await expect(freshPage.locator('[data-kind="terminal"]')).toContainText("unrestricted host shell");
+    await expect(freshPage.locator('[data-kind="terminal"] .xterm')).toHaveCount(0);
+    await expect(
+      freshPage.locator('[data-kind="terminal"]').getByRole("button", {
+        name: "start shell",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(freshPage.locator('[data-kind="chat"] .chat-response')).toContainText("durable cross-context answer");
+    await expect(freshPage.locator('[data-kind="chat"] .chat-turn-status')).toContainText("done · attempt 1");
+    await expect.poll(() => freshPage.locator("#canvas").evaluate((canvas) => ({ left: canvas.scrollLeft, top: canvas.scrollTop }))).toEqual({ left: 0, top: 0 });
+  } finally {
+    await freshContext.close();
+  }
 });
 
 test("file rejection state survives reload with its input", async ({

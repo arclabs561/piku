@@ -603,9 +603,11 @@ function createActivity(goal, anchor, requestKind = "workspace") {
   card.dataset.runOrdinal = String(activitySequence);
   card.className = "activity-card running";
   card.dataset.requestKind = requestKind;
+  card.dataset.persistence = "transient";
+  card.setAttribute("aria-label", "Execution trace");
   card.setAttribute("aria-live", "polite");
   card.innerHTML =
-    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
+    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-persistence">execution trace · transient</span><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
   card.querySelector(".activity-goal").textContent = goal;
   card.querySelector(".activity-kind").textContent =
     requestKind === "chat"

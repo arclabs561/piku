@@ -46,6 +46,12 @@ Reconcile that inventory against the screenshot pixels. If the screenshot and
 predicate disagree, report the contradiction, mark validity compromised, and do
 not promote the negative claim to a finding or hypothesis outcome.
 
+For console or network evidence, capture representative exact messages, source
+URL/origin, timing, and observed product impact. Separate host-page failures from
+sandboxed `about:srcdoc` preview errors and intentional rejected requests. A raw
+error count or HTTP status without this classification cannot support a product
+finding.
+
 Delete the surface through the UI and close the browser before returning. Return
 only JSON matching the supplied schema. Include concrete todo, idea, or retest
 followups that would help a later run; do not turn speculation into a finding.

@@ -86,6 +86,10 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
   assert.match(recoveryPrompt, /screenshot and\s+predicate disagree/);
   assert.match(synthesisPrompt, /resolve each\s+screenshot–predicate contradiction/);
   assert.match(synthesisPrompt, /Keyword-regex absence cannot override visible\s+screenshot text/);
+  assert.match(tracePrompt, /Execution trace.*transient[\s\S]*not an authored or persisted workspace card/);
+  assert.match(tracePrompt, /aggregate console count alone cannot support a finding/i);
+  assert.match(recoveryPrompt, /raw\s+error count or HTTP status[\s\S]*cannot support a product\s+finding/);
+  assert.match(synthesisPrompt, /aggregate console counts or generic DOM article counts/);
 });
 
 test("web evaluator records timeout separately from product failure", () => {

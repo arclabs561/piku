@@ -47,5 +47,10 @@ screenshot–predicate contradiction in `disagreements`; if it cannot be resolve
 from current evidence, reject the negative claim and mark causal validity
 `compromised` or `inconclusive`. Keyword-regex absence cannot override visible
 screenshot text.
+Do not treat aggregate console counts or generic DOM article counts as product
+findings. Console evidence must identify representative messages, origin,
+timing, and impact. Object-count evidence must distinguish persisted
+`.workspace-object` cards from elements explicitly labeled as transient
+execution traces.
 Return only JSON matching the supplied schema, including useful todo, idea, and
 retest followups for future runs.

@@ -32,6 +32,14 @@ non-destructive `browser_evaluate` call before cleanup. Do not combine evidence
 capture, surface deletion, dialog handling, or browser close in one compound
 tool call.
 
+Classify every top-level article by its accessible label, `data-persistence`,
+and membership in `.workspace-object`. An `Execution trace` marked `transient`
+is runtime provenance, not an authored or persisted workspace card; do not count
+it as object proliferation. If console errors exist, record representative exact
+messages, source URL/origin, timing, and observed product impact. Separate host
+page errors from sandboxed `about:srcdoc` preview errors and intentional rejected
+requests. An aggregate console count alone cannot support a finding.
+
 Delete the surface through the UI and close the browser before returning. Return
 only JSON matching the supplied schema. Include concrete todo, idea, or retest
 followups that would help a later run; do not turn speculation into a finding.
