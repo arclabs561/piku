@@ -323,6 +323,23 @@ test("run manifest indexes role evidence and screenshots", async (t) => {
   assert.deepEqual(manifest.runtime, runtime);
 });
 
+test("run manifest safely indexes an absolute screenshot below the run", async (t) => {
+  const root = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-eval-")));
+  t.after(async () => (await import("node:fs/promises")).rm(root, { recursive: true, force: true }));
+  const roleDir = path.join(root, "recovery");
+  const screenshot = path.join(roleDir, "playwright-output", "after.png");
+  await (await import("node:fs/promises")).mkdir(path.dirname(screenshot), { recursive: true });
+  await (await import("node:fs/promises")).writeFile(screenshot, "fixture");
+  await (await import("node:fs/promises")).writeFile(path.join(roleDir, "evidence.json"), JSON.stringify({
+    evidence: [
+      { kind: "screenshot", artifact: screenshot },
+      { kind: "screenshot", artifact: "/outside/untrusted.png" },
+    ],
+  }));
+  const manifest = await writeRunManifest(root, "run-absolute", [{ role: "recovery", runStatus: "harness_failure" }]);
+  assert.deepEqual(manifest.explorers.recovery.screenshots, ["recovery/playwright-output/after.png"]);
+});
+
 async function writeResumeFixture(root, runId, statuses = { coding_trace: "completed", recovery: "completed" }) {
   const explorers = {};
   for (const role of ["coding_trace", "recovery"]) {

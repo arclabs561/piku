@@ -542,7 +542,14 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
         viewport = report.viewport || null;
         screenshots = (report.evidence || [])
           .filter((item) => item.kind === "screenshot" && typeof item.artifact === "string")
-          .map((item) => `${explorer.role}/${item.artifact}`);
+          .map((item) => {
+            const artifactPath = path.isAbsolute(item.artifact)
+              ? path.resolve(item.artifact)
+              : path.resolve(roleDir, item.artifact);
+            const relative = path.relative(runDir, artifactPath);
+            return relative.startsWith("..") || path.isAbsolute(relative) ? null : relative;
+          })
+          .filter(Boolean);
       } catch { /* Invalid reports remain visible through explorer status. */ }
     }
     roles[explorer.role] = {
