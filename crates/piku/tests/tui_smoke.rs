@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::serial;
 
+#[path = "test_helpers.rs"]
+mod test_helpers;
+
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
 // into the grid a human would see. Same observer the agentic judge loop uses,
 // so these smoke tests and the judge assert on one definition of "the screen".
@@ -46,6 +49,10 @@ use screen::{ScreenObserver, ScreenSnapshot};
 /// with the size piku actually drew into.
 const TEST_ROWS: u16 = 24;
 const TEST_COLS: u16 = 80;
+
+fn isolated_config_home() -> PathBuf {
+    std::env::temp_dir().join(format!("piku-tui-smoke-{}", std::process::id()))
+}
 
 fn piku_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -93,10 +100,14 @@ impl Pty {
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("XDG_CONFIG_HOME", isolated_config_home())
             .env("TERM", "xterm-256color")
             // Fake key so piku enters TUI. No request will succeed; we
             // never wait for LLM output.
             .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
+            // Keep turn-start smoke tests offline. The dedicated cancellation
+            // test below replaces this with its own hanging local listener.
+            .env("PIKU_BASE_URL", "http://127.0.0.1:9/v1")
             // Disable terminal-restoring signal handlers. Under nextest,
             // each test runs in its own process group, and nextest forwards
             // SIGTERM to grandchildren on timeout/cancellation. Our handler
@@ -365,10 +376,10 @@ fn two_consecutive_prompts_echo_normally() {
     let ready = pty.wait_for("❯", Duration::from_secs(5));
     assert!(ready, "prompt not reached:\n{}", pty.captured());
 
-    // First prompt — kicks off a turn that will error out on fake API key.
+    // First prompt — kicks off a turn against the offline local endpoint.
     pty.send(b"first\r");
     // Wait for the error + return to prompt.
-    let back_to_prompt = pty.wait_for("HTTP error 401", Duration::from_secs(5));
+    let back_to_prompt = pty.wait_for("[error]", Duration::from_secs(5));
     assert!(
         back_to_prompt,
         "first turn did not produce expected error:\n{}",
@@ -577,6 +588,7 @@ fn sigterm_restores_terminal_before_exit() {
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("XDG_CONFIG_HOME", isolated_config_home())
         .env("TERM", "xterm-256color")
         .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
         .env("PIKU_INSTALL_SIGNAL_HANDLERS", "1")
@@ -674,6 +686,7 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("XDG_CONFIG_HOME", isolated_config_home())
         .env("TERM", "xterm-256color")
         .env("OPENROUTER_API_KEY", "sk-or-fake-smoke-test")
         .env("PIKU_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
@@ -796,6 +809,7 @@ fn header_is_pinned_and_shows_version_on_launch() {
     // version, and the provider — and it must survive (not be wiped) once the
     // prompt is ready. This is the regression guard for "typing piku clears my
     // screen": if the frame were wiped, none of these would render.
+    let started = Instant::now();
     let mut pty = Pty::spawn();
     let snap = wait_ready(&mut pty);
 
@@ -811,11 +825,42 @@ fn header_is_pinned_and_shows_version_on_launch() {
         snap.summary(24)
     );
     assert!(
-        snap.shows("openrouter"),
+        snap.shows("custom"),
         "provider should be visible in the header; screen:\n{}",
         snap.summary(24)
     );
     pty.exit_cleanly();
+    test_helpers::append_live_ledger_for_surface(
+        test_helpers::EvaluationSurface::Tui,
+        "tui_smoke",
+        "local",
+        "none",
+        std::env::temp_dir().as_path(),
+        true,
+        started.elapsed(),
+    );
+}
+
+#[test]
+fn tui_ledger_record_satisfies_the_runtime_envelope() {
+    let record = test_helpers::build_live_ledger_record(
+        test_helpers::EvaluationSurface::Tui,
+        std::env::temp_dir().as_path(),
+        "tui_smoke",
+        "local",
+        "none",
+        true,
+        Duration::from_millis(7),
+    );
+
+    test_helpers::validate_evaluation_envelope(&record).unwrap();
+    assert_eq!(record["surface"], "tui");
+    assert_eq!(record["record_kind"], "run");
+    assert_eq!(record["stage_id"], "result");
+    assert_eq!(record["run_status"], "completed");
+    assert!(record["run_id"].as_str().is_some_and(
+        |run_id| run_id.starts_with("tui-tui_ledger_record_satisfies_the_runtime_envelope-")
+    ));
 }
 
 #[test]

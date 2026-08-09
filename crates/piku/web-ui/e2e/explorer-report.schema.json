@@ -21,6 +21,20 @@
       "required": ["width", "height", "device_scale_factor", "color_scheme", "canvas_scroll_x", "canvas_scroll_y"]
     },
     "summary": { "type": "string", "minLength": 1 },
+    "causal_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hypotheses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/hypothesis" }
+        },
+        "validity": { "$ref": "#/$defs/validity" }
+      },
+      "required": ["hypotheses", "validity"]
+    },
     "evidence": {
       "type": "array",
       "minItems": 1,
@@ -32,9 +46,21 @@
           "id": { "type": "string", "pattern": "^[a-z_]+:[A-Za-z0-9._-]+$" },
           "kind": { "type": "string", "enum": ["dom", "screenshot", "network", "console", "action", "predicate"] },
           "observation": { "type": "string", "minLength": 1 },
-          "artifact": { "type": ["string", "null"] }
+          "artifact": { "type": ["string", "null"] },
+          "artifact_metadata": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "size_bytes": { "type": "integer", "minimum": 0 },
+              "media_type": { "type": "string", "minLength": 1 },
+              "producer_event_id": { "type": "string", "minLength": 1 },
+              "producer_tool": { "type": "string", "minLength": 1 }
+            },
+            "required": ["sha256", "size_bytes", "media_type", "producer_event_id", "producer_tool"]
+          }
         },
-        "required": ["id", "kind", "observation", "artifact"]
+        "required": ["id", "kind", "observation", "artifact", "artifact_metadata"]
       }
     },
     "findings": {
@@ -69,5 +95,56 @@
       }
     }
   },
-  "required": ["perspective", "surface", "request_id", "status", "viewport", "summary", "evidence", "findings", "followups"]
+  "required": ["perspective", "surface", "request_id", "status", "viewport", "summary", "causal_assessment", "evidence", "findings", "followups"],
+  "$defs": {
+    "hypothesis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^h[1-9][0-9]*$" },
+        "mechanism": { "type": "string", "minLength": 1 },
+        "prediction": { "type": "string", "minLength": 1 },
+        "falsifier": { "type": "string", "minLength": 1 },
+        "observed_outcome": { "type": "string", "minLength": 1 },
+        "disposition": { "type": "string", "enum": ["supported", "disconfirmed", "mixed", "not_tested"] },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } },
+        "confounders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "factor": { "type": "string", "minLength": 1 },
+              "possible_effect": { "type": "string", "minLength": 1 }
+            },
+            "required": ["factor", "possible_effect"]
+          }
+        },
+        "alternative_explanations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "explanation": { "type": "string", "minLength": 1 },
+              "distinguishing_test": { "type": "string", "minLength": 1 }
+            },
+            "required": ["explanation", "distinguishing_test"]
+          }
+        }
+      },
+      "required": ["id", "mechanism", "prediction", "falsifier", "observed_outcome", "disposition", "evidence_ids", "confounders", "alternative_explanations"]
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "enum": ["valid", "compromised", "inconclusive"] },
+        "compromised_by": { "type": "array", "items": { "type": "string" } },
+        "rationale": { "type": "string", "minLength": 1 },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["status", "compromised_by", "rationale", "evidence_ids"]
+    }
+  }
 }

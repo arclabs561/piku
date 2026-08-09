@@ -147,6 +147,8 @@ fn live_ledger_summarizes_trace_file() {
     let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
     assert_eq!(row["schema_version"], 1);
     assert_eq!(row["surface"], "cli");
+    assert_eq!(row["record_kind"], "run");
+    assert_eq!(row["stage_id"], "result");
     assert_eq!(row["scenario_id"], "live_ledger_summarizes_trace_file");
     assert_eq!(row["run_status"], "inconclusive");
     assert!(row["run_id"]
@@ -169,6 +171,42 @@ fn live_ledger_summarizes_trace_file() {
     assert!(row["trace_path"]
         .as_str()
         .is_some_and(|path| path.ends_with("session.jsonl")));
+}
+
+#[test]
+fn rust_ledger_validation_rejects_schema_drift() {
+    let dir = tempdir();
+    let record = test_helpers::build_live_ledger_record(
+        test_helpers::EvaluationSurface::Cli,
+        &dir,
+        "llm_e2e",
+        "fixture",
+        "fixture-model",
+        true,
+        Duration::from_millis(1),
+    );
+    test_helpers::validate_evaluation_envelope(&record).unwrap();
+
+    let mut missing_stage = record.clone();
+    missing_stage.as_object_mut().unwrap().remove("stage_id");
+    assert_eq!(
+        test_helpers::validate_evaluation_envelope(&missing_stage).unwrap_err(),
+        "missing required field stage_id"
+    );
+
+    let mut unknown_surface = record.clone();
+    unknown_surface["surface"] = serde_json::json!("terminal");
+    assert_eq!(
+        test_helpers::validate_evaluation_envelope(&unknown_surface).unwrap_err(),
+        "surface has invalid value terminal"
+    );
+
+    let mut malformed_evidence = record;
+    malformed_evidence["evidence_ids"] = serde_json::json!([7]);
+    assert_eq!(
+        test_helpers::validate_evaluation_envelope(&malformed_evidence).unwrap_err(),
+        "evidence_ids must contain only non-empty strings"
+    );
 }
 
 /// Run piku with a prompt against a controlled directory.

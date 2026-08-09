@@ -11,6 +11,17 @@ diff, then use its rerun control once. Record only observed evidence, with IDs
 prefixed `coding_trace:`. Do not add a file card or make a separate chat request.
 Stay below {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
+Before acting, state at least one falsifiable mechanism hypothesis in the
+structured report: what UI mechanism should make attribution understandable,
+what observation it predicts, and what observation would falsify it. After the
+journey, record the observed outcome and mark the hypothesis supported,
+disconfirmed, mixed, or not tested. Cite at least one evidence ID for every
+disposition except `not_tested`. Name confounders and plausible alternative
+explanations with a distinguishing retest. A score, finding severity, or overall
+verdict is not a mechanism. If provider failure, missing state, or incomplete
+exercise compromises the inference, say so in `causal_assessment.validity` and
+do not claim the product caused the outcome.
+
 Set and retain a 1440×1000 CSS-pixel viewport. Before each screenshot, record
 window.innerWidth/innerHeight, devicePixelRatio, prefers-color-scheme, and the
 canvas scroll offsets. Return the final values in `viewport`. Distinguish saved
@@ -24,3 +35,5 @@ tool call.
 Delete the surface through the UI and close the browser before returning. Return
 only JSON matching the supplied schema. Include concrete todo, idea, or retest
 followups that would help a later run; do not turn speculation into a finding.
+Set every `artifact_metadata` to null; the harness attests artifact bytes after
+your report is validated.

@@ -500,6 +500,175 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
     .toBe("Explain the parser strictly.");
 });
 
+test("chat notebook parsing drops invalid turns and repairs duplicate identities", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [
+          {
+            id: "normalized-chat",
+            kind: "chat",
+            title: "normalized thread",
+            x: 80,
+            y: 90,
+            width: 704,
+            height: 544,
+            content: JSON.stringify({
+              version: 4,
+              executor: "provider",
+              threadId: "",
+              model: "",
+              context: "parser context",
+              sources: [],
+              turns: [
+                {
+                  id: "duplicate-turn",
+                  prompt: "First valid prompt",
+                  response: "First valid response",
+                  status: "done",
+                },
+                null,
+                {
+                  id: "duplicate-turn",
+                  prompt: "Second valid prompt",
+                  response: "Second valid response",
+                  status: "unknown",
+                },
+                { id: "invalid-response", prompt: "Missing response" },
+              ],
+            }),
+          },
+        ],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+
+  await page.reload();
+  const chat = page.locator('[data-object-id="normalized-chat"]');
+  await expect(chat.locator(".chat-turn")).toHaveCount(2);
+  await expect
+    .poll(() =>
+      chat
+        .getByLabel("User turn")
+        .evaluateAll((fields) => fields.map((field) => field.value)),
+    )
+    .toEqual(["First valid prompt", "Second valid prompt"]);
+  const turnIds = await chat.locator(".chat-turn").evaluateAll((turns) =>
+    turns.map((turn) => turn.dataset.turnId),
+  );
+  expect(new Set(turnIds).size).toBe(2);
+  expect(turnIds[0]).toBe("duplicate-turn");
+  expect(turnIds[1]).toMatch(/^turn-/);
+  await expect(chat.locator(".chat-turn-status")).toHaveText([
+    /done/,
+    /stale/,
+  ]);
+});
+
+test("a running notebook stays on its originating surface until its result is saved", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [
+          {
+            id: "pinned-chat",
+            kind: "chat",
+            title: "pinned thread",
+            x: 80,
+            y: 90,
+            width: 704,
+            height: 544,
+            content: JSON.stringify({
+              version: 4,
+              executor: "provider",
+              threadId: "",
+              model: "",
+              context: "",
+              sources: [],
+              turns: [
+                {
+                  id: "pinned-turn",
+                  prompt: "Keep this answer on its original surface.",
+                  response: "",
+                  status: "idle",
+                  attempt: 0,
+                  completedAt: "",
+                },
+              ],
+            }),
+          },
+        ],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+
+  let releaseResponse;
+  const responseGate = new Promise((resolve) => {
+    releaseResponse = resolve;
+  });
+  await page.route("**/api/chat", async (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.surface).toBe(surfaceName);
+    await responseGate;
+    const events = [
+      { kind: "request_accepted", surface: surfaceName },
+      {
+        kind: "model_started",
+        surface: surfaceName,
+        provider: "fixture",
+        model: "fixture",
+        message: "Answering",
+        request_kind: "chat",
+      },
+      { kind: "text_delta", text: "Persisted on the originating surface." },
+      {
+        kind: "completed",
+        surface: surfaceName,
+        message: "done",
+        iterations: 1,
+        elapsed_seconds: 0.01,
+        canvas_changed: false,
+      },
+    ];
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  await page.reload();
+  const chat = page.locator('[data-object-id="pinned-chat"]');
+  await chat.getByRole("button", { name: "run all", exact: true }).click();
+  const scratch = page.getByRole("button", { name: "scratch", exact: true });
+  await expect(scratch).toBeDisabled();
+  await scratch.evaluate((button) => button.click());
+  await expect(page).toHaveURL(
+    new RegExp(`\\?surface=${encodeURIComponent(surfaceName)}$`),
+  );
+
+  releaseResponse();
+  await expect(chat.locator(".chat-turn-status")).toContainText("done");
+  await expect(scratch).toBeEnabled();
+  await scratch.click();
+  await page.getByRole("button", { name: surfaceName, exact: true }).click();
+  await expect(
+    page.locator('[data-object-id="pinned-chat"] .chat-response'),
+  ).toContainText("Persisted on the originating surface.");
+});
+
 test("Codex chat cards persist and resume their native thread identity", async ({
   page,
   request,
@@ -791,8 +960,12 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await change.getByLabel("Change instruction").fill("revise the heading");
   await change.getByLabel("Change instruction").press("Enter");
   await expect(change.locator(".source-diff")).toContainText("revision 1");
+  const diffDisclosure = change.locator(".change-source-diff");
+  await diffDisclosure.locator("summary").click();
+  await expect(diffDisclosure).toHaveAttribute("open", "");
   await change.getByRole("button", { name: "run again" }).click();
   await expect(change.locator(".source-diff")).toContainText("revision 2");
+  await expect(diffDisclosure).toHaveAttribute("open", "");
   await expect(change.locator(".change-history li")).toHaveCount(2);
   await expect(change.locator(".change-history")).toContainText("run #1 · done");
   await expect(change.locator(".change-history")).toContainText("request-page-2");
@@ -938,6 +1111,23 @@ test("narrow layout keeps every object handle reachable without overlap", async 
   expect(ordered[1].top).toBeGreaterThanOrEqual(ordered[0].bottom);
   expect(ordered[2].top).toBeGreaterThanOrEqual(ordered[1].bottom);
   await expect(page.locator(".object-close").first()).toHaveCSS("min-height", "44px");
+
+  const note = page.locator('[data-kind="note"]');
+  const noteBefore = await note.boundingBox();
+  const noteHandle = await note.locator(".object-handle").boundingBox();
+  expect(noteBefore).not.toBeNull();
+  expect(noteHandle).not.toBeNull();
+  await expect(note.locator(".object-handle")).toHaveCSS("cursor", "default");
+  await page.mouse.move(
+    noteHandle.x + noteHandle.width / 2,
+    noteHandle.y + noteHandle.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(noteHandle.x + 120, noteHandle.y + 120, { steps: 6 });
+  await page.mouse.up();
+  const noteAfter = await note.boundingBox();
+  expect(noteAfter.x).toBe(noteBefore.x);
+  expect(noteAfter.y).toBe(noteBefore.y);
 });
 
 test("returning from a scrolled narrow layout restores the desktop canvas", async ({

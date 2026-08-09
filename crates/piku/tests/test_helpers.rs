@@ -6,6 +6,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationSurface {
+    Cli,
+    Tui,
+}
+
+impl EvaluationSurface {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Tui => "tui",
+        }
+    }
+}
+
 /// Strip ANSI escape sequences from a string for plain-text assertions.
 #[must_use]
 pub fn strip_ansi(s: &str) -> String {
@@ -64,10 +79,50 @@ pub fn append_live_ledger(
     exit_ok: bool,
     duration: Duration,
 ) {
+    append_live_ledger_for_surface(
+        EvaluationSurface::Cli,
+        suite,
+        provider,
+        model,
+        config_dir,
+        exit_ok,
+        duration,
+    );
+}
+
+pub fn append_live_ledger_for_surface(
+    surface: EvaluationSurface,
+    suite: &str,
+    provider: &str,
+    model: &str,
+    config_dir: &Path,
+    exit_ok: bool,
+    duration: Duration,
+) {
     let Ok(ledger_path) = std::env::var("PIKU_LIVE_LEDGER") else {
         return;
     };
 
+    let record = build_live_ledger_record(
+        surface, config_dir, suite, provider, model, exit_ok, duration,
+    );
+    if let Err(error) = validate_evaluation_envelope(&record) {
+        eprintln!("refusing to append invalid evaluation envelope: {error}");
+        return;
+    }
+    append_json_line(Path::new(&ledger_path), &record);
+}
+
+#[must_use]
+pub fn build_live_ledger_record(
+    surface: EvaluationSurface,
+    config_dir: &Path,
+    suite: &str,
+    provider: &str,
+    model: &str,
+    exit_ok: bool,
+    duration: Duration,
+) -> serde_json::Value {
     let trace_path = latest_trace_path(config_dir);
     let mut input_tokens = 0;
     let mut output_tokens = 0;
@@ -114,7 +169,8 @@ pub fn append_live_ledger(
     };
     let test_name = current_test_name();
     let run_id = format!(
-        "cli-{}-{}",
+        "{}-{}-{}",
+        surface.as_str(),
         test_name,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -126,17 +182,19 @@ pub fn append_live_ledger(
         .map(|path| vec![path.display().to_string()])
         .unwrap_or_default();
 
-    let record = serde_json::json!({
+    serde_json::json!({
         "schema_version": 1,
         "run_id": run_id,
         "scenario_id": test_name,
-        "surface": "cli",
+        "surface": surface.as_str(),
         "subject_surface": serde_json::Value::Null,
         "perspective": suite,
         "subject_model": model,
         "explorer_model": serde_json::Value::Null,
         "judge_model": serde_json::Value::Null,
         "task_contract": current_test_name(),
+        "record_kind": "run",
+        "stage_id": "result",
         "run_status": if exit_ok { "completed" } else { "inconclusive" },
         "product_verdict": serde_json::Value::Null,
         "finding_count": serde_json::Value::Null,
@@ -158,9 +216,146 @@ pub fn append_live_ledger(
         "failed_tools": failed_tools,
         "permission_denied": permission_denied,
         "duration_ms": duration.as_millis(),
-    });
+    })
+}
 
-    append_json_line(Path::new(&ledger_path), &record);
+pub fn validate_evaluation_envelope(record: &serde_json::Value) -> Result<(), String> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| "envelope must be a JSON object".to_string())?;
+    let required = [
+        "schema_version",
+        "run_id",
+        "scenario_id",
+        "surface",
+        "perspective",
+        "task_contract",
+        "record_kind",
+        "stage_id",
+        "run_status",
+        "failure_class",
+        "product_verdict",
+        "finding_count",
+        "evidence_ids",
+        "artifact_refs",
+        "followups",
+        "duration_ms",
+    ];
+    for field in required {
+        if !object.contains_key(field) {
+            return Err(format!("missing required field {field}"));
+        }
+    }
+    if object["schema_version"].as_u64() != Some(1) {
+        return Err("schema_version must equal 1".to_string());
+    }
+    for field in [
+        "run_id",
+        "scenario_id",
+        "perspective",
+        "task_contract",
+        "stage_id",
+        "failure_class",
+    ] {
+        if object[field].as_str().is_none_or(str::is_empty) {
+            return Err(format!("{field} must be a non-empty string"));
+        }
+    }
+    require_enum(object, "surface", &["cli", "tui", "web"])?;
+    require_enum(object, "record_kind", &["run", "stage"])?;
+    require_enum(
+        object,
+        "run_status",
+        &[
+            "completed",
+            "product_failure",
+            "harness_failure",
+            "infrastructure_failure",
+            "timeout",
+            "inconclusive",
+        ],
+    )?;
+    if !matches!(
+        object["product_verdict"].as_str(),
+        None | Some("supported" | "partial" | "not_supported")
+    ) || (!object["product_verdict"].is_null() && !object["product_verdict"].is_string())
+    {
+        return Err("product_verdict has an invalid value".to_string());
+    }
+    if !(object["finding_count"].is_null() || object["finding_count"].as_u64().is_some()) {
+        return Err("finding_count must be null or a non-negative integer".to_string());
+    }
+    require_string_array(object, "evidence_ids")?;
+    require_string_array(object, "artifact_refs")?;
+    let followups = object["followups"]
+        .as_array()
+        .ok_or_else(|| "followups must be an array".to_string())?;
+    for followup in followups {
+        validate_followup(followup)?;
+    }
+    if object["duration_ms"].as_u64().is_none() {
+        return Err("duration_ms must be a non-negative integer".to_string());
+    }
+    Ok(())
+}
+
+fn require_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), String> {
+    let values = object[field]
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array"))?;
+    if values
+        .iter()
+        .any(|value| value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(format!("{field} must contain only non-empty strings"));
+    }
+    Ok(())
+}
+
+fn validate_followup(followup: &serde_json::Value) -> Result<(), String> {
+    let object = followup
+        .as_object()
+        .ok_or_else(|| "followup must be an object".to_string())?;
+    let expected = [
+        "kind",
+        "priority",
+        "title",
+        "rationale",
+        "perspective",
+        "evidence_ids",
+    ];
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err("followup fields do not match the envelope schema".to_string());
+    }
+    require_enum(object, "kind", &["todo", "idea", "retest"])?;
+    require_enum(object, "priority", &["high", "medium", "low"])?;
+    for field in ["title", "rationale"] {
+        if object[field].as_str().is_none_or(str::is_empty) {
+            return Err(format!("followup {field} must be a non-empty string"));
+        }
+    }
+    if !(object["perspective"].is_null() || object["perspective"].is_string()) {
+        return Err("followup perspective must be null or a string".to_string());
+    }
+    require_string_array(object, "evidence_ids")
+}
+
+fn require_enum(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let value = object[field]
+        .as_str()
+        .ok_or_else(|| format!("{field} must be a string"))?;
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{field} has invalid value {value}"))
+    }
 }
 
 fn append_json_line(path: &Path, record: &serde_json::Value) {

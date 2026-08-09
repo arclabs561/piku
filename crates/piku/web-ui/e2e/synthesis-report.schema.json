@@ -7,6 +7,30 @@
     "summary": { "type": "string", "minLength": 1 },
     "evidence_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
     "disagreements": { "type": "array", "items": { "type": "string" } },
+    "causal_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mechanism_summary": { "type": "string", "minLength": 1 },
+        "hypotheses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/hypothesis" }
+        },
+        "validity": { "$ref": "#/$defs/validity" }
+      },
+      "required": ["mechanism_summary", "hypotheses", "validity"]
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "coding_trace": { "$ref": "#/$defs/coverage" },
+        "recovery": { "$ref": "#/$defs/coverage" }
+      },
+      "required": ["coding_trace", "recovery"]
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -15,9 +39,10 @@
         "properties": {
           "severity": { "type": "string", "enum": ["high", "medium", "low"] },
           "title": { "type": "string" },
+          "modality": { "type": "string", "enum": ["visual", "layout", "interaction", "persistence", "network", "console", "provenance"] },
           "evidence_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } }
         },
-        "required": ["severity", "title", "evidence_ids"]
+        "required": ["severity", "title", "modality", "evidence_ids"]
       }
     },
     "followups": {
@@ -38,5 +63,66 @@
       }
     }
   },
-  "required": ["verdict", "summary", "evidence_ids", "disagreements", "findings", "followups"]
+  "required": ["verdict", "summary", "evidence_ids", "disagreements", "causal_assessment", "coverage", "findings", "followups"],
+  "$defs": {
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "enum": ["assessed", "limited"] },
+        "rationale": { "type": "string", "minLength": 1 },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["status", "rationale", "evidence_ids"]
+    },
+    "hypothesis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^h[1-9][0-9]*$" },
+        "mechanism": { "type": "string", "minLength": 1 },
+        "prediction": { "type": "string", "minLength": 1 },
+        "falsifier": { "type": "string", "minLength": 1 },
+        "observed_outcome": { "type": "string", "minLength": 1 },
+        "disposition": { "type": "string", "enum": ["supported", "disconfirmed", "mixed", "not_tested"] },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } },
+        "confounders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "factor": { "type": "string", "minLength": 1 },
+              "possible_effect": { "type": "string", "minLength": 1 }
+            },
+            "required": ["factor", "possible_effect"]
+          }
+        },
+        "alternative_explanations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "explanation": { "type": "string", "minLength": 1 },
+              "distinguishing_test": { "type": "string", "minLength": 1 }
+            },
+            "required": ["explanation", "distinguishing_test"]
+          }
+        }
+      },
+      "required": ["id", "mechanism", "prediction", "falsifier", "observed_outcome", "disposition", "evidence_ids", "confounders", "alternative_explanations"]
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "enum": ["valid", "compromised", "inconclusive"] },
+        "compromised_by": { "type": "array", "items": { "type": "string" } },
+        "rationale": { "type": "string", "minLength": 1 },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["status", "compromised_by", "rationale", "evidence_ids"]
+    }
+  }
 }

@@ -12,7 +12,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
     run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, Session, TurnResult,
@@ -33,6 +33,10 @@ const MAX_OBJECT_CONTENT_CHARS: usize = 32_000;
 const MAX_CHAT_NOTEBOOK_CHARS: usize = 256_000;
 const MAX_CHAT_CONTEXT_CHARS: usize = 32_000;
 const MAX_CHAT_HISTORY_MESSAGES: usize = 128;
+const MODEL_REQUEST_SLOTS: usize = 4;
+const SSE_QUEUE_EVENTS: usize = 128;
+const SSE_CONTROL_RESERVE: usize = 16;
+const MAX_RUN_ID_LEN: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Surface storage
@@ -123,29 +127,21 @@ struct CanvasState {
 }
 
 impl CanvasState {
-    fn save(&self, dir: &FsPath) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join("canvas.html"), &self.html);
-        if let Ok(json) = serde_json::to_string(&self.messages) {
-            let _ = std::fs::write(dir.join("chat.json"), json);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.objects) {
-            let _ = std::fs::write(dir.join("workspace.json"), json);
-        }
-        let _ = self.session.save(&dir.join("session.json"));
-        let _ = self.chat_session.save(&dir.join("chat-session.json"));
-        let _ = self
-            .workspace_session
-            .save(&dir.join("workspace-session.json"));
+    fn save(&self, dir: &FsPath) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        atomic_write_json(&dir.join("canvas-state.json"), self)
     }
 
     fn save_workspace(&self, dir: &FsPath) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let json = serde_json::to_vec_pretty(&self.objects).map_err(std::io::Error::other)?;
-        std::fs::write(dir.join("workspace.json"), json)
+        self.save(dir)
     }
 
     fn load(dir: &FsPath) -> Self {
+        if let Ok(bytes) = std::fs::read(dir.join("canvas-state.json")) {
+            if let Ok(state) = serde_json::from_slice(&bytes) {
+                return state;
+            }
+        }
         let html = std::fs::read_to_string(dir.join("canvas.html")).unwrap_or_default();
         let messages = std::fs::read_to_string(dir.join("chat.json"))
             .ok()
@@ -179,8 +175,42 @@ impl CanvasState {
         let _ = std::fs::remove_file(dir.join("chat-session.json"));
         let _ = std::fs::remove_file(dir.join("workspace.json"));
         let _ = std::fs::remove_file(dir.join("workspace-session.json"));
+        let _ = std::fs::remove_file(dir.join("canvas-state.json"));
         let _ = std::fs::remove_dir(dir);
     }
+}
+
+fn atomic_write_json(path: &FsPath, value: &impl Serialize) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("state path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("state path has no file name"))?
+        .to_string_lossy();
+    let temp = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        crate::new_session_id()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 fn list_surfaces(root: &FsPath) -> Vec<String> {
@@ -206,12 +236,34 @@ struct SurfacesState {
     root: PathBuf,
 }
 
+struct RunningSurfaceGuard {
+    surfaces: Arc<RwLock<SurfacesState>>,
+    surface: String,
+}
+
+impl RunningSurfaceGuard {
+    fn new(surfaces: Arc<RwLock<SurfacesState>>, surface: String) -> Self {
+        Self { surfaces, surface }
+    }
+}
+
+impl Drop for RunningSurfaceGuard {
+    fn drop(&mut self) {
+        let surfaces = Arc::clone(&self.surfaces);
+        let surface = self.surface.clone();
+        tokio::spawn(async move {
+            surfaces.write().await.running.remove(&surface);
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct AppState {
     config: Arc<PikuConfig>,
     surfaces: Arc<RwLock<SurfacesState>>,
     pub(super) workspace_root: Arc<PathBuf>,
     pub(super) terminal_slots: Arc<tokio::sync::Semaphore>,
+    model_slots: Arc<Semaphore>,
     codex_root: Arc<PathBuf>,
 }
 
@@ -356,6 +408,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         })),
         workspace_root: Arc::new(workspace_root),
         terminal_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        model_slots: Arc::new(Semaphore::new(MODEL_REQUEST_SLOTS)),
         codex_root: Arc::new(config.config_dir.join("_codex")),
     });
 
@@ -638,8 +691,9 @@ async fn update_workspace(
         .cache
         .entry(name.clone())
         .or_insert_with(|| CanvasState::load(&dir));
-    entry.objects = update.objects;
-    if let Err(error) = entry.save_workspace(&dir) {
+    let mut candidate = entry.clone();
+    candidate.objects = update.objects;
+    if let Err(error) = candidate.save_workspace(&dir) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(WebError {
@@ -648,6 +702,7 @@ async fn update_workspace(
         )
             .into_response();
     }
+    *entry = candidate;
     tracing::info!(surface = %name, objects = entry.objects.len(), "workspace saved");
     Json(serde_json::json!({"objects": entry.objects})).into_response()
 }
@@ -1123,7 +1178,7 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let surface_name = surface_name(req.surface.as_deref().unwrap_or("scratch"));
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let (tx, rx) = mpsc::channel::<String>(SSE_QUEUE_EVENTS);
     let request_error = validate_request_message(&req.message)
         .map_err(str::to_string)
         .and_then(|()| validate_chat_notebook_input(req.context.as_deref(), &req.history))
@@ -1139,18 +1194,27 @@ async fn chat_handler(
             &serde_json::json!({"kind":"failed","surface":surface_name,"message":message}),
         );
     } else if accepted {
-        tokio::spawn(run_model_request(
-            state,
-            surface_name,
-            req.message,
-            req.kind,
-            req.target_id,
-            req.context,
-            req.history,
-            req.executor,
-            req.thread_id,
-            tx,
-        ));
+        if let Ok(permit) = Arc::clone(&state.model_slots).try_acquire_owned() {
+            tokio::spawn(run_model_request(
+                state,
+                surface_name,
+                req.message,
+                req.kind,
+                req.target_id,
+                req.context,
+                req.history,
+                req.executor,
+                req.thread_id,
+                tx,
+                permit,
+            ));
+        } else {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":"Model request capacity is full; retry after an active request finishes"}),
+            );
+            state.surfaces.write().await.running.remove(&surface_name);
+        }
     } else {
         emit(
             &tx,
@@ -1193,8 +1257,10 @@ async fn run_model_request(
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
+    _permit: OwnedSemaphorePermit,
 ) {
+    let _running = RunningSurfaceGuard::new(Arc::clone(&state.surfaces), surface_name.clone());
     match kind {
         RequestKind::Chat => {
             run_chat_request(
@@ -1224,7 +1290,7 @@ async fn run_chat_request(
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 ) {
     if executor == ChatExecutor::Codex {
         run_codex_chat_request(
@@ -1260,7 +1326,7 @@ async fn run_codex_chat_request(
     context: Option<String>,
     history: Vec<ChatMessage>,
     thread_id: Option<String>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
     emit(
@@ -1307,7 +1373,7 @@ async fn run_codex_chat_request(
                 &event_tx,
                 &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
             ),
-            codex::CodexEvent::Delta(text) => emit(
+            codex::CodexEvent::Delta(text) => emit_lossy(
                 &event_tx,
                 &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":text}),
             ),
@@ -1370,7 +1436,7 @@ async fn run_provider_chat_request(
     target_id: Option<String>,
     context: Option<String>,
     history: Vec<ChatMessage>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
     emit(
@@ -1472,20 +1538,28 @@ async fn run_provider_chat_request(
         .cache
         .entry(surface_name.clone())
         .or_insert_with(|| CanvasState::load(&dir));
+    let mut candidate = entry.clone();
     if !notebook_request {
-        entry.chat_session = session;
-        entry.messages.push(ChatMessage {
+        candidate.chat_session = session;
+        candidate.messages.push(ChatMessage {
             role: "user".into(),
             content: message,
         });
     }
     if result.stream_error.is_none() && !reply.is_empty() {
         if !notebook_request {
-            entry.messages.push(ChatMessage {
+            candidate.messages.push(ChatMessage {
                 role: "assistant".into(),
                 content: reply,
             });
-            entry.save(&dir);
+            if let Err(error) = candidate.save(&dir) {
+                emit(
+                    &tx,
+                    &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist chat history: {error}")}),
+                );
+                return;
+            }
+            *entry = candidate;
         }
         emit(
             &tx,
@@ -1505,11 +1579,13 @@ async fn run_provider_chat_request(
             .stream_error
             .unwrap_or_else(|| "model returned an empty chat response".to_string());
         if !notebook_request {
-            entry.messages.push(ChatMessage {
+            candidate.messages.push(ChatMessage {
                 role: "assistant".into(),
                 content: format!("Chat failed: {reason}"),
             });
-            entry.save(&dir);
+            if candidate.save(&dir).is_ok() {
+                *entry = candidate;
+            }
         }
         emit(
             &tx,
@@ -1524,7 +1600,7 @@ async fn run_workspace_request(
     state: Arc<AppState>,
     surface_name: String,
     message: String,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
     emit(
@@ -1601,17 +1677,18 @@ async fn run_workspace_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
-        entry.objects.clone_from(&objects);
-        entry.workspace_session = session;
-        entry.messages.push(ChatMessage {
+        let mut candidate = entry.clone();
+        candidate.objects.clone_from(&objects);
+        candidate.workspace_session = session;
+        candidate.messages.push(ChatMessage {
             role: "user".into(),
             content: message,
         });
-        entry.messages.push(ChatMessage {
+        candidate.messages.push(ChatMessage {
             role: "assistant".into(),
             content: narration(&sink.output),
         });
-        if let Err(error) = entry.save_workspace(&dir) {
+        if let Err(error) = candidate.save_workspace(&dir) {
             emit(
                 &tx,
                 &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist workspace: {error}")}),
@@ -1620,7 +1697,7 @@ async fn run_workspace_request(
             state.surfaces.write().await.running.remove(&surface_name);
             return;
         }
-        entry.save(&dir);
+        *entry = candidate;
         emit(
             &tx,
             &serde_json::json!({"kind":"workspace_snapshot","objects":objects}),
@@ -1760,7 +1837,7 @@ async fn run_canvas_request(
     surface_name: String,
     message: String,
     target_id: Option<String>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
     emit(
@@ -1860,17 +1937,25 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
-        entry.html.clone_from(&canvas_html);
-        entry.session = session;
-        entry.messages.push(ChatMessage {
+        let mut candidate = entry.clone();
+        candidate.html.clone_from(&canvas_html);
+        candidate.session = session;
+        candidate.messages.push(ChatMessage {
             role: "user".into(),
             content: message,
         });
-        entry.messages.push(ChatMessage {
+        candidate.messages.push(ChatMessage {
             role: "assistant".into(),
             content: narration(&reply),
         });
-        entry.save(&dir);
+        if let Err(error) = candidate.save(&dir) {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist page source: {error}")}),
+            );
+            return;
+        }
+        *entry = candidate;
         surfaces.active.clone_from(&surface_name);
         emit(
             &tx,
@@ -1897,16 +1982,24 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
-        entry.session = session;
-        entry.messages.push(ChatMessage {
+        let mut candidate = entry.clone();
+        candidate.session = session;
+        candidate.messages.push(ChatMessage {
             role: "user".into(),
             content: message,
         });
-        entry.messages.push(ChatMessage {
+        candidate.messages.push(ChatMessage {
             role: "assistant".into(),
             content: format!("Canvas unchanged: {reason}"),
         });
-        entry.save(&dir);
+        if let Err(error) = candidate.save(&dir) {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist page history: {error}")}),
+            );
+            return;
+        }
+        *entry = candidate;
         drop(surfaces);
         if unchanged {
             emit(
@@ -1954,7 +2047,13 @@ async fn run_canvas_request(
             role: "assistant".into(),
             content: format!("Canvas unchanged; clarification requested: {clarification}"),
         });
-        entry.save(&dir);
+        if let Err(error) = entry.save(&dir) {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist page history: {error}")}),
+            );
+            return;
+        }
         emit(
             &tx,
             &serde_json::json!({"kind":"needs_input","surface":surface_name,"message":clarification,"iterations":result.iterations,"elapsed_seconds":elapsed}),
@@ -1987,7 +2086,9 @@ async fn run_canvas_request(
             role: "assistant".into(),
             content: format!("Canvas unchanged: {reason}"),
         });
-        entry.save(&dir);
+        if let Err(error) = entry.save(&dir) {
+            tracing::error!(request_id, kind = "page", %error, "cannot persist failed page turn");
+        }
         drop(surfaces);
         emit(
             &tx,
@@ -1998,8 +2099,28 @@ async fn run_canvas_request(
     state.surfaces.write().await.running.remove(&surface_name);
 }
 
-fn emit(tx: &mpsc::UnboundedSender<String>, event: &impl ToString) {
-    let _ = tx.send(event.to_string());
+fn emit(tx: &mpsc::Sender<String>, event: &impl ToString) {
+    match tx.try_send(event.to_string()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::error!(
+                queue_capacity = SSE_QUEUE_EVENTS,
+                reserved_events = SSE_CONTROL_RESERVE,
+                "SSE control event could not be delivered despite reserved capacity"
+            );
+        }
+    }
+}
+
+fn emit_lossy(tx: &mpsc::Sender<String>, event: &impl ToString) {
+    if tx.capacity() <= SSE_CONTROL_RESERVE {
+        tracing::debug!(
+            reserved_events = SSE_CONTROL_RESERVE,
+            "SSE progress event coalesced to preserve control-event capacity"
+        );
+        return;
+    }
+    let _ = tx.try_send(event.to_string());
 }
 
 fn validate_request_message(message: &str) -> Result<(), &'static str> {
@@ -2210,15 +2331,11 @@ struct WebSink {
     last_canvas: String,
     last_snapshot_at: Instant,
     initial_canvas: Option<String>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 }
 
 impl WebSink {
-    fn new(
-        request_id: String,
-        tx: mpsc::UnboundedSender<String>,
-        initial_canvas: Option<String>,
-    ) -> Self {
+    fn new(request_id: String, tx: mpsc::Sender<String>, initial_canvas: Option<String>) -> Self {
         Self {
             request_id,
             started: Instant::now(),
@@ -2239,7 +2356,7 @@ impl OutputSink for WebSink {
             tracing::debug!(request_id = %self.request_id, elapsed_seconds = self.started.elapsed().as_secs_f32(), "first model output received");
         }
         self.output.push_str(text);
-        emit(
+        emit_lossy(
             &self.tx,
             &serde_json::json!({"kind":"text_delta","text":text}),
         );
@@ -2257,7 +2374,7 @@ impl OutputSink for WebSink {
             {
                 self.last_canvas.clone_from(&partial);
                 self.last_snapshot_at = Instant::now();
-                emit(
+                emit_lossy(
                     &self.tx,
                     &serde_json::json!({"kind":"page_snapshot","html":partial}),
                 );
@@ -2294,6 +2411,9 @@ async fn view_run(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(message) = validate_run_id(&session_id) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let path = state.config.runs_dir().join(format!("{session_id}.jsonl"));
     match piku_runtime::read_run_record(&path) {
         Ok(events) if !events.is_empty() => {
@@ -2319,6 +2439,19 @@ async fn view_run(
     }
 }
 
+fn validate_run_id(session_id: &str) -> Result<(), &'static str> {
+    if session_id.is_empty()
+        || session_id.len() > MAX_RUN_ID_LEN
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Err("invalid run identity")
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2328,13 +2461,14 @@ mod tests {
 
     use super::{
         apply_canvas_reply, apply_workspace_operations, canvas_system_prompt, chat_system_prompt,
-        compact_canvas_turn, execute_terminal_read, extract_canvas_html,
+        compact_canvas_turn, emit, emit_lossy, execute_terminal_read, extract_canvas_html,
         extract_partial_canvas_html, extract_workspace_operations, has_chat_target,
         has_page_edit_target, has_sensitive_path_component, is_allowed_host, is_same_local_origin,
         render_home, resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
-        validate_chat_notebook_input, validate_request_message, validate_workspace_objects,
-        workspace_input, CanvasState, ChatMessage, TerminalReadRequest, WorkspaceObject,
-        WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS,
+        validate_chat_notebook_input, validate_request_message, validate_run_id,
+        validate_workspace_objects, workspace_input, CanvasState, ChatMessage, TerminalReadRequest,
+        WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN,
+        SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{ContentBlock, ConversationMessage, Session};
 
@@ -2346,6 +2480,88 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("temporary directory exists");
         dir
+    }
+
+    #[test]
+    fn run_ids_are_validated_before_building_record_paths() {
+        for valid in ["session-123", "run_ABC", "0"] {
+            assert!(validate_run_id(valid).is_ok(), "expected valid id: {valid}");
+        }
+        for invalid in ["", "../outside", "a/b", "with space", "é"] {
+            assert!(
+                validate_run_id(invalid).is_err(),
+                "expected invalid id: {invalid}"
+            );
+        }
+        assert!(validate_run_id(&"a".repeat(MAX_RUN_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn canvas_state_uses_one_atomic_authoritative_snapshot() {
+        let dir = temp_dir("piku-web-atomic-canvas");
+        let mut state = CanvasState {
+            html: "<main>saved</main>".to_string(),
+            ..CanvasState::default()
+        };
+        state.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: "persisted".to_string(),
+        });
+
+        state.save(&dir).expect("atomic state save succeeds");
+        fs::write(dir.join("canvas.html"), "<main>stale legacy</main>")
+            .expect("legacy fixture writes");
+        let loaded = CanvasState::load(&dir);
+
+        assert_eq!(loaded.html, "<main>saved</main>");
+        assert_eq!(loaded.messages[0].content, "persisted");
+        let leftovers = fs::read_dir(&dir)
+            .expect("state directory reads")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+        fs::remove_dir_all(dir).expect("remove temp directory");
+    }
+
+    #[test]
+    fn canvas_state_reports_persistence_failures() {
+        let base = temp_dir("piku-web-failed-canvas");
+        let blocked = base.join("not-a-directory");
+        fs::write(&blocked, "file").expect("blocking file writes");
+
+        let error = CanvasState::default()
+            .save(&blocked)
+            .expect_err("invalid state directory must fail");
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        fs::remove_dir_all(base).expect("remove temp directory");
+    }
+
+    #[test]
+    fn lossy_sse_progress_preserves_capacity_for_control_events() {
+        let capacity = SSE_CONTROL_RESERVE + 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(capacity);
+
+        emit_lossy(&tx, &"delta-1");
+        emit_lossy(&tx, &"delta-2");
+        emit_lossy(&tx, &"delta-coalesced");
+        for index in 0..SSE_CONTROL_RESERVE {
+            emit(&tx, &format!("control-{index}"));
+        }
+
+        assert_eq!(rx.try_recv().expect("first delta queued"), "delta-1");
+        assert_eq!(rx.try_recv().expect("second delta queued"), "delta-2");
+        for index in 0..SSE_CONTROL_RESERVE {
+            assert_eq!(
+                rx.try_recv().expect("reserved control event queued"),
+                format!("control-{index}")
+            );
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

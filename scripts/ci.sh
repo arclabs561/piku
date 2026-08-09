@@ -68,13 +68,13 @@ pty() {
   fi
 
   if [[ -z "$runner" ]]; then
-    cargo test --test tui_smoke -p piku -- --ignored
+    cargo test --test tui_smoke -p piku -- --ignored --test-threads=1
     return
   fi
 
   local status=0
   # --foreground so the tests keep the terminal they need for a PTY.
-  "$runner" --foreground "$seconds" cargo test --test tui_smoke -p piku -- --ignored || status=$?
+  "$runner" --foreground "$seconds" cargo test --test tui_smoke -p piku -- --ignored --test-threads=1 || status=$?
   if (( status == 124 )); then
     printf 'pty: no result after %ss. These tests need an idle machine; rerun scripts/ci.sh pty alone, or raise PIKU_PTY_TIMEOUT_SECS.\n' "$seconds" >&2
   fi

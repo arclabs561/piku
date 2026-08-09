@@ -1099,11 +1099,14 @@ function createWorkspaceObject(kind, anchor, restore = null) {
     if (!restore && pageKind) state.target = "page";
     scope.value = state.target;
     field.value = state.instruction;
+    let diffExpanded = false;
     const persistChange = () => {
       object.dataset.content = JSON.stringify(state);
       saveWorkspaceLayout();
     };
     const renderResult = () => {
+      const existingDiff = output.querySelector(".change-source-diff");
+      if (existingDiff) diffExpanded = existingDiff.open;
       output.replaceChildren();
       output.dataset.status = state.status;
       if (!state.summary && !state.diff) return;
@@ -1115,6 +1118,8 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         const details = document.createElement("details"),
           label = document.createElement("summary"),
           diff = document.createElement("pre");
+        details.className = "change-source-diff";
+        details.open = diffExpanded;
         label.textContent = "source diff";
         diff.className = "source-diff";
         diff.textContent = state.diff;

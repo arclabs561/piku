@@ -6,8 +6,10 @@
   "properties": {
     "schema_version": { "const": 1 },
     "run_id": { "type": "string", "minLength": 1 },
+    "record_kind": { "type": "string", "enum": ["run", "stage", "amendment"] },
+    "stage_id": { "type": "string", "minLength": 1 },
     "scenario_id": { "type": "string", "minLength": 1 },
-    "surface": { "type": "string", "enum": ["cli", "web"] },
+    "surface": { "type": "string", "enum": ["cli", "tui", "web"] },
     "subject_surface": { "type": ["string", "null"] },
     "perspective": { "type": "string", "minLength": 1 },
     "subject_model": { "type": ["string", "null"] },
@@ -71,11 +73,45 @@
         ]
       }
     },
-    "duration_ms": { "type": "integer", "minimum": 0 }
+    "duration_ms": { "type": "integer", "minimum": 0 },
+    "target_run_id": { "type": "string", "minLength": 1 },
+    "target_stage_id": { "type": "string", "minLength": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "contract_version": { "type": "string", "minLength": 1 },
+    "amendment_action": { "type": "string", "enum": ["invalidate", "qualify", "supersede", "reinstate"] },
+    "reason_code": { "type": "string", "minLength": 1 },
+    "amendment_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "evidence_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "finding_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "verdict": { "type": "boolean" }
+      },
+      "required": ["evidence_ids", "finding_refs", "verdict"]
+    },
+    "basis_refs": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "basis_hashes": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } },
+    "replacement_run_id": { "type": ["string", "null"], "minLength": 1 },
+    "replacement": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "product_verdict": { "type": ["string", "null"], "enum": ["supported", "partial", "not_supported", null] },
+        "finding_count": { "type": ["integer", "null"], "minimum": 0 },
+        "evidence_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "finding_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "actor": { "type": "string", "minLength": 1 },
+    "tool_version": { "type": "string", "minLength": 1 }
   },
   "required": [
     "schema_version",
     "run_id",
+    "record_kind",
+    "stage_id",
     "scenario_id",
     "surface",
     "perspective",
@@ -88,5 +124,17 @@
     "artifact_refs",
     "followups",
     "duration_ms"
+  ],
+  "allOf": [
+    {
+      "if": { "properties": { "record_kind": { "const": "amendment" } } },
+      "then": {
+        "required": [
+          "target_run_id", "target_stage_id", "event_id", "recorded_at", "contract_version",
+          "amendment_action", "reason_code",
+          "amendment_scope", "basis_refs", "basis_hashes", "actor", "tool_version"
+        ]
+      }
+    }
   ]
 }

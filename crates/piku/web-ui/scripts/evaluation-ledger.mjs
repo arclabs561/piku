@@ -1,10 +1,15 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { resolvedCodexModel } from "./codex-exec.mjs";
+import {
+  assertEvaluationEnvelope,
+  EVALUATION_SCHEMA_VERSION,
+} from "../../../../scripts/evaluation-envelope.mjs";
 
-export const EVALUATION_SCHEMA_VERSION = 1;
+export { assertEvaluationEnvelope, EVALUATION_SCHEMA_VERSION };
 
 function commandOutput(command, args, cwd) {
   try {
@@ -41,6 +46,8 @@ export function evaluationRecord({
   return {
     schema_version: EVALUATION_SCHEMA_VERSION,
     run_id: runId,
+    record_kind: "stage",
+    stage_id: surface ?? "synthesis",
     scenario_id: "web-codex-replacement-thesis",
     surface: "web",
     subject_surface: surface,
@@ -61,7 +68,54 @@ export function evaluationRecord({
   };
 }
 
+export function evaluationAmendment({
+  targetRecord,
+  action,
+  reasonCode,
+  scope,
+  basisRefs = [],
+  basisHashes = [],
+  replacement = null,
+  replacementRunId = null,
+  actor,
+  toolVersion,
+  eventId = randomUUID(),
+  recordedAt = new Date().toISOString(),
+  contractVersion = "piku-evaluation-amendment-v1",
+}) {
+  if (!targetRecord || targetRecord.record_kind === "amendment")
+    throw new TypeError("an amendment must target an original run or stage record");
+  return assertEvaluationEnvelope({
+    ...targetRecord,
+    record_kind: "amendment",
+    stage_id: `amendment:${eventId}`,
+    target_run_id: targetRecord.run_id,
+    target_stage_id: targetRecord.stage_id,
+    event_id: eventId,
+    recorded_at: recordedAt,
+    contract_version: contractVersion,
+    amendment_action: action,
+    reason_code: reasonCode,
+    amendment_scope: scope,
+    basis_refs: basisRefs,
+    basis_hashes: basisHashes,
+    replacement,
+    replacement_run_id: replacementRunId,
+    actor,
+    tool_version: toolVersion,
+    run_status: "completed",
+    failure_class: "none",
+    product_verdict: null,
+    finding_count: null,
+    evidence_ids: [],
+    artifact_refs: basisRefs,
+    followups: [],
+    duration_ms: 0,
+  });
+}
+
 export async function appendEvaluationRecord(ledgerPath, record) {
+  assertEvaluationEnvelope(record, `evaluation record for ${ledgerPath}`);
   await mkdir(path.dirname(ledgerPath), { recursive: true });
   await appendFile(ledgerPath, `${JSON.stringify(record)}\n`, "utf8");
 }
