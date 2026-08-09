@@ -1184,6 +1184,7 @@ test("page changes persist an inspectable source diff and rerun control", async 
   const restored = page.locator('[data-kind="workspace_task"]');
   await expect(restored.locator(".source-diff")).toContainText("revision 2");
   await expect(restored).toContainText("run again");
+  await restored.locator(".change-history > summary").click();
   await expect(restored.locator(".change-history li")).toHaveCount(2);
   const latestRun = restored.locator(".change-history li").first();
   await expect(latestRun).toContainText("run #2 · done");
