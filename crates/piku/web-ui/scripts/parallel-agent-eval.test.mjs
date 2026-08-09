@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest } from "./parallel-agent-eval.mjs";
+import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest, writeSynthesisFocusProposals } from "./parallel-agent-eval.mjs";
 import { attestedFiles, attestedValue, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -324,6 +324,59 @@ test("prompt manifest captures the canonical focus projection without exposing i
   const stored = await readFile(path.join(root, "focus.json"), "utf8");
   assert.equal(stored.endsWith("\n"), true);
   assert.equal(JSON.parse(stored).subject_state_hash, hash);
+});
+
+test("validated synthesis emits inert retest proposals as a separate artifact", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-focus-proposals-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const record = {
+    schema_version: 2,
+    run_id: "focus-proposal-run",
+    record_kind: "stage",
+    stage_id: "synthesis",
+    scenario_id: "web-codex-replacement-thesis",
+    surface: "web",
+    subject_surface: null,
+    perspective: "synthesis",
+    subject_revision: cleanRevision,
+    subject_dirty: false,
+    task_contract: "agentic-legibility-evidence-board",
+    run_status: "completed",
+    failure_class: "none",
+    product_verdict: "partial",
+    finding_count: 1,
+    finding_refs: ["focus-proposal-run:synthesis:finding:f1"],
+    evidence_ids: ["coding_trace:e1"],
+    artifact_refs: [],
+    followups: [{
+      obligation_id: "focus-proposal-run:synthesis:obligation:o1",
+      kind: "retest",
+      priority: "high",
+      title: "File context freshness",
+      rationale: "Retest explicit refresh after reload.",
+      perspective: "coding_trace",
+      evidence_ids: ["coding_trace:e1"],
+      finding_refs: ["focus-proposal-run:synthesis:finding:f1"],
+      retest_of: null,
+    }],
+    duration_ms: 1,
+  };
+  const result = await writeSynthesisFocusProposals(record, {
+    directory: root,
+    runtime: { subject_revision: cleanRevision, subject_dirty: false },
+    recordedAt: "2026-08-09T12:00:00.000Z",
+    suggestedExpiresAt: "2026-08-16T12:00:00.000Z",
+  });
+  assert.equal(result.proposals.length, 1);
+  assert.equal(result.proposals[0].event_kind, "proposal");
+  assert.equal(Object.hasOwn(result.proposals[0], "promotion_id"), false);
+  assert.deepEqual(result.proposals[0].evidence_refs, [
+    "coding_trace:e1", "focus-proposal-run:synthesis:finding:f1",
+  ]);
+  assert.equal(path.basename(result.path), "focus-proposals.jsonl");
+  const lines = (await readFile(result.path, "utf8")).trim().split("\n");
+  assert.equal(lines.length, 1);
+  assert.deepEqual(JSON.parse(lines[0]), result.proposals[0]);
 });
 
 test("trace authority fails closed for unsafe, unknown, and malformed events", () => {

@@ -11,6 +11,7 @@ import { codexExecArgs, codexJudgeEnvironment, resolvedCodexModel } from "./code
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
 import {
   canonicalEvaluationFocus,
+  evaluationStageToFocusProposals,
   projectEvaluationFocus,
 } from "../../../../scripts/evaluation-focus.mjs";
 
@@ -20,6 +21,7 @@ const repoRoot = path.resolve(webUiDir, "../../..");
 const roles = ["coding_trace", "recovery"];
 const scenarioId = "web-codex-replacement-thesis";
 const focusFile = "focus.json";
+const focusProposalsFile = "focus-proposals.jsonl";
 const activeChildren = new Set();
 export const PLAYWRIGHT_TOOLS = Object.freeze([
   "browser_click", "browser_close", "browser_console_messages", "browser_drag",
@@ -281,6 +283,26 @@ export async function prepareEvaluationFocus({
       subject_state_hash: projection.subject_state_hash,
     },
   };
+}
+
+export async function writeSynthesisFocusProposals(record, {
+  directory,
+  runtime,
+  recordedAt = new Date().toISOString(),
+  suggestedExpiresAt = new Date(Date.parse(recordedAt) + 7 * 24 * 60 * 60 * 1000).toISOString(),
+} = {}) {
+  if (!directory) throw new TypeError("focus proposal directory is required");
+  const proposals = evaluationStageToFocusProposals(record, {
+    sourceRevision: runtime?.subject_revision,
+    subjectStateHash: subjectStateHash(runtime),
+    allowedTargets: [{ surface: "web", scenario_id: scenarioId, perspective: "coding_trace" }],
+    recordedAt,
+    suggestedExpiresAt,
+  });
+  const proposalPath = path.join(directory, focusProposalsFile);
+  await writeFile(proposalPath, proposals.map((event) => JSON.stringify(event)).join("\n")
+    + (proposals.length ? "\n" : ""), { encoding: "utf8", flag: "wx", mode: 0o600 });
+  return { path: proposalPath, proposals };
 }
 
 function invocationArgs({ schemaPath, reportPath, prompt, model, playwright = false, playwrightOutputDir = null }) {
@@ -589,6 +611,10 @@ export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, 
     path: path.relative(repoRoot, validated.promptManifest.manifestPath),
     sha256: validated.promptManifest.reference.sha256,
   };
+  if (runStatus === "completed") {
+    const proposals = await writeSynthesisFocusProposals(record, { directory: attemptDir, runtime });
+    record.artifact_refs.push(path.relative(repoRoot, proposals.path));
+  }
   await appendEvaluationRecord(ledgerPath, record);
   const attempts = validated.manifest.synthesis.attempts || [];
   attempts.push({
@@ -1022,6 +1048,10 @@ export async function main() {
     path: path.relative(repoRoot, path.join(runDir, promptManifest.path)),
     sha256: promptManifest.sha256,
   };
+  if (runStatus === "completed") {
+    const proposals = await writeSynthesisFocusProposals(record, { directory: synthesisDir, runtime });
+    record.artifact_refs.push(path.relative(repoRoot, proposals.path));
+  }
   await appendEvaluationRecord(ledgerPath, record);
   await writeRunManifest(runDir, runId, results, { runStatus, report }, runtime, promptManifest);
   if (runStatus !== "completed") process.exitCode = 1;
