@@ -288,7 +288,7 @@ async function submitMessage(
   if (!msg) return { ok: false, text: "", error: "empty message" };
   const requestSurface = active;
   if (!options.local) addMsg("user", msg);
-  const activity = createActivity(msg, anchor, kind);
+  const activity = createActivity(msg, anchor, kind, options.runOrdinal);
   activity.querySelector(".activity-boundary").textContent =
     kind === "page"
       ? "selected page source"
@@ -302,6 +302,8 @@ async function submitMessage(
     pageSnapshot = null,
     threadId = options.threadId || "",
     executorModel = "";
+  let verification = null,
+    outcomeMessage = "";
   let requestId = "";
   if (options.contextSources?.length) {
     setActivityEvent(
@@ -490,6 +492,8 @@ async function submitMessage(
           } else if (event.kind === "completed") {
             terminal = true;
             succeeded = true;
+            verification = event.verification || null;
+            outcomeMessage = event.message || "Request completed";
             const changed = event.canvas_changed !== false;
             terminalWrite(
               "complete  [" +
@@ -528,6 +532,7 @@ async function submitMessage(
           } else if (event.kind === "needs_input") {
             terminal = true;
             outcomeError = event.message;
+            outcomeMessage = event.message || "Needs direction";
             terminalWrite(
               "paused    [" +
                 event.surface +
@@ -549,6 +554,7 @@ async function submitMessage(
           } else if (event.kind === "failed") {
             terminal = true;
             outcomeError = event.message;
+            outcomeMessage = event.message || "Request failed";
             terminalWrite(
               "failed    [" +
                 (event.surface || requestSurface) +
@@ -603,14 +609,18 @@ async function submitMessage(
     threadId,
     model: executorModel,
     requestId,
+    verification,
+    result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
   };
 }
-function createActivity(goal, anchor, requestKind = "workspace") {
+function createActivity(goal, anchor, requestKind = "workspace", runOrdinal = null) {
   const card = document.createElement("article"),
     fallback = nextActivityPosition();
   activitySequence += 1;
-  card.dataset.runOrdinal = String(activitySequence);
+  card.dataset.runOrdinal = String(
+    Number.isInteger(runOrdinal) && runOrdinal > 0 ? runOrdinal : activitySequence,
+  );
   card.className = "activity-card running";
   card.dataset.requestKind = requestKind;
   card.dataset.persistence = "transient";
@@ -971,18 +981,48 @@ function parseFileCard(content) {
 function parseChangeCard(content) {
   try {
     const value = JSON.parse(content || "");
-    if ([1, 2].includes(value?.version))
+    if ([1, 2, 3].includes(value?.version))
       return {
-        version: 2,
+        version: 3,
         instruction: typeof value.instruction === "string" ? value.instruction : "",
         target: value.target === "page" ? "page" : "workspace",
         status: ["idle", "running", "done", "error"].includes(value.status) ? value.status : "idle",
         summary: typeof value.summary === "string" ? value.summary : "",
         diff: typeof value.diff === "string" ? value.diff : "",
-        runs: Array.isArray(value.runs) ? value.runs.slice(-8) : [],
+        runs: Array.isArray(value.runs)
+          ? value.runs.slice(-8).map((run, index) => ({
+              ordinal: Number.isInteger(run?.ordinal) && run.ordinal > 0
+                ? run.ordinal
+                : index + 1,
+              target: run?.target === "page" ? "page" : "workspace",
+              targetId: typeof run?.targetId === "string" ? run.targetId : "",
+              instruction: typeof run?.instruction === "string"
+                ? run.instruction
+                : typeof value.instruction === "string" ? value.instruction : "",
+              requestId: typeof run?.requestId === "string" ? run.requestId : "",
+              startedAt: typeof run?.startedAt === "string" ? run.startedAt : "",
+              completedAt: typeof run?.completedAt === "string" ? run.completedAt : "",
+              status: ["idle", "running", "done", "error"].includes(run?.status)
+                ? run.status
+                : "idle",
+              result: typeof run?.result === "string"
+                ? run.result
+                : typeof run?.summary === "string" ? run.summary : "",
+              diff: typeof run?.diff === "string" ? run.diff : "",
+              verification: run?.verification && typeof run.verification === "object"
+                ? run.verification
+                : null,
+            }))
+          : [],
       };
   } catch { /* Older change cards had no durable execution state. */ }
-  return { version: 2, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+  return { version: 3, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+}
+function nextChangeRunOrdinal(runs) {
+  return runs.reduce(
+    (highest, run) => Math.max(highest, Number.isInteger(run.ordinal) ? run.ordinal : 0),
+    0,
+  ) + 1;
 }
 function sourceDiff(before, after) {
   const left = String(before || "").split("\n"),
@@ -1149,10 +1189,29 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         for (const run of state.runs.toReversed()) {
           const item = document.createElement("li"),
             heading = document.createElement("strong"),
-            meta = document.createElement("span");
+            meta = document.createElement("span"),
+            evidence = document.createElement("details"),
+            evidenceLabel = document.createElement("summary"),
+            evidenceBody = document.createElement("pre");
           heading.textContent = `run #${run.ordinal} · ${run.status}`;
           meta.textContent = `${run.requestId || "no server ID"} · ${run.completedAt || run.startedAt}`;
-          item.append(heading, meta);
+          evidenceLabel.textContent = "provenance";
+          const checks = Array.isArray(run.verification?.checks)
+            ? run.verification.checks.map((check) =>
+                `${check.outcome || "unknown"} · ${check.name || "unnamed check"}: ${check.detail || "no detail"}`,
+              )
+            : [];
+          evidenceBody.textContent = [
+            `target: ${run.target}${run.targetId ? ` · ${run.targetId}` : ""}`,
+            `instruction: ${run.instruction || "(not recorded by legacy run)"}`,
+            `result: ${run.result || "(not recorded by legacy run)"}`,
+            `verification actor: ${run.verification?.actor || "not recorded"}`,
+            ...(checks.length ? checks : ["checks: not recorded"]),
+            "exact diff:",
+            run.diff || "No textual source difference recorded.",
+          ].join("\n");
+          evidence.append(evidenceLabel, evidenceBody);
+          item.append(heading, meta, evidence);
           list.append(item);
         }
         history.append(label, list);
@@ -1178,28 +1237,36 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       state.diff = "";
       persistChange();
       renderResult();
-      const ordinal = state.runs.length + 1,
+      const ordinal = nextChangeRunOrdinal(state.runs),
         startedAt = new Date().toISOString();
       const changesPage = state.target === "page",
         before = currentPageHtml,
+        targetId = changesPage
+          ? selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null
+          : null,
         result = await submitMessage(
           message,
           { x: parseFloat(object.style.left), y: parseFloat(object.style.top) + object.offsetHeight + 8 },
           changesPage ? "page" : "workspace",
           null,
-          changesPage ? selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null : null,
+          targetId,
+          { runOrdinal: ordinal },
         );
       state.status = result.ok ? "done" : "error";
       state.summary = result.ok ? (result.text || (changesPage ? "Page source updated" : "Workspace updated")) : result.error;
       state.diff = changesPage && result.ok ? sourceDiff(before, result.pageHtml || currentPageHtml) : "";
       state.runs.push({
         ordinal,
+        target: state.target,
+        targetId: targetId || "",
+        instruction: message,
         requestId: result.requestId || "",
         startedAt,
         completedAt: new Date().toISOString(),
         status: state.status,
-        summary: state.summary,
+        result: result.result || state.summary,
         diff: state.diff,
+        verification: result.verification || null,
       });
       state.runs = state.runs.slice(-8);
       persistChange();

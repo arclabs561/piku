@@ -1121,9 +1121,13 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await expect(diffDisclosure).toHaveAttribute("open", "");
   await expect(change.locator(".change-history li")).toHaveCount(2);
   await expect(change.locator(".change-history")).toContainText("run #1 · done");
+  await expect(change.locator(".change-history")).toContainText("run #2 · done");
   await expect(change.locator(".change-history")).toContainText("request-page-2");
   const activities = page.locator(".activity-card");
   await expect(activities).toHaveCount(2);
+  await expect(activities.nth(1).locator(".activity-identity")).toContainText(
+    "run #2 · request-page-2 · completed",
+  );
   const boxes = await activities.evaluateAll((cards) => cards.map((card) => {
     const rect = card.getBoundingClientRect();
     return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
@@ -1135,9 +1139,29 @@ test("page changes persist an inspectable source diff and rerun control", async 
   expect(calls).toBe(2);
   await expect(page.locator("#save-status")).toHaveText("saved");
   await page.reload();
-  await expect(page.locator('[data-kind="workspace_task"] .source-diff')).toContainText("revision 2");
-  await expect(page.locator('[data-kind="workspace_task"]')).toContainText("run again");
-  await expect(page.locator('[data-kind="workspace_task"] .change-history li')).toHaveCount(2);
+  const restored = page.locator('[data-kind="workspace_task"]');
+  await expect(restored.locator(".source-diff")).toContainText("revision 2");
+  await expect(restored).toContainText("run again");
+  await expect(restored.locator(".change-history li")).toHaveCount(2);
+  const latestRun = restored.locator(".change-history li").first();
+  await expect(latestRun).toContainText("run #2 · done");
+  await latestRun.getByText("provenance", { exact: true }).click();
+  const provenance = latestRun.locator("pre");
+  await expect(provenance).toContainText("target: page ·");
+  await expect(provenance).toContainText("instruction: revise the heading");
+  await expect(provenance).toContainText("result: Page source updated");
+  await expect(provenance).toContainText("verification actor: Piku host");
+  await expect(provenance).toContainText("passed · page source persistence: saved");
+  await expect(provenance).toContainText("exact diff:");
+  await expect(provenance).toContainText("revision 2");
+  await restored.getByRole("button", { name: "run again" }).click();
+  await expect(restored.locator(".change-history li")).toHaveCount(3);
+  await expect(restored.locator(".change-history li").first()).toContainText(
+    "run #3 · done",
+  );
+  await expect(page.locator(".activity-card .activity-identity")).toContainText(
+    "run #3 · request-page-3 · completed",
+  );
 });
 
 test("chat output renders safe Markdown, KaTeX, and Mermaid by default", async ({
