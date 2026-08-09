@@ -26,6 +26,7 @@ use crate::config::PikuConfig;
 
 mod codex;
 mod pty;
+mod write_lease;
 
 const MAX_CANVAS_INSTRUCTION_CHARS: usize = 20_000;
 const MAX_CANVAS_ARTIFACT_CHARS: usize = 250_000;
@@ -1732,6 +1733,39 @@ async fn run_codex_chat_request(
                 codex::CodexEvent::Delta(text) => emit_lossy(
                     &event_tx,
                     &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":text}),
+                ),
+                codex::CodexEvent::ToolStarted {
+                    tool_call_id,
+                    name,
+                    arguments,
+                } => append_codex_run_event(
+                    &mut recorder,
+                    &turn_id,
+                    RunEvent::ToolStarted {
+                        tool_call_id,
+                        name,
+                        arguments,
+                    },
+                    &mut activity_sink,
+                    &mut record_error,
+                ),
+                codex::CodexEvent::ToolCompleted {
+                    tool_call_id,
+                    result,
+                    is_error,
+                    effects,
+                } => append_codex_run_event(
+                    &mut recorder,
+                    &turn_id,
+                    RunEvent::ToolCompleted {
+                        tool_call_id,
+                        result,
+                        is_error,
+                        effects,
+                        verification: None,
+                    },
+                    &mut activity_sink,
+                    &mut record_error,
                 ),
             },
         );

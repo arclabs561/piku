@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -8,6 +9,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
+
+use piku_runtime::{RunContentChange, RunContentRef, RunToolEffect};
 
 use super::ChatMessage;
 
@@ -62,6 +65,17 @@ pub(super) enum CodexEvent {
         input: String,
     },
     Delta(String),
+    ToolStarted {
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolCompleted {
+        tool_call_id: String,
+        result: RunContentRef,
+        is_error: bool,
+        effects: Vec<RunToolEffect>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +227,7 @@ where
 
     let mut output = String::new();
     let mut usage = None;
+    let mut tools = ToolLifecycle::default();
     loop {
         if cancellation
             .as_ref()
@@ -283,6 +298,7 @@ where
             parse_stream_event(&message),
             &mut output,
             &mut usage,
+            &mut tools,
             &mut on_event,
         )? {
             break;
@@ -308,6 +324,7 @@ fn apply_stream_event<F>(
     event: StreamEvent,
     output: &mut String,
     usage: &mut Option<CodexUsage>,
+    tools: &mut ToolLifecycle,
     on_event: &mut F,
 ) -> Result<bool, CodexFailure>
 where
@@ -319,12 +336,35 @@ where
             on_event(CodexEvent::Delta(delta));
             Ok(false)
         }
+        StreamEvent::ToolStarted(tool) => {
+            let event = tools
+                .start(tool)
+                .map_err(|error| CodexFailure::new(error.to_string(), std::mem::take(output)))?;
+            on_event(event);
+            Ok(false)
+        }
+        StreamEvent::ToolCompleted(tool) => {
+            let event = tools
+                .complete(tool)
+                .map_err(|error| CodexFailure::new(error.to_string(), std::mem::take(output)))?;
+            on_event(event);
+            Ok(false)
+        }
         StreamEvent::TurnStarted | StreamEvent::Ignore => Ok(false),
         StreamEvent::Usage(value) => {
             *usage = Some(value);
             Ok(false)
         }
-        StreamEvent::Completed => Ok(true),
+        StreamEvent::Completed => {
+            if tools.active.is_empty() {
+                Ok(true)
+            } else {
+                Err(CodexFailure::new(
+                    "Codex completed the turn with unfinished tool items",
+                    std::mem::take(output),
+                ))
+            }
+        }
         StreamEvent::Interrupted => Err(CodexFailure::interrupted(std::mem::take(output))),
         StreamEvent::Failed(reason) => Err(CodexFailure::new(reason, std::mem::take(output))),
     }
@@ -536,10 +576,176 @@ enum StreamEvent {
     TurnStarted,
     Usage(CodexUsage),
     Delta(String),
+    ToolStarted(NativeToolItem),
+    ToolCompleted(NativeToolItem),
     Completed,
     Interrupted,
     Failed(String),
     Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeToolKind {
+    CommandExecution,
+    FileChange,
+}
+
+#[derive(Debug, PartialEq)]
+struct NativeToolItem {
+    id: String,
+    kind: NativeToolKind,
+    value: Value,
+}
+
+#[derive(Default)]
+struct ToolLifecycle {
+    active: HashMap<String, NativeToolKind>,
+}
+
+impl ToolLifecycle {
+    fn start(&mut self, tool: NativeToolItem) -> Result<CodexEvent, CodexFailure> {
+        if self.active.insert(tool.id.clone(), tool.kind).is_some() {
+            return Err(CodexFailure::new(
+                format!("Codex started duplicate tool item {}", tool.id),
+                String::new(),
+            ));
+        }
+        let (name, arguments) = match tool.kind {
+            NativeToolKind::CommandExecution => {
+                let command = required_string(&tool.value, "command", &tool.id)?;
+                let cwd = tool.value.get("cwd").and_then(Value::as_str);
+                (
+                    "commandExecution".to_string(),
+                    json!({"command": command, "cwd": cwd}),
+                )
+            }
+            NativeToolKind::FileChange => {
+                let changes = required_array(&tool.value, "changes", &tool.id)?;
+                ("fileChange".to_string(), json!({"changes": changes}))
+            }
+        };
+        Ok(CodexEvent::ToolStarted {
+            tool_call_id: tool.id,
+            name,
+            arguments,
+        })
+    }
+
+    fn complete(&mut self, tool: NativeToolItem) -> Result<CodexEvent, CodexFailure> {
+        match self.active.remove(&tool.id) {
+            Some(kind) if kind == tool.kind => {}
+            Some(_) => {
+                return Err(CodexFailure::new(
+                    format!("Codex changed tool item type for {}", tool.id),
+                    String::new(),
+                ))
+            }
+            None => {
+                return Err(CodexFailure::new(
+                    format!("Codex completed tool item {} without a start", tool.id),
+                    String::new(),
+                ))
+            }
+        }
+        let status = required_string(&tool.value, "status", &tool.id)?;
+        let (result, is_error, effects) = match tool.kind {
+            NativeToolKind::CommandExecution => {
+                let command = required_string(&tool.value, "command", &tool.id)?.to_string();
+                let exit_code = tool
+                    .value
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok());
+                let output = tool
+                    .value
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    RunContentRef::Inline { text: output },
+                    status != "completed" || exit_code.is_some_and(|code| code != 0),
+                    vec![RunToolEffect::ShellCommand { command, exit_code }],
+                )
+            }
+            NativeToolKind::FileChange => {
+                let changes = required_array(&tool.value, "changes", &tool.id)?;
+                let effects = changes.iter().filter_map(file_write_effect).collect();
+                (
+                    RunContentRef::Inline {
+                        text: format!("Codex reported {} file changes", changes.len()),
+                    },
+                    status != "completed",
+                    effects,
+                )
+            }
+        };
+        Ok(CodexEvent::ToolCompleted {
+            tool_call_id: tool.id,
+            result,
+            is_error,
+            effects,
+        })
+    }
+}
+
+fn required_string<'a>(value: &'a Value, field: &str, id: &str) -> Result<&'a str, CodexFailure> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CodexFailure::new(
+                format!("Codex tool item {id} has no {field}"),
+                String::new(),
+            )
+        })
+}
+
+fn required_array<'a>(
+    value: &'a Value,
+    field: &str,
+    id: &str,
+) -> Result<&'a Vec<Value>, CodexFailure> {
+    value.get(field).and_then(Value::as_array).ok_or_else(|| {
+        CodexFailure::new(
+            format!("Codex tool item {id} has no {field} array"),
+            String::new(),
+        )
+    })
+}
+
+fn file_write_effect(change: &Value) -> Option<RunToolEffect> {
+    let path = change.get("path").and_then(Value::as_str)?;
+    let kind = change
+        .pointer("/kind/type")
+        .or_else(|| change.get("kind"))
+        .and_then(Value::as_str)?;
+    let content_change = match kind {
+        "add" | "create" => RunContentChange::Created,
+        "update" | "modify" => RunContentChange::Modified,
+        // Unknown, delete, and rename kinds cannot honestly be represented as
+        // a FileWrite by the current run-record schema.
+        _ => return None,
+    };
+    Some(RunToolEffect::FileWrite {
+        path: PathBuf::from(path),
+        content_change,
+    })
+}
+
+fn parse_tool_item(message: &Value) -> Option<NativeToolItem> {
+    let value = message.pointer("/params/item")?.clone();
+    let id = value.get("id")?.as_str()?.to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let kind = match value.get("type")?.as_str()? {
+        "commandExecution" => NativeToolKind::CommandExecution,
+        "fileChange" => NativeToolKind::FileChange,
+        _ => return None,
+    };
+    Some(NativeToolItem { id, kind, value })
 }
 
 fn parse_stream_event(message: &Value) -> StreamEvent {
@@ -566,6 +772,12 @@ fn parse_stream_event(message: &Value) -> StreamEvent {
             .map_or(StreamEvent::Ignore, |value| {
                 StreamEvent::Delta(value.to_string())
             }),
+        Some("item/started") => {
+            parse_tool_item(message).map_or(StreamEvent::Ignore, StreamEvent::ToolStarted)
+        }
+        Some("item/completed") => {
+            parse_tool_item(message).map_or(StreamEvent::Ignore, StreamEvent::ToolCompleted)
+        }
         Some("turn/completed") => {
             let status = message
                 .pointer("/params/turn/status")
@@ -740,6 +952,7 @@ mod tests {
     fn preserves_streamed_assistant_text_in_typed_failure() {
         let mut output = String::new();
         let mut usage = None;
+        let mut tools = ToolLifecycle::default();
         let mut observed = Vec::new();
         let mut on_event = |event| {
             if let CodexEvent::Delta(delta) = event {
@@ -751,6 +964,7 @@ mod tests {
             StreamEvent::Delta("partial ".into()),
             &mut output,
             &mut usage,
+            &mut tools,
             &mut on_event,
         )
         .unwrap());
@@ -758,6 +972,7 @@ mod tests {
             StreamEvent::Delta("answer".into()),
             &mut output,
             &mut usage,
+            &mut tools,
             &mut on_event,
         )
         .unwrap());
@@ -766,6 +981,7 @@ mod tests {
             StreamEvent::Failed("provider failed".into()),
             &mut output,
             &mut usage,
+            &mut tools,
             &mut on_event,
         )
         .unwrap_err();
@@ -774,6 +990,124 @@ mod tests {
         assert_eq!(failure.partial_output(), "partial answer");
         assert_eq!(observed, ["partial ", "answer"]);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn projects_command_lifecycle_with_native_id() {
+        let started = parse_stream_event(&json!({
+            "method":"item/started",
+            "params":{"item":{"id":"native-7","type":"commandExecution","status":"inProgress","command":"cargo test","cwd":"/work"}}
+        }));
+        let completed = parse_stream_event(&json!({
+            "method":"item/completed",
+            "params":{"item":{"id":"native-7","type":"commandExecution","status":"completed","command":"cargo test","cwd":"/work","exitCode":0,"aggregatedOutput":"ok"}}
+        }));
+        let mut tools = ToolLifecycle::default();
+        let CodexEvent::ToolStarted {
+            tool_call_id,
+            name,
+            arguments,
+        } = tools
+            .start(match started {
+                StreamEvent::ToolStarted(tool) => tool,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .unwrap()
+        else {
+            panic!("expected tool start")
+        };
+        assert_eq!(tool_call_id, "native-7");
+        assert_eq!(name, "commandExecution");
+        assert_eq!(arguments, json!({"command":"cargo test","cwd":"/work"}));
+
+        let CodexEvent::ToolCompleted {
+            tool_call_id,
+            result,
+            is_error,
+            effects,
+        } = tools
+            .complete(match completed {
+                StreamEvent::ToolCompleted(tool) => tool,
+                event => panic!("unexpected event: {event:?}"),
+            })
+            .unwrap()
+        else {
+            panic!("expected tool completion")
+        };
+        assert_eq!(tool_call_id, "native-7");
+        assert_eq!(result, RunContentRef::Inline { text: "ok".into() });
+        assert!(!is_error);
+        assert_eq!(
+            effects,
+            vec![RunToolEffect::ShellCommand {
+                command: "cargo test".into(),
+                exit_code: Some(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn file_changes_omit_unrepresentable_deletes_and_renames() {
+        let changes = json!([
+            {"path":"new.rs","kind":{"type":"add"}},
+            {"path":"old.rs","kind":{"type":"delete"}},
+            {"path":"from.rs","kind":{"type":"rename"}},
+            {"path":"lib.rs","kind":{"type":"update"}}
+        ]);
+        let mut tools = ToolLifecycle::default();
+        tools
+            .start(NativeToolItem {
+                id: "files-1".into(),
+                kind: NativeToolKind::FileChange,
+                value: json!({"changes":changes}),
+            })
+            .unwrap();
+        let CodexEvent::ToolCompleted { effects, .. } = tools
+            .complete(NativeToolItem {
+                id: "files-1".into(),
+                kind: NativeToolKind::FileChange,
+                value: json!({"status":"completed","changes":changes}),
+            })
+            .unwrap()
+        else {
+            panic!("expected tool completion")
+        };
+        assert_eq!(
+            effects,
+            vec![
+                RunToolEffect::FileWrite {
+                    path: PathBuf::from("new.rs"),
+                    content_change: RunContentChange::Created
+                },
+                RunToolEffect::FileWrite {
+                    path: PathBuf::from("lib.rs"),
+                    content_change: RunContentChange::Modified
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_starts_and_completion_without_start() {
+        let item = || NativeToolItem {
+            id: "tool-1".into(),
+            kind: NativeToolKind::CommandExecution,
+            value: json!({"command":"true","status":"completed","exitCode":0}),
+        };
+        let mut tools = ToolLifecycle::default();
+        tools.start(item()).unwrap();
+        assert!(tools
+            .start(item())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+
+        let mut tools = ToolLifecycle::default();
+        assert!(tools
+            .complete(item())
+            .unwrap_err()
+            .to_string()
+            .contains("without a start"));
     }
 
     #[test]
@@ -835,10 +1169,12 @@ mod tests {
     fn interrupted_failure_is_distinct_and_keeps_partial_output() {
         let mut output = "partial".to_string();
         let mut usage = None;
+        let mut tools = ToolLifecycle::default();
         let failure = apply_stream_event(
             StreamEvent::Interrupted,
             &mut output,
             &mut usage,
+            &mut tools,
             &mut |_| {},
         )
         .unwrap_err();
