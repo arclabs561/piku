@@ -20,35 +20,7 @@ use std::process::{Command, Output};
 // ---------------------------------------------------------------------------
 
 fn piku_binary() -> PathBuf {
-    // Resolve binary relative to the test executable.
-    // test binary lives at: target/{profile}/deps/binary_tests-*
-    // piku binary lives at: target/{profile}/piku
-    let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe
-        .parent()
-        .unwrap() // deps/
-        .parent()
-        .unwrap(); // {profile}/
-
-    // Prefer same profile (debug when running `cargo test`, release when running
-    // `cargo test --release`) — ensures we always test the freshest build.
-    let same_profile = profile_dir.join("piku");
-    if same_profile.exists() {
-        return same_profile;
-    }
-    // Fallback: look in sibling profile directories
-    let release = profile_dir.parent().unwrap().join("release").join("piku");
-    if release.exists() {
-        return release;
-    }
-    let debug = profile_dir.parent().unwrap().join("debug").join("piku");
-    if debug.exists() {
-        return debug;
-    }
-    panic!(
-        "piku binary not found. Run `cargo build -p piku` first.\n\
-         Searched:\n  {same_profile:?}\n  {release:?}\n  {debug:?}"
-    );
+    PathBuf::from(env!("CARGO_BIN_EXE_piku"))
 }
 
 /// Build a Command with API keys scrubbed from the environment.

@@ -35,17 +35,7 @@ use std::process::{Command, Stdio};
 // ---------------------------------------------------------------------------
 
 fn piku_binary() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().unwrap().parent().unwrap();
-    let same = profile_dir.join("piku");
-    if same.exists() {
-        return same;
-    }
-    let release = profile_dir.parent().unwrap().join("release").join("piku");
-    if release.exists() {
-        return release;
-    }
-    panic!("piku binary not found — run `cargo build --release -p piku` first");
+    PathBuf::from(env!("CARGO_BIN_EXE_piku"))
 }
 
 fn has_key(var: &str) -> bool {

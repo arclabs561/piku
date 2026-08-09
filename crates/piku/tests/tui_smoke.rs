@@ -55,18 +55,7 @@ fn isolated_config_home() -> PathBuf {
 }
 
 fn piku_binary() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().unwrap().parent().unwrap();
-    for candidate in [
-        profile_dir.join("piku"),
-        profile_dir.parent().unwrap().join("debug").join("piku"),
-        profile_dir.parent().unwrap().join("release").join("piku"),
-    ] {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    panic!("piku binary not found — run `cargo build -p piku` first");
+    PathBuf::from(env!("CARGO_BIN_EXE_piku"))
 }
 
 struct Pty {
