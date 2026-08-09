@@ -46,6 +46,30 @@ uses fewer lines.
 
 ## Layer placement
 
+### Current three-surface boundary
+
+Piku has three first-class product surfaces with different presentations:
+
+- CLI is the composable command and automation projection;
+- TUI is the terminal-native interactive projection;
+- web is the spatial notebook, artifact, source, and terminal projection.
+
+CLI and TUI already execute through the same runtime `Session`, agent loop,
+tool registry, context selection, and durable run recorder. Web provider calls
+reuse the runtime loop but currently project events only to SSE, omit the
+durable recorder, and keep separate page, chat, and workspace sessions inside
+the canvas snapshot. The Codex web executor also has its own native thread and
+event protocol. These are implementation debts, not reasons to merge the three
+interfaces or make canvas layout part of the runtime ontology.
+
+The next shared-core slice is a runtime-owned run handle around a session,
+recorder, resolved context/tool policy, and presentation sink. Web objects keep
+stable run/session references; SSE becomes one projection of recorded semantic
+events, while canvas state remains layout and artifact presentation. Codex may
+adapt into the same event contract later while retaining honest executor-native
+metadata. A human PTY remains a separate artifact stream rather than pretending
+shell bytes are conversation messages.
+
 ### 0. Canonical work artifacts
 
 Repository files, Git history, tests, commands, datasets, citations, and human
