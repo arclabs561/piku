@@ -936,38 +936,42 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
   return { role, report, reportPath, runStatus };
 }
 
-export async function main() {
-  const resumeIndex = process.argv.indexOf("--resume-synthesis");
-  const resumeRunId = resumeIndex >= 0 ? process.argv[resumeIndex + 1] : process.env.PIKU_EVAL_RESUME_RUN_ID;
+export async function runEvaluation({
+  environment = process.env,
+  argv = [],
+  fetchImpl = fetch,
+} = {}) {
+  const resumeIndex = argv.indexOf("--resume-synthesis");
+  const resumeRunId = resumeIndex >= 0 ? argv[resumeIndex + 1] : environment.PIKU_EVAL_RESUME_RUN_ID;
   if (resumeRunId) {
     await resumeSynthesis(resumeRunId, {
-      ledgerPath: process.env.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl"),
+      ledgerPath: environment.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl"),
     });
-    return;
+    return { runId: resumeRunId, runStatus: "completed", resumed: true };
   }
-  const baseUrl = new URL(process.env.PIKU_WEB_URL || "http://127.0.0.1:9090");
+  const baseUrl = new URL(environment.PIKU_WEB_URL || "http://127.0.0.1:9090");
   if (baseUrl.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(baseUrl.hostname) || baseUrl.port !== "9090")
     throw new Error("PIKU_WEB_URL must be the local Piku server on port 9090");
-  const response = await fetch(baseUrl, { signal: AbortSignal.timeout(3_000) });
+  const response = await fetchImpl(baseUrl, { signal: AbortSignal.timeout(3_000) });
   if (!response.ok) throw new Error(`Piku returned HTTP ${response.status}`);
   const removed = await cleanupStaleAutomationSurfaces(baseUrl);
   if (removed.length)
     console.error(`[piku eval] removed ${removed.length} stale automation surfaces`);
-  const runId = safeRunId(process.env.PIKU_EVAL_RUN_ID);
+  const runId = safeRunId(environment.PIKU_EVAL_RUN_ID);
   const runDir = path.join(repoRoot, ".artifacts", "playwright-agent", "parallel", runId);
-  const ledgerPath = process.env.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl");
-  const maxSnapshots = Number(process.env.PIKU_EXPLORER_MAX_SNAPSHOTS || 6);
-  const timeoutMs = Number(process.env.PIKU_EXPLORER_TIMEOUT_MS || 600_000);
-  const explorerModel = resolvedCodexModel();
+  const ledgerPath = environment.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl");
+  const maxSnapshots = Number(environment.PIKU_EXPLORER_MAX_SNAPSHOTS || 6);
+  const timeoutMs = Number(environment.PIKU_EXPLORER_TIMEOUT_MS || 600_000);
+  const explorerModel = resolvedCodexModel(environment);
   const synthesisConfig = {
-    model: process.env.PIKU_SYNTHESIS_MODEL || explorerModel,
-    timeout_ms: Number(process.env.PIKU_SYNTHESIS_TIMEOUT_MS || 240_000),
+    model: environment.PIKU_SYNTHESIS_MODEL || explorerModel,
+    timeout_ms: Number(environment.PIKU_SYNTHESIS_TIMEOUT_MS || 240_000),
   };
   const explorerConfigs = Object.fromEntries(roles.map((role) => [role, {
     identity: explorerIdentity(runId, role),
     model: explorerModel,
-    target_calls: explorerCallBudget(role),
-    hard_max_calls: explorerHardCallLimit(),
+    target_calls: explorerCallBudget(role, environment),
+    hard_max_calls: explorerHardCallLimit(environment),
     max_snapshots: maxSnapshots,
     timeout_ms: timeoutMs,
   }]));
@@ -975,11 +979,11 @@ export async function main() {
     ...evaluationRuntimeMetadata(repoRoot),
     viewport: { width: 1440, height: 1000 },
     explorer_target_calls: Object.fromEntries(roles.map((role) => [role, explorerConfigs[role].target_calls])),
-    explorer_hard_max_calls: explorerHardCallLimit(),
+    explorer_hard_max_calls: explorerHardCallLimit(environment),
     explorer_max_snapshots: maxSnapshots,
     explorer_timeout_ms: timeoutMs,
   };
-  const evaluationFocus = await prepareEvaluationFocus({ runtime, runDir });
+  const evaluationFocus = await prepareEvaluationFocus({ environment, runtime, runDir });
   const promptManifestDocument = await buildPromptManifest({
     runId, runDir, baseUrl, runtime, explorerConfigs, synthesisConfig, evaluationFocus,
   });
@@ -1003,8 +1007,7 @@ export async function main() {
   await writeRunManifest(runDir, runId, results, null, runtime, promptManifest);
   if (results.some((result) => result.runStatus !== "completed")) {
     console.error("At least one explorer failed; synthesis was not run.");
-    process.exitCode = 1;
-    return;
+    return { runId, runDir, runStatus: "inconclusive", runtime, promptManifest, promptManifestDocument, results, synthesis: null };
   }
   const packets = results.map((result) => result.report);
   const validated = await loadValidatedExplorerRun(runDir, runId);
@@ -1054,8 +1057,13 @@ export async function main() {
   }
   await appendEvaluationRecord(ledgerPath, record);
   await writeRunManifest(runDir, runId, results, { runStatus, report }, runtime, promptManifest);
-  if (runStatus !== "completed") process.exitCode = 1;
-  else console.error(`Parallel evaluation complete: ${runDir}`);
+  if (runStatus === "completed") console.error(`Parallel evaluation complete: ${runDir}`);
+  return { runId, runDir, runStatus, runtime, promptManifest, promptManifestDocument, results, synthesis: { runStatus, report } };
+}
+
+export async function main() {
+  const result = await runEvaluation({ argv: process.argv.slice(2) });
+  if (result.runStatus !== "completed") process.exitCode = 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
