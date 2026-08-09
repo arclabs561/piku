@@ -292,6 +292,11 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   assert.match(recoveryPrompt, /Do not combine verification, surface deletion/);
   assert.match(recoveryPrompt, /full\s+absolute filename below `\{\{RUN_DIR\}\}`/);
   assert.match(recoveryPrompt, /never overwrite or recapture/);
+  assert.match(recoveryPrompt, /semantic selected-state predicate[^.]*`true` before reload/i);
+  assert.match(recoveryPrompt, /move\s+each card to a distinctive, non-default canvas position/i);
+  assert.match(recoveryPrompt, /saved canvas coordinates[^.]*before\s+and after reload/i);
+  assert.match(recoveryPrompt, /deterministic delayed-provider fixture/i);
+  assert.match(recoveryPrompt, /do not treat a response\s+that merely completed quickly as cancellation evidence/i);
   const codingPrompt = await readFile(path.join(webUiDir, "e2e", "explorer-coding-trace.md"), "utf8");
   assert.match(codingPrompt, /Clicking empty canvas space opens the card\s+creation menu/);
   assert.match(codingPrompt, /unique full absolute filename/);

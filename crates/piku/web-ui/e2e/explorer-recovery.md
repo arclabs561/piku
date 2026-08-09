@@ -15,6 +15,23 @@ console or network failures once, near the end. Record evidence with IDs prefixe
 `recovery:`. Stay below
 {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
+Before reload, select a named card and record a semantic selected-state predicate
+as `true` before reload; a border color or screenshot alone is insufficient. Move
+each card to a distinctive, non-default canvas position with ordinary pointer
+interaction. Record the card identity and saved canvas coordinates immediately
+before reload and compare the same identities and saved canvas coordinates before
+and after reload. Viewport-relative bounding rectangles are supporting visual
+evidence, not substitutes for the saved-coordinate comparison.
+
+For cancellation, use the deterministic delayed-provider fixture when that
+fixture is exposed by the running evaluation surface. Start the delayed turn,
+prove it is visibly active, cancel it through the UI, and capture both the
+immediate cancelled state and the state after reload. Do not treat a response
+that merely completed quickly as cancellation evidence. If no deterministic
+delayed-provider fixture is exposed, record cancellation as `not_tested` with
+timing as the confounder; do not race a normal provider response or infer a
+product defect from losing that race.
+
 Give every screenshot call a unique filename and never overwrite or recapture a
 filename, including after reload or while correcting evidence. Pass the full
 absolute filename below `{{RUN_DIR}}` to every screenshot call; relative paths
