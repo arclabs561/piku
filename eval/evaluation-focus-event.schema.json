@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://piku.dev/schemas/evaluation-focus-event-v1.json",
+  "title": "Piku evaluation focus event",
+  "oneOf": [
+    { "$ref": "#/$defs/proposal" },
+    { "$ref": "#/$defs/promotion" },
+    { "$ref": "#/$defs/retirement" }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["judge", "harness", "operator", "reviewer"] },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "scenario_id", "perspective"],
+      "properties": {
+        "surface": { "enum": ["cli", "tui", "web"] },
+        "scenario_id": { "type": "string", "minLength": 1 },
+        "perspective": { "type": "string", "minLength": 1 }
+      }
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "schema_version", "event_id", "event_kind", "recorded_at", "actor",
+        "subject_state_hash"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "type": "string", "minLength": 1 },
+        "event_kind": { "enum": ["proposal", "promotion", "retirement"] },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "actor": { "$ref": "#/$defs/actor" },
+        "subject_state_hash": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "proposal": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version", "event_id", "event_kind", "recorded_at", "actor",
+            "subject_state_hash", "proposal_id", "source_run_id", "scope",
+            "evidence_refs", "question", "category", "suggested_expires_at",
+            "task_clause"
+          ],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "event_id": { "type": "string", "minLength": 1 },
+            "event_kind": { "const": "proposal" },
+            "recorded_at": { "type": "string", "format": "date-time" },
+            "actor": { "$ref": "#/$defs/actor" },
+            "subject_state_hash": { "$ref": "#/$defs/digest" },
+            "proposal_id": { "type": "string", "minLength": 1 },
+            "source_run_id": { "type": "string", "minLength": 1 },
+            "scope": { "$ref": "#/$defs/scope" },
+            "evidence_refs": {
+              "type": "array", "minItems": 1, "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "question": { "type": "string", "minLength": 2, "pattern": "\\?$" },
+            "category": { "type": "string", "minLength": 1 },
+            "suggested_expires_at": { "type": "string", "format": "date-time" },
+            "task_clause": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "promotion": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version", "event_id", "event_kind", "recorded_at", "actor",
+            "subject_state_hash", "promotion_id", "proposal_id", "scope",
+            "activates_at", "expires_at", "max_prompt_bytes", "retest_obligation"
+          ],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "event_id": { "type": "string", "minLength": 1 },
+            "event_kind": { "const": "promotion" },
+            "recorded_at": { "type": "string", "format": "date-time" },
+            "actor": { "$ref": "#/$defs/actor" },
+            "subject_state_hash": { "$ref": "#/$defs/digest" },
+            "promotion_id": { "type": "string", "minLength": 1 },
+            "proposal_id": { "type": "string", "minLength": 1 },
+            "scope": { "$ref": "#/$defs/scope" },
+            "activates_at": { "type": "string", "format": "date-time" },
+            "expires_at": { "type": "string", "format": "date-time" },
+            "max_prompt_bytes": { "type": "integer", "minimum": 1 },
+            "retest_obligation": { "type": ["string", "null"], "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "retirement": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version", "event_id", "event_kind", "recorded_at", "actor",
+            "subject_state_hash", "retirement_id", "promotion_id", "reason"
+          ],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "event_id": { "type": "string", "minLength": 1 },
+            "event_kind": { "const": "retirement" },
+            "recorded_at": { "type": "string", "format": "date-time" },
+            "actor": { "$ref": "#/$defs/actor" },
+            "subject_state_hash": { "$ref": "#/$defs/digest" },
+            "retirement_id": { "type": "string", "minLength": 1 },
+            "promotion_id": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}
