@@ -11,8 +11,16 @@ creation menu. Use only four cards: note, chat, change, and page preview. Attach
 to chat without submitting it. First use the change card to create a small seeded
 page containing a heading, one styled control, and an unrelated layout element.
 Then edit the same card's instruction and submit a narrow heading-only change.
-Inspect the second run's source diff and rendered result, then use its rerun
-control once. Attribute preservation only from the seeded-to-edited diff; the
+Before reloading, capture the change card's durable target ID, its execution
+history, the exact source diff, verification status, and the linkage between
+the edited instruction and its result. Reload the page before using rerun.
+After reload, verify that the same target ID, execution history, exact diff,
+verification status, and edited-instruction-to-result linkage are still
+inspectable. Only then use that persisted run's rerun control once, and verify
+the new result links back to the same target and instruction rather than merely
+repeating similar visible text. If any required pre-reload predicate was not
+captured, mark reload durability not tested rather than reconstructing it from
+memory. Attribute preservation only from the seeded-to-edited diff; the
 initial empty-to-document creation is setup, not evidence of broad rewriting.
 Record only observed evidence, with IDs
 prefixed `coding_trace:`. Do not add a file card or make a separate chat request.
