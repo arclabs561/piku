@@ -854,6 +854,17 @@ textarea:focus-visible {
   margin-right: auto;
 }
 
+.chat-turn-run,
+.activity-run-link {
+  color: var(--color-accent-fg);
+  text-decoration: none;
+}
+
+.chat-turn-run:hover,
+.activity-run-link:hover {
+  text-decoration: underline;
+}
+
 .chat-turn textarea {
   display: block;
   width: 100%;

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
-    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, Session, TurnResult,
+    run_turn, AllowAll, ContentBlock, ConversationMessage, MessageRole, RecordingSink, RunEvent,
+    RunRecorder, Session, TurnResult,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -69,6 +70,38 @@ fn surface_name(name: &str) -> String {
     } else {
         name
     }
+}
+
+fn open_web_run_record(
+    config: &PikuConfig,
+    session_id: &str,
+    request_id: &str,
+    request_kind: &str,
+) -> std::io::Result<(RunRecorder, String)> {
+    let path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    let recorder = RunRecorder::open(path, session_id)?;
+    let turn_id = format!("web-{request_kind}-{request_id}");
+    Ok((recorder, turn_id))
+}
+
+fn emit_run_record_started(
+    tx: &mpsc::Sender<String>,
+    surface: &str,
+    request_id: &str,
+    run_id: &str,
+    turn_id: &str,
+) {
+    emit(
+        tx,
+        &serde_json::json!({
+            "kind": "run_record_started",
+            "surface": surface,
+            "request_id": request_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "url": format!("/run/{run_id}"),
+        }),
+    );
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1560,6 +1593,24 @@ async fn run_provider_chat_request(
         session = Session::new(request_id.clone());
     }
     session.record_provider(&provider_name, &model);
+    let run_id = session.id.clone();
+    let (mut recorder, turn_id) = match open_web_run_record(
+        &state.config,
+        &run_id,
+        &request_id,
+        "chat",
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot open durable run record: {error}")}),
+            );
+            state.surfaces.write().await.running.remove(&surface_name);
+            return;
+        }
+    };
+    emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
     tracing::info!(request_id, surface = %surface_name, kind = "chat", executor = "provider", %model, "request accepted");
     emit(
         &tx,
@@ -1573,21 +1624,34 @@ async fn run_provider_chat_request(
         message.clone()
     };
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), None);
-    let result = run_turn(
-        &input,
-        &mut session,
-        resolved.as_provider(),
-        &model,
-        &chat_system_prompt(),
-        Vec::new(),
-        &AllowAll,
-        &mut sink,
-        Some(2),
-        None,
-    )
-    .await;
+    let (result, record_error) = {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let result = run_turn(
+            &input,
+            &mut session,
+            resolved.as_provider(),
+            &model,
+            &chat_system_prompt(),
+            Vec::new(),
+            &AllowAll,
+            &mut recording_sink,
+            Some(2),
+            None,
+        )
+        .await;
+        let record_error = recording_sink.take_record_error();
+        (result, record_error)
+    };
     let elapsed = sink.started.elapsed().as_secs_f32();
     let reply = sink.output.trim().to_string();
+    if let Some(error) = record_error {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable run record: {error}")}),
+        );
+        state.surfaces.write().await.running.remove(&surface_name);
+        return;
+    }
     let mut surfaces = state.surfaces.write().await;
     let dir = surface_dir(&surfaces.root, &surface_name);
     let entry = surfaces
@@ -1694,6 +1758,24 @@ async fn run_workspace_request(
         session = Session::new(request_id.clone());
     }
     session.record_provider(&provider_name, &model);
+    let run_id = session.id.clone();
+    let (mut recorder, turn_id) = match open_web_run_record(
+        &state.config,
+        &run_id,
+        &request_id,
+        "workspace",
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot open durable run record: {error}")}),
+            );
+            state.surfaces.write().await.running.remove(&surface_name);
+            return;
+        }
+    };
+    emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
     tracing::info!(request_id, surface = %surface_name, kind = "workspace", %model, objects = existing_objects.len(), "request accepted");
     emit(
         &tx,
@@ -1701,20 +1783,33 @@ async fn run_workspace_request(
     );
     let input = workspace_input(&message, &existing_objects);
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), None);
-    let result = run_turn(
-        &input,
-        &mut session,
-        resolved.as_provider(),
-        &model,
-        &workspace_system_prompt(),
-        Vec::new(),
-        &AllowAll,
-        &mut sink,
-        Some(2),
-        None,
-    )
-    .await;
+    let (result, record_error) = {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let result = run_turn(
+            &input,
+            &mut session,
+            resolved.as_provider(),
+            &model,
+            &workspace_system_prompt(),
+            Vec::new(),
+            &AllowAll,
+            &mut recording_sink,
+            Some(2),
+            None,
+        )
+        .await;
+        let record_error = recording_sink.take_record_error();
+        (result, record_error)
+    };
     let elapsed = sink.started.elapsed().as_secs_f32();
+    if let Some(error) = record_error {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable run record: {error}")}),
+        );
+        state.surfaces.write().await.running.remove(&surface_name);
+        return;
+    }
     let operations = extract_workspace_operations(&sink.output);
     let update = operations.and_then(|operations| {
         if operations.is_empty() {
@@ -1957,6 +2052,25 @@ async fn run_canvas_request(
     }
     session.record_provider(&provider_name, &model);
 
+    let run_id = session.id.clone();
+    let (mut recorder, turn_id) = match open_web_run_record(
+        &state.config,
+        &run_id,
+        &request_id,
+        "page",
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot open durable run record: {error}")}),
+            );
+            state.surfaces.write().await.running.remove(&surface_name);
+            return;
+        }
+    };
+    emit_run_record_started(&tx, &surface_name, &request_id, &run_id, &turn_id);
+
     tracing::info!(request_id, surface = %surface_name, kind = "page", %model, instruction_chars = message.chars().count(), "request accepted");
     emit(
         &tx,
@@ -1965,23 +2079,36 @@ async fn run_canvas_request(
 
     let input = canvas_input(&message, &existing_html);
     let mut sink = WebSink::new(request_id.clone(), tx.clone(), Some(existing_html.clone()));
-    let result: TurnResult = run_turn(
-        &input,
-        &mut session,
-        resolved.as_provider(),
-        &model,
-        &canvas_system_prompt(),
-        Vec::new(),
-        &AllowAll,
-        &mut sink,
-        Some(2),
-        None,
-    )
-    .await;
+    let (result, record_error): (TurnResult, _) = {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, turn_id);
+        let result = run_turn(
+            &input,
+            &mut session,
+            resolved.as_provider(),
+            &model,
+            &canvas_system_prompt(),
+            Vec::new(),
+            &AllowAll,
+            &mut recording_sink,
+            Some(2),
+            None,
+        )
+        .await;
+        let record_error = recording_sink.take_record_error();
+        (result, record_error)
+    };
 
     let reply = sink.output.clone();
     let canvas_update = apply_canvas_reply(&existing_html, &reply);
     let elapsed = sink.started.elapsed().as_secs_f32();
+    if let Some(error) = record_error {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot persist durable run record: {error}")}),
+        );
+        state.surfaces.write().await.running.remove(&surface_name);
+        return;
+    }
     compact_canvas_turn(&mut session, &message, &reply);
     if result.stream_error.is_none() && matches!(canvas_update, Ok(Some(_))) {
         let canvas_html = canvas_update
@@ -2502,6 +2629,109 @@ impl OutputSink for WebSink {
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
         tracing::info!(request_id = %self.request_id, iterations, input_tokens = usage.input_tokens, output_tokens = usage.output_tokens, "model turn completed");
     }
+
+    fn on_run_event(&mut self, event: &RunEvent) {
+        let activity = match event {
+            RunEvent::TurnStarted {
+                provider, model, ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "turn:start",
+                "phase": "turn",
+                "state": "running",
+                "label": "Turn started",
+                "detail": format!("{} · {model}", provider.as_deref().unwrap_or("provider pending")),
+            }),
+            RunEvent::ContextBuilt { manifest } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "context:built",
+                "phase": "context",
+                "state": "verified",
+                "label": "Context assembled",
+                "detail": format!(
+                    "{} system sections · {} of {} messages · {} tools",
+                    manifest.system_sections.iter().filter(|item| item.selected).count(),
+                    manifest.messages.iter().filter(|item| item.selected).count(),
+                    manifest.messages.len(),
+                    manifest.tools.iter().filter(|item| item.selected).count(),
+                ),
+            }),
+            RunEvent::CompactionApplied {
+                before_messages,
+                after_messages,
+                masked_tool_results,
+                ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "context:compaction",
+                "phase": "context",
+                "state": "changed",
+                "label": "Context compacted",
+                "detail": format!("{before_messages} → {after_messages} messages · {masked_tool_results} tool results masked"),
+            }),
+            RunEvent::AssistantMessage { .. } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "assistant:recorded",
+                "phase": "output",
+                "state": "verified",
+                "label": "Assistant response recorded",
+                "detail": "Full response retained in the durable run record",
+            }),
+            RunEvent::ToolStarted {
+                tool_call_id, name, ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("tool:{tool_call_id}:start"),
+                "phase": "tool",
+                "state": "running",
+                "label": format!("Tool started · {name}"),
+                "detail": tool_call_id,
+            }),
+            RunEvent::PermissionDecision {
+                tool_call_id,
+                decision,
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("tool:{tool_call_id}:permission"),
+                "phase": "permission",
+                "state": "verified",
+                "label": "Permission decision recorded",
+                "detail": format!("{decision:?}"),
+            }),
+            RunEvent::ToolCompleted {
+                tool_call_id,
+                is_error,
+                effects,
+                verification,
+                ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("tool:{tool_call_id}:complete"),
+                "phase": "tool",
+                "state": if *is_error { "error" } else { "done" },
+                "label": if *is_error { "Tool failed" } else { "Tool completed" },
+                "detail": format!("{} effects · verification {}", effects.len(), if verification.is_some() { "recorded" } else { "not reported" }),
+            }),
+            RunEvent::TurnCompleted { usage, stop_reason } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "turn:complete",
+                "phase": "turn",
+                "state": "done",
+                "label": "Turn recorded",
+                "detail": format!("{} in · {} out · {}", usage.input_tokens, usage.output_tokens, stop_reason.as_deref().unwrap_or("complete")),
+            }),
+            RunEvent::Warning { message } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("warning:{}", self.request_id),
+                "phase": "warning",
+                "state": "error",
+                "label": "Runtime warning",
+                "detail": message,
+            }),
+            RunEvent::UserDisposition { .. } | RunEvent::ChildRunRef { .. } => return,
+        };
+        emit_lossy(&self.tx, &activity);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2565,14 +2795,16 @@ mod tests {
         canvas_system_prompt, chat_system_prompt, compact_canvas_turn, emit, emit_lossy,
         execute_terminal_read, extract_canvas_html, extract_partial_canvas_html,
         extract_workspace_operations, has_chat_target, has_page_edit_target,
-        has_sensitive_path_component, is_allowed_host, is_same_local_origin, render_home,
-        resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
+        has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run_record,
+        render_home, resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
         validate_chat_notebook_input, validate_request_message, validate_run_id,
         validate_workspace_objects, workspace_input, CanvasState, ChatMessage, TerminalReadRequest,
-        WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN,
-        SSE_CONTROL_RESERVE,
+        WebSink, WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS,
+        MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
-    use piku_runtime::{ContentBlock, ConversationMessage, Session};
+    use piku_runtime::{
+        read_run_record, ContentBlock, ConversationMessage, OutputSink, RunEvent, Session,
+    };
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -3152,5 +3384,54 @@ mod tests {
             sanitize_terminal_text("safe\n\u{1b}[31m\u{202e}txt"),
             "safe\n\\u{001b}[31m\\u{202e}txt"
         );
+    }
+
+    #[test]
+    fn web_run_records_use_session_identity_and_request_scoped_turns() {
+        let root = temp_dir("piku-web-run-record");
+        let mut config = crate::config::PikuConfig::load(None, None, Some(&root));
+        config.config_dir.clone_from(&root);
+        let (mut recorder, turn_id) =
+            open_web_run_record(&config, "session-1", "request-2", "chat")
+                .expect("web run record opens");
+
+        recorder
+            .append(
+                &turn_id,
+                RunEvent::Warning {
+                    message: "recorded".to_string(),
+                },
+            )
+            .expect("event records");
+
+        assert_eq!(turn_id, "web-chat-request-2");
+        let events =
+            read_run_record(config.runs_dir().join("session-1.jsonl")).expect("record reads");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, "session-1");
+        assert_eq!(events[0].scope.turn_id(), Some("web-chat-request-2"));
+        fs::remove_dir_all(root).expect("run record fixture cleans up");
+    }
+
+    #[test]
+    fn web_sink_projects_semantic_events_without_fabricating_tools() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut sink = WebSink::new("request-1".to_string(), tx, None);
+
+        sink.on_run_event(&RunEvent::TurnCompleted {
+            usage: piku_runtime::UsageRecord {
+                input_tokens: 12,
+                output_tokens: 7,
+            },
+            stop_reason: Some("end_turn".to_string()),
+        });
+
+        let event: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().expect("activity event is projected"))
+                .expect("activity event is JSON");
+        assert_eq!(event["kind"], "activity_event");
+        assert_eq!(event["event_id"], "turn:complete");
+        assert_eq!(event["label"], "Turn recorded");
+        assert_eq!(event["detail"], "12 in · 7 out · end_turn");
     }
 }

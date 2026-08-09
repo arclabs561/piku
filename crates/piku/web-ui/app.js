@@ -310,7 +310,9 @@ async function submitMessage(
     executorModel = "";
   let verification = null,
     outcomeMessage = "";
-  let requestId = "";
+  let requestId = "",
+    runId = "",
+    runUrl = "";
   if (options.contextSources?.length) {
     setActivityEvent(
       activity,
@@ -382,6 +384,23 @@ async function submitMessage(
               "Request accepted",
               "Waiting for the model",
             );
+          } else if (event.kind === "run_record_started") {
+            runId = event.run_id || "";
+            runUrl = event.url || (runId ? "/run/" + encodeURIComponent(runId) : "");
+            if (runId) activity.dataset.runId = runId;
+            const link = activity.querySelector(".activity-run-link");
+            if (link && runUrl) {
+              link.href = runUrl;
+              link.hidden = false;
+            }
+            setActivityIdentity(activity, "", "recording");
+            setActivityEvent(
+              activity,
+              "record",
+              "Durable run opened",
+              event.turn_id || runId,
+              "verified",
+            );
           } else if (event.kind === "model_started") {
             if (event.thread_id) threadId = event.thread_id;
             if (event.model) executorModel = event.model;
@@ -422,6 +441,14 @@ async function submitMessage(
                 : event.request_kind === "workspace"
                   ? "Model is preparing typed object changes"
                   : "Model is answering",
+            );
+          } else if (event.kind === "activity_event") {
+            setActivityEvent(
+              activity,
+              event.event_id || "runtime:" + event.phase,
+              event.label || "Runtime event",
+              event.detail || "",
+              event.state || "running",
             );
           } else if (event.kind === "text_delta") {
             narration += event.text;
@@ -615,7 +642,10 @@ async function submitMessage(
     threadId,
     model: executorModel,
     requestId,
+    runId,
+    runUrl,
     verification,
+    activity,
     result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
   };
@@ -639,7 +669,7 @@ function createActivity(
   card.setAttribute("aria-label", "Execution trace");
   card.setAttribute("aria-live", "polite");
   card.innerHTML =
-    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-persistence">execution trace · transient</span><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
+    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-persistence">execution trace · transient</span><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span><a class="activity-meta activity-run-link" hidden target="_blank" rel="noopener">inspect run</a></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
   card.querySelector(".activity-goal").textContent = goal;
   card.querySelector(".activity-kind").textContent =
     requestKind === "chat"
@@ -661,7 +691,10 @@ function createActivity(
   );
   card
     .querySelector(".activity-close")
-    .addEventListener("click", () => card.remove());
+    .addEventListener("click", () => {
+      card.dataset.dismissed = "true";
+      card.remove();
+    });
   (host || overlay).append(card);
   if (!host) placeActivity(card, anchor || fallback);
   return card;
@@ -669,7 +702,9 @@ function createActivity(
 function setActivityIdentity(card, requestId, status) {
   if (requestId) card.dataset.requestId = requestId;
   const ordinal = card.dataset.runOrdinal,
-    identity = card.dataset.requestId || "awaiting server ID",
+    identity = card.dataset.runId
+      ? "run " + card.dataset.runId
+      : card.dataset.requestId || "awaiting server ID",
     time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   card.querySelector(".activity-identity").textContent = `run #${ordinal} · ${identity} · ${status} ${time}`;
 }
@@ -1316,7 +1351,7 @@ function parseChatNotebook(content) {
   try {
     const value = JSON.parse(content || "");
     if (
-      [1, 2, 3, 4].includes(value?.version) &&
+      [1, 2, 3, 4, 5].includes(value?.version) &&
       typeof value.context === "string" &&
       Array.isArray(value.turns)
     ) {
@@ -1343,6 +1378,10 @@ function parseChatNotebook(content) {
                 : 0,
             completedAt:
               typeof turn.completedAt === "string" ? turn.completedAt : "",
+            runId:
+              value.version >= 5 && typeof turn.runId === "string"
+                ? turn.runId
+                : "",
             status: ["idle", "running", "done", "stale", "error", "cancelled"].includes(
               turn.status,
             )
@@ -1354,7 +1393,7 @@ function parseChatNotebook(content) {
         ];
       });
       return {
-        version: 4,
+        version: 5,
         executor: value.version >= 3 && ["codex", "provider", "evaluation_fixture"].includes(value.executor)
           ? value.executor
           : "provider",
@@ -1374,11 +1413,11 @@ function parseChatNotebook(content) {
   } catch {
     // Older chat cards had no structured content.
   }
-  return { version: 4, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 5, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function newChatNotebook() {
-  return { version: 4, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 5, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function renderChatExecutor(object, state) {
@@ -1546,6 +1585,7 @@ function renderChatNotebook(object) {
       status: "idle",
       attempt: 0,
       completedAt: "",
+      runId: "",
     });
     field.value = "";
     persistChatNotebook(object, state);
@@ -1570,7 +1610,7 @@ function renderChatTurns(object, state) {
     cell.className = "chat-turn";
     cell.dataset.turnId = turn.id;
     cell.innerHTML =
-      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
+      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect run</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
     cell.querySelector(".chat-turn-index").textContent =
       "IN [" + (index + 1) + "]";
     const attempt = Number(turn.attempt) || 0;
@@ -1578,6 +1618,12 @@ function renderChatTurns(object, state) {
       (turn.status || "idle") +
       (attempt ? " · attempt " + attempt : "") +
       (turn.completedAt ? " · " + turn.completedAt : "");
+    const runLink = cell.querySelector(".chat-turn-run");
+    if (turn.runId) {
+      runLink.href = "/run/" + encodeURIComponent(turn.runId);
+      runLink.textContent = "run " + turn.runId.slice(0, 8);
+      runLink.hidden = false;
+    }
     const prompt = cell.querySelector("textarea");
     prompt.value = turn.prompt;
     prompt.disabled = running;
@@ -1631,6 +1677,7 @@ async function runChatNotebook(object, state, start, end) {
   }
   object.dataset.running = "true";
   object.chatAbortController = new AbortController();
+  const transientActivities = new Map();
   const continuingNativeThread =
     state.executor === "codex" &&
     Boolean(state.threadId) &&
@@ -1666,6 +1713,7 @@ async function runChatNotebook(object, state, start, end) {
       turn.attempt = (Number(turn.attempt) || 0) + 1;
       turn.completedAt = "";
       renderChatTurns(object, state);
+      restoreChatActivities(object, transientActivities);
       const output = object.querySelector(
         '[data-turn-id="' + CSS.escape(turn.id) + '"] .chat-response',
       );
@@ -1698,6 +1746,8 @@ async function runChatNotebook(object, state, start, end) {
       if (result.threadId) state.threadId = result.threadId;
       if (result.model) state.model = result.model;
       if (result.error === "Cancelled") state.threadId = "";
+      turn.runId = result.runId || "";
+      if (result.activity) transientActivities.set(turn.id, result.activity);
       turn.response = result.text || result.error || "No response";
       turn.status = result.ok
         ? "done"
@@ -1722,7 +1772,18 @@ async function runChatNotebook(object, state, start, end) {
       button.disabled = false;
     });
     renderChatTurns(object, state);
+    restoreChatActivities(object, transientActivities);
     persistChatNotebook(object, state);
+  }
+}
+
+function restoreChatActivities(object, activities) {
+  for (const [turnId, activity] of activities) {
+    if (activity.dataset.dismissed === "true") continue;
+    const host = object.querySelector(
+      '[data-turn-id="' + CSS.escape(turnId) + '"] .chat-turn-activity',
+    );
+    if (host) host.append(activity);
   }
 }
 

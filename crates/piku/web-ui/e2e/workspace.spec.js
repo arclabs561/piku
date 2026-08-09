@@ -964,6 +964,8 @@ test("execution traces stay visibly transient and outside workspace persistence"
       contentType: "text/event-stream",
       body: [
         { kind: "request_accepted", surface: surfaceName, request_id: "trace-contract" },
+        { kind: "run_record_started", surface: surfaceName, request_id: "trace-contract", run_id: "durable-trace-run", turn_id: "web-chat-trace-contract", url: "/run/durable-trace-run" },
+        { kind: "activity_event", event_id: "context:built", phase: "context", state: "verified", label: "Context assembled", detail: "2 system sections · 1 of 1 messages · 0 tools" },
         { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Answering", request_kind: "chat" },
         { kind: "text_delta", text: "trace complete" },
         { kind: "completed", surface: surfaceName, message: "done", iterations: 1, elapsed_seconds: 0.1, canvas_changed: false, request_kind: "chat" },
@@ -982,6 +984,12 @@ test("execution traces stay visibly transient and outside workspace persistence"
   await expect(trace).toHaveClass(/embedded/);
   await expect(trace).toContainText("execution trace · transient");
   await expect(trace).toContainText("Request queued");
+  await expect(trace).toContainText("Durable run opened");
+  await expect(trace).toContainText("Context assembled");
+  await expect(trace.getByRole("link", { name: "inspect run" })).toHaveAttribute(
+    "href",
+    "/run/durable-trace-run",
+  );
   await expect(trace).toHaveAttribute("data-persistence", "transient");
   await expect(page.locator("#object-picker option")).toHaveCount(2);
 
@@ -998,6 +1006,21 @@ test("execution traces stay visibly transient and outside workspace persistence"
   ).json();
   expect(completed.objects).toHaveLength(1);
   expect(completed.objects.some((object) => object.kind === "activity")).toBeFalsy();
+  const savedNotebook = JSON.parse(completed.objects[0].content);
+  expect(savedNotebook.version).toBe(5);
+  expect(savedNotebook.turns[0].runId).toBe("durable-trace-run");
+
+  await page.reload();
+  const restored = page.locator('[data-kind="chat"]');
+  await expect(restored).toHaveCount(1);
+  await expect(restored.locator(".activity-card")).toHaveCount(0);
+  const restoredRun = restored.locator(".chat-turn-run");
+  await expect(restoredRun).toBeVisible();
+  await expect(restoredRun).toHaveText("run durable-");
+  await expect(restoredRun).toHaveAttribute(
+    "href",
+    "/run/durable-trace-run",
+  );
 });
 
 test("workspace state crosses browser contexts while viewport state does not", async ({
