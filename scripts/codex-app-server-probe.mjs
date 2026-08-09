@@ -2,13 +2,17 @@
 
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_INTERACTIVE_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_CAP = 16 * 1024;
+const MAX_FIXTURES = 8;
+const MAX_FIXTURE_TEXT = 512;
+const MAX_RETAINED_NOTIFICATIONS = 32;
 
 function cleanEnvironment(codexHome) {
   return {
@@ -23,6 +27,37 @@ function cleanEnvironment(codexHome) {
 
 function boundedText(chunks, cap) {
   return Buffer.concat(chunks).subarray(0, cap).toString("utf8");
+}
+
+function safeRpcDetail(value, fallback) {
+  if (typeof value !== "string" && typeof value !== "number") return fallback;
+  return String(value)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\b(api[_-]?key|token|secret|authorization)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(/(?:\/[A-Za-z0-9._-]+){2,}/g, "[path]")
+    .slice(0, 256);
+}
+
+async function copyInteractiveAuth(codexHome, explicitAuthFile) {
+  const candidates = explicitAuthFile
+    ? [explicitAuthFile]
+    : [
+        process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, "auth.json") : null,
+        process.env.HOME ? path.join(process.env.HOME, ".codex", "auth.json") : null,
+      ].filter(Boolean);
+  for (const source of candidates) {
+    try {
+      const metadata = await stat(source);
+      if (!metadata.isFile()) continue;
+      const destination = path.join(codexHome, "auth.json");
+      await copyFile(source, destination, fsConstants.COPYFILE_EXCL);
+      await chmod(destination, 0o600);
+      return;
+    } catch {
+      // Try the next structural Codex home candidate without exposing its path.
+    }
+  }
+  throw new Error("Codex authentication unavailable");
 }
 
 async function exists(target) {
@@ -69,6 +104,8 @@ class RpcClient {
     this.outputCap = outputCap;
     this.nextId = 1;
     this.pending = new Map();
+    this.notifications = [];
+    this.waiters = [];
     this.buffer = "";
     this.stderrBytes = 0;
     child.stdout.setEncoding("utf8");
@@ -102,12 +139,32 @@ class RpcClient {
         this.failAll("App server returned invalid JSON");
         return;
       }
-      if (message.id === undefined) continue;
+      if (message.id === undefined) {
+        const itemType = message.params?.item?.type;
+        const retain = message.method === "turn/completed"
+          || (["item/started", "item/completed"].includes(message.method)
+            && ["commandExecution", "fileChange"].includes(itemType));
+        if (retain) {
+          if (this.notifications.length === MAX_RETAINED_NOTIFICATIONS) this.notifications.shift();
+          this.notifications.push(message);
+        }
+        for (const waiter of [...this.waiters]) {
+          if (!waiter.predicate(message)) continue;
+          clearTimeout(waiter.timer);
+          this.waiters.splice(this.waiters.indexOf(waiter), 1);
+          waiter.resolve(message);
+        }
+        continue;
+      }
       const pending = this.pending.get(message.id);
       if (!pending) continue;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error("App server RPC failed"));
+      if (message.error) {
+        const code = safeRpcDetail(message.error.code, "unknown");
+        const detail = safeRpcDetail(message.error.message, "no safe detail");
+        pending.reject(new Error(`App server ${pending.method} failed (${code}): ${detail}`));
+      }
       else pending.resolve(message.result);
     }
   }
@@ -128,13 +185,27 @@ class RpcClient {
         this.child.kill("SIGKILL");
         reject(new Error(`App server ${method} timed out`));
       }, this.timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       this.child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
     });
   }
 
   notify(method, params = {}) {
     this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  }
+
+  waitForNotification(predicate, description) {
+    const queued = this.notifications.find(predicate);
+    if (queued) return Promise.resolve(queued);
+    return new Promise((resolve, reject) => {
+      const waiter = { predicate, resolve, reject };
+      waiter.timer = setTimeout(() => {
+        this.waiters.splice(this.waiters.indexOf(waiter), 1);
+        this.child.kill("SIGKILL");
+        reject(new Error(`App server ${description} timed out`));
+      }, this.timeoutMs);
+      this.waiters.push(waiter);
+    });
   }
 }
 
@@ -152,10 +223,146 @@ function validExecResult(result) {
     && typeof result.stdout === "string" && typeof result.stderr === "string";
 }
 
+function workspacePolicy(workspace) {
+  return {
+    type: "workspaceWrite",
+    writableRoots: [workspace],
+    networkAccess: false,
+    excludeSlashTmp: true,
+    excludeTmpdirEnvVar: true,
+  };
+}
+
+function normalizeText(value, temporaryRoot, workspace) {
+  if (typeof value !== "string") return null;
+  return value
+    .replaceAll(workspace, "$WORKSPACE")
+    .replaceAll(temporaryRoot, "$TEMP_ROOT")
+    .slice(0, MAX_FIXTURE_TEXT);
+}
+
+function itemFixture(message, temporaryRoot, workspace, turnIds) {
+  const item = message?.params?.item;
+  if (!item || !["commandExecution", "fileChange"].includes(item.type)) return null;
+  const fixture = {
+    event: message.method,
+    turn: message.params?.turnId === turnIds.inside
+      ? "workspaceWrite"
+      : message.params?.turnId === turnIds.denied ? "siblingDenial" : null,
+    type: item.type,
+    status: typeof item.status === "string" ? item.status : null,
+  };
+  if (item.type === "commandExecution") {
+    fixture.cwd = normalizeText(item.cwd, temporaryRoot, workspace);
+    fixture.exitCode = Number.isInteger(item.exitCode) ? item.exitCode : null;
+    fixture.outputBytes = typeof item.aggregatedOutput === "string"
+      ? Math.min(Buffer.byteLength(item.aggregatedOutput), MAX_FIXTURE_TEXT)
+      : 0;
+  } else {
+    fixture.changes = Array.isArray(item.changes) ? item.changes.slice(0, 8).map((change) => ({
+      path: normalizeText(change.path, temporaryRoot, workspace),
+      kind: change.kind?.type ?? change.kind ?? null,
+    })) : [];
+  }
+  return fixture;
+}
+
+async function awaitTurn(rpc, threadId, turnId) {
+  return rpc.waitForNotification(
+    (message) => message.method === "turn/completed"
+      && message.params?.threadId === threadId
+      && message.params?.turn?.id === turnId,
+    `turn ${turnId} completion`,
+  );
+}
+
+async function containsProbe(target) {
+  try {
+    return (await readFile(target, "utf8")).trim() === "probe";
+  } catch {
+    return false;
+  }
+}
+
+async function runInteractiveProbe(rpc, temporaryRoot, workspace) {
+  const commandSentinel = path.join(workspace, "interactive-command-sentinel");
+  const fileSentinel = path.join(workspace, "interactive-file-sentinel");
+  const siblingSentinel = path.join(temporaryRoot, "interactive-sibling-sentinel");
+  const policy = workspacePolicy(workspace);
+  const start = await rpc.request("thread/start", {
+    cwd: workspace,
+    sandbox: "workspace-write",
+    approvalPolicy: "never",
+    ephemeral: false,
+    developerInstructions: "Follow the probe instructions exactly. Do not use the network or modify any other path.",
+  });
+  const threadId = start?.thread?.id;
+  if (typeof threadId !== "string") throw new Error("App server thread/start returned no thread id");
+  const first = await rpc.request("turn/start", {
+    threadId,
+    approvalPolicy: "never",
+    sandboxPolicy: policy,
+    input: [{ type: "text", text: `Run a shell command that writes exactly probe to ${commandSentinel}, then use the file-change tool to create ${fileSentinel} containing exactly probe. Do nothing else.` }],
+  });
+  const firstTurnId = first?.turn?.id;
+  if (typeof firstTurnId !== "string") throw new Error("App server first turn/start returned no turn id");
+  const firstCompleted = await awaitTurn(rpc, threadId, firstTurnId);
+
+  const resumed = await rpc.request("thread/resume", {
+    threadId,
+    cwd: workspace,
+    sandbox: "workspace-write",
+    approvalPolicy: "never",
+  });
+  if (resumed?.thread?.id !== threadId) throw new Error("App server resumed an unexpected thread");
+  const second = await rpc.request("turn/start", {
+    threadId,
+    approvalPolicy: "never",
+    sandboxPolicy: policy,
+    input: [{ type: "text", text: `This is a sandbox-denial probe. Use the shell tool to execute exactly: printf probe > '${siblingSentinel}'. Execute it even though failure is expected. Do not ask for approval, reason about permissions first, or do anything else.` }],
+  });
+  const secondTurnId = second?.turn?.id;
+  if (typeof secondTurnId !== "string") throw new Error("App server second turn/start returned no turn id");
+  const secondCompleted = await awaitTurn(rpc, threadId, secondTurnId);
+
+  const fixtures = rpc.notifications
+    .map((message) => itemFixture(message, temporaryRoot, workspace, {
+      inside: firstTurnId,
+      denied: secondTurnId,
+    }))
+    .filter(Boolean)
+    .slice(0, MAX_FIXTURES);
+  const insideWritten = await containsProbe(commandSentinel) && await containsProbe(fileSentinel);
+  const siblingDenied = !(await exists(siblingSentinel));
+  const turnsCompleted = [firstCompleted, secondCompleted]
+    .every((message) => message.params?.turn?.status === "completed");
+  const lifecycleFixtures = fixtures.some((fixture) => fixture.event === "item/started" && fixture.type === "commandExecution")
+    && fixtures.some((fixture) => fixture.event === "item/completed" && fixture.type === "commandExecution")
+    && fixtures.some((fixture) => fixture.event === "item/started" && fixture.type === "fileChange")
+    && fixtures.some((fixture) => fixture.event === "item/completed" && fixture.type === "fileChange");
+  const denialObserved = fixtures.some((fixture) => fixture.turn === "siblingDenial"
+    && fixture.event === "item/completed"
+    && fixture.type === "commandExecution"
+    && fixture.exitCode !== null && fixture.exitCode !== 0);
+  return {
+    // The deterministic command/exec probe above is the enforcement evidence.
+    // A model may decline an obviously forbidden command before emitting an
+    // item, so its attempted denial is useful behavioral evidence, not a gate.
+    passed: insideWritten && siblingDenied && turnsCompleted && lifecycleFixtures,
+    insideWritten,
+    siblingDenied,
+    denialObserved,
+    denialEvidence: denialObserved ? "turn_command_denied" : "model_declined_before_tool",
+    turnsCompleted,
+    fixtures,
+  };
+}
+
 export async function runProbe(options = {}) {
   const executable = options.executable ?? "codex";
   const prefixArgs = options.prefixArgs ?? [];
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs
+    ?? (options.interactive ? DEFAULT_INTERACTIVE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
   const outputCap = options.outputCap ?? DEFAULT_OUTPUT_CAP;
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "piku-codex-probe-"));
   const codexHome = path.join(temporaryRoot, "codex-home");
@@ -167,6 +374,7 @@ export async function runProbe(options = {}) {
   try {
     await mkdir(codexHome);
     await mkdir(workspace);
+    if (options.interactive) await copyInteractiveAuth(codexHome, options.authFile);
     const env = cleanEnvironment(codexHome);
     const version = await runVersion(executable, prefixArgs, env, timeoutMs, outputCap);
     child = spawn(executable, [...prefixArgs, "app-server", "--listen", "stdio://"], {
@@ -192,20 +400,8 @@ export async function runProbe(options = {}) {
       type: "readOnly",
       networkAccess: false,
     });
-    const insideResult = await exec(writeCommand(workspaceSentinel), {
-      type: "workspaceWrite",
-      writableRoots: [workspace],
-      networkAccess: false,
-      excludeSlashTmp: true,
-      excludeTmpdirEnvVar: true,
-    });
-    const outsideResult = await exec(writeCommand(siblingSentinel), {
-      type: "workspaceWrite",
-      writableRoots: [workspace],
-      networkAccess: false,
-      excludeSlashTmp: true,
-      excludeTmpdirEnvVar: true,
-    });
+    const insideResult = await exec(writeCommand(workspaceSentinel), workspacePolicy(workspace));
+    const outsideResult = await exec(writeCommand(siblingSentinel), workspacePolicy(workspace));
     const resultsValid = [readOnlyResult, insideResult, outsideResult].every(validExecResult);
     const readOnlyAbsent = !(await exists(readOnlySentinel));
     const insidePresent = await exists(workspaceSentinel);
@@ -213,8 +409,11 @@ export async function runProbe(options = {}) {
     const readOnlyPassed = resultsValid && readOnlyResult.exitCode !== 0 && readOnlyAbsent;
     const workspaceWritePassed = resultsValid && insideResult.exitCode === 0 && insidePresent
       && outsideResult.exitCode !== 0 && outsideAbsent;
+    const interactive = options.interactive
+      ? await runInteractiveProbe(rpc, temporaryRoot, workspace)
+      : undefined;
     return {
-      ok: readOnlyPassed && workspaceWritePassed,
+      ok: readOnlyPassed && workspaceWritePassed && (!interactive || interactive.passed),
       codexVersion: version,
       protocol: {
         initialized: Boolean(initialization && typeof initialization === "object"),
@@ -227,6 +426,7 @@ export async function runProbe(options = {}) {
           outsideSentinelAbsent: outsideAbsent,
         },
       },
+      ...(interactive ? { interactive } : {}),
     };
   } finally {
     if (child && child.exitCode === null) child.kill("SIGKILL");
@@ -236,7 +436,9 @@ export async function runProbe(options = {}) {
 
 async function main() {
   try {
-    const result = await runProbe();
+    const args = process.argv.slice(2);
+    if (args.some((arg) => arg !== "--interactive")) throw new Error("Usage: codex-app-server-probe.mjs [--interactive]");
+    const result = await runProbe({ interactive: args.includes("--interactive") });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     process.exitCode = result.ok ? 0 : 1;
   } catch (error) {
