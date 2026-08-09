@@ -4,8 +4,10 @@ context, model intent, actions, files or page mutations, diffs, verification,
 and result. Do not inspect repository source or run shell commands.
 
 Use the exact surface `{{SURFACE}}`, request ID `{{REQUEST_ID}}`, and write
-screenshots only below `{{RUN_DIR}}`. Create the surface through the UI and use
-only four cards: note, chat, change, and page preview. Attach the note explicitly
+screenshots only below `{{RUN_DIR}}`. Pass a unique full absolute filename below
+that directory to each screenshot call; never overwrite or recapture a path.
+Create the surface through the UI. Clicking empty canvas space opens the card
+creation menu. Use only four cards: note, chat, change, and page preview. Attach the note explicitly
 to chat without submitting it. First use the change card to create a small seeded
 page containing a heading, one styled control, and an unrelated layout element.
 Then edit the same card's instruction and submit a narrow heading-only change.

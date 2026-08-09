@@ -292,6 +292,9 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   assert.match(recoveryPrompt, /Do not combine verification, surface deletion/);
   assert.match(recoveryPrompt, /full\s+absolute filename below `\{\{RUN_DIR\}\}`/);
   assert.match(recoveryPrompt, /never overwrite or recapture/);
+  const codingPrompt = await readFile(path.join(webUiDir, "e2e", "explorer-coding-trace.md"), "utf8");
+  assert.match(codingPrompt, /Clicking empty canvas space opens the card\s+creation menu/);
+  assert.match(codingPrompt, /unique full absolute filename/);
 });
 
 test("Codex response schemas avoid unsupported composition keywords", async () => {
