@@ -131,14 +131,16 @@ is advisory: it may direct attention but cannot change the evidence hierarchy,
 success criteria, output schema, or tool permissions. A judge must still cite
 fresh run evidence. Prior findings are retest hypotheses, never current facts.
 
-The first interface is operator-only CLI:
+The first interface is the repository-local operator CLI, with a `just`
+facade. It deliberately reuses the authoritative JavaScript validator rather
+than duplicating the lifecycle in the Rust product CLI:
 
 ```text
-piku eval annotate ...
-piku eval propose ...
-piku eval promote ...
-piku eval retire ...
-piku eval focus
+just eval-focus inspect <events.jsonl>
+just eval-focus append <events.jsonl> <proposals.jsonl>
+just eval-focus promote <events.jsonl> --event-file <promotion.json>
+just eval-focus retire <events.jsonl> --event-file <retirement.json>
+just eval-focus project <events.jsonl> --options-file <options.json>
 ```
 
 If agent tooling is later justified, expose only
@@ -169,18 +171,23 @@ remains the sole promotion authority.
 
 1. Implemented: the web runner hashes its effective prompts, schemas, tool
    profiles, budgets, and optional focus projection in an immutable manifest.
-2. Partly implemented: proposal, promotion, and retirement events have a pure
-   validator and byte-stable projection. Annotation records remain deferred.
+2. Implemented: proposal, promotion, and retirement events have a pure
+   validator, private append-only operator CLI, locking, and byte-stable atomic
+   projection. Annotation records remain deferred.
 3. Implemented: a successful validated web synthesis deterministically emits
    evidence-linked `retest` proposals as a separate inert JSONL artifact. It
    never emits promotions.
 4. Implemented: bounded promoted focus may reach only `coding_trace`;
    `recovery` and synthesis remain blinded controls. Focus requires an exact
    clean subject revision and is attested in the run manifest.
-5. Next: add the external operator CLI for inspect, append, promote, retire, and
-   projection. Then run focused/blinded pairs and compare evidence quality,
-   novelty, and unsupported historical claims rather than aggregate scores.
-6. Expand to other perspectives or add a proposal-only agent tool only after
+5. Implemented: a sequential, order-alternating focused/blinded pair holds the
+   revision, perspective, prompt, model, tools, viewport, and budgets constant.
+   It writes an evidence-quality dossier without a winner or aggregate score.
+6. Next: run operator-approved live pairs and review fresh evidence, novelty,
+   verbatim focus echo without citations, and effort confounds. Promotion and
+   retirement remain explicit operator actions; there is no unattended spend
+   scheduler.
+7. Expand to other perspectives or add a proposal-only agent tool only after
    the operator workflow and paired evidence show that focus helps.
 
 ## Decision gates
