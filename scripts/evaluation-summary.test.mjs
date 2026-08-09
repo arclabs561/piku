@@ -178,6 +178,31 @@ test("summary separates legacy rows and quarantines invalid versioned rows", asy
   }
 });
 
+test("playground fixture contributes one shared summary while detailed evidence stays lossless", async () => {
+  const fixture = path.resolve("scripts/fixtures/playground-envelope");
+  const result = spawnSync(process.execPath, [path.resolve("scripts/evaluation-summary.mjs"), fixture], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.runs, 1);
+  assert.equal(summary.stages, 1);
+  assert.equal(summary.records, 1);
+  assert.deepEqual(summary.by_surface, { tui: 1 });
+  assert.deepEqual(summary.by_status, { product_failure: 1 });
+  assert.equal(summary.followup_count, 2);
+  assert.deepEqual(summary.followups.map((item) => item.kind), ["todo", "retest"]);
+
+  const detailed = await readFile(
+    path.join(fixture, "detailed", "agentic-findings", "playground.jsonl"),
+    "utf8",
+  );
+  const records = detailed.trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((row) => row.kind), ["config", "turn", "improvement_handoff"]);
+  assert.equal(records[1].viewport, "full terminal output retained");
+  assert.deepEqual(records[2].hypotheses, ["[unreviewed] rerun after fixing output"]);
+});
+
 test("append-only amendments derive eligibility without rewriting original verdicts", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "piku-eval-amendments-"));
   try {

@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+pub const EVALUATION_CONTRACT: &str = "piku-evaluation-envelope-v1";
+pub const EVALUATOR_VERSION: &str = concat!("agentic-playground-rust/", env!("CARGO_PKG_VERSION"));
+
 /// A reviewable terminal-playground turn. Provider labels deliberately exclude
 /// credentials; terminal text is bounded by the caller before persistence.
 #[derive(Serialize)]
@@ -262,6 +265,90 @@ pub struct ImprovementHandoffRecord<'a> {
     pub piku_run_record_path: &'a str,
 }
 
+/// The single shared-envelope projection of a completed playground run.
+///
+/// The detailed append-only playground ledger remains authoritative. This
+/// deliberately small projection lets the CLI/TUI and web evaluators share
+/// summaries without flattening the evidence bundle into a second ledger.
+#[derive(Debug, Serialize)]
+pub struct EvaluationSummaryRecord<'a> {
+    pub schema_version: u8,
+    pub run_id: &'a str,
+    pub record_kind: &'static str,
+    pub stage_id: &'static str,
+    pub scenario_id: &'a str,
+    pub surface: &'static str,
+    pub subject_surface: &'static str,
+    pub perspective: &'a str,
+    pub subject_model: &'a str,
+    pub explorer_model: &'a str,
+    pub judge_model: &'a str,
+    pub subject_version: &'static str,
+    pub subject_revision: &'a str,
+    pub subject_dirty: bool,
+    pub evaluator_runtime: &'static str,
+    pub evaluator_version: &'static str,
+    pub evaluation_contract: &'static str,
+    pub task_contract: &'a str,
+    pub run_status: &'a str,
+    pub failure_class: &'a str,
+    pub product_verdict: Option<&'a str>,
+    pub finding_count: usize,
+    pub evidence_ids: &'a [String],
+    pub artifact_refs: &'a [String],
+    pub followups: &'a [EvaluationFollowup],
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EvaluationFollowup {
+    pub kind: &'static str,
+    pub priority: &'static str,
+    pub title: String,
+    pub rationale: String,
+    pub perspective: Option<String>,
+    pub evidence_ids: Vec<String>,
+}
+
+#[must_use]
+pub fn evaluation_followups(
+    persona: &str,
+    verified_findings: &[String],
+    hypotheses: &[String],
+) -> Vec<EvaluationFollowup> {
+    let mut followups = Vec::with_capacity(verified_findings.len() + hypotheses.len());
+    followups.extend(verified_findings.iter().map(|finding| EvaluationFollowup {
+        kind: "todo",
+        priority: "high",
+        title: bounded_title(finding, "Address verified finding"),
+        rationale: finding.clone(),
+        perspective: Some(persona.to_string()),
+        evidence_ids: Vec::new(),
+    }));
+    followups.extend(hypotheses.iter().map(|hypothesis| EvaluationFollowup {
+        kind: "retest",
+        priority: "medium",
+        title: bounded_title(hypothesis, "Reproduce hypothesis"),
+        rationale: hypothesis.clone(),
+        perspective: Some(persona.to_string()),
+        evidence_ids: Vec::new(),
+    }));
+    followups
+}
+
+fn bounded_title(value: &str, fallback: &str) -> String {
+    let first_line = value.lines().next().unwrap_or_default().trim();
+    let without_prefix = first_line
+        .split_once("] ")
+        .map_or(first_line, |(_, remainder)| remainder);
+    let title: String = without_prefix.chars().take(120).collect();
+    if title.is_empty() {
+        fallback.to_string()
+    } else {
+        title
+    }
+}
+
 /// Deterministic context for the engineer who closes the evaluation loop.
 /// It deliberately excludes free-form judge prose: only reproducible evidence
 /// and the selected next action belong in a product-development handoff.
@@ -319,6 +406,11 @@ impl PlaygroundLedger {
     #[must_use]
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn append_turn(&self, record: &TurnRecord<'_>) -> std::io::Result<()> {
@@ -434,6 +526,37 @@ impl PlaygroundLedger {
         self.append(record)
     }
 
+    /// Append the one canonical summary row for this run.
+    ///
+    /// `PIKU_LIVE_LEDGER` joins an explicitly selected shared ledger. Otherwise
+    /// playground runs use the standard local live-ledger directory.
+    pub fn append_evaluation_summary(
+        &self,
+        record: &EvaluationSummaryRecord<'_>,
+    ) -> std::io::Result<PathBuf> {
+        let path = std::env::var("PIKU_LIVE_LEDGER").map_or_else(
+            |_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|path| path.parent())
+                    .expect("piku crate has workspace root")
+                    .join("target/live-ledger/playground.jsonl")
+            },
+            PathBuf::from,
+        );
+        if path == self.path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shared evaluation ledger must differ from detailed playground ledger",
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_json_line(&path, record)?;
+        Ok(path)
+    }
+
     pub fn write_development_context(
         &self,
         record: &DevelopmentContextRecord<'_>,
@@ -474,6 +597,17 @@ impl PlaygroundLedger {
     }
 }
 
+fn append_json_line<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push('\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
 #[must_use]
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -485,6 +619,70 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary_record<'a>(
+        ledger: &'a PlaygroundLedger,
+        artifacts: &'a [String],
+        followups: &'a [EvaluationFollowup],
+    ) -> EvaluationSummaryRecord<'a> {
+        EvaluationSummaryRecord {
+            schema_version: 1,
+            run_id: ledger.run_id(),
+            record_kind: "stage",
+            stage_id: "summary",
+            scenario_id: "fixture-repair",
+            surface: "tui",
+            subject_surface: "tui",
+            perspective: "confident_dev",
+            subject_model: "subject-model",
+            explorer_model: "explorer-model",
+            judge_model: "judge-model",
+            subject_version: env!("CARGO_PKG_VERSION"),
+            subject_revision: "0123456789abcdef0123456789abcdef01234567",
+            subject_dirty: true,
+            evaluator_runtime: "rust-agentic-playground",
+            evaluator_version: EVALUATOR_VERSION,
+            evaluation_contract: EVALUATION_CONTRACT,
+            task_contract: "repair the fixture",
+            run_status: "product_failure",
+            failure_class: "observed_product_behavior",
+            product_verdict: Some("not_supported"),
+            finding_count: 2,
+            evidence_ids: &[],
+            artifact_refs: artifacts,
+            followups,
+            duration_ms: 42,
+        }
+    }
+
+    #[test]
+    fn canonical_summary_is_one_projection_with_typed_followups() {
+        let directory = tempfile::tempdir().unwrap();
+        let detailed_path = directory.path().join("agentic-findings/playground.jsonl");
+        let ledger = PlaygroundLedger::open_at(detailed_path.clone()).unwrap();
+        let verified = vec!["[scenario:fixture] acceptance failed".to_string()];
+        let hypotheses = vec!["[unreviewed] rerun after fixing output".to_string()];
+        let followups = evaluation_followups("confident_dev", &verified, &hypotheses);
+        let artifacts = vec![detailed_path.display().to_string()];
+        let summary = summary_record(&ledger, &artifacts, &followups);
+        let shared_path = directory.path().join("live-ledger/playground.jsonl");
+
+        append_json_line(&shared_path, &summary).unwrap();
+
+        let lines = fs::read_to_string(shared_path).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(row["record_kind"], "stage");
+        assert_eq!(row["stage_id"], "summary");
+        assert_eq!(row["run_status"], "product_failure");
+        assert_eq!(row["subject_revision"].as_str().unwrap().len(), 40);
+        assert_eq!(row["subject_dirty"], true);
+        assert_eq!(row["artifact_refs"][0], artifacts[0]);
+        assert_eq!(row["followups"][0]["kind"], "todo");
+        assert_eq!(row["followups"][1]["kind"], "retest");
+        assert_eq!(followups[0].rationale, verified[0]);
+        assert_eq!(followups[1].rationale, hypotheses[0]);
+    }
 
     #[test]
     fn run_bundle_copy_preserves_relative_artifact_paths() {

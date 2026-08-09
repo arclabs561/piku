@@ -60,10 +60,11 @@ mod scenario;
 
 use playground::PlaygroundDecision as NextAction;
 use playground_ledger::{
-    now_secs, AttentionMetrics, ConfigRecord, ControlMetrics, DevelopmentContextRecord,
-    EvidenceMetrics, ImprovementHandoffRecord, ObserverClaimRecord, ObserverRecord, OutcomeMetrics,
-    PlaygroundLedger, PrincipleMetricsRecord, ReviewClaimRecord, ReviewRecord, RunEvidenceRecord,
-    ScenarioContractRecord, SpendRecord, TurnRecord,
+    evaluation_followups, now_secs, AttentionMetrics, ConfigRecord, ControlMetrics,
+    DevelopmentContextRecord, EvaluationSummaryRecord, EvidenceMetrics, ImprovementHandoffRecord,
+    ObserverClaimRecord, ObserverRecord, OutcomeMetrics, PlaygroundLedger, PrincipleMetricsRecord,
+    ReviewClaimRecord, ReviewRecord, RunEvidenceRecord, ScenarioContractRecord, SpendRecord,
+    TurnRecord, EVALUATION_CONTRACT, EVALUATOR_VERSION,
 };
 use recursive_observer::RecursiveReview;
 
@@ -3569,7 +3570,7 @@ fn is_verified_finding(record: &serde_json::Value) -> bool {
 /// aims the next run at a problem that may no longer exist.
 fn piku_revision() -> String {
     Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()
@@ -3578,6 +3579,16 @@ fn piku_revision() -> String {
         .map(|revision| revision.trim().to_string())
         .filter(|revision| !revision.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn piku_worktree_dirty() -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_none_or(|output| !output.stdout.is_empty())
 }
 
 /// Split prior deterministic findings by whether they were reproduced against
@@ -3652,6 +3663,7 @@ fn evidence_excerpt(s: &str, max_chars: usize) -> String {
 
 fn run_agentic_session(persona: &Persona) {
     load_playground_env();
+    let run_started = Instant::now();
     let Some(ua_spec) = user_agent_provider(false) else {
         eprintln!("skipping: no user-agent provider");
         return;
@@ -4782,6 +4794,74 @@ fn run_agentic_session(persona: &Persona) {
             piku_run_record_path: &piku_run_record_copy,
         }) {
             eprintln!("[playground] could not append improvement handoff: {error}");
+        }
+
+        let followups = evaluation_followups(persona.name, &verified_findings, &hypotheses);
+        let artifact_refs = [
+            ledger.path().display().to_string(),
+            development_context_path,
+            piku_session_copy.clone(),
+            piku_run_record_copy.clone(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+        let has_harness_failure = verified_findings
+            .iter()
+            .any(|finding| finding.starts_with("[harness:"));
+        let has_product_failure = !scenario_failures.is_empty()
+            || verified_findings
+                .iter()
+                .any(|finding| !finding.starts_with("[harness:"));
+        let (run_status, failure_class, product_verdict) = if has_harness_failure {
+            ("harness_failure", "playground_harness", None)
+        } else if has_product_failure {
+            (
+                "product_failure",
+                "observed_product_behavior",
+                Some("not_supported"),
+            )
+        } else {
+            ("completed", "none", Some("supported"))
+        };
+        let scenario_id = contract.map_or("uncontracted-playground", |scenario| scenario.id);
+        let task_contract = if scenario_goal.is_empty() {
+            scenario_id
+        } else {
+            &scenario_goal
+        };
+        let empty_evidence = Vec::new();
+        let summary = EvaluationSummaryRecord {
+            schema_version: 1,
+            run_id: ledger.run_id(),
+            record_kind: "stage",
+            stage_id: "summary",
+            scenario_id,
+            surface: "tui",
+            subject_surface: "tui",
+            perspective: persona.name,
+            subject_model: &piku_spec.model,
+            explorer_model: &ua_llm.spec.model,
+            judge_model: &judge_llm.spec.model,
+            subject_version: env!("CARGO_PKG_VERSION"),
+            subject_revision: &revision,
+            subject_dirty: piku_worktree_dirty(),
+            evaluator_runtime: "rust-agentic-playground",
+            evaluator_version: EVALUATOR_VERSION,
+            evaluation_contract: EVALUATION_CONTRACT,
+            task_contract,
+            run_status,
+            failure_class,
+            product_verdict,
+            finding_count: verified_findings.len() + hypotheses.len(),
+            evidence_ids: &empty_evidence,
+            artifact_refs: &artifact_refs,
+            followups: &followups,
+            duration_ms: u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        match ledger.append_evaluation_summary(&summary) {
+            Ok(path) => eprintln!("[playground] evaluation summary: {}", path.display()),
+            Err(error) => eprintln!("[playground] could not append evaluation summary: {error}"),
         }
     }
 }
