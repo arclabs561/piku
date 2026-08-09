@@ -205,8 +205,38 @@ objectPicker.addEventListener("change", () => {
   );
   if (!object) return;
   selectWorkspaceObject(object);
+  revealWorkspaceObject(object);
   object.focus({ preventScroll: true });
 });
+function revealWorkspaceObject(object) {
+  const handle = object.querySelector(".object-handle");
+  if (!handle) return;
+  const padding = 8;
+  const viewportLeft = canvas.scrollLeft;
+  const viewportTop = canvas.scrollTop;
+  const viewportRight = viewportLeft + canvas.clientWidth;
+  const viewportBottom = viewportTop + canvas.clientHeight;
+  const handleLeft = object.offsetLeft + handle.offsetLeft;
+  const handleTop = object.offsetTop + handle.offsetTop;
+  const visibleHandleWidth = Math.min(
+    handle.offsetWidth,
+    Math.max(1, canvas.clientWidth - padding * 2),
+  );
+  const visibleHandleHeight = Math.min(
+    handle.offsetHeight,
+    Math.max(1, canvas.clientHeight - padding * 2),
+  );
+  const handleRight = handleLeft + visibleHandleWidth;
+  const handleBottom = handleTop + visibleHandleHeight;
+  let left = viewportLeft;
+  let top = viewportTop;
+  if (handleRight <= viewportLeft + padding || handleLeft >= viewportRight - padding)
+    left = handleLeft - padding;
+  if (handleBottom <= viewportTop + padding || handleTop >= viewportBottom - padding)
+    top = handleTop - padding;
+  if (left !== viewportLeft || top !== viewportTop)
+    canvas.scrollTo({ left: Math.max(0, left), top: Math.max(0, top) });
+}
 function selectWorkspaceObject(object) {
   overlay.querySelectorAll(".workspace-object.selected").forEach((item) => {
     if (item !== object && item.dataset.kind !== "page_preview")
@@ -312,7 +342,8 @@ async function submitMessage(
     outcomeMessage = "";
   let requestId = "",
     runId = "",
-    runUrl = "";
+    runUrl = "",
+    turnId = "";
   if (options.contextSources?.length) {
     setActivityEvent(
       activity,
@@ -387,8 +418,10 @@ async function submitMessage(
             );
           } else if (event.kind === "run_record_started") {
             runId = event.run_id || "";
+            turnId = event.turn_id || "";
             runUrl = event.url || (runId ? "/run/" + encodeURIComponent(runId) : "");
             if (runId) activity.dataset.runId = runId;
+            if (turnId) activity.dataset.turnId = turnId;
             const link = activity.querySelector(".activity-run-link");
             if (link && runUrl) {
               link.href = runUrl;
@@ -645,6 +678,7 @@ async function submitMessage(
     requestId,
     runId,
     runUrl,
+    turnId,
     verification,
     activity,
     result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
@@ -670,7 +704,7 @@ function createActivity(
   card.setAttribute("aria-label", "Execution trace");
   card.setAttribute("aria-live", "polite");
   card.innerHTML =
-    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-persistence">execution trace · transient</span><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span><a class="activity-meta activity-run-link" hidden target="_blank" rel="noopener">inspect run</a></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
+    '<button class="activity-close" type="button" aria-label="Dismiss activity" disabled>×</button><div class="activity-heading"><span class="activity-kind"></span><span class="activity-identity"></span><div class="activity-goal"></div></div><div class="activity-context"><span class="activity-meta activity-persistence">execution trace · transient</span><span class="activity-meta activity-boundary">canvas authority only</span><span class="activity-meta activity-provider">model pending</span><a class="activity-meta activity-run-link" hidden target="_blank" rel="noopener">inspect session record</a></div><ol class="activity-timeline" aria-label="Agent provenance"></ol><div class="activity-status">Queued</div><div class="activity-detail">Waiting for the renderer</div><div class="activity-metrics"><span data-metric="elapsed">elapsed —</span><span data-metric="tokens">tokens not reported</span><span data-metric="errors">errors 0</span></div>';
   card.querySelector(".activity-goal").textContent = goal;
   card.querySelector(".activity-kind").textContent =
     requestKind === "chat"
@@ -703,11 +737,13 @@ function createActivity(
 function setActivityIdentity(card, requestId, status) {
   if (requestId) card.dataset.requestId = requestId;
   const ordinal = card.dataset.runOrdinal,
-    identity = card.dataset.runId
-      ? "run " + card.dataset.runId
-      : card.dataset.requestId || "awaiting server ID",
+    identities = [
+      card.dataset.requestId ? "request " + card.dataset.requestId : "awaiting request ID",
+      card.dataset.runId ? "session " + card.dataset.runId : "session pending",
+      card.dataset.turnId ? "turn " + card.dataset.turnId : "",
+    ].filter(Boolean),
     time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  card.querySelector(".activity-identity").textContent = `run #${ordinal} · ${identity} · ${status} ${time}`;
+  card.querySelector(".activity-identity").textContent = `attempt #${ordinal} · ${identities.join(" · ")} · ${status} ${time}`;
 }
 function activityVerificationSummary(event, changed) {
   const verification = event.verification;
@@ -1029,9 +1065,9 @@ function parseFileCard(content) {
 function parseChangeCard(content) {
   try {
     const value = JSON.parse(content || "");
-    if ([1, 2, 3].includes(value?.version))
+    if ([1, 2, 3, 4].includes(value?.version))
       return {
-        version: 3,
+        version: 4,
         instruction: typeof value.instruction === "string" ? value.instruction : "",
         target: value.target === "page" ? "page" : "workspace",
         status: ["idle", "running", "done", "error"].includes(value.status) ? value.status : "idle",
@@ -1048,6 +1084,9 @@ function parseChangeCard(content) {
                 ? run.instruction
                 : typeof value.instruction === "string" ? value.instruction : "",
               requestId: typeof run?.requestId === "string" ? run.requestId : "",
+              runId: typeof run?.runId === "string" ? run.runId : "",
+              runUrl: typeof run?.runUrl === "string" ? run.runUrl : "",
+              turnId: typeof run?.turnId === "string" ? run.turnId : "",
               startedAt: typeof run?.startedAt === "string" ? run.startedAt : "",
               completedAt: typeof run?.completedAt === "string" ? run.completedAt : "",
               status: ["idle", "running", "done", "error"].includes(run?.status)
@@ -1064,7 +1103,7 @@ function parseChangeCard(content) {
           : [],
       };
   } catch { /* Older change cards had no durable execution state. */ }
-  return { version: 3, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+  return { version: 4, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
 }
 function nextChangeRunOrdinal(runs) {
   return runs.reduce(
@@ -1241,8 +1280,13 @@ function createWorkspaceObject(kind, anchor, restore = null) {
             evidence = document.createElement("details"),
             evidenceLabel = document.createElement("summary"),
             evidenceBody = document.createElement("pre");
-          heading.textContent = `run #${run.ordinal} · ${run.status}`;
-          meta.textContent = `${run.requestId || "no server ID"} · ${run.completedAt || run.startedAt}`;
+          heading.textContent = `attempt #${run.ordinal} · ${run.status}`;
+          meta.textContent = [
+            run.requestId ? `request ${run.requestId}` : "request ID unavailable",
+            run.runId ? `session ${run.runId}` : "session ID unavailable",
+            run.turnId ? `turn ${run.turnId}` : "",
+            run.completedAt || run.startedAt,
+          ].filter(Boolean).join(" · ");
           evidenceLabel.textContent = "provenance";
           const checks = Array.isArray(run.verification?.checks)
             ? run.verification.checks.map((check) =>
@@ -1309,6 +1353,9 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         targetId: targetId || "",
         instruction: message,
         requestId: result.requestId || "",
+        runId: result.runId || "",
+        runUrl: result.runUrl || "",
+        turnId: result.turnId || "",
         startedAt,
         completedAt: new Date().toISOString(),
         status: state.status,
@@ -1352,7 +1399,7 @@ function parseChatNotebook(content) {
   try {
     const value = JSON.parse(content || "");
     if (
-      [1, 2, 3, 4, 5].includes(value?.version) &&
+      [1, 2, 3, 4, 5, 6].includes(value?.version) &&
       typeof value.context === "string" &&
       Array.isArray(value.turns)
     ) {
@@ -1383,6 +1430,18 @@ function parseChatNotebook(content) {
               value.version >= 5 && typeof turn.runId === "string"
                 ? turn.runId
                 : "",
+            runUrl:
+              value.version >= 6 && typeof turn.runUrl === "string"
+                ? turn.runUrl
+                : "",
+            requestId:
+              value.version >= 6 && typeof turn.requestId === "string"
+                ? turn.requestId
+                : "",
+            serverTurnId:
+              value.version >= 6 && typeof turn.serverTurnId === "string"
+                ? turn.serverTurnId
+                : "",
             status: ["idle", "running", "done", "stale", "error", "cancelled"].includes(
               turn.status,
             )
@@ -1394,7 +1453,7 @@ function parseChatNotebook(content) {
         ];
       });
       return {
-        version: 5,
+        version: 6,
         executor: value.version >= 3 && ["codex", "provider", "evaluation_fixture"].includes(value.executor)
           ? value.executor
           : "provider",
@@ -1414,11 +1473,11 @@ function parseChatNotebook(content) {
   } catch {
     // Older chat cards had no structured content.
   }
-  return { version: 5, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 6, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function newChatNotebook() {
-  return { version: 5, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 6, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function renderChatExecutor(object, state) {
@@ -1573,6 +1632,9 @@ function renderChatNotebook(object) {
       attempt: 0,
       completedAt: "",
       runId: "",
+      runUrl: "",
+      requestId: "",
+      serverTurnId: "",
     });
     field.value = "";
     persistChatNotebook(object, state);
@@ -1597,7 +1659,7 @@ function renderChatTurns(object, state) {
     cell.className = "chat-turn";
     cell.dataset.turnId = turn.id;
     cell.innerHTML =
-      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect run</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
+      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect session record</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
     cell.querySelector(".chat-turn-index").textContent =
       "IN [" + (index + 1) + "]";
     const attempt = Number(turn.attempt) || 0;
@@ -1606,9 +1668,14 @@ function renderChatTurns(object, state) {
       (attempt ? " · attempt " + attempt : "") +
       (turn.completedAt ? " · " + turn.completedAt : "");
     const runLink = cell.querySelector(".chat-turn-run");
-    if (turn.runId) {
-      runLink.href = "/run/" + encodeURIComponent(turn.runId);
-      runLink.textContent = "run " + turn.runId.slice(0, 8);
+    if (turn.runUrl || turn.runId) {
+      runLink.href = turn.runUrl || "/run/" + encodeURIComponent(turn.runId);
+      runLink.textContent = "inspect session record";
+      runLink.title = [
+        turn.requestId ? `request ${turn.requestId}` : "",
+        turn.runId ? `session ${turn.runId}` : "",
+        turn.serverTurnId ? `turn ${turn.serverTurnId}` : "",
+      ].filter(Boolean).join(" · ");
       runLink.hidden = false;
     }
     const prompt = cell.querySelector("textarea");
@@ -1735,6 +1802,9 @@ async function runChatNotebook(object, state, start, end) {
       if (result.model) state.model = result.model;
       if (result.error === "Cancelled") state.threadId = "";
       turn.runId = result.runId || "";
+      turn.runUrl = result.runUrl || "";
+      turn.requestId = result.requestId || "";
+      turn.serverTurnId = result.turnId || "";
       if (result.activity) transientActivities.set(turn.id, result.activity);
       turn.response = result.text || result.error || "No response";
       turn.status = result.ok

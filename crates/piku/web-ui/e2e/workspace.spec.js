@@ -311,7 +311,9 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
   const activity = page.locator(".activity-card");
   await expect(activity).toHaveClass(/activity-card(?!.*running)/);
   await expect(activity.locator(".activity-kind")).toHaveText("page change");
-  await expect(activity.locator(".activity-identity")).toContainText("run #1 · request-fixture-1 · completed");
+  await expect(activity.locator(".activity-identity")).toContainText(
+    "attempt #1 · request request-fixture-1 · session pending · completed",
+  );
   await expect(activity.locator(".activity-boundary")).toHaveText(
     "selected page source",
   );
@@ -881,7 +883,7 @@ test("a running chat exposes user-owned cancellation", async ({
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
-test("selecting a card marks it without changing canvas viewport", async ({
+test("pointer selection marks a card without changing canvas viewport", async ({
   page,
   surfaceName: _surfaceName,
 }) => {
@@ -892,15 +894,111 @@ test("selecting a card marks it without changing canvas viewport", async ({
     x: node.scrollLeft,
     y: node.scrollTop,
   }));
-  await page.locator("#object-picker").selectOption({ label: "note · note" });
+  await page.locator('[data-kind="note"] .note-editor').click();
   await expect(page.locator('[data-kind="note"]')).toHaveClass(/selected/);
   expect(await canvas.evaluate((node) => ({ x: node.scrollLeft, y: node.scrollTop })))
     .toEqual(before);
-  await page.locator("#object-picker").selectOption({ label: "file · file" });
+  await page.locator('[data-kind="file"] input').click();
   await expect(page.locator('[data-kind="file"]')).toHaveClass(/selected/);
   await expect(page.locator('[data-kind="note"]')).not.toHaveClass(/selected/);
   expect(await canvas.evaluate((node) => ({ x: node.scrollLeft, y: node.scrollTop })))
     .toEqual(before);
+});
+
+test("object picker reveals an offscreen persisted card in a fresh context", async ({
+  browser,
+  request,
+  surfaceName,
+}) => {
+  const geometry = { x: 1800, y: 1200, width: 520, height: 320 };
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [{
+          id: "offscreen-note",
+          kind: "note",
+          title: "far note",
+          ...geometry,
+          z: 1,
+          content: "persisted beyond the initial viewport",
+        }],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const freshPage = await context.newPage();
+  await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+  await freshPage.getByLabel("Workspace objects").selectOption("offscreen-note");
+  const visibility = await freshPage.locator('[data-object-id="offscreen-note"]')
+    .evaluate((object) => {
+      const canvas = document.querySelector("#canvas").getBoundingClientRect();
+      const handle = object.querySelector(".object-handle").getBoundingClientRect();
+      return {
+        handleVisible:
+          handle.right > canvas.left && handle.left < canvas.right &&
+          handle.bottom > canvas.top && handle.top < canvas.bottom,
+        scrollLeft: document.querySelector("#canvas").scrollLeft,
+        scrollTop: document.querySelector("#canvas").scrollTop,
+      };
+    });
+  expect(visibility.handleVisible).toBeTruthy();
+  // Responsive layout may already place one axis inside the viewport. The
+  // recovery action only needs to move the canvas on whichever axis is hidden.
+  expect(visibility.scrollLeft + visibility.scrollTop).toBeGreaterThan(0);
+  await expect(freshPage.locator("#save-status")).toHaveText("saved");
+  const persisted = await (await request.get(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+  )).json();
+  expect(persisted.objects.find((object) => object.id === "offscreen-note"))
+    .toMatchObject(geometry);
+  await context.close();
+});
+
+test("object picker reveals an oversized card by its handle", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  const geometry = { x: 1500, y: 80, width: 1600, height: 320 };
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [{
+          id: "oversized-note",
+          kind: "note",
+          title: "wide note",
+          ...geometry,
+          z: 1,
+          content: "wide persisted card",
+        }],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+  await page.reload();
+  await page.getByLabel("Workspace objects").selectOption("oversized-note");
+  const visibility = await page.locator('[data-object-id="oversized-note"]')
+    .evaluate((object) => {
+      const canvas = document.querySelector("#canvas").getBoundingClientRect();
+      const handle = object.querySelector(".object-handle").getBoundingClientRect();
+      return {
+        visible: handle.right > canvas.left && handle.left < canvas.right,
+        leadingEdge: handle.left - canvas.left,
+      };
+    });
+  expect(visibility.visible).toBeTruthy();
+  expect(visibility.leadingEdge).toBeGreaterThanOrEqual(0);
+  expect(visibility.leadingEdge).toBeLessThanOrEqual(12);
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  const persisted = await (await request.get(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+  )).json();
+  expect(persisted.objects.find((object) => object.id === "oversized-note"))
+    .toMatchObject(geometry);
 });
 
 test("chat cards attach selected workspace context explicitly", async ({
@@ -1003,7 +1101,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
   await expect(trace).toContainText("Request queued");
   await expect(trace).toContainText("Durable run opened");
   await expect(trace).toContainText("Context assembled");
-  await expect(trace.getByRole("link", { name: "inspect run" })).toHaveAttribute(
+  await expect(trace.getByRole("link", { name: "inspect session record" })).toHaveAttribute(
     "href",
     "/run/durable-trace-run",
   );
@@ -1024,8 +1122,11 @@ test("execution traces stay visibly transient and outside workspace persistence"
   expect(completed.objects).toHaveLength(1);
   expect(completed.objects.some((object) => object.kind === "activity")).toBeFalsy();
   const savedNotebook = JSON.parse(completed.objects[0].content);
-  expect(savedNotebook.version).toBe(5);
+  expect(savedNotebook.version).toBe(6);
   expect(savedNotebook.turns[0].runId).toBe("durable-trace-run");
+  expect(savedNotebook.turns[0].runUrl).toBe("/run/durable-trace-run");
+  expect(savedNotebook.turns[0].requestId).toBe("trace-contract");
+  expect(savedNotebook.turns[0].serverTurnId).toBe("web-chat-trace-contract");
 
   await page.reload();
   const restored = page.locator('[data-kind="chat"]');
@@ -1033,7 +1134,11 @@ test("execution traces stay visibly transient and outside workspace persistence"
   await expect(restored.locator(".activity-card")).toHaveCount(0);
   const restoredRun = restored.locator(".chat-turn-run");
   await expect(restoredRun).toBeVisible();
-  await expect(restoredRun).toHaveText("run durable-");
+  await expect(restoredRun).toHaveText("inspect session record");
+  await expect(restoredRun).toHaveAttribute(
+    "title",
+    "request trace-contract · session durable-trace-run · turn web-chat-trace-contract",
+  );
   await expect(restoredRun).toHaveAttribute(
     "href",
     "/run/durable-trace-run",
@@ -1130,6 +1235,7 @@ test("absolute file paths are rejected before a noisy network request", async ({
 
 test("page changes persist an inspectable source diff and rerun control", async ({
   page,
+  request,
   surfaceName,
 }) => {
   let calls = 0;
@@ -1142,6 +1248,7 @@ test("page changes persist an inspectable source diff and rerun control", async 
       contentType: "text/event-stream",
       body: [
         { kind: "request_accepted", request_id: `request-page-${calls}`, surface: surfaceName, request_kind: "page" },
+        { kind: "run_record_started", request_id: `request-page-${calls}`, surface: surfaceName, run_id: "shared-page-session", turn_id: `page-turn-${calls}`, url: "/run/shared-page-session" },
         { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Planning", request_kind: "page" },
         { kind: "page_snapshot", target_id: request.target_id, html },
         { kind: "completed", surface: surfaceName, message: "Page source updated", iterations: 1, elapsed_seconds: 0.1, request_kind: "page", verification: { actor: "Piku host", checks: [{ name: "page source persistence", outcome: "passed", detail: "saved" }] } },
@@ -1162,13 +1269,15 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await expect(change.locator(".source-diff")).toContainText("revision 2");
   await expect(diffDisclosure).toHaveAttribute("open", "");
   await expect(change.locator(".change-history li")).toHaveCount(2);
-  await expect(change.locator(".change-history")).toContainText("run #1 · done");
-  await expect(change.locator(".change-history")).toContainText("run #2 · done");
-  await expect(change.locator(".change-history")).toContainText("request-page-2");
+  await expect(change.locator(".change-history")).toContainText("attempt #1 · done");
+  await expect(change.locator(".change-history")).toContainText("attempt #2 · done");
+  await expect(change.locator(".change-history")).toContainText("request request-page-2");
+  await expect(change.locator(".change-history")).toContainText("session shared-page-session");
+  await expect(change.locator(".change-history")).toContainText("turn page-turn-2");
   const activities = page.locator(".activity-card");
   await expect(activities).toHaveCount(2);
   await expect(activities.nth(1).locator(".activity-identity")).toContainText(
-    "run #2 · request-page-2 · completed",
+    "attempt #2 · request request-page-2 · session shared-page-session · turn page-turn-2 · completed",
   );
   const boxes = await activities.evaluateAll((cards) => cards.map((card) => {
     const rect = card.getBoundingClientRect();
@@ -1187,7 +1296,24 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await restored.locator(".change-history > summary").click();
   await expect(restored.locator(".change-history li")).toHaveCount(2);
   const latestRun = restored.locator(".change-history li").first();
-  await expect(latestRun).toContainText("run #2 · done");
+  await expect(latestRun).toContainText("attempt #2 · done");
+  await expect(latestRun).toContainText("request request-page-2");
+  await expect(latestRun).toContainText("session shared-page-session");
+  await expect(latestRun).toContainText("turn page-turn-2");
+  const persistedChange = await (
+    await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)
+  ).json();
+  const savedChange = JSON.parse(
+    persistedChange.objects.find((object) => object.kind === "workspace_task").content,
+  );
+  expect(savedChange.version).toBe(4);
+  expect(savedChange.runs[1]).toMatchObject({
+    ordinal: 2,
+    requestId: "request-page-2",
+    runId: "shared-page-session",
+    runUrl: "/run/shared-page-session",
+    turnId: "page-turn-2",
+  });
   await latestRun.getByText("provenance", { exact: true }).click();
   const provenance = latestRun.locator("pre");
   await expect(provenance).toContainText("target: page ·");
@@ -1200,10 +1326,10 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await restored.getByRole("button", { name: "run again" }).click();
   await expect(restored.locator(".change-history li")).toHaveCount(3);
   await expect(restored.locator(".change-history li").first()).toContainText(
-    "run #3 · done",
+    "attempt #3 · done",
   );
   await expect(page.locator(".activity-card .activity-identity")).toContainText(
-    "run #3 · request-page-3 · completed",
+    "attempt #3 · request request-page-3 · session shared-page-session · turn page-turn-3 · completed",
   );
 });
 
