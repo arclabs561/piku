@@ -348,6 +348,7 @@ fn read_only_flag_starts_read_only_tui() {
         "read-only shell escape created {}",
         blocked_path.display()
     );
+    pty.exit_cleanly();
 }
 
 /// Regression guard for the raw-mode leak noted in the coverage audit:
