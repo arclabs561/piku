@@ -139,7 +139,7 @@ eventReader.on("line", (line) => {
     console.error("[qa warning] Codex emitted a non-JSON event line");
   }
 });
-const timeoutMs = Number(process.env.PIKU_CODEX_TIMEOUT_MS || 900_000);
+const timeoutMs = Number(process.env.PIKU_CODEX_TIMEOUT_MS || 1_200_000);
 let timedOut = false;
 let killTimer;
 const stopChild = (signal) => {
