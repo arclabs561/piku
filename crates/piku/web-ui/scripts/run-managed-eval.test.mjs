@@ -6,11 +6,18 @@ import { test } from "node:test";
 import path from "node:path";
 import {
   evaluationArtifactPaths,
+  managedTerminalEnabled,
   managedArtifactDir,
   validateRunId,
   writeBindingWithoutMaskingChildFailure,
   writeManagedLifecycleBinding,
 } from "./run-managed-eval.mjs";
+
+test("model-driven managed judges cannot reach the host terminal", () => {
+  assert.equal(managedTerminalEnabled("e2e"), true);
+  for (const mode of ["single", "parallel", "focus-pair"])
+    assert.equal(managedTerminalEnabled(mode), false);
+});
 
 test("managed run IDs accept only bounded filename components", () => {
   assert.equal(validateRunId("2026-08-10T12-00-00-000Z"), "2026-08-10T12-00-00-000Z");

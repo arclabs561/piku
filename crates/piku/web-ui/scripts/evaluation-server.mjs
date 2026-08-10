@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -42,6 +42,36 @@ function evaluationEnvironment(parentEnv, stateDir) {
     PIKU_NO_DOTENV: "1",
     PIKU_WEB_EVALUATION_FIXTURES: "1",
   };
+}
+
+async function prepareEvaluationWorkspace(repoRoot, stateDir) {
+  const workspaceDir = path.join(stateDir, "workspace");
+  const fixtureSource = path.join(
+    repoRoot,
+    "crates",
+    "piku",
+    "web-ui",
+    "e2e",
+    "fixtures",
+    "operator-repo",
+  );
+  const fixtureTarget = path.join(
+    workspaceDir,
+    "crates",
+    "piku",
+    "web-ui",
+    "e2e",
+    "fixtures",
+    "operator-repo",
+  );
+  await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+  await cp(fixtureSource, fixtureTarget, { recursive: true, force: false });
+  await writeFile(
+    path.join(workspaceDir, "README.md"),
+    "# Piku managed evaluation workspace\n\nThis workspace contains only deterministic test fixtures.\n",
+    { encoding: "utf8", flag: "wx", mode: 0o600 },
+  );
+  return workspaceDir;
 }
 
 function stopProcessGroup(child, signal, killImpl = process.kill) {
@@ -94,6 +124,7 @@ export async function startManagedEvaluationServer({
   parentEnv = process.env,
   timeoutMs = 60_000,
   shutdownGraceMs = 3_000,
+  terminalEnabled = false,
 } = {}) {
   if (!repoRoot || !artifactDir) throw new TypeError("repoRoot and artifactDir are required");
   const serverDir = path.join(artifactDir, "server");
@@ -103,16 +134,29 @@ export async function startManagedEvaluationServer({
   const lifecyclePath = path.join(serverDir, "lifecycle.json");
   await mkdir(stateDir, { recursive: true });
   const env = evaluationEnvironment(parentEnv, stateDir);
+  if (!terminalEnabled) env.PIKU_WEB_DISABLE_TERMINAL = "1";
   await Promise.all([
     mkdir(env.HOME, { recursive: true }),
     mkdir(env.XDG_CACHE_HOME, { recursive: true }),
     mkdir(env.XDG_CONFIG_HOME, { recursive: true }),
     mkdir(env.XDG_DATA_HOME, { recursive: true }),
   ]);
+  const workspaceDir = await prepareEvaluationWorkspace(repoRoot, stateDir);
   const log = createWriteStream(logPath, { flags: "wx", mode: 0o600 });
   const startedAt = new Date().toISOString();
-  const child = spawnImpl("cargo", ["run", "--quiet", "-p", "piku", "--", "web", "--port", "0"], {
-    cwd: repoRoot,
+  const child = spawnImpl("cargo", [
+    "run",
+    "--quiet",
+    "--manifest-path",
+    path.join(repoRoot, "Cargo.toml"),
+    "-p",
+    "piku",
+    "--",
+    "web",
+    "--port",
+    "0",
+  ], {
+    cwd: workspaceDir,
     env: { ...env, PIKU_WEB_READY_FILE: readyPath },
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -145,7 +189,9 @@ export async function startManagedEvaluationServer({
       const metadata = {
         ownership: "managed",
         fixture_available: true,
+        terminal_enabled: terminalEnabled,
         ready_file: readyPath,
+        workspace_root: workspaceDir,
         url: baseUrl.toString(),
         pid: child.pid,
         started_at: startedAt,

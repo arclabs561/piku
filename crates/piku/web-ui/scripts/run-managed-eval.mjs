@@ -31,6 +31,10 @@ export function managedArtifactDir(root, runId) {
   return artifactDir;
 }
 
+export function managedTerminalEnabled(mode) {
+  return mode === "e2e";
+}
+
 export function evaluationArtifactPaths(root, mode, runId) {
   validateRunId(runId);
   const artifactsRoot = path.join(root, ".artifacts", "playwright-agent");
@@ -132,7 +136,11 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
   await mkdir(artifactDir, { recursive: true });
   const server = environment.PIKU_WEB_URL
     ? await connectExternalEvaluationServer(environment.PIKU_WEB_URL)
-    : await startManagedEvaluationServer({ repoRoot, artifactDir });
+    : await startManagedEvaluationServer({
+      repoRoot,
+      artifactDir,
+      terminalEnabled: managedTerminalEnabled(mode),
+    });
   let child;
   let outcome;
   let stopping = false;

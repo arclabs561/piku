@@ -74,6 +74,9 @@ async function refreshExecutorCatalog() {
 }
 refreshExecutorCatalog();
 
+const terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled !== false;
+if (!terminalEnabled) terminalBtn.hidden = true;
+
 function viewportKey(surface) {
   return `piku:viewport:${surface}`;
 }
@@ -305,7 +308,7 @@ delBtn.addEventListener("click", async () => {
   if (list.length) switchSurface(list[0]);
 });
 terminalBtn.addEventListener("click", () =>
-  createWorkspaceObject("terminal", { x: 24, y: 24 }),
+  terminalEnabled && createWorkspaceObject("terminal", { x: 24, y: 24 }),
 );
 async function submitMessage(
   msg,
@@ -969,6 +972,7 @@ function openCreationMenu(event) {
   menu.className = "create-menu";
   menu.innerHTML =
     '<strong>add to workspace</strong><button data-kind="chat">chat</button><button data-kind="workspace_task">change workspace or page</button><button data-kind="terminal">terminal</button><button data-kind="file">file</button><button data-kind="note">note</button><button data-kind="page_preview">page preview</button>';
+  if (!terminalEnabled) menu.querySelector('[data-kind="terminal"]').remove();
   if (overlay.querySelector('[data-kind="page_preview"]'))
     menu.querySelector('[data-kind="page_preview"]').remove();
   overlay.append(menu);
@@ -2359,8 +2363,10 @@ window.addEventListener("resize", () => {
 function renderTerminalStarter(object) {
   const body = object.querySelector(".object-body");
   body.className = "object-body terminal-starter";
-  body.innerHTML =
-    '<p>This is an unrestricted host shell in the current workspace. It may read your files, credentials, and network. Start it only for a workspace you trust.</p><button type="button">start shell</button>';
+  body.innerHTML = terminalEnabled
+    ? '<p>This is an unrestricted host shell in the current workspace. It may read your files, credentials, and network. Start it only for a workspace you trust.</p><button type="button">start shell</button>'
+    : '<p>Terminal access is unavailable in this capability profile.</p>';
+  if (!terminalEnabled) return;
   body
     .querySelector("button")
     .addEventListener("click", () => mountPtyTerminal(object));

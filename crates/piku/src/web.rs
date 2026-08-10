@@ -335,6 +335,7 @@ pub(super) struct AppState {
     codex_root: Arc<PathBuf>,
     write_leases: Arc<write_lease::WriteLeaseStore>,
     workspace_write_available: bool,
+    terminal_enabled: bool,
     evaluation_fixtures: bool,
     fixture_cancellation_acks: Arc<RwLock<HashMap<String, Instant>>>,
 }
@@ -525,6 +526,8 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
     } else {
         false
     };
+    let terminal_enabled =
+        std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1");
     let state = Arc::new(AppState {
         config: Arc::new(config.clone()),
         surfaces: Arc::new(RwLock::new(SurfacesState {
@@ -539,6 +542,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         codex_root: Arc::new(codex_root),
         write_leases: Arc::new(write_lease::WriteLeaseStore::default()),
         workspace_write_available,
+        terminal_enabled,
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
         fixture_cancellation_acks: Arc::new(RwLock::new(HashMap::new())),
@@ -556,8 +560,10 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         .route("/api/chat/write-lease", post(write_lease_handler))
         .route("/api/executors", get(executor_catalog))
         .route("/api/terminal/read", post(terminal_read_handler))
-        .route("/api/terminal/pty", get(pty::terminal_pty_handler))
         .route("/run/{session_id}", get(view_run));
+    if state.terminal_enabled {
+        app = app.route("/api/terminal/pty", get(pty::terminal_pty_handler));
+    }
     if state.evaluation_fixtures {
         app = app.route(
             "/api/evaluation-fixtures/cancellations/{request_id}",
@@ -591,7 +597,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         url = %url,
         workspace = %state.workspace_root.display(),
         storage = %state.surfaces.read().await.root.display(),
-        terminal = "pty",
+        terminal = if state.terminal_enabled { "pty" } else { "disabled" },
         loopback_only = true,
         evaluation_fixtures = state.evaluation_fixtures,
         "web surface listening"
@@ -742,14 +748,25 @@ async fn home(
         .unwrap_or_default();
     drop(s);
 
-    Html(render_home(&active, &canvas_html, &objects))
+    Html(render_home(
+        &active,
+        &canvas_html,
+        &objects,
+        state.terminal_enabled,
+    ))
 }
 
-fn render_home(active: &str, canvas_html: &str, objects: &[WorkspaceObject]) -> String {
+fn render_home(
+    active: &str,
+    canvas_html: &str,
+    objects: &[WorkspaceObject],
+    terminal_enabled: bool,
+) -> String {
     let bootstrap = js_json(&serde_json::json!({
         "active": active,
         "canvasHtml": canvas_html,
         "objects": objects,
+        "terminalEnabled": terminal_enabled,
     }));
 
     format!(
@@ -4165,7 +4182,7 @@ mod tests {
 
     #[test]
     fn home_quotes_active_surface_and_enables_canvas_input() {
-        let page = render_home("scratch's surface", "", &[]);
+        let page = render_home("scratch's surface", "", &[], true);
 
         assert!(page.contains(r#""active":"scratch's surface""#));
         assert!(page.contains("canvas.addEventListener"));
@@ -4189,11 +4206,16 @@ mod tests {
         assert!(page.contains("page_snapshot"));
         assert!(page.contains("workspace_snapshot"));
         assert!(page.contains(r#""canvasHtml":"""#));
+        assert!(page.contains(r#""terminalEnabled":true"#));
         assert!(page.contains("+ terminal"));
         assert!(page.contains("human shell"));
         assert!(page.contains("model isolated"));
         assert!(page.contains("/api/terminal/pty"));
         assert!(page.contains("Interactive terminal"));
+
+        let restricted = render_home("scratch", "", &[], false);
+        assert!(restricted.contains(r#""terminalEnabled":false"#));
+        assert!(restricted.contains("Terminal access is unavailable in this capability profile"));
     }
 
     #[test]
@@ -4683,7 +4705,12 @@ mod tests {
 
     #[test]
     fn initial_canvas_cannot_terminate_the_host_script() {
-        let page = render_home("scratch", "</script><script>alert('owned')</script>", &[]);
+        let page = render_home(
+            "scratch",
+            "</script><script>alert('owned')</script>",
+            &[],
+            true,
+        );
 
         assert_eq!(page.matches("</script>").count(), 1);
         assert!(page.contains(r"\u003c/script\u003e"));
@@ -4691,7 +4718,7 @@ mod tests {
 
     #[test]
     fn browser_program_parses_when_node_is_available() {
-        let page = render_home("scratch", "<main>hello</main>", &[]);
+        let page = render_home("scratch", "<main>hello</main>", &[], true);
         let script = page
             .split_once("<script>")
             .and_then(|(_, rest)| rest.split_once("</script>"))
