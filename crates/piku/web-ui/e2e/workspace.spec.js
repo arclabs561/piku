@@ -1633,6 +1633,7 @@ test("page changes persist an inspectable source diff and rerun control", async 
     calls += 1;
     const request = route.request().postDataJSON();
     const html = `<!doctype html><html><body><main>revision ${calls}</main></body></html>`;
+    const noChange = calls === 3;
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
@@ -1640,8 +1641,8 @@ test("page changes persist an inspectable source diff and rerun control", async 
         { kind: "request_accepted", request_id: `request-page-${calls}`, surface: surfaceName, request_kind: "page" },
         { kind: "run_record_started", request_id: `request-page-${calls}`, surface: surfaceName, run_id: "shared-page-session", turn_id: `page-turn-${calls}`, url: "/run/shared-page-session" },
         { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Planning", request_kind: "page" },
-        { kind: "page_snapshot", target_id: request.target_id, html },
-        { kind: "completed", surface: surfaceName, message: "Page source updated", iterations: 1, elapsed_seconds: 0.1, request_kind: "page", provider: "fixture", model: "fixture", tool_policy: "none", tool_calls: [], mutation_actor: "Piku host", verification: { actor: "Piku host", checks: [{ name: "page source persistence", outcome: "passed", detail: "saved" }] } },
+        ...(!noChange ? [{ kind: "page_snapshot", target_id: request.target_id, html }] : []),
+        { kind: "completed", surface: surfaceName, message: noChange ? "Page source already matched the request" : "Page source updated", canvas_changed: !noChange, iterations: 1, elapsed_seconds: 0.1, request_kind: "page", provider: "fixture", model: "fixture", tool_policy: "none", tool_calls: [], mutation_actor: "Piku host", verification: { actor: "Piku host", checks: [{ name: noChange ? "page source comparison" : "page source persistence", outcome: "passed", detail: noChange ? "saved source remained unchanged" : "saved" }] } },
       ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
     });
   });
@@ -1731,6 +1732,13 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await expect(page.locator(".activity-card .activity-identity")).toContainText(
     "attempt #3 · request request-page-3 · session shared-page-session · turn page-turn-3 · completed",
   );
+  await expect(restored.locator(".source-diff")).toContainText("revision 2");
+  await expect(restored.locator(".source-diff")).not.toContainText("revision 3");
+  const noChangeRun = restored.locator(".change-history li").first();
+  await expect(noChangeRun).toContainText("Page source already matched the request");
+  await expect(page.locator(".activity-card").last()).toContainText("Done");
+  await expect(page.locator(".activity-card").last()).toContainText("Host verification");
+  await expect(page.locator(".activity-card").last()).toContainText("saved source remained unchanged");
 });
 
 test("chat output renders safe Markdown, KaTeX, and Mermaid by default", async ({

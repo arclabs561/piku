@@ -346,7 +346,8 @@ async function submitMessage(
     reportedEffects = [],
     toolPolicy = "unknown",
     toolCalls = null,
-    mutationActor = "unknown";
+    mutationActor = "unknown",
+    canvasChanged = null;
   let requestId = "",
     runId = "",
     runUrl = "",
@@ -578,6 +579,7 @@ async function submitMessage(
             if (typeof event.tool_policy === "string") toolPolicy = event.tool_policy;
             if (Array.isArray(event.tool_calls)) toolCalls = event.tool_calls.slice(0, 12);
             if (typeof event.mutation_actor === "string") mutationActor = event.mutation_actor;
+            if (typeof event.canvas_changed === "boolean") canvasChanged = event.canvas_changed;
             if (typeof event.authority === "string") reportedAuthority = event.authority;
             if (Array.isArray(event.effects)) {
               reportedEffects = event.effects.slice(0, 12).map((effect) => {
@@ -643,6 +645,7 @@ async function submitMessage(
               "paused",
             );
             setActivityMetrics(activity, event);
+            setActivityIdentity(activity, requestId, "paused");
             if (!options.local && active === requestSurface)
               addMsg("agent", event.message);
           } else if (event.kind === "failed") {
@@ -713,6 +716,7 @@ async function submitMessage(
     toolPolicy,
     toolCalls,
     mutationActor,
+    canvasChanged,
     activity,
     result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
@@ -1538,7 +1542,7 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       state.target = scope.value;
       state.status = "running";
       state.summary = "running…";
-      state.diff = "";
+      if (state.target !== "page") state.diff = "";
       persistChange();
       renderResult();
       const ordinal = nextChangeRunOrdinal(state.runs),
@@ -1558,7 +1562,11 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         );
       state.status = result.ok ? "done" : "error";
       state.summary = result.ok ? (result.text || (changesPage ? "Page source updated" : "Workspace updated")) : result.error;
-      state.diff = changesPage && result.ok ? sourceDiff(before, result.pageHtml || currentPageHtml) : "";
+      const runDiff = changesPage && result.ok && result.canvasChanged !== false
+        ? sourceDiff(before, result.pageHtml || currentPageHtml)
+        : "";
+      if (runDiff) state.diff = runDiff;
+      if (!changesPage) state.diff = "";
       state.runs.push({
         ordinal,
         target: state.target,
@@ -1572,7 +1580,7 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         completedAt: new Date().toISOString(),
         status: state.status,
         result: result.result || state.summary,
-        diff: state.diff,
+        diff: runDiff,
         verification: result.verification || null,
         provider: result.provider || "unknown",
         model: result.model || "unknown",
@@ -2312,6 +2320,10 @@ function layoutWorkspaceForViewport() {
       top += object.offsetHeight + 12;
     }
   } else {
+    if (objects.some((object) => object.dataset.responsive === "stacked")) {
+      canvas.scrollTop = 0;
+      canvas.scrollLeft = 0;
+    }
     for (const object of objects) {
       delete object.dataset.responsive;
       object.querySelector(".object-handle").removeAttribute("title");
