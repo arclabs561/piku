@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest, writeSynthesisFocusProposals } from "./parallel-agent-eval.mjs";
+import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, codexExitFailureClass, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest, writeSynthesisFocusProposals } from "./parallel-agent-eval.mjs";
 import { attestedFiles, attestedValue, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +71,12 @@ test("explorers get working budgets inside a separate hard runaway limit", () =>
   assert.equal(explorerCallBudget("recovery", { PIKU_RECOVERY_MAX_CALLS: "44" }), 44);
   assert.equal(explorerHardCallLimit({}), 80);
   assert.equal(explorerHardCallLimit({ PIKU_EXPLORER_HARD_MAX_CALLS: "72" }), 72);
+});
+
+test("Codex usage exhaustion is classified as evaluator quota", () => {
+  const trace = `${JSON.stringify({ type: "error", message: "You've hit your usage limit. Purchase more credits." })}\n`;
+  assert.equal(codexExitFailureClass(trace), "evaluator_quota");
+  assert.equal(codexExitFailureClass(`${JSON.stringify({ type: "error", message: "transport closed" })}\n`), "codex_exit");
 });
 
 test("a blocked explorer cannot authorize product synthesis", () => {

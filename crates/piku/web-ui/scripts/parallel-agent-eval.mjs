@@ -192,6 +192,20 @@ export function traceAuthorityViolation(contents) {
   return null;
 }
 
+export function codexExitFailureClass(contents, fallback = "codex_exit") {
+  for (const line of contents.split("\n").filter(Boolean)) {
+    let event;
+    try { event = JSON.parse(line); }
+    catch { continue; }
+    if (
+      event.type === "error" &&
+      typeof event.message === "string" &&
+      /usage limit|purchase more credits/i.test(event.message)
+    ) return "evaluator_quota";
+  }
+  return fallback;
+}
+
 export function renderExplorerPrompt(template, { baseUrl, surface, requestId, playwrightOutputDir, targetCalls, maxSnapshots }) {
   return template
     .replaceAll("{{PIKU_WEB_URL}}", baseUrl.toString())
@@ -923,6 +937,8 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
       failureClass = "forbidden_playwright_tool";
     } else if (outcome.reason === "invalid_event_trace") {
       failureClass = "invalid_event_trace";
+    } else if (outcome.code !== 0) {
+      failureClass = codexExitFailureClass(await readFile(eventsPath, "utf8"));
     } else if (outcome.code === 0) {
       report = JSON.parse(await readFile(reportPath, "utf8"));
       if (report.perspective !== role || report.surface !== identity.surface || report.request_id !== identity.requestId)
