@@ -527,6 +527,143 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
     .toBe("Explain the parser strictly.");
 });
 
+test("write review freezes one turn while ordinary notebook actions stay read-only", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  const workspaceRoot = "/tmp/piku-e2e-workspace";
+  const ordinaryRequests = [];
+  const writeRequests = [];
+  const leaseRequests = [];
+  await page.route("**/api/executors", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        default: "codex",
+        workspace_root: workspaceRoot,
+        executors: [{
+          id: "codex",
+          available: true,
+          isolated: true,
+          workspace_write_available: true,
+          model: "fixture-codex",
+          detail: "app-server · isolated",
+        }],
+      }),
+    });
+  });
+  await page.route("**/api/chat**", async (route) => {
+    const body = route.request().postDataJSON();
+    if (new URL(route.request().url()).pathname === "/api/chat/write-lease") {
+      leaseRequests.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          write_lease: "single-use-test-token",
+          lease_turn_id: "lease-turn-1",
+          start_deadline_ms: 1000,
+          expires_at_ms: 2000,
+          authority: "workspace_write",
+          workspace_root: workspaceRoot,
+          network_enabled: false,
+          tool_profile: "workspace-files-and-shell",
+        }),
+      });
+      return;
+    }
+    if (body.authority === "workspace_write") writeRequests.push(body);
+    else ordinaryRequests.push(body);
+    const write = body.authority === "workspace_write";
+    const events = [
+      { kind: "request_accepted", surface: surfaceName, request_id: "request-1" },
+      {
+        kind: "model_started",
+        surface: surfaceName,
+        provider: "codex",
+        model: "fixture-codex",
+        sandbox: write ? "workspace-write" : "read-only",
+        message: write ? "Applying reviewed turn" : "Answering",
+        request_kind: "chat",
+      },
+      { kind: "text_delta", text: write ? "Reviewed change complete." : "Read-only answer." },
+      {
+        kind: "completed",
+        surface: surfaceName,
+        message: "done",
+        iterations: 1,
+        elapsed_seconds: 0.01,
+        canvas_changed: false,
+        authority: write ? "workspace_write" : "read_only",
+        effects: write ? [{ kind: "file_write", path: "README.md" }] : [],
+      },
+    ];
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  await page.reload();
+  await addObject(page, "chat", { x: 220, y: 120 });
+  const chat = page.locator('[data-kind="chat"]');
+  await chat.getByLabel("New chat turn").fill("Update the reviewed file only.");
+  await chat.getByLabel("New chat turn").press("Enter");
+  await expect.poll(() => ordinaryRequests.length).toBe(1);
+  expect(ordinaryRequests[0].authority).toBe("read_only");
+  expect(ordinaryRequests[0]).not.toHaveProperty("write_lease");
+  expect(leaseRequests).toHaveLength(0);
+
+  await chat.getByRole("button", { name: "review write turn", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText(workspaceRoot);
+  await expect(dialog).toContainText("one turn; lease consumed on first submission");
+  await expect(dialog.getByText("off", { exact: true })).toBeVisible();
+  await expect(dialog).toContainText("approval requests fail closed");
+  await expect(dialog).toContainText("Update the reviewed file only.");
+  const lightBackground = await dialog.evaluate((element) =>
+    getComputedStyle(element).backgroundColor,
+  );
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect.poll(() => dialog.evaluate((element) =>
+    getComputedStyle(element).backgroundColor,
+  )).not.toBe(lightBackground);
+  expect(leaseRequests).toHaveLength(0);
+  await dialog.getByRole("button", { name: "confirm one write turn" }).click();
+
+  await expect.poll(() => leaseRequests.length).toBe(1);
+  await expect.poll(() => writeRequests.length).toBe(1);
+  expect(leaseRequests[0]).toEqual({
+    ...ordinaryRequests[0],
+    authority: "workspace_write",
+  });
+  expect(writeRequests[0]).toEqual({
+    ...leaseRequests[0],
+    write_lease: "single-use-test-token",
+    lease_turn_id: "lease-turn-1",
+    start_deadline_ms: 1000,
+    expires_at_ms: 2000,
+  });
+  await expect(chat.locator(".chat-write-state")).toContainText(
+    "runtime reported authority workspace_write · lease consumed",
+  );
+  await expect(chat.locator(".chat-write-state")).toContainText(
+    "file_write:README.md",
+  );
+  await expect(chat.getByRole("button", { name: "review write turn" })).toBeVisible();
+  const persistedObjects = async () => {
+    const saved = await (await request.get(
+      `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+    )).json();
+    return JSON.stringify(saved.objects || []);
+  };
+  await expect.poll(persistedObjects).toContain("Update the reviewed file only.");
+  expect(await persistedObjects()).not.toContain("single-use-test-token");
+});
+
 test("chat notebook parsing drops invalid turns and repairs duplicate identities", async ({
   page,
   request,

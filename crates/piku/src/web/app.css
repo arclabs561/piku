@@ -230,6 +230,10 @@
   --color-accent-muted: rgba(47, 129, 247, 0.16);
   --color-success-fg: #3fb950;
   --color-danger-fg: #f85149;
+  --color-attention-fg: #d29922;
+  --color-attention-subtle: rgba(187, 128, 9, 0.18);
+  --color-attention-emphasis: #9e6a03;
+  --color-fg-on-emphasis: #ffffff;
   --color-shadow: rgba(1, 4, 9, 0.7);
   --color-glass: rgba(22, 27, 34, 0.82);
   --color-glass-strong: rgba(13, 17, 23, 0.94);
@@ -268,6 +272,9 @@
     --color-accent-muted: rgba(9, 105, 218, 0.12);
     --color-success-fg: #1a7f37;
     --color-danger-fg: #d1242f;
+    --color-attention-fg: #9a6700;
+    --color-attention-subtle: rgba(212, 167, 44, 0.18);
+    --color-attention-emphasis: #bf8700;
     --color-shadow: rgba(31, 35, 40, 0.12);
     --color-glass: rgba(255, 255, 255, 0.78);
     --color-glass-strong: rgba(246, 248, 250, 0.92);
@@ -1008,6 +1015,116 @@ textarea:focus-visible {
 }
 .chat-turn textarea:focus {
   box-shadow: inset 3px 0 var(--color-accent-fg);
+}
+.chat-turn [data-action=review-write] {
+  border-color: color-mix(in srgb, var(--color-attention-fg) 55%, var(--color-border-default));
+  background: color-mix(in srgb, var(--color-attention-subtle) 72%, transparent);
+}
+.chat-write-state {
+  border-bottom: 1px solid var(--color-border-default);
+  padding: 6px 10px;
+  background: var(--color-canvas-inset);
+  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+}
+.chat-write-state[data-state=pending],
+.chat-write-state[data-state=active] {
+  color: var(--color-attention-fg);
+}
+.chat-write-state[data-state=consumed] {
+  color: var(--color-success-fg);
+}
+.chat-write-state[data-state=failed] {
+  color: var(--color-danger-fg);
+}
+.write-review-dialog {
+  width: min(38rem, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  border: 1px solid color-mix(in srgb, var(--color-attention-fg) 60%, var(--color-border-default));
+  border-radius: calc(var(--radius) + 4px);
+  padding: 0;
+  overflow: auto;
+  background: color-mix(in srgb, var(--color-glass-strong) 94%, transparent);
+  color: var(--color-fg-default);
+  box-shadow: 0 24px 64px var(--color-shadow);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+}
+.write-review-dialog::backdrop {
+  background: color-mix(in srgb, var(--color-canvas-default) 64%, transparent);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+.write-review-dialog form > header,
+.write-review-dialog form > footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--color-canvas-inset);
+}
+.write-review-dialog form > header {
+  border-bottom: 1px solid var(--color-border-default);
+  font-weight: 600;
+}
+.write-review-dialog form > header button {
+  margin-left: auto;
+}
+.write-review-dialog form > footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--color-border-default);
+}
+.write-review-dialog button {
+  min-height: 30px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  background: var(--color-border-muted);
+  color: var(--color-fg-default);
+  cursor: pointer;
+}
+.write-review-dialog .write-review-confirm {
+  border-color: var(--color-attention-fg);
+  background: var(--color-attention-emphasis);
+  color: var(--color-fg-on-emphasis);
+}
+.write-review-body {
+  padding: 12px;
+}
+.write-review-body > p:first-child {
+  margin-top: 0;
+}
+.write-review-body dl {
+  display: grid;
+  gap: 1px;
+  border: 1px solid var(--color-border-default);
+  background: var(--color-border-default);
+}
+.write-review-body dl > div {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  background: var(--color-canvas-default);
+}
+.write-review-body dt,
+.write-review-body dd {
+  margin: 0;
+  padding: 7px 9px;
+  overflow-wrap: anywhere;
+}
+.write-review-body dt {
+  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+}
+.write-review-root,
+.write-review-request {
+  white-space: pre-wrap;
+}
+.write-review-note {
+  margin-bottom: 0;
+  color: var(--color-fg-muted);
+  font-size: var(--text-small);
 }
 .chat-response {
   min-height: 3rem;

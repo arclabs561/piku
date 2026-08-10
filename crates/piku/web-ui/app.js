@@ -339,7 +339,9 @@ async function submitMessage(
     threadId = options.threadId || "",
     executorModel = "";
   let verification = null,
-    outcomeMessage = "";
+    outcomeMessage = "",
+    reportedAuthority = "",
+    reportedEffects = [];
   let requestId = "",
     runId = "",
     runUrl = "",
@@ -354,21 +356,25 @@ async function submitMessage(
     );
   }
   try {
+    const requestBody = options.request || {
+      message: msg,
+      surface: requestSurface,
+      kind,
+      target_id: targetId,
+      context: options.context || null,
+      context_source_ids: options.contextSourceIds || [],
+      history: options.history || [],
+      executor: options.executor || "provider",
+      thread_id: options.threadId || null,
+      authority: "read_only",
+    };
     const res = await fetch("/api/chat", {
       method: "POST",
       signal: options.signal,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: msg,
-        surface: requestSurface,
-        kind,
-        target_id: targetId,
-        context: options.context || null,
-        context_source_ids: options.contextSourceIds || [],
-        history: options.history || [],
-        executor: options.executor || "provider",
-        thread_id: options.threadId || null,
-      }),
+      body: JSON.stringify(options.writeLease
+        ? { ...requestBody, ...options.writeLease }
+        : requestBody),
     });
     if (!res.ok) {
       finishActivity(activity, "failed", "request failed: HTTP " + res.status);
@@ -561,6 +567,16 @@ async function submitMessage(
             succeeded = true;
             verification = event.verification || null;
             outcomeMessage = event.message || "Request completed";
+            if (typeof event.authority === "string") reportedAuthority = event.authority;
+            if (Array.isArray(event.effects)) {
+              reportedEffects = event.effects.slice(0, 12).map((effect) => {
+                if (typeof effect === "string") return effect;
+                if (!effect || typeof effect !== "object") return "unclassified";
+                return [effect.effect || effect.kind, effect.path, effect.command, effect.category]
+                  .filter((value) => typeof value === "string" && value)
+                  .join(":") || "unclassified";
+              });
+            }
             const changed = event.canvas_changed !== false;
             terminalWrite(
               "complete  [" +
@@ -680,6 +696,8 @@ async function submitMessage(
     runUrl,
     turnId,
     verification,
+    authority: reportedAuthority,
+    effects: reportedEffects,
     activity,
     result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
@@ -1594,6 +1612,157 @@ function selectedChatContext(object, state) {
   };
 }
 
+function chatHistoryBefore(state, index) {
+  const history = [];
+  for (const turn of state.turns.slice(0, index)) {
+    if (!turn.response || turn.status === "error") continue;
+    history.push({ role: "user", content: turn.prompt });
+    history.push({ role: "assistant", content: turn.response });
+  }
+  return history;
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.values(value).forEach(deepFreeze);
+  return Object.freeze(value);
+}
+
+function frozenWriteRequest(object, state, index) {
+  const context = selectedChatContext(object, state);
+  return deepFreeze({
+    message: state.turns[index].prompt.trim(),
+    surface: active,
+    kind: "chat",
+    target_id: object.dataset.objectId,
+    context: context.text || null,
+    context_source_ids: [...context.ids],
+    // Write reviews bind only context visible in this notebook. A resumed Codex
+    // rollout can contain host-invisible state, so approved writes always fork
+    // a fresh native thread from the explicit notebook history.
+    history: chatHistoryBefore(state, index),
+    executor: state.executor,
+    thread_id: null,
+    authority: "workspace_write",
+  });
+}
+
+function writeTurnView(object, turnId) {
+  object.writeTurnViews ||= new Map();
+  if (!object.writeTurnViews.has(turnId)) {
+    object.writeTurnViews.set(turnId, {
+      state: "idle",
+      detail: "read-only · no write lease requested",
+      authority: "read-only",
+      effects: [],
+    });
+  }
+  return object.writeTurnViews.get(turnId);
+}
+
+function renderWriteTurnView(cell, view) {
+  const panel = cell.querySelector(".chat-write-state");
+  if (!panel) return;
+  panel.dataset.state = view.state;
+  panel.hidden = view.state === "idle";
+  const effects = Array.isArray(view.effects) && view.effects.length
+    ? ` · reported effects: ${view.effects.join(", ")}`
+    : "";
+  panel.textContent = `${view.authority} · lease ${view.state} · ${view.detail}${effects}`;
+}
+
+function workspaceWriteRoot() {
+  return typeof executorCatalog.workspace_root === "string"
+    ? executorCatalog.workspace_root
+    : "";
+}
+
+function workspaceWriteExecutor(state) {
+  return (executorCatalog.executors || []).find(
+    (executor) => executor.id === state.executor,
+  );
+}
+
+function reviewWriteDialog(request) {
+  const workspaceRoot = workspaceWriteRoot();
+  const dialog = document.createElement("dialog");
+  dialog.className = "write-review-dialog";
+  dialog.innerHTML =
+    '<form method="dialog"><header><span>review write turn</span><button value="cancel" aria-label="Cancel write review">×</button></header>' +
+    '<div class="write-review-body"><p>This grants one tightly bounded Codex turn permission to modify files.</p>' +
+    '<dl><div><dt>workspace</dt><dd class="write-review-root"></dd></div><div><dt>duration</dt><dd>one turn; lease consumed on first submission</dd></div><div><dt>network</dt><dd>off</dd></div><div><dt>elevation</dt><dd>denied; approval requests fail closed</dd></div><div><dt>request</dt><dd class="write-review-request"></dd></div></dl>' +
+    '<p class="write-review-note">The prompt, context, history, executor, thread, and target shown here are frozen. Editing the notebook later requires a new review.</p></div>' +
+    '<footer><button value="cancel">keep read-only</button><button class="write-review-confirm" value="confirm">confirm one write turn</button></footer></form>';
+  dialog.querySelector(".write-review-root").textContent = workspaceRoot;
+  dialog.querySelector(".write-review-request").textContent = request.message;
+  document.body.append(dialog);
+  dialog.showModal();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const confirmed = dialog.returnValue === "confirm";
+      dialog.remove();
+      resolve(confirmed);
+    }, { once: true });
+  });
+}
+
+async function reviewWriteTurn(object, state, index) {
+  const turn = state.turns[index];
+  if (!turn?.prompt.trim() || object.dataset.running === "true") return;
+  const view = writeTurnView(object, turn.id);
+  const root = workspaceWriteRoot();
+  const executor = workspaceWriteExecutor(state);
+  if (state.executor !== "codex" || !executor?.workspace_write_available || !root) {
+    view.state = "failed";
+    view.authority = "read-only";
+    view.detail = state.executor !== "codex"
+      ? "write review requires the Codex executor"
+      : !root
+        ? "server did not report a canonical workspace; no lease requested"
+        : "Codex workspace-write containment is unavailable; no lease requested";
+    renderChatTurns(object, state);
+    return;
+  }
+  const request = frozenWriteRequest(object, state, index);
+  if (!(await reviewWriteDialog(request))) return;
+  view.state = "pending";
+  view.authority = "requested authority workspace-write";
+  view.detail = "requesting a single-use lease";
+  renderChatTurns(object, state);
+  try {
+    const response = await fetch("/api/chat/write-lease", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const lease = await response.json();
+    if (typeof lease.write_lease !== "string" || !lease.write_lease)
+      throw new Error("server returned no write lease");
+    if (lease.workspace_root && lease.workspace_root !== root)
+      throw new Error("workspace changed during review");
+    view.state = "active";
+    view.authority = "lease authority workspace-write";
+    view.detail = "single-use lease issued; submitting frozen request";
+    renderChatTurns(object, state);
+    await runChatNotebook(object, state, index, index + 1, {
+      frozenRequest: request,
+      writeLease: {
+        write_lease: lease.write_lease,
+        lease_turn_id: lease.lease_turn_id,
+        start_deadline_ms: lease.start_deadline_ms,
+        expires_at_ms: lease.expires_at_ms,
+      },
+      writeView: view,
+    });
+  } catch (error) {
+    view.state = "failed";
+    view.authority = "read-only";
+    view.detail = `write turn not started: ${error.message}`;
+    renderChatTurns(object, state);
+  }
+}
+
 function renderChatContextSources(object, state) {
   const target = object.querySelector(".chat-context-sources");
   if (!target) return;
@@ -1743,7 +1912,7 @@ function renderChatTurns(object, state) {
     cell.className = "chat-turn";
     cell.dataset.turnId = turn.id;
     cell.innerHTML =
-      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect session record</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
+      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect session record</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="review-write">review write turn</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-write-state" role="status" hidden></div><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
     cell.querySelector(".chat-turn-index").textContent =
       "IN [" + (index + 1) + "]";
     const attempt = Number(turn.attempt) || 0;
@@ -1766,9 +1935,15 @@ function renderChatTurns(object, state) {
     prompt.value = turn.prompt;
     prompt.disabled = running;
     renderMarkdown(cell.querySelector(".chat-response"), turn.response);
+    renderWriteTurnView(cell, writeTurnView(object, turn.id));
     cell.querySelectorAll("button").forEach((button) => {
       button.disabled = running;
     });
+    const writeReview = cell.querySelector('[data-action="review-write"]');
+    const writeExecutor = workspaceWriteExecutor(state);
+    writeReview.disabled = running || state.executor !== "codex" || !writeExecutor?.workspace_write_available;
+    if (!writeExecutor?.workspace_write_available)
+      writeReview.title = "Workspace-write review is unavailable until Codex containment passes";
     prompt.addEventListener("input", () => {
       turn.prompt = prompt.value;
       for (let next = index; next < state.turns.length; next += 1) {
@@ -1790,6 +1965,9 @@ function renderChatTurns(object, state) {
       .addEventListener("click", () => {
         runChatNotebook(object, state, index, state.turns.length);
       });
+    cell.querySelector('[data-action="review-write"]').addEventListener("click", () => {
+      reviewWriteTurn(object, state, index);
+    });
     cell.querySelector('[data-action="delete"]').addEventListener("click", () => {
       state.turns.splice(index, 1);
       for (let next = index; next < state.turns.length; next += 1) {
@@ -1805,7 +1983,7 @@ function renderChatTurns(object, state) {
   object.querySelector('[data-action="stop"]').disabled = !running;
 }
 
-async function runChatNotebook(object, state, start, end) {
+async function runChatNotebook(object, state, start, end, execution = {}) {
   if (object.dataset.running === "true") return;
   const executor = (executorCatalog.executors || []).find((item) => item.id === state.executor);
   if (!executor?.available) {
@@ -1832,12 +2010,7 @@ async function runChatNotebook(object, state, start, end) {
     if (state.turns[index].response) state.turns[index].status = "stale";
   }
   renderChatTurns(object, state);
-  const history = [];
-  for (const turn of state.turns.slice(0, start)) {
-    if (!turn.response || turn.status === "error") continue;
-    history.push({ role: "user", content: turn.prompt });
-    history.push({ role: "assistant", content: turn.response });
-  }
+  const history = chatHistoryBefore(state, start);
   try {
     for (let index = start; index < Math.min(end, state.turns.length); index += 1) {
       const turn = state.turns[index];
@@ -1879,9 +2052,21 @@ async function runChatNotebook(object, state, start, end) {
             threadId: state.threadId,
             signal: object.chatAbortController.signal,
             activityHost,
+            request: execution.frozenRequest,
+            writeLease: execution.writeLease,
           };
         })(),
       );
+      if (execution.writeView) {
+        execution.writeView.state = result.ok ? "consumed" : "failed";
+        execution.writeView.authority = result.authority
+          ? `runtime reported authority ${result.authority}`
+          : "authority outcome unreported";
+        execution.writeView.detail = result.ok
+          ? "turn completed; lease cannot be reused"
+          : `lease consumed; ${result.error || "turn failed"}`;
+        execution.writeView.effects = result.effects || [];
+      }
       if (result.threadId) state.threadId = result.threadId;
       if (result.model) state.model = result.model;
       if (result.error === "Cancelled") state.threadId = "";
