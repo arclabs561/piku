@@ -8,7 +8,9 @@ import {
   evaluationArtifactPaths,
   managedTerminalEnabled,
   managedPageBroker,
+  managedJudgeEnvironment,
   managedArtifactDir,
+  resolveManagedEvaluationEnvironment,
   validateRunId,
   writeBindingWithoutMaskingChildFailure,
   writeManagedLifecycleBinding,
@@ -22,7 +24,7 @@ test("model-driven managed judges cannot reach the host terminal", () => {
 
 test("model-driven managed runs use a parent-only page broker when configured", () => {
   assert.equal(managedPageBroker("e2e", { OPENROUTER_API_KEY: "secret" }), null);
-  assert.equal(managedPageBroker("parallel", {}), null);
+  assert.throws(() => managedPageBroker("parallel", {}), /requires OPENROUTER_API_KEY/);
   assert.deepEqual(managedPageBroker("parallel", { OPENROUTER_API_KEY: "secret" }), {
     model: "openai/gpt-5.6-terra",
   });
@@ -30,6 +32,55 @@ test("model-driven managed runs use a parent-only page broker when configured", 
     OPENROUTER_API_KEY: "secret",
     PIKU_EVAL_PAGE_MODEL: "anthropic/custom",
   }), { model: "anthropic/custom" });
+});
+
+test("managed model-driven runs resolve only the broker key from the nearest ancestor env file", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "piku-managed-env-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const nested = path.join(root, "one", "two");
+  await mkdir(nested, { recursive: true });
+  await writeFile(path.join(root, ".env"), [
+    "OPENROUTER_API_KEY='farther-secret'",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(root, "one", ".env"), [
+    "OPENROUTER_API_KEY='nearest-secret'",
+    "UNRELATED_SECRET=must-not-load",
+    "",
+  ].join("\n"));
+  const source = { PATH: "/bin" };
+
+  const resolved = await resolveManagedEvaluationEnvironment({
+    mode: "parallel", environment: source, startDir: nested,
+  });
+
+  assert.deepEqual(source, { PATH: "/bin" });
+  assert.equal(resolved.OPENROUTER_API_KEY, "nearest-secret");
+  assert.equal(resolved.UNRELATED_SECRET, undefined);
+});
+
+test("process broker credentials take precedence and never enter the judge environment", async () => {
+  const source = { OPENROUTER_API_KEY: "process-secret", PATH: "/bin" };
+  const resolved = await resolveManagedEvaluationEnvironment({
+    mode: "single", environment: source, startDir: "/path/that/need/not/exist",
+  });
+  assert.equal(resolved.OPENROUTER_API_KEY, "process-secret");
+  assert.deepEqual(managedJudgeEnvironment(resolved), { PATH: "/bin" });
+  assert.equal(source.OPENROUTER_API_KEY, "process-secret");
+});
+
+test("managed model-driven runs fail preflight without a broker credential", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "piku-managed-no-env-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await assert.rejects(resolveManagedEvaluationEnvironment({
+    mode: "focus-pair", environment: {}, startDir: root,
+  }), /requires OPENROUTER_API_KEY/);
+});
+
+test("deterministic e2e remains credential-free", async () => {
+  assert.deepEqual(await resolveManagedEvaluationEnvironment({
+    mode: "e2e", environment: { PATH: "/bin" }, startDir: "/does/not/matter",
+  }), { PATH: "/bin" });
 });
 
 test("managed run IDs accept only bounded filename components", () => {

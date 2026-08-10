@@ -618,11 +618,7 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
     let provider = ResolvedProvider::resolve(state.config.provider.as_deref());
     let page_broker = page_broker::PageBroker::is_configured();
     let provider_model = if page_broker {
-        state
-            .config
-            .model
-            .clone()
-            .unwrap_or_else(page_broker::PageBroker::configured_model)
+        page_broker::PageBroker::configured_model()
     } else {
         provider.as_ref().map_or_else(
             |_| "unavailable".to_string(),
@@ -3074,17 +3070,18 @@ async fn run_canvas_request(
     } else {
         None
     };
-    let default_model = broker.as_ref().map_or_else(
+    let model = broker.as_ref().map_or_else(
         || {
-            resolved
-                .as_ref()
-                .expect("resolved provider exists without broker")
-                .default_model
-                .clone()
+            state.config.model.clone().unwrap_or_else(|| {
+                resolved
+                    .as_ref()
+                    .expect("resolved provider exists without broker")
+                    .default_model
+                    .clone()
+            })
         },
         |_| page_broker::PageBroker::configured_model(),
     );
-    let model = state.config.model.clone().unwrap_or(default_model);
     let provider: &dyn piku_runtime::Provider = broker.as_ref().map_or_else(
         || {
             resolved

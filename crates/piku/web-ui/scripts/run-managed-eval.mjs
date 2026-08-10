@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { parseEnv } from "node:util";
 import path from "node:path";
 import { connectExternalEvaluationServer, startManagedEvaluationServer } from "./evaluation-server.mjs";
 
@@ -36,10 +37,51 @@ export function managedTerminalEnabled(mode) {
 }
 
 export function managedPageBroker(mode, environment) {
-  if (mode === "e2e" || !environment.OPENROUTER_API_KEY) return null;
+  if (mode === "e2e") return null;
+  if (typeof environment.OPENROUTER_API_KEY !== "string"
+    || !environment.OPENROUTER_API_KEY.trim())
+    throw new Error("managed model-driven evaluation requires OPENROUTER_API_KEY");
   return {
     model: environment.PIKU_EVAL_PAGE_MODEL || "openai/gpt-5.6-terra",
   };
+}
+
+async function ancestorOpenRouterKey(startDir) {
+  let directory = path.resolve(startDir);
+  while (true) {
+    try {
+      const parsed = parseEnv(await readFile(path.join(directory, ".env"), "utf8"));
+      if (typeof parsed.OPENROUTER_API_KEY === "string"
+        && parsed.OPENROUTER_API_KEY.trim())
+        return parsed.OPENROUTER_API_KEY;
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw new Error("could not read managed evaluation credentials");
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
+}
+
+export async function resolveManagedEvaluationEnvironment({ mode, environment, startDir }) {
+  const resolved = { ...environment };
+  if (mode === "e2e") return resolved;
+  if (typeof resolved.OPENROUTER_API_KEY !== "string"
+    || !resolved.OPENROUTER_API_KEY.trim())
+    resolved.OPENROUTER_API_KEY = await ancestorOpenRouterKey(startDir);
+  if (!resolved.OPENROUTER_API_KEY)
+    throw new Error(
+      "managed model-driven evaluation requires OPENROUTER_API_KEY "
+      + "in the process environment or an ancestor .env",
+    );
+  return resolved;
+}
+
+export function managedJudgeEnvironment(environment) {
+  const child = { ...environment };
+  delete child.OPENROUTER_API_KEY;
+  return child;
 }
 
 export function evaluationArtifactPaths(root, mode, runId) {
@@ -141,13 +183,17 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
     : validateRunId(environment.PIKU_EVAL_RUN_ID);
   const artifactDir = managedArtifactDir(repoRoot, runId);
   await mkdir(artifactDir, { recursive: true });
+  const parentEnvironment = environment.PIKU_WEB_URL
+    ? { ...environment }
+    : await resolveManagedEvaluationEnvironment({ mode, environment, startDir: repoRoot });
   const server = environment.PIKU_WEB_URL
     ? await connectExternalEvaluationServer(environment.PIKU_WEB_URL)
     : await startManagedEvaluationServer({
       repoRoot,
       artifactDir,
       terminalEnabled: managedTerminalEnabled(mode),
-      pageBroker: managedPageBroker(mode, environment),
+      pageBroker: managedPageBroker(mode, parentEnvironment),
+      parentEnv: parentEnvironment,
     });
   let child;
   let outcome;
@@ -165,7 +211,7 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
     child = spawn(process.execPath, [...commands[mode], ...args], {
       cwd: webUiDir,
       env: {
-        ...environment,
+        ...managedJudgeEnvironment(parentEnvironment),
         PIKU_EVAL_RUN_ID: runId,
         ...(mode === "focus-pair" ? { PIKU_EVAL_PAIR_ID: runId } : {}),
         PIKU_WEB_URL: server.baseUrl.toString(),
