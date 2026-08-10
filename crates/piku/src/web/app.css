@@ -556,7 +556,7 @@ textarea:focus-visible {
   min-width: 288px;
   min-height: 128px;
   overflow: hidden;
-  resize: both;
+  resize: none;
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius);
   background: var(--color-glass);
@@ -564,6 +564,44 @@ textarea:focus-visible {
   -webkit-backdrop-filter: blur(18px) saturate(1.2);
   backdrop-filter: blur(18px) saturate(1.2);
   cursor: default;
+}
+.object-resize-handle {
+  position: absolute;
+  z-index: 2;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-accent-fg);
+  background: var(--color-glass-strong);
+  opacity: 0.72;
+  touch-action: none;
+}
+.object-resize-nw {
+  top: -2px;
+  left: -2px;
+  border-right: 0;
+  border-bottom: 0;
+  cursor: nwse-resize;
+}
+.object-resize-ne {
+  top: -2px;
+  right: -2px;
+  border-bottom: 0;
+  border-left: 0;
+  cursor: nesw-resize;
+}
+.object-resize-sw {
+  bottom: -2px;
+  left: -2px;
+  border-top: 0;
+  border-right: 0;
+  cursor: nesw-resize;
+}
+.object-resize-se {
+  right: -2px;
+  bottom: -2px;
+  border-top: 0;
+  border-left: 0;
+  cursor: nwse-resize;
 }
 .workspace-object:focus-within,
 .workspace-object.selected {
@@ -1550,6 +1588,9 @@ pre,
   }
   .workspace-object[data-responsive=stacked] {
     width: calc(100vw - 16px) !important;
+  }
+  .workspace-object[data-responsive=stacked] .object-resize-handle {
+    display: none;
   }
   #chat {
     padding: 8px;

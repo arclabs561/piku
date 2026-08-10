@@ -102,6 +102,8 @@ pub enum AuditSeverity {
 #[derive(Default)]
 struct TurnState {
     started: Option<u64>,
+    started_input_sha256: Option<crate::Sha256Digest>,
+    started_input_bytes: Option<usize>,
     completed: Option<u64>,
     context_builds: usize,
     authority_lease: Option<u64>,
@@ -207,9 +209,16 @@ impl<'a> Auditor<'a> {
             (EventScope::Turn { turn_id }, _) => turn_id.as_str(),
         };
         self.audit_turn_boundary(turn_id, envelope);
+        self.observe_turn_event(turn_id, envelope);
+    }
+
+    fn observe_turn_event(&mut self, turn_id: &'a str, envelope: &'a RunEventEnvelope) {
         match &envelope.event {
             RunEvent::TurnStarted { input, .. } => self.on_turn_started(turn_id, envelope, input),
             RunEvent::ContextBuilt { manifest } => self.on_context(turn_id, manifest),
+            RunEvent::RequestContextResolved { .. } => {
+                self.on_request_context(turn_id, envelope);
+            }
             RunEvent::ContextUnavailable { reason } => {
                 self.on_context_unavailable(turn_id, envelope, reason);
             }
@@ -341,7 +350,59 @@ impl<'a> Auditor<'a> {
                 vec![previous, envelope.sequence],
             );
         }
+        let turn = self.turns.entry(turn_id).or_default();
+        match input {
+            ContentRef::Inline { text } => {
+                turn.started_input_sha256 = Some(crate::Sha256Digest::of_bytes(text.as_bytes()));
+                turn.started_input_bytes = Some(text.len());
+            }
+            ContentRef::Artifact(artifact) => {
+                turn.started_input_bytes = usize::try_from(artifact.bytes).ok();
+            }
+            ContentRef::Unavailable { .. } => {}
+        }
         audit_content(&mut self.audit.content, input);
+    }
+
+    fn on_request_context(&mut self, turn_id: &'a str, envelope: &'a RunEventEnvelope) {
+        let RunEvent::RequestContextResolved {
+            context,
+            composed_input_sha256,
+            composed_input_bytes,
+            ..
+        } = &envelope.event
+        else {
+            unreachable!("request context handler requires request context event")
+        };
+        audit_content(&mut self.audit.content, context);
+        let (bytes_mismatch, digest_mismatch) = {
+            let turn = self.turns.entry(turn_id).or_default();
+            (
+                turn.started_input_bytes
+                    .is_some_and(|bytes| bytes != *composed_input_bytes),
+                turn.started_input_sha256
+                    .as_ref()
+                    .is_some_and(|digest| digest != composed_input_sha256),
+            )
+        };
+        if bytes_mismatch {
+            self.add_finding(
+                AuditSeverity::Error,
+                "request_context_input_bytes_mismatch",
+                format!(
+                    "turn {turn_id} request context byte count does not match its recorded input"
+                ),
+                vec![envelope.sequence],
+            );
+        }
+        if digest_mismatch {
+            self.add_finding(
+                AuditSeverity::Error,
+                "request_context_input_digest_mismatch",
+                format!("turn {turn_id} request context digest does not match its recorded input"),
+                vec![envelope.sequence],
+            );
+        }
     }
 
     fn on_context(&mut self, turn_id: &'a str, manifest: &crate::ContextManifest) {
@@ -775,6 +836,7 @@ fn event_name(event: &RunEvent) -> &'static str {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
         RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
+        RunEvent::RequestContextResolved { .. } => "request_context_resolved",
         RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
@@ -940,6 +1002,48 @@ mod tests {
         let audit = audit_run_record(&events);
         assert_eq!(audit.context_build_count, 0);
         assert_eq!(audit.event_count, 3);
+    }
+
+    #[test]
+    fn request_context_digest_and_size_are_checked_against_turn_input() {
+        let input = "exact composed request";
+        let events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".into()),
+                    model: "model".into(),
+                    input: inline(input),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::RequestContextResolved {
+                    context: inline(""),
+                    sources: Vec::new(),
+                    history_messages: 0,
+                    composed_input_sha256: Sha256Digest::of_bytes(b"different request"),
+                    composed_input_bytes: input.len() + 1,
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::TurnCompleted {
+                    usage: None,
+                    stop_reason: Some("complete".into()),
+                },
+            ),
+        ];
+
+        let audit = audit_run_record(&events);
+        let codes = audit
+            .findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"request_context_input_bytes_mismatch"));
+        assert!(codes.contains(&"request_context_input_digest_mismatch"));
+        assert_eq!(audit.content.inline_items, 2);
     }
 
     #[test]

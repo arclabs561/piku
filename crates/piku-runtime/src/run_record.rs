@@ -21,8 +21,9 @@ use piku_api::TokenUsage;
 /// reported. Version 4 records payload-free summaries of explicitly resolved
 /// context sources. Version 5 records turn-scoped authority leases and effects
 /// that an executor cannot attribute to a concrete target. The reader remains
-/// compatible with earlier records.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 5;
+/// compatible with earlier records. Version 6 records the exact Piku-resolved
+/// request context and the digest of the composed model input.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 6;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -158,6 +159,16 @@ pub enum RunEvent {
     ContextSourcesResolved {
         sources: Vec<ContextSourceSummary>,
     },
+    /// The exact request boundary resolved by Piku before handing a turn to a
+    /// native executor. This does not claim visibility into executor-owned
+    /// system instructions, tools, or subsequent context assembly.
+    RequestContextResolved {
+        context: ContentRef,
+        sources: Vec<ContextSourceSummary>,
+        history_messages: usize,
+        composed_input_sha256: Sha256Digest,
+        composed_input_bytes: usize,
+    },
     ContextUnavailable {
         reason: String,
     },
@@ -245,6 +256,7 @@ impl RunEvent {
             | Self::TurnStarted { .. }
             | Self::ContextBuilt { .. }
             | Self::ContextSourcesResolved { .. }
+            | Self::RequestContextResolved { .. }
             | Self::ContextUnavailable { .. }
             | Self::CompactionApplied { .. }
             | Self::AssistantMessage { .. }
@@ -675,6 +687,7 @@ impl RunRecorder {
     fn materialize_large_content(&self, sequence: u64, event: &mut RunEvent) -> io::Result<()> {
         let target = match event {
             RunEvent::TurnStarted { input, .. } => Some(("input", input)),
+            RunEvent::RequestContextResolved { context, .. } => Some(("request-context", context)),
             RunEvent::CompactionApplied { summary, .. } => Some(("summary", summary)),
             RunEvent::AssistantMessage { content } => Some(("assistant", content)),
             RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
@@ -889,6 +902,37 @@ mod tests {
         assert!(!encoded.contains("source bytes"));
         assert!(!encoded.contains("resolved bytes"));
         assert!(!encoded.contains("payload"));
+        assert_eq!(
+            serde_json::from_str::<RunEventEnvelope>(&encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn request_context_roundtrips_an_explicit_empty_boundary() {
+        let input = "Current turn:\ninspect this";
+        let event = RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence: 0,
+            recorded_at_ms: 0,
+            session_id: "session-1".into(),
+            scope: EventScope::Turn {
+                turn_id: "turn-0".into(),
+            },
+            event: RunEvent::RequestContextResolved {
+                context: ContentRef::Inline {
+                    text: String::new(),
+                },
+                sources: Vec::new(),
+                history_messages: 0,
+                composed_input_sha256: Sha256Digest::of_bytes(input.as_bytes()),
+                composed_input_bytes: input.len(),
+            },
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(r#""schema_version":6"#));
+        assert!(encoded.contains(r#""context":{"storage":"inline","text":""}"#));
         assert_eq!(
             serde_json::from_str::<RunEventEnvelope>(&encoded).unwrap(),
             event

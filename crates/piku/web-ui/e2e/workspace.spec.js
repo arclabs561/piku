@@ -174,6 +174,94 @@ test("notes drag and persist through the server", async ({
   expect(restored.y).toBeGreaterThan(before.y + 50);
 });
 
+test("corner handles resize, reposition, and persist workspace cards", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  await addObject(page, "note", { x: 360, y: 240 });
+  const note = page.locator('[data-kind="note"]');
+  const initial = await note.boundingBox();
+  const southeast = await note.locator('[data-resize-corner="se"]').boundingBox();
+  expect(initial).not.toBeNull();
+  expect(southeast).not.toBeNull();
+
+  await page.mouse.move(
+    southeast.x + southeast.width / 2,
+    southeast.y + southeast.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(southeast.x + 126, southeast.y + 86, { steps: 8 });
+  await page.mouse.up();
+  const afterSoutheast = await note.boundingBox();
+  expect(afterSoutheast.x).toBeCloseTo(initial.x, 0);
+  expect(afterSoutheast.y).toBeCloseTo(initial.y, 0);
+  expect(afterSoutheast.width).toBeGreaterThan(initial.width + 90);
+  expect(afterSoutheast.height).toBeGreaterThan(initial.height + 50);
+
+  const northwest = await note.locator('[data-resize-corner="nw"]').boundingBox();
+  expect(northwest).not.toBeNull();
+  await page.mouse.move(
+    northwest.x + northwest.width / 2,
+    northwest.y + northwest.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(northwest.x - 74, northwest.y - 54, { steps: 8 });
+  await page.mouse.up();
+  const resized = await note.boundingBox();
+  expect(resized.x).toBeLessThan(afterSoutheast.x - 50);
+  expect(resized.y).toBeLessThan(afterSoutheast.y - 30);
+  expect(resized.width).toBeGreaterThan(afterSoutheast.width + 50);
+  expect(resized.height).toBeGreaterThan(afterSoutheast.height + 30);
+  expect(resized.x + resized.width).toBeCloseTo(
+    afterSoutheast.x + afterSoutheast.width,
+    0,
+  );
+  expect(resized.y + resized.height).toBeCloseTo(
+    afterSoutheast.y + afterSoutheast.height,
+    0,
+  );
+
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  await page.reload();
+  const restored = await page.locator('[data-kind="note"]').boundingBox();
+  expect(restored.x).toBeCloseTo(resized.x, 0);
+  expect(restored.y).toBeCloseTo(resized.y, 0);
+  expect(restored.width).toBeCloseTo(resized.width, 0);
+  expect(restored.height).toBeCloseTo(resized.height, 0);
+
+  const restoredNorthwest = page.locator('[data-resize-corner="nw"]');
+  const restoredNorthwestBox = await restoredNorthwest.boundingBox();
+  await page.mouse.move(restoredNorthwestBox.x + 5, restoredNorthwestBox.y + 5);
+  await page.mouse.down();
+  await page.mouse.move(-500, -500, { steps: 4 });
+  await page.mouse.up();
+  expect(await note.evaluate((object) => ({
+    left: parseFloat(object.style.left),
+    top: parseFloat(object.style.top),
+  }))).toEqual({ left: 8, top: 8 });
+
+  const clampedNorthwest = await restoredNorthwest.boundingBox();
+  await page.mouse.move(clampedNorthwest.x + 5, clampedNorthwest.y + 5);
+  await page.mouse.down();
+  await page.mouse.move(5000, 5000, { steps: 4 });
+  await page.mouse.up();
+  const minimum = await note.boundingBox();
+  expect(minimum.width).toBeGreaterThanOrEqual(288);
+  expect(minimum.height).toBeGreaterThanOrEqual(128);
+
+  const clampedSoutheast = await note.locator('[data-resize-corner="se"]')
+    .boundingBox();
+  await page.mouse.move(clampedSoutheast.x + 5, clampedSoutheast.y + 5);
+  await page.mouse.down();
+  await page.mouse.move(5000, clampedSoutheast.y + 5, { steps: 4 });
+  await page.mouse.up();
+  expect(await note.evaluate((object) =>
+    object.offsetLeft + object.offsetWidth <=
+      document.querySelector("#canvas").clientWidth - 8,
+  )).toBeTruthy();
+  await expect(page.locator("#save-status")).toHaveText("saved");
+});
+
 test("repeated creation at one point cascades cards without blocking controls", async ({
   page,
   surfaceName: _surfaceName,
@@ -505,7 +593,13 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
 
   await chat.getByLabel("User turn").first().fill("Explain the parser strictly.");
   await expect(chat.locator(".chat-turn-status")).toHaveText(["stale", "stale"]);
-  await chat.getByRole("button", { name: "run all", exact: true }).click();
+  await chat.getByLabel("User turn").first().press("Shift+Enter");
+  await expect(chat.getByLabel("User turn").first()).toHaveValue(
+    "Explain the parser strictly.\n",
+  );
+  expect(requests).toHaveLength(0);
+  await chat.getByLabel("User turn").first().press("Backspace");
+  await chat.getByLabel("User turn").first().press("Enter");
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[0]).toMatchObject({
     target_id: "chat-notebook",
@@ -1695,6 +1789,8 @@ test("narrow layout keeps every object handle reachable without overlap", async 
   await expect(page.locator("#reflow-notice")).toBeVisible();
   await expect(page.locator("#reflow-notice")).toContainText("arrange on desktop");
   await expect(page.locator('.workspace-object[data-responsive="stacked"]')).toHaveCount(3);
+  await expect(page.locator(".object-resize-handle")).toHaveCount(12);
+  await expect(page.locator(".object-resize-handle").first()).toBeHidden();
 
   const boxes = await page.locator(".workspace-object").evaluateAll((objects) =>
     objects.map((object) => {

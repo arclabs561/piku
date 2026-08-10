@@ -1994,6 +1994,7 @@ async fn run_codex_chat_request(
     let event_tx = tx.clone();
     let mut activity_sink = WebSink::new(request_id.clone(), tx.clone(), None);
     let mut record_error = None;
+    let composed_input = codex::compose_input(&message, context.as_deref(), &history);
     append_codex_run_event(
         &mut recorder,
         &turn_id,
@@ -2001,7 +2002,7 @@ async fn run_codex_chat_request(
             provider: Some("codex app-server".to_string()),
             model: "resolved by Codex after thread start".to_string(),
             input: RunContentRef::Inline {
-                text: codex::compose_input(&message, context.as_deref(), &history),
+                text: composed_input.clone(),
             },
         },
         &mut activity_sink,
@@ -2037,17 +2038,21 @@ async fn run_codex_chat_request(
             &mut record_error,
         );
     }
-    if !context_sources.is_empty() {
-        append_codex_run_event(
-            &mut recorder,
-            &turn_id,
-            RunEvent::ContextSourcesResolved {
-                sources: context_sources,
+    append_codex_run_event(
+        &mut recorder,
+        &turn_id,
+        RunEvent::RequestContextResolved {
+            context: RunContentRef::Inline {
+                text: context.clone().unwrap_or_default(),
             },
-            &mut activity_sink,
-            &mut record_error,
-        );
-    }
+            sources: context_sources,
+            history_messages: history.len(),
+            composed_input_sha256: Sha256Digest::of_bytes(composed_input.as_bytes()),
+            composed_input_bytes: composed_input.len(),
+        },
+        &mut activity_sink,
+        &mut record_error,
+    );
     if let Some(error) = record_error.take() {
         emit(
             &tx,
@@ -2084,17 +2089,12 @@ async fn run_codex_chat_request(
                     &mut recorder,
                     &turn_id,
                     RunEvent::ContextUnavailable {
-                        reason: format!(
-                            "Codex {model} owns native thread context; Piku observed thread {thread_id} turn {native_turn_id} but not its resolved context manifest"
-                        ),
+                        reason: format!("Native Codex manifest unavailable: Piku recorded its exact request boundary for Codex {model} thread {thread_id} turn {native_turn_id}, but Codex-owned internal system and tool context is not exposed"),
                     },
                     &mut activity_sink,
                     &mut record_error,
                 );
-                    debug_assert_eq!(
-                        input,
-                        codex::compose_input(&message, context.as_deref(), &history)
-                    );
+                    debug_assert_eq!(input, composed_input);
                     emit(
                         &event_tx,
                         &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":sandbox_name,"authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id,"configuration":"isolated","message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answering in an isolated read-only Codex thread"} else {"Running one approved workspace-write Codex turn"},"request_kind":"chat"}),
@@ -3000,7 +3000,15 @@ async fn run_canvas_request(
         );
         emit(
             &tx,
-            &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Page source updated","iterations":result.iterations,"elapsed_seconds":elapsed,"request_kind":"page","verification":{"actor":"Piku host","checks":[{"name":"page source persistence","outcome":"passed","detail":"validated source was written before completion"},{"name":"sandbox preview projection","outcome":"passed","detail":"saved source snapshot was emitted to the selected preview"}]}}),
+            &page_completion_event(
+                &surface_name,
+                "Page source updated",
+                result.iterations,
+                elapsed,
+                &provider_name,
+                &model,
+                &serde_json::json!({"actor":"Piku host","checks":[{"name":"page source persistence","outcome":"passed","detail":"validated source was written before completion"},{"name":"sandbox preview projection","outcome":"passed","detail":"saved source snapshot was emitted to the selected preview"}]}),
+            ),
         );
         tracing::info!(
             request_id,
@@ -3041,7 +3049,15 @@ async fn run_canvas_request(
         if unchanged {
             emit(
                 &tx,
-                &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Page source already matched the request","iterations":result.iterations,"elapsed_seconds":elapsed,"request_kind":"page","verification":{"actor":"Piku host","checks":[{"name":"page source comparison","outcome":"passed","detail":"the proposed exact patches produced no source difference; saved source remained unchanged"}]}}),
+                &page_completion_event(
+                    &surface_name,
+                    "Page source already matched the request",
+                    result.iterations,
+                    elapsed,
+                    &provider_name,
+                    &model,
+                    &serde_json::json!({"actor":"Piku host","checks":[{"name":"page source comparison","outcome":"passed","detail":"the proposed exact patches produced no source difference; saved source remained unchanged"}]}),
+                ),
             );
             tracing::info!(
                 request_id,
@@ -3289,6 +3305,31 @@ fn apply_canvas_reply(existing_html: &str, reply: &str) -> Result<Option<String>
     Ok(Some(source))
 }
 
+fn page_completion_event(
+    surface: &str,
+    message: &str,
+    iterations: u32,
+    elapsed_seconds: f32,
+    provider: &str,
+    model: &str,
+    verification: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "completed",
+        "surface": surface,
+        "message": message,
+        "iterations": iterations,
+        "elapsed_seconds": elapsed_seconds,
+        "request_kind": "page",
+        "provider": provider,
+        "model": model,
+        "tool_policy": "none",
+        "tool_calls": [],
+        "mutation_actor": "Piku host",
+        "verification": verification,
+    })
+}
+
 fn extract_canvas_patches(text: &str) -> Result<Vec<CanvasPatch>, String> {
     let mut patches = Vec::new();
     let mut rest = text;
@@ -3513,12 +3554,25 @@ impl OutputSink for WebSink {
                 "label": "Workspace evidence resolved",
                 "detail": format!("{} sources · {} bytes · payloads omitted from provenance record", sources.len(), sources.iter().map(|source| source.byte_size).sum::<usize>()),
             }),
+            RunEvent::RequestContextResolved {
+                sources,
+                history_messages,
+                composed_input_bytes,
+                ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "context:request",
+                "phase": "context",
+                "state": "verified",
+                "label": "Request context recorded",
+                "detail": format!("{} sources · {history_messages} history messages · {composed_input_bytes} composed bytes", sources.len()),
+            }),
             RunEvent::ContextUnavailable { reason } => serde_json::json!({
                 "kind": "activity_event",
                 "event_id": "context:unavailable",
                 "phase": "context",
                 "state": "changed",
-                "label": "Context details unavailable",
+                "label": "Native Codex manifest unavailable",
                 "detail": reason,
             }),
             RunEvent::CompactionApplied {
@@ -3711,11 +3765,12 @@ mod tests {
         execute_terminal_read, extract_canvas_html, extract_partial_canvas_html,
         extract_workspace_operations, has_chat_target, has_page_edit_target,
         has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run,
-        render_home, resolve_chat_context, resolve_or_find_terminal_file, resolve_terminal_path,
-        sanitize_terminal_text, validate_authority_fields, validate_chat_notebook_input,
-        validate_request_message, validate_run_id, validate_workspace_objects, workspace_input,
-        write_request_digest, CanvasState, ChatExecutor, ChatMessage, ChatRequest, RequestKind,
-        ResolvedChatContext, TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
+        page_completion_event, render_home, resolve_chat_context, resolve_or_find_terminal_file,
+        resolve_terminal_path, sanitize_terminal_text, validate_authority_fields,
+        validate_chat_notebook_input, validate_request_message, validate_run_id,
+        validate_workspace_objects, workspace_input, write_request_digest, CanvasState,
+        ChatExecutor, ChatMessage, ChatRequest, RequestKind, ResolvedChatContext,
+        TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
         MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{
@@ -4005,6 +4060,25 @@ mod tests {
         assert!(prompt.contains("authority is canvas-only"));
         assert!(prompt.contains("never claim to read or edit files"));
         assert!(prompt.contains("sandboxed preview"));
+    }
+
+    #[test]
+    fn page_completion_records_zero_tool_and_host_mutation_provenance() {
+        let event = page_completion_event(
+            "main",
+            "Page source updated",
+            1,
+            0.25,
+            "fixture-provider",
+            "fixture-model",
+            &serde_json::json!({"actor":"Piku host","checks":[]}),
+        );
+
+        assert_eq!(event["provider"], "fixture-provider");
+        assert_eq!(event["model"], "fixture-model");
+        assert_eq!(event["tool_policy"], "none");
+        assert_eq!(event["tool_calls"], serde_json::json!([]));
+        assert_eq!(event["mutation_actor"], "Piku host");
     }
 
     #[test]
@@ -4576,5 +4650,24 @@ mod tests {
         assert_eq!(event["event_id"], "turn:complete");
         assert_eq!(event["label"], "Turn recorded");
         assert_eq!(event["detail"], "12 in · 7 out · end_turn");
+
+        sink.on_run_event(&RunEvent::RequestContextResolved {
+            context: piku_runtime::RunContentRef::Inline {
+                text: String::new(),
+            },
+            sources: Vec::new(),
+            history_messages: 2,
+            composed_input_sha256: piku_runtime::Sha256Digest::of_bytes(b"request"),
+            composed_input_bytes: 7,
+        });
+        let event: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().expect("request context event is projected"))
+                .expect("activity event is JSON");
+        assert_eq!(event["event_id"], "context:request");
+        assert_eq!(event["label"], "Request context recorded");
+        assert_eq!(
+            event["detail"],
+            "0 sources · 2 history messages · 7 composed bytes"
+        );
     }
 }

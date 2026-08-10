@@ -337,11 +337,15 @@ async function submitMessage(
     outcomeError = null,
     pageSnapshot = null,
     threadId = options.threadId || "",
+    executorProvider = "",
     executorModel = "";
   let verification = null,
     outcomeMessage = "",
     reportedAuthority = "",
-    reportedEffects = [];
+    reportedEffects = [],
+    toolPolicy = "unknown",
+    toolCalls = null,
+    mutationActor = "unknown";
   let requestId = "",
     runId = "",
     runUrl = "",
@@ -443,6 +447,7 @@ async function submitMessage(
             );
           } else if (event.kind === "model_started") {
             if (event.thread_id) threadId = event.thread_id;
+            if (event.provider) executorProvider = event.provider;
             if (event.model) executorModel = event.model;
             terminalWrite(
               "model     [" +
@@ -567,6 +572,11 @@ async function submitMessage(
             succeeded = true;
             verification = event.verification || null;
             outcomeMessage = event.message || "Request completed";
+            if (typeof event.provider === "string") executorProvider = event.provider;
+            if (typeof event.model === "string") executorModel = event.model;
+            if (typeof event.tool_policy === "string") toolPolicy = event.tool_policy;
+            if (Array.isArray(event.tool_calls)) toolCalls = event.tool_calls.slice(0, 12);
+            if (typeof event.mutation_actor === "string") mutationActor = event.mutation_actor;
             if (typeof event.authority === "string") reportedAuthority = event.authority;
             if (Array.isArray(event.effects)) {
               reportedEffects = event.effects.slice(0, 12).map((effect) => {
@@ -690,6 +700,7 @@ async function submitMessage(
     text: visibleNarration(narration),
     pageHtml: pageSnapshot,
     threadId,
+    provider: executorProvider,
     model: executorModel,
     requestId,
     runId,
@@ -698,6 +709,9 @@ async function submitMessage(
     verification,
     authority: reportedAuthority,
     effects: reportedEffects,
+    toolPolicy,
+    toolCalls,
+    mutationActor,
     activity,
     result: outcomeMessage || outcomeError || (succeeded ? "Request completed" : "Request failed"),
     error: outcomeError || (terminal ? null : "stream ended without an outcome"),
@@ -987,7 +1001,11 @@ function objectShell(kind, title, anchor, restore) {
     esc(kind) +
     '</span><button class="object-close" type="button" aria-label="Close ' +
     esc(kind) +
-    '">×</button></header><div class="object-body"></div>';
+    '">×</button></header><div class="object-body"></div>' +
+    ["nw", "ne", "sw", "se"].map((corner) =>
+      '<span class="object-resize-handle object-resize-' + corner +
+      '" data-resize-corner="' + corner + '" aria-hidden="true"></span>',
+    ).join("");
   overlay.append(object);
   if (restore) {
     if (restore.width) object.style.width = restore.width + "px";
@@ -1023,6 +1041,7 @@ function objectShell(kind, title, anchor, restore) {
     saveWorkspaceLayout();
   });
   enableDrag(object);
+  enableResize(object);
   refreshObjectPicker();
   new ResizeObserver(() => {
     if (renderingWorkspace || object.dataset.responsive === "stacked") return;
@@ -1031,6 +1050,69 @@ function objectShell(kind, title, anchor, restore) {
     saveWorkspaceLayout();
   }).observe(object);
   return object;
+}
+function enableResize(object) {
+  for (const handle of object.querySelectorAll(".object-resize-handle")) {
+    handle.addEventListener("pointerdown", (event) => {
+      if (object.dataset.responsive === "stacked") return;
+      event.preventDefault();
+      event.stopPropagation();
+      selectWorkspaceObject(object);
+      handle.setPointerCapture(event.pointerId);
+      const corner = handle.dataset.resizeCorner;
+      const startX = event.clientX,
+        startY = event.clientY,
+        left = parseFloat(object.style.left) || 8,
+        top = parseFloat(object.style.top) || 8,
+        width = object.offsetWidth,
+        height = object.offsetHeight,
+        right = left + width,
+        bottom = top + height,
+        styles = getComputedStyle(object),
+        minWidth = parseFloat(styles.minWidth) || 288,
+        minHeight = parseFloat(styles.minHeight) || 128;
+      const move = (next) => {
+        const dx = next.clientX - startX,
+          dy = next.clientY - startY;
+        let nextLeft = left,
+          nextTop = top,
+          nextWidth = width,
+          nextHeight = height;
+        if (corner.includes("w")) {
+          nextLeft = Math.max(8, Math.min(left + dx, right - minWidth));
+          nextWidth = right - nextLeft;
+        } else {
+          nextWidth = Math.max(
+            minWidth,
+            Math.min(width + dx, canvas.clientWidth - left - 8),
+          );
+        }
+        if (corner.includes("n")) {
+          nextTop = Math.max(8, Math.min(top + dy, bottom - minHeight));
+          nextHeight = bottom - nextTop;
+        } else {
+          nextHeight = Math.max(minHeight, height + dy);
+        }
+        object.style.left = nextLeft + "px";
+        object.style.top = nextTop + "px";
+        object.style.width = nextWidth + "px";
+        object.style.height = nextHeight + "px";
+      };
+      const stop = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", stop);
+        handle.removeEventListener("pointercancel", stop);
+        object.dataset.layoutX = String(parseFloat(object.style.left) || 8);
+        object.dataset.layoutY = String(parseFloat(object.style.top) || 8);
+        object.dataset.layoutWidth = String(object.offsetWidth);
+        object.dataset.layoutHeight = String(object.offsetHeight);
+        saveWorkspaceLayout();
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", stop);
+      handle.addEventListener("pointercancel", stop);
+    });
+  }
 }
 function enableDrag(object) {
   const handle = object.querySelector(".object-handle");
@@ -1096,9 +1178,9 @@ function parseFileCard(content) {
 function parseChangeCard(content) {
   try {
     const value = JSON.parse(content || "");
-    if ([1, 2, 3, 4].includes(value?.version))
+    if ([1, 2, 3, 4, 5].includes(value?.version))
       return {
-        version: 4,
+        version: 5,
         instruction: typeof value.instruction === "string" ? value.instruction : "",
         target: value.target === "page" ? "page" : "workspace",
         status: ["idle", "running", "done", "error"].includes(value.status) ? value.status : "idle",
@@ -1130,11 +1212,26 @@ function parseChangeCard(content) {
               verification: run?.verification && typeof run.verification === "object"
                 ? run.verification
                 : null,
+              provider: value.version >= 5 && typeof run?.provider === "string"
+                ? run.provider
+                : "unknown",
+              model: value.version >= 5 && typeof run?.model === "string"
+                ? run.model
+                : "unknown",
+              toolPolicy: value.version >= 5 && typeof run?.toolPolicy === "string"
+                ? run.toolPolicy
+                : "unknown",
+              toolCalls: value.version >= 5 && Array.isArray(run?.toolCalls)
+                ? run.toolCalls.slice(0, 12)
+                : null,
+              mutationActor: value.version >= 5 && typeof run?.mutationActor === "string"
+                ? run.mutationActor
+                : "unknown",
             }))
           : [],
       };
   } catch { /* Older change cards had no durable execution state. */ }
-  return { version: 4, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+  return { version: 5, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
 }
 function nextChangeRunOrdinal(runs) {
   return runs.reduce(
@@ -1399,6 +1496,11 @@ function createWorkspaceObject(kind, anchor, restore = null) {
             `target: ${run.target}${run.targetId ? ` · ${run.targetId}` : ""}`,
             `instruction: ${run.instruction || "(not recorded by legacy run)"}`,
             `result: ${run.result || "(not recorded by legacy run)"}`,
+            `provider: ${run.provider}`,
+            `model: ${run.model}`,
+            `tool policy: ${run.toolPolicy}`,
+            `tool calls: ${Array.isArray(run.toolCalls) ? run.toolCalls.length : "unknown"}`,
+            `mutation actor: ${run.mutationActor}`,
             `verification actor: ${run.verification?.actor || "not recorded"}`,
             ...(checks.length ? checks : ["checks: not recorded"]),
             "exact diff:",
@@ -1464,6 +1566,11 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         result: result.result || state.summary,
         diff: state.diff,
         verification: result.verification || null,
+        provider: result.provider || "unknown",
+        model: result.model || "unknown",
+        toolPolicy: result.toolPolicy || "unknown",
+        toolCalls: Array.isArray(result.toolCalls) ? result.toolCalls : null,
+        mutationActor: result.mutationActor || "unknown",
       });
       state.runs = state.runs.slice(-8);
       persistChange();
@@ -1956,6 +2063,12 @@ function renderChatTurns(object, state) {
           nextCell.querySelector(".chat-turn-status").textContent = "stale";
       }
       persistChatNotebook(object, state);
+    });
+    prompt.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        runChatNotebook(object, state, index, state.turns.length);
+      }
     });
     cell.querySelector('[data-action="run"]').addEventListener("click", () => {
       runChatNotebook(object, state, index, index + 1);

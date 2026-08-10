@@ -148,6 +148,21 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                     }
                 }
             }
+            RunEvent::RequestContextResolved {
+                context,
+                sources,
+                history_messages,
+                composed_input_sha256,
+                composed_input_bytes,
+            } => {
+                let _ = writeln!(
+                    output,
+                    "  ◇ request context recorded · {} sources · {history_messages} history messages · {composed_input_bytes} composed bytes · sha256:{} · {}",
+                    sources.len(),
+                    composed_input_sha256.as_str(),
+                    content_preview(context, 120),
+                );
+            }
             RunEvent::ContextUnavailable { reason } => {
                 let _ = writeln!(output, "  ◇ context unavailable · {reason}");
             }
@@ -346,8 +361,8 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script id="run-data" type="application/json">{}</script>
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const searchBySequence=new Map(documentData.search_index.map(e=>[e.sequence,e]));const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
-const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>searchBySequence.get(e.sequence)?.search_text??'';const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
-function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'context_unavailable':return e.reason;case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'authority_lease':return `${{e.authority}} · ${{e.outcome?.outcome??'unknown'}} · network=${{e.network_access}} · tools=${{e.tool_profile}}`;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage?`${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓`:'tokens not reported'}} · ${{e.stop_reason??'unknown'}}`;case'turn_failed':return `${{e.class}} · ${{e.message}}`;case'turn_cancelled':return e.reason;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
+const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>searchBySequence.get(e.sequence)?.search_text??'';const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.context??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
+function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'request_context_resolved':return `${{e.sources.length}} sources · ${{e.history_messages}} history messages · ${{e.composed_input_bytes}} composed bytes · ${{content(e.context)}}`;case'context_unavailable':return e.reason;case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'authority_lease':return `${{e.authority}} · ${{e.outcome?.outcome??'unknown'}} · network=${{e.network_access}} · tools=${{e.tool_profile}}`;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage?`${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓`:'tokens not reported'}} · ${{e.stop_reason??'unknown'}}`;case'turn_failed':return `${{e.class}} · ${{e.message}}`;case'turn_cancelled':return e.reason;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
 function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed · '+audit.failed_turn_count+' failed · '+audit.cancelled_turn_count+' cancelled'],['authority',audit.authority_lease_count,`${{audit.workspace_write_granted}} write granted · ${{audit.workspace_write_denied}} denied · ${{audit.workspace_write_revoked}} revoked`],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified · ${{audit.unattributed_effect_count}} unattributed`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
 function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;const scope=scopeLabel(e);if(!seen.has(scope)){{seen.add(scope);const b=document.createElement('button');b.textContent=scope;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['scope',scope],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','scope','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
@@ -409,6 +424,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
         RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
+        RunEvent::RequestContextResolved { .. } => "request_context_resolved",
         RunEvent::ContextUnavailable { .. } => "context_unavailable",
         RunEvent::CompactionApplied { .. } => "compaction_applied",
         RunEvent::AssistantMessage { .. } => "assistant_message",
@@ -486,6 +502,7 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         | RunEvent::TurnCancelled { .. }
         | RunEvent::Warning { .. }
         | RunEvent::ChildRunRef { .. } => None,
+        RunEvent::RequestContextResolved { context, .. } => Some(context),
         RunEvent::UserDisposition { note, .. } => Some(note),
     }
 }
@@ -581,6 +598,25 @@ mod tests {
         assert!(output.contains("surface:scratch/object:note-1 · sha256:"));
         assert!(!output.contains("private source bytes"));
         assert!(!output.contains("resolved bytes"));
+    }
+
+    #[test]
+    fn text_projection_surfaces_exact_request_context_evidence() {
+        let input = "History:\nuser: prior\n\nCurrent turn:\nquestion";
+        let output = render_text(&[event(RunEvent::RequestContextResolved {
+            context: RunContentRef::Inline {
+                text: "workspace note".into(),
+            },
+            sources: Vec::new(),
+            history_messages: 1,
+            composed_input_sha256: Sha256Digest::of_bytes(input.as_bytes()),
+            composed_input_bytes: input.len(),
+        })]);
+
+        assert!(output.contains("request context recorded · 0 sources · 1 history messages"));
+        assert!(output.contains(&format!("{} composed bytes", input.len())));
+        assert!(output.contains("workspace note"));
+        assert!(output.contains("sha256:"));
     }
 
     #[test]
