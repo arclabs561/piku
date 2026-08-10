@@ -67,11 +67,16 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
     );
     let _ = writeln!(
         output,
-        "effects: {} created / {} modified / {} unchanged / {} unknown · verification: {} passed / {} failed / {} indeterminate",
+        "authority: {} leases · {} write granted / {} denied / {} revoked · effects: {} created / {} modified / {} unchanged / {} unknown / {} unattributed · verification: {} passed / {} failed / {} indeterminate",
+        audit.authority_lease_count,
+        audit.workspace_write_granted,
+        audit.workspace_write_denied,
+        audit.workspace_write_revoked,
         audit.files_created,
         audit.files_modified,
         audit.file_writes_unchanged,
         audit.file_writes_unknown,
+        audit.unattributed_effect_count,
         audit.verification_passed,
         audit.verification_failed,
         audit.verification_indeterminate
@@ -168,6 +173,28 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
             RunEvent::PermissionDecision { decision, .. } => {
                 let _ = writeln!(output, "  ◆ permission {decision:?}");
             }
+            RunEvent::AuthorityLease {
+                authority,
+                scope_digest,
+                expires_at_ms,
+                turn_deadline_ms,
+                cwd,
+                network_access,
+                tool_profile,
+                outcome,
+                ..
+            } => {
+                let _ = writeln!(
+                    output,
+                    "  ◆ authority {authority:?} · {outcome:?} · scope sha256:{}",
+                    scope_digest.as_str()
+                );
+                let _ = writeln!(
+                    output,
+                    "    ↳ cwd {} · network={network_access} · tools={tool_profile} · expires={expires_at_ms} · deadline={turn_deadline_ms}",
+                    cwd.display()
+                );
+            }
             RunEvent::ToolCompleted {
                 result,
                 is_error,
@@ -191,6 +218,9 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                         }
                         piku_runtime::RunToolEffect::ShellCommand { command, exit_code } => {
                             let _ = writeln!(output, "    ↳ shell exit={exit_code:?} `{command}`");
+                        }
+                        piku_runtime::RunToolEffect::Unattributed { category, reason } => {
+                            let _ = writeln!(output, "    ↳ unattributed {category:?} · {reason}");
                         }
                     }
                 }
@@ -317,8 +347,8 @@ dl{{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.4
 <script>
 const documentData=JSON.parse(document.getElementById('run-data').textContent);const events=documentData.events,audit=documentData.audit;const searchBySequence=new Map(documentData.search_index.map(e=>[e.sequence,e]));const timeline=document.getElementById('timeline');const turns=document.getElementById('turns');const filter=document.getElementById('filter');
 const text=v=>v==null?'':typeof v==='string'?v:JSON.stringify(v,null,2);const label=e=>e.event.replaceAll('_',' ');const eventText=e=>searchBySequence.get(e.sequence)?.search_text??'';const artifactText=c=>c?.relative_path?documentData.artifacts[c.relative_path]:null;const preview=v=>v&&v.length>320?v.slice(0,320)+'…':v??'';const content=c=>c?.text??(c?.relative_path?preview(artifactText(c))||`${{c.relative_path}} · ${{c.bytes}} bytes`:c?.reason??'');const eventContent=e=>e.input??e.summary??e.content??e.result??e.note;const scopeLabel=e=>e.scope==='run'?'run':e.turn_id;
-function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'context_unavailable':return e.reason;case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage?`${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓`:'tokens not reported'}} · ${{e.stop_reason??'unknown'}}`;case'turn_failed':return `${{e.class}} · ${{e.message}}`;case'turn_cancelled':return e.reason;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
-function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed · '+audit.failed_turn_count+' failed · '+audit.cancelled_turn_count+' cancelled'],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
+function eventSummary(e){{switch(e.event){{case'turn_started':return `${{e.provider??'unknown'}} / ${{e.model}} · ${{content(e.input)}}`;case'context_built':{{const m=e.manifest.messages,s=m.filter(x=>x.selected).length;return `${{e.manifest.estimated_input_tokens}} estimated tokens · ${{s}} selected · ${{m.length-s}} excluded · ${{e.manifest.tools.length}} tools`}}case'context_unavailable':return e.reason;case'compaction_applied':return `${{e.before_messages}} → ${{e.after_messages}} messages · ${{e.masked_tool_results}} masked results`;case'assistant_message':return content(e.content);case'tool_started':return `${{e.name}} ${{text(e.arguments)}}`;case'permission_decision':return e.decision;case'authority_lease':return `${{e.authority}} · ${{e.outcome?.outcome??'unknown'}} · network=${{e.network_access}} · tools=${{e.tool_profile}}`;case'tool_completed':{{const facts=[];if(e.effects?.length)facts.push(`${{e.effects.length}} effect${{e.effects.length===1?'':'s'}}`);if(e.verification)facts.push(`verify ${{e.verification.status}}`);return `${{e.is_error?'error':'ok'}} · ${{content(e.result)}}${{facts.length?' · '+facts.join(' · '):''}}`}}case'turn_completed':return `${{e.usage?`${{e.usage.input_tokens}}↑ ${{e.usage.output_tokens}}↓`:'tokens not reported'}} · ${{e.stop_reason??'unknown'}}`;case'turn_failed':return `${{e.class}} · ${{e.message}}`;case'turn_cancelled':return e.reason;case'warning':return e.message;case'user_disposition':return `${{e.disposition}} · ${{content(e.note)}}`;default:return''}}}}
+function drawAudit(){{const root=document.getElementById('audit');const cards=[['evidence',audit.findings.some(f=>f.severity==='error')?'incomplete':'complete',`${{audit.findings.length}} findings`],['turns',`${{audit.completed_turn_count}} / ${{audit.turn_count}}`,'completed · '+audit.failed_turn_count+' failed · '+audit.cancelled_turn_count+' cancelled'],['authority',audit.authority_lease_count,`${{audit.workspace_write_granted}} write granted · ${{audit.workspace_write_denied}} denied · ${{audit.workspace_write_revoked}} revoked`],['effects',audit.tool_effect_count,`${{audit.files_created}} created · ${{audit.files_modified}} modified · ${{audit.unattributed_effect_count}} unattributed`],['verification',audit.verification_count,`${{audit.verification_passed}} passed · ${{audit.verification_failed}} failed · ${{audit.verification_indeterminate}} indeterminate`]];cards.forEach(([name,value,detail])=>{{const d=document.createElement('div');d.className='metric'+(name==='evidence'&&value==='incomplete'?' error':'');const k=document.createElement('div'),v=document.createElement('strong'),p=document.createElement('div');k.className='kicker';k.textContent=name;v.textContent=value;p.className='detail';p.textContent=detail;d.append(k,v,p);root.append(d)}})}}
 function draw(q=''){{timeline.replaceChildren();turns.replaceChildren();const seen=new Set();let shown=0;events.forEach((e,i)=>{{if(q&&!eventText(e).includes(q))return;shown++;const scope=scopeLabel(e);if(!seen.has(scope)){{seen.add(scope);const b=document.createElement('button');b.textContent=scope;b.onclick=()=>document.getElementById('event-'+e.sequence)?.scrollIntoView({{behavior:'smooth'}});turns.append(b)}}const a=document.createElement('article');a.id='event-'+e.sequence;a.style.setProperty('--i',i);if(e.is_error)a.className='error';const s=document.createElement('div');s.className='seq';s.textContent=String(e.sequence).padStart(4,'0');const body=document.createElement('div');const h=document.createElement('h2');h.textContent=label(e);body.append(h);const dl=document.createElement('dl');[['scope',scope],['recorded',new Date(e.recorded_at_ms).toLocaleString()]].forEach(([k,v])=>{{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd)}});body.append(dl);const summary=document.createElement('p');summary.className='summary';summary.textContent=eventSummary(e);body.append(summary);const payload={{...e}};['schema_version','sequence','recorded_at_ms','session_id','scope','turn_id','event'].forEach(k=>delete payload[k]);const d=document.createElement('details');const sum=document.createElement('summary');sum.textContent='inspect payload';const pre=document.createElement('pre');pre.textContent=text(payload);d.append(sum,pre);body.append(d);const resolved=artifactText(eventContent(e));if(resolved!=null){{const ad=document.createElement('details'),as=document.createElement('summary'),ap=document.createElement('pre');as.textContent='inspect full artifact';ap.textContent=resolved;ad.append(as,ap);body.append(ad)}}a.append(s,body);timeline.append(a)}});if(!shown){{const p=document.createElement('p');p.className='empty';p.textContent='No evidence matches this filter.';timeline.append(p)}}}}
 filter.addEventListener('input',()=>draw(filter.value.trim().toLowerCase()));document.addEventListener('keydown',e=>{{if(e.key==='/'&&document.activeElement!==filter){{e.preventDefault();filter.focus()}}}});drawAudit();draw();
 </script>
@@ -384,6 +414,7 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::AssistantMessage { .. } => "assistant_message",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::PermissionDecision { .. } => "permission_decision",
+        RunEvent::AuthorityLease { .. } => "authority_lease",
         RunEvent::ToolCompleted { .. } => "tool_completed",
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::TurnFailed { .. } => "turn_failed",
@@ -449,6 +480,7 @@ fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
         | RunEvent::ContextUnavailable { .. }
         | RunEvent::ToolStarted { .. }
         | RunEvent::PermissionDecision { .. }
+        | RunEvent::AuthorityLease { .. }
         | RunEvent::TurnCompleted { .. }
         | RunEvent::TurnFailed { .. }
         | RunEvent::TurnCancelled { .. }
@@ -597,6 +629,42 @@ mod tests {
         assert!(text.contains("verify Passed · unit tests"));
         assert!(html.contains("verify ${e.verification.status}"));
         assert!(html.contains("tool_effect_count"));
+    }
+
+    #[test]
+    fn projections_surface_authority_and_unattributed_effects() {
+        let authority = event(RunEvent::AuthorityLease {
+            authority: piku_runtime::TurnAuthority::WorkspaceWrite,
+            scope_digest: Sha256Digest::of_bytes(b"scope"),
+            issued_at_ms: 10,
+            expires_at_ms: 20,
+            turn_deadline_ms: 30,
+            cwd: "/workspace".into(),
+            network_access: false,
+            tool_profile: "codex_workspace_write".into(),
+            outcome: piku_runtime::AuthorityLeaseOutcome::Granted,
+        });
+        let completion = event(RunEvent::ToolCompleted {
+            tool_call_id: "shell-1".into(),
+            result: RunContentRef::Inline { text: "ok".into() },
+            is_error: false,
+            effects: vec![RunToolEffect::Unattributed {
+                category: piku_runtime::RunEffectCategory::FileSystem,
+                reason: "shell did not report changed paths".into(),
+            }],
+            verification: None,
+        });
+
+        let text = render_text(&[authority.clone(), completion.clone()]);
+        let json = render_json(&[authority.clone(), completion.clone()]).unwrap();
+        let html = render_html(&[authority, completion]).unwrap();
+
+        assert!(text.contains("authority WorkspaceWrite · Granted"));
+        assert!(text.contains("unattributed FileSystem · shell did not report changed paths"));
+        assert!(json.contains("authority_lease"));
+        assert!(json.contains("unattributed"));
+        assert!(html.contains("authority_lease"));
+        assert!(html.contains("unattributed"));
     }
 
     #[test]

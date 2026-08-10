@@ -19,8 +19,10 @@ use piku_api::TokenUsage;
 /// Version 2 made run-vs-turn scope explicit. Version 3 adds typed failed and
 /// cancelled terminals and permits completion when token usage was not
 /// reported. Version 4 records payload-free summaries of explicitly resolved
-/// context sources. The reader remains compatible with earlier records.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 4;
+/// context sources. Version 5 records turn-scoped authority leases and effects
+/// that an executor cannot attribute to a concrete target. The reader remains
+/// compatible with earlier records.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 5;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -177,6 +179,20 @@ pub enum RunEvent {
         tool_call_id: String,
         decision: PermissionDecision,
     },
+    /// The bounded authority decision for exactly one turn. `scope_digest` is
+    /// a stable, non-secret reference to the frozen lease scope; it is not the
+    /// bearer token used to consume the lease.
+    AuthorityLease {
+        authority: TurnAuthority,
+        scope_digest: Sha256Digest,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        turn_deadline_ms: u64,
+        cwd: PathBuf,
+        network_access: bool,
+        tool_profile: String,
+        outcome: AuthorityLeaseOutcome,
+    },
     ToolCompleted {
         tool_call_id: String,
         result: ContentRef,
@@ -234,6 +250,7 @@ impl RunEvent {
             | Self::AssistantMessage { .. }
             | Self::ToolStarted { .. }
             | Self::PermissionDecision { .. }
+            | Self::AuthorityLease { .. }
             | Self::ToolCompleted { .. }
             | Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
@@ -274,6 +291,36 @@ pub enum ToolEffect {
         command: String,
         exit_code: Option<i32>,
     },
+    /// The executor observed that an effect may have occurred but cannot
+    /// honestly attribute it to a concrete path or other target.
+    Unattributed {
+        category: EffectCategory,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectCategory {
+    FileSystem,
+    Process,
+    Network,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnAuthority {
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AuthorityLeaseOutcome {
+    Granted,
+    Denied { reason: String },
+    Revoked { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +684,7 @@ impl RunRecorder {
             | RunEvent::ContextUnavailable { .. }
             | RunEvent::ToolStarted { .. }
             | RunEvent::PermissionDecision { .. }
+            | RunEvent::AuthorityLease { .. }
             | RunEvent::TurnCompleted { .. }
             | RunEvent::TurnFailed { .. }
             | RunEvent::TurnCancelled { .. }
@@ -1041,7 +1089,10 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values[0]["schema_version"], 1);
-        assert_eq!(values[1]["schema_version"], 4);
+        assert_eq!(
+            values[1]["schema_version"],
+            serde_json::json!(RUN_RECORD_SCHEMA_VERSION)
+        );
         assert_eq!(values[1]["scope"], "turn");
         fs::remove_file(path).unwrap();
     }
@@ -1065,6 +1116,45 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert!(value.get("effects").is_none());
         assert!(value.get("verification").is_none());
+    }
+
+    #[test]
+    fn authority_and_unattributed_effect_evidence_round_trip() {
+        let authority = RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence: 0,
+            recorded_at_ms: 10,
+            session_id: "session-1".into(),
+            scope: EventScope::Turn {
+                turn_id: "turn-0".into(),
+            },
+            event: RunEvent::AuthorityLease {
+                authority: TurnAuthority::WorkspaceWrite,
+                scope_digest: Sha256Digest::of_bytes(b"frozen scope"),
+                issued_at_ms: 10,
+                expires_at_ms: 20,
+                turn_deadline_ms: 30,
+                cwd: "/workspace".into(),
+                network_access: false,
+                tool_profile: "codex_workspace_write".into(),
+                outcome: AuthorityLeaseOutcome::Denied {
+                    reason: "scope mismatch".into(),
+                },
+            },
+        };
+        let effect = ToolEffect::Unattributed {
+            category: EffectCategory::FileSystem,
+            reason: "shell command may have changed paths not reported by the executor".into(),
+        };
+
+        let encoded = serde_json::to_string(&authority).unwrap();
+        let decoded: RunEventEnvelope = serde_json::from_str(&encoded).unwrap();
+        let effect =
+            serde_json::from_value::<ToolEffect>(serde_json::to_value(effect).unwrap()).unwrap();
+
+        assert_eq!(decoded, authority);
+        assert!(matches!(effect, ToolEffect::Unattributed { .. }));
+        assert!(!encoded.contains("frozen scope"));
     }
 
     #[test]

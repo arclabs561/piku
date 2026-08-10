@@ -62,11 +62,12 @@ pub use run_audit::{
 };
 pub use run_handle::{RunHandle, RunTurn};
 pub use run_record::{
-    read_run_record, ArtifactRef, ContentChange as RunContentChange, ContentRef as RunContentRef,
-    ContextManifest, ContextMessage, ContextSection, ContextSourceSummary, ContextTool,
+    read_run_record, ArtifactRef, AuthorityLeaseOutcome, ContentChange as RunContentChange,
+    ContentRef as RunContentRef, ContextManifest, ContextMessage, ContextSection,
+    ContextSourceSummary, ContextTool, EffectCategory as RunEffectCategory,
     EventScope as RunEventScope, PermissionDecision as RunPermissionDecision, RecordingSink,
     RunDisposition, RunEvent, RunEventEnvelope, RunRecorder, ToolEffect as RunToolEffect,
-    UsageRecord, VerificationIndeterminate, VerificationRecord, VerificationStatus,
+    TurnAuthority, UsageRecord, VerificationIndeterminate, VerificationRecord, VerificationStatus,
     RUN_INLINE_CONTENT_LIMIT_BYTES, RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};

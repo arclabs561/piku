@@ -28,7 +28,17 @@ pub struct RunAudit {
     pub tool_calls_started: usize,
     pub tool_calls_completed: usize,
     pub tool_calls_with_permission_decision: usize,
+    #[serde(default)]
+    pub authority_lease_count: usize,
+    #[serde(default)]
+    pub workspace_write_granted: usize,
+    #[serde(default)]
+    pub workspace_write_denied: usize,
+    #[serde(default)]
+    pub workspace_write_revoked: usize,
     pub tool_effect_count: usize,
+    #[serde(default)]
+    pub unattributed_effect_count: usize,
     pub files_created: usize,
     pub files_modified: usize,
     pub file_writes_unchanged: usize,
@@ -94,6 +104,7 @@ struct TurnState {
     started: Option<u64>,
     completed: Option<u64>,
     context_builds: usize,
+    authority_lease: Option<u64>,
 }
 
 struct ToolState<'a> {
@@ -140,7 +151,12 @@ impl<'a> Auditor<'a> {
                 tool_calls_started: 0,
                 tool_calls_completed: 0,
                 tool_calls_with_permission_decision: 0,
+                authority_lease_count: 0,
+                workspace_write_granted: 0,
+                workspace_write_denied: 0,
+                workspace_write_revoked: 0,
                 tool_effect_count: 0,
+                unattributed_effect_count: 0,
                 files_created: 0,
                 files_modified: 0,
                 file_writes_unchanged: 0,
@@ -209,6 +225,28 @@ impl<'a> Auditor<'a> {
             }
             RunEvent::PermissionDecision { tool_call_id, .. } => {
                 self.on_permission(turn_id, envelope, tool_call_id);
+            }
+            RunEvent::AuthorityLease {
+                authority,
+                expires_at_ms,
+                issued_at_ms,
+                turn_deadline_ms,
+                cwd,
+                tool_profile,
+                outcome,
+                ..
+            } => {
+                self.on_authority_lease(
+                    turn_id,
+                    envelope,
+                    *authority,
+                    *issued_at_ms,
+                    *expires_at_ms,
+                    *turn_deadline_ms,
+                    cwd,
+                    tool_profile,
+                    outcome,
+                );
             }
             RunEvent::ToolCompleted {
                 tool_call_id,
@@ -414,6 +452,83 @@ impl<'a> Auditor<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn on_authority_lease(
+        &mut self,
+        turn_id: &'a str,
+        envelope: &RunEventEnvelope,
+        authority: crate::run_record::TurnAuthority,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        turn_deadline_ms: u64,
+        cwd: &std::path::Path,
+        tool_profile: &str,
+        outcome: &crate::run_record::AuthorityLeaseOutcome,
+    ) {
+        use crate::run_record::{AuthorityLeaseOutcome, TurnAuthority};
+
+        self.audit.authority_lease_count += 1;
+        let previous = self
+            .turns
+            .entry(turn_id)
+            .or_default()
+            .authority_lease
+            .replace(envelope.sequence);
+        if let Some(previous) = previous {
+            self.add_finding(
+                AuditSeverity::Error,
+                "duplicate_authority_lease",
+                format!("turn {turn_id} records more than one authority lease"),
+                vec![previous, envelope.sequence],
+            );
+        }
+        if authority == TurnAuthority::WorkspaceWrite {
+            match outcome {
+                AuthorityLeaseOutcome::Granted => self.audit.workspace_write_granted += 1,
+                AuthorityLeaseOutcome::Denied { .. } => self.audit.workspace_write_denied += 1,
+                AuthorityLeaseOutcome::Revoked { .. } => self.audit.workspace_write_revoked += 1,
+            }
+        }
+        if issued_at_ms > expires_at_ms || issued_at_ms > turn_deadline_ms {
+            self.add_finding(
+                AuditSeverity::Error,
+                "invalid_authority_deadline",
+                "authority lease deadline precedes issuance".to_string(),
+                vec![envelope.sequence],
+            );
+        }
+        if !cwd.is_absolute() {
+            self.add_finding(
+                AuditSeverity::Error,
+                "invalid_authority_cwd",
+                "authority lease working directory must be absolute".to_string(),
+                vec![envelope.sequence],
+            );
+        }
+        if tool_profile.trim().is_empty() {
+            self.add_finding(
+                AuditSeverity::Error,
+                "empty_authority_tool_profile",
+                "authority lease has an empty tool profile".to_string(),
+                vec![envelope.sequence],
+            );
+        }
+        match outcome {
+            AuthorityLeaseOutcome::Denied { reason }
+            | AuthorityLeaseOutcome::Revoked { reason }
+                if reason.trim().is_empty() =>
+            {
+                self.add_finding(
+                    AuditSeverity::Error,
+                    "empty_authority_outcome_reason",
+                    "denied or revoked authority lease requires a reason".to_string(),
+                    vec![envelope.sequence],
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn on_tool_completed(
         &mut self,
         turn_id: &str,
@@ -460,6 +575,20 @@ impl<'a> Auditor<'a> {
                     content_change,
                 } => Some((path, content_change)),
                 ToolEffect::ShellCommand { .. } => None,
+                ToolEffect::Unattributed { reason, .. } => {
+                    self.audit.unattributed_effect_count += 1;
+                    if reason.trim().is_empty() {
+                        self.add_finding(
+                            AuditSeverity::Error,
+                            "empty_unattributed_effect_reason",
+                            format!(
+                                "tool call {tool_call_id} reports an unattributed effect without a reason"
+                            ),
+                            vec![envelope.sequence],
+                        );
+                    }
+                    None
+                }
             }) else {
                 continue;
             };
@@ -651,6 +780,7 @@ fn event_name(event: &RunEvent) -> &'static str {
         RunEvent::AssistantMessage { .. } => "assistant_message",
         RunEvent::ToolStarted { .. } => "tool_started",
         RunEvent::PermissionDecision { .. } => "permission_decision",
+        RunEvent::AuthorityLease { .. } => "authority_lease",
         RunEvent::ToolCompleted { .. } => "tool_completed",
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::TurnFailed { .. } => "turn_failed",
@@ -912,6 +1042,138 @@ mod tests {
         assert_eq!(audit.verification_passed, 1);
         assert_eq!(audit.verification_failed, 1);
         assert_eq!(audit.verification_indeterminate, 1);
+    }
+
+    #[test]
+    fn audits_authority_and_unattributed_effects_without_inventing_file_writes() {
+        let events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".into()),
+                    model: "model".into(),
+                    input: inline("change one file"),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::ContextBuilt {
+                    manifest: ContextManifest {
+                        model: "model".into(),
+                        context_window_tokens: 100,
+                        estimated_input_tokens: 10,
+                        system_sections: Vec::new(),
+                        messages: Vec::new(),
+                        tools: Vec::new(),
+                    },
+                },
+            ),
+            envelope(
+                2,
+                RunEvent::AuthorityLease {
+                    authority: crate::run_record::TurnAuthority::WorkspaceWrite,
+                    scope_digest: Sha256Digest::of_bytes(b"scope"),
+                    issued_at_ms: 10,
+                    expires_at_ms: 20,
+                    turn_deadline_ms: 30,
+                    cwd: "/workspace".into(),
+                    network_access: false,
+                    tool_profile: "codex_workspace_write".into(),
+                    outcome: crate::run_record::AuthorityLeaseOutcome::Granted,
+                },
+            ),
+            envelope(
+                3,
+                RunEvent::ToolStarted {
+                    tool_call_id: "shell-1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "build"}),
+                },
+            ),
+            envelope(
+                4,
+                RunEvent::ToolCompleted {
+                    tool_call_id: "shell-1".into(),
+                    result: inline("done"),
+                    is_error: false,
+                    effects: vec![ToolEffect::Unattributed {
+                        category: crate::run_record::EffectCategory::FileSystem,
+                        reason: "shell execution does not report changed paths".into(),
+                    }],
+                    verification: None,
+                },
+            ),
+            envelope(
+                5,
+                RunEvent::TurnCompleted {
+                    usage: None,
+                    stop_reason: Some("complete".into()),
+                },
+            ),
+        ];
+
+        let audit = audit_run_record(&events);
+
+        assert!(audit.is_structurally_complete());
+        assert_eq!(audit.authority_lease_count, 1);
+        assert_eq!(audit.workspace_write_granted, 1);
+        assert_eq!(audit.workspace_write_denied, 0);
+        assert_eq!(audit.workspace_write_revoked, 0);
+        assert_eq!(audit.unattributed_effect_count, 1);
+        assert_eq!(audit.files_created, 0);
+        assert_eq!(audit.files_modified, 0);
+        assert_eq!(audit.file_writes_unknown, 0);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_malformed_authority_evidence() {
+        let authority = |issued_at_ms, outcome| RunEvent::AuthorityLease {
+            authority: crate::run_record::TurnAuthority::WorkspaceWrite,
+            scope_digest: Sha256Digest::of_bytes(b"scope"),
+            issued_at_ms,
+            expires_at_ms: 20,
+            turn_deadline_ms: 30,
+            cwd: "".into(),
+            network_access: false,
+            tool_profile: String::new(),
+            outcome,
+        };
+        let events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".into()),
+                    model: "model".into(),
+                    input: inline("change"),
+                },
+            ),
+            envelope(
+                1,
+                authority(
+                    40,
+                    crate::run_record::AuthorityLeaseOutcome::Denied {
+                        reason: String::new(),
+                    },
+                ),
+            ),
+            envelope(
+                2,
+                authority(10, crate::run_record::AuthorityLeaseOutcome::Granted),
+            ),
+        ];
+
+        let audit = audit_run_record(&events);
+        let codes = audit
+            .findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"invalid_authority_deadline"));
+        assert!(codes.contains(&"invalid_authority_cwd"));
+        assert!(codes.contains(&"empty_authority_tool_profile"));
+        assert!(codes.contains(&"empty_authority_outcome_reason"));
+        assert!(codes.contains(&"duplicate_authority_lease"));
     }
 
     #[test]
