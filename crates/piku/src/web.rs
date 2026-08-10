@@ -44,6 +44,8 @@ const MODEL_REQUEST_SLOTS: usize = 4;
 const SSE_QUEUE_EVENTS: usize = 128;
 const SSE_CONTROL_RESERVE: usize = 16;
 const MAX_RUN_ID_LEN: usize = 128;
+const MAX_FIXTURE_CANCELLATION_ACKS: usize = 128;
+const FIXTURE_CANCELLATION_ACK_TTL: Duration = Duration::from_mins(1);
 const WRITE_LEASE_START_WINDOW: Duration = Duration::from_mins(1);
 const WRITE_LEASE_LIFETIME: Duration = Duration::from_mins(5);
 const WRITE_TOOL_PROFILE: &str = "codex_native_workspace_write_v1";
@@ -282,6 +284,15 @@ fn list_surfaces(root: &FsPath) -> Vec<String> {
     names
 }
 
+fn ensure_default_surface(root: &FsPath) -> std::io::Result<Vec<String>> {
+    let mut surfaces = list_surfaces(root);
+    if surfaces.is_empty() {
+        CanvasState::default().save(&surface_dir(root, "scratch"))?;
+        surfaces.push("scratch".to_string());
+    }
+    Ok(surfaces)
+}
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -325,6 +336,7 @@ pub(super) struct AppState {
     write_leases: Arc<write_lease::WriteLeaseStore>,
     workspace_write_available: bool,
     evaluation_fixtures: bool,
+    fixture_cancellation_acks: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -497,12 +509,8 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
     let root = surfaces_root(config);
     let _ = std::fs::create_dir_all(&root);
 
-    let surfaces_list = list_surfaces(&root);
-    let active = if surfaces_list.is_empty() {
-        "scratch".to_string()
-    } else {
-        surfaces_list[0].clone()
-    };
+    let surfaces_list = ensure_default_surface(&root)?;
+    let active = surfaces_list[0].clone();
 
     let workspace_root = std::env::current_dir()?.canonicalize()?;
     let codex_root = config.config_dir.join("_codex");
@@ -533,9 +541,10 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         workspace_write_available,
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
+        fixture_cancellation_acks: Arc::new(RwLock::new(HashMap::new())),
     });
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(home))
         .route("/api/surfaces", get(list_surfaces_api).post(create_surface))
         .route(
@@ -548,13 +557,38 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         .route("/api/executors", get(executor_catalog))
         .route("/api/terminal/read", post(terminal_read_handler))
         .route("/api/terminal/pty", get(pty::terminal_pty_handler))
-        .route("/run/{session_id}", get(view_run))
+        .route("/run/{session_id}", get(view_run));
+    if state.evaluation_fixtures {
+        app = app.route(
+            "/api/evaluation-fixtures/cancellations/{request_id}",
+            get(evaluation_fixture_cancellation_ack),
+        );
+    }
+    let app = app
         .layer(middleware::from_fn(local_request_guard))
         .with_state(Arc::clone(&state));
 
     let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let local_addr = listener.local_addr()?;
+    let url = format!("http://localhost:{}", local_addr.port());
+    if let Some(path) = std::env::var_os("PIKU_WEB_READY_FILE") {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let ready = serde_json::json!({
+            "schema_version": 1,
+            "url": url,
+            "fixture_enabled": state.evaluation_fixtures,
+            "pid": std::process::id(),
+        });
+        std::fs::write(&temporary, serde_json::to_vec(&ready)?)?;
+        std::fs::rename(&temporary, &path)?;
+    }
     tracing::info!(
-        url = %format!("http://localhost:{port}"),
+        url = %url,
         workspace = %state.workspace_root.display(),
         storage = %state.surfaces.read().await.root.display(),
         terminal = "pty",
@@ -562,7 +596,6 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         evaluation_fixtures = state.evaluation_fixtures,
         "web surface listening"
     );
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1893,7 +1926,7 @@ async fn run_chat_request(
             .await;
         }
         ChatExecutor::EvaluationFixture => {
-            run_evaluation_fixture_request(surface_name, tx).await;
+            run_evaluation_fixture_request(state, surface_name, tx).await;
         }
         ChatExecutor::Provider => {
             run_provider_chat_request(
@@ -1911,7 +1944,48 @@ async fn run_chat_request(
     }
 }
 
-async fn run_evaluation_fixture_request(surface_name: String, tx: mpsc::Sender<String>) {
+#[derive(Serialize)]
+struct FixtureCancellationAck {
+    request_id: String,
+    acknowledged: bool,
+}
+
+async fn evaluation_fixture_cancellation_ack(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+) -> Response {
+    if request_id.len() > MAX_RUN_ID_LEN
+        || !request_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return (StatusCode::BAD_REQUEST, "invalid request identity").into_response();
+    }
+    let now = Instant::now();
+    let mut acknowledgements = state.fixture_cancellation_acks.write().await;
+    acknowledgements.retain(|_, acknowledged_at| {
+        now.duration_since(*acknowledged_at) <= FIXTURE_CANCELLATION_ACK_TTL
+    });
+    let acknowledged = acknowledgements.contains_key(&request_id);
+    (
+        if acknowledged {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        },
+        Json(FixtureCancellationAck {
+            request_id,
+            acknowledged,
+        }),
+    )
+        .into_response()
+}
+
+async fn run_evaluation_fixture_request(
+    state: Arc<AppState>,
+    surface_name: String,
+    tx: mpsc::Sender<String>,
+) {
     let request_id = crate::new_session_id();
     emit(
         &tx,
@@ -1926,6 +2000,22 @@ async fn run_evaluation_fixture_request(surface_name: String, tx: mpsc::Sender<S
         &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":"Fixture active; cancel this turn to continue the evaluation."}),
     );
     tx.closed().await;
+    let mut acknowledgements = state.fixture_cancellation_acks.write().await;
+    let now = Instant::now();
+    acknowledgements.retain(|_, acknowledged_at| {
+        now.duration_since(*acknowledged_at) <= FIXTURE_CANCELLATION_ACK_TTL
+    });
+    if acknowledgements.len() >= MAX_FIXTURE_CANCELLATION_ACKS {
+        if let Some(oldest) = acknowledgements
+            .iter()
+            .min_by_key(|(_, acknowledged_at)| **acknowledged_at)
+            .map(|(request_id, _)| request_id.clone())
+        {
+            acknowledgements.remove(&oldest);
+        }
+    }
+    acknowledgements.insert(request_id.clone(), now);
+    drop(acknowledgements);
     tracing::info!(
         request_id,
         surface = %surface_name,
@@ -3880,7 +3970,7 @@ mod tests {
     use super::{
         apply_canvas_reply, apply_workspace_operations, canvas_proposal_summary,
         canvas_system_prompt, chat_system_prompt, compact_canvas_turn, emit, emit_lossy,
-        execute_terminal_read, extract_canvas_html, extract_canvas_noop,
+        ensure_default_surface, execute_terminal_read, extract_canvas_html, extract_canvas_noop,
         extract_partial_canvas_html, extract_workspace_operations, has_chat_target,
         has_page_edit_target, has_sensitive_path_component, is_allowed_host, is_same_local_origin,
         open_web_run, page_completion_event, render_home, resolve_chat_context,
@@ -3904,6 +3994,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("temporary directory exists");
         dir
+    }
+
+    #[test]
+    fn empty_web_store_gets_a_durable_scratch_surface() {
+        let root = temp_dir("piku-web-default-surface");
+        let surfaces = ensure_default_surface(&root).expect("default surface is created");
+        assert_eq!(surfaces, ["scratch"]);
+        assert!(root.join("scratch/canvas-state.json").is_file());
+        assert_eq!(
+            ensure_default_surface(&root).expect("existing surface remains canonical"),
+            ["scratch"]
+        );
+        fs::remove_dir_all(root).expect("temporary surface store is removed");
     }
 
     #[test]

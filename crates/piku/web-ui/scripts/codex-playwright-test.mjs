@@ -23,7 +23,7 @@ const repoRoot = path.resolve(webUiDir, "../../..");
 const artifactsDir = path.join(repoRoot, ".artifacts", "playwright-agent");
 const promptPath = path.join(webUiDir, "e2e", "codex-live-qa.md");
 const schemaPath = path.join(webUiDir, "e2e", "agent-report.schema.json");
-const runId = new Date().toISOString().replaceAll(/[:.]/g, "-");
+const runId = process.env.PIKU_EVAL_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-");
 const surfaceName = `qa-${Date.now()}-journey`;
 const runDir = path.join(artifactsDir, "runs", runId);
 const playwrightOutputDir = path.join(runDir, "playwright-output");
@@ -33,7 +33,11 @@ const ledgerPath =
   process.env.PIKU_LIVE_LEDGER ||
   path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl");
 const startedAt = Date.now();
-const runtime = evaluationRuntimeMetadata(repoRoot);
+const runtime = {
+  ...evaluationRuntimeMetadata(repoRoot),
+  evaluation_server_ownership: process.env.PIKU_EVAL_SERVER_OWNERSHIP || "external",
+  evaluation_fixture_available: process.env.PIKU_EVAL_FIXTURE_AVAILABLE === "true",
+};
 const requiredPhases = ["ORIENT", "DISCOVER", "CONSTRUCT", "MANIPULATE", "TRUST", "STRESS", "REFLOW", "REFLECT"];
 const requiredThesisDimensions = [
   "task_comprehension",
@@ -61,9 +65,9 @@ const parsed = new URL(target);
 if (
   parsed.protocol !== "http:" ||
   !["localhost", "127.0.0.1"].includes(parsed.hostname) ||
-  parsed.port !== "9090"
+  !parsed.port
 ) {
-  throw new Error("--url must be http://localhost:9090 or http://127.0.0.1:9090");
+  throw new Error("--url must be a loopback HTTP origin with an explicit port");
 }
 
 try {
@@ -71,7 +75,7 @@ try {
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
 } catch (error) {
   console.error(`Piku is not reachable at ${parsed}: ${error.message}`);
-  console.error("Start it in your own terminal, then rerun this command.");
+  console.error("Use npm run test:agent to start a managed evaluator server, or provide a healthy PIKU_WEB_URL.");
   process.exit(2);
 }
 
@@ -97,6 +101,7 @@ const baseArgs = codexExecArgs({
   prompt,
   playwright: true,
   playwrightCwd: webUiDir,
+  playwrightOrigin: parsed.toString(),
   cwd: repoRoot,
 });
 const args = withPlaywrightAuthority(baseArgs, playwrightOutputDir);

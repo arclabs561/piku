@@ -35,3 +35,27 @@ test("judge environment excludes provider secrets and agent configuration", () =
   assert.deepEqual(env, { HOME: "/auth-home", LANG: "en_US.UTF-8", PATH: "/bin" });
   assert.equal(env.OPENROUTER_API_KEY, undefined);
 });
+
+test("browser judge authority follows the managed loopback origin", () => {
+  const args = codexExecArgs({
+    schemaPath: "schema.json",
+    reportPath: "report.json",
+    prompt: "Inspect the managed surface.",
+    cwd: "/repo",
+    playwright: true,
+    playwrightCwd: "/repo/web-ui",
+    playwrightOrigin: "http://localhost:43210/",
+  });
+  const setting = args.find((arg) => arg.startsWith("mcp_servers.playwright.args="));
+  const configured = JSON.parse(setting.slice(setting.indexOf("=") + 1));
+  assert.equal(configured[configured.indexOf("--allowed-origins") + 1], "http://localhost:43210");
+  assert.throws(() => codexExecArgs({
+    schemaPath: "schema.json",
+    reportPath: "report.json",
+    prompt: "bad origin",
+    cwd: "/repo",
+    playwright: true,
+    playwrightCwd: "/repo/web-ui",
+    playwrightOrigin: "https://example.com",
+  }));
+});

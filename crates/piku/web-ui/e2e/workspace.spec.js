@@ -33,6 +33,11 @@ async function addObject(page, label, position) {
   await page.getByRole("button", { name: label, exact: true }).click();
 }
 
+async function selectManagedFixture(chat) {
+  if (process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1")
+    await chat.getByLabel("Chat executor").selectOption("evaluation_fixture");
+}
+
 test("loads without host-page errors and exposes the spatial workspace", async ({
   page,
   surfaceName,
@@ -352,6 +357,59 @@ test("object picker can raise a buried workspace object", async ({
   expect(restoredFileZ).toBeGreaterThan(restoredNoteZ);
 });
 
+test("crowded desktop cards remain reachable through the object picker", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  const anchor = { x: 240, y: 170 };
+  for (const label of ["note", "file", "chat", "change workspace or page", "page preview"])
+    await addObject(page, label, anchor);
+  const created = await page.locator(".workspace-object").evaluateAll((objects) =>
+    objects.map((object) => {
+      const box = object.getBoundingClientRect();
+      return { id: object.dataset.objectId, left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+    }),
+  );
+  for (let left = 0; left < created.length; left += 1) {
+    for (let right = left + 1; right < created.length; right += 1) {
+      const a = created[left], b = created[right];
+      expect(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top).toBeTruthy();
+    }
+  }
+
+  await page.locator(".workspace-object").evaluateAll((objects) => {
+    objects.forEach((object, index) => {
+      object.style.left = "360px";
+      object.style.top = "220px";
+      object.style.zIndex = String(100 - index);
+      object.dataset.layoutX = "360";
+      object.dataset.layoutY = "220";
+    });
+  });
+  const ids = await page.locator(".workspace-object").evaluateAll((objects) =>
+    objects.map((object) => object.dataset.objectId),
+  );
+  for (const id of ids) {
+    await page.getByLabel("Workspace objects").selectOption(id);
+    const card = page.locator(`[data-object-id="${id}"]`);
+    await expect.poll(async () => card.evaluate((object) => {
+      const peers = [...document.querySelectorAll(".workspace-object")];
+      return Number(object.style.zIndex) === Math.max(...peers.map((peer) => Number(peer.style.zIndex)));
+    })).toBeTruthy();
+    const handle = card.locator(".object-handle");
+    await expect.poll(async () => handle.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      return hit === element || element.contains(hit);
+    })).toBeTruthy();
+  }
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  await page.reload();
+  const bottom = ids.at(-1);
+  await page.getByLabel("Workspace objects").selectOption(bottom);
+  await expect(page.locator(`[data-object-id="${bottom}"] .object-handle`)).toBeVisible();
+});
+
 test("chat and explicit change authority are visibly different intents", async ({
   page,
   surfaceName: _surfaceName,
@@ -374,6 +432,10 @@ test("new chat cards default to the visible isolated Codex executor", async ({
   page,
   surfaceName: _surfaceName,
 }) => {
+  test.skip(
+    process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1",
+    "the hermetic managed server intentionally has no operator Codex credentials",
+  );
   await addObject(page, "chat", { x: 240, y: 120 });
   const chat = page.locator('[data-kind="chat"]');
   await expect(chat.getByLabel("Chat executor")).toHaveValue("codex");
@@ -988,11 +1050,14 @@ test("a running notebook stays on its originating surface until its result is sa
   ).toContainText("Persisted on the originating surface.");
 });
 
-test("Codex chat cards persist and resume their native thread identity", async ({
+test("chat cards persist and resume their server thread identity", async ({
   page,
   request,
   surfaceName,
 }) => {
+  const executor = process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
+    ? "evaluation_fixture"
+    : "codex";
   const threadId = "019fe300-0000-7000-8000-000000000001";
   const saved = await request.put(
     `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
@@ -1009,7 +1074,7 @@ test("Codex chat cards persist and resume their native thread identity", async (
             height: 544,
             content: JSON.stringify({
               version: 4,
-              executor: "codex",
+              executor,
               threadId: "",
               context: "",
               sources: [],
@@ -1035,11 +1100,11 @@ test("Codex chat cards persist and resume their native thread identity", async (
   await page.route("**/api/chat", async (route) => {
     requests.push(route.request().postDataJSON());
     const events = [
-      { kind: "request_accepted", surface: surfaceName, executor: "codex" },
+      { kind: "request_accepted", surface: surfaceName, executor },
       {
         kind: "model_started",
         surface: surfaceName,
-        provider: "codex",
+        provider: executor,
         model: "fixture-sol",
         sandbox: "read-only",
         thread_id: threadId,
@@ -1053,7 +1118,7 @@ test("Codex chat cards persist and resume their native thread identity", async (
         message: "done",
         elapsed_seconds: 0.01,
         canvas_changed: false,
-        executor: "codex",
+        executor,
         thread_id: threadId,
       },
     ];
@@ -1068,7 +1133,7 @@ test("Codex chat cards persist and resume their native thread identity", async (
   const chat = page.locator('[data-object-id="codex-thread"]');
   await chat.getByRole("button", { name: "run all", exact: true }).click();
   await expect.poll(() => requests.length).toBe(1);
-  expect(requests[0]).toMatchObject({ executor: "codex", thread_id: null });
+  expect(requests[0]).toMatchObject({ executor, thread_id: null });
   await expect(chat.locator(".chat-executor-status")).toContainText("thread 019fe300");
 
   await expect(page.locator("#save-status")).toHaveText("saved");
@@ -1078,7 +1143,7 @@ test("Codex chat cards persist and resume their native thread identity", async (
   await chat.getByLabel("New chat turn").press("Enter");
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[1]).toMatchObject({
-    executor: "codex",
+    executor,
     thread_id: threadId,
     history: [],
   });
@@ -1173,6 +1238,66 @@ test("a running chat exposes user-owned cancellation", async ({
     );
   });
   expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("managed evaluation fixture cancellation survives fresh context", async ({
+  browser,
+  page,
+  request,
+  surfaceName,
+}) => {
+  test.skip(process.env.PIKU_REQUIRE_EVALUATION_FIXTURES !== "1", "managed evaluator integration probe");
+  const catalog = await (await request.get("/api/executors")).json();
+  expect(catalog.executors).toContainEqual(expect.objectContaining({
+    id: "evaluation_fixture",
+    available: true,
+  }));
+  const content = JSON.stringify({
+    version: 4,
+    executor: "evaluation_fixture",
+    threadId: "",
+    model: "",
+    context: "",
+    sources: [],
+    turns: [{ id: "slow", prompt: "Take a long time.", response: "", status: "idle", attempt: 0, completedAt: "" }],
+  });
+  const saved = await request.put(`/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`, {
+    data: { objects: [{ id: "managed-cancel", kind: "chat", title: "managed cancel", x: 80, y: 90, width: 704, height: 544, content }] },
+  });
+  expect(saved.ok()).toBeTruthy();
+  await page.reload();
+  const chat = page.locator('[data-object-id="managed-cancel"]');
+  await chat.getByRole("button", { name: "run all", exact: true }).click();
+  const stop = chat.getByRole("button", { name: "stop", exact: true });
+  await expect(stop).toBeEnabled();
+  await expect(page.getByRole("article", { name: "Execution trace" })).toContainText("Waiting for explicit user cancellation");
+  await expect(chat.locator(".chat-response")).toContainText("Fixture active");
+  const requestId = await page
+    .getByRole("article", { name: "Execution trace" })
+    .getAttribute("data-request-id");
+  expect(requestId).toMatch(/^[A-Za-z0-9_-]+$/);
+  await stop.click();
+  await expect(chat.locator(".chat-turn-status")).toContainText("cancelled");
+  await expect(chat.locator(".chat-turn-status")).not.toContainText("done");
+  await expect.poll(async () => {
+    const response = await request.get(
+      `/api/evaluation-fixtures/cancellations/${encodeURIComponent(requestId)}`,
+    );
+    return response.ok() ? await response.json() : null;
+  }).toEqual({ request_id: requestId, acknowledged: true });
+
+  const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const freshPage = await freshContext.newPage();
+  try {
+    await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+    const restored = freshPage.locator('[data-object-id="managed-cancel"]');
+    await expect(restored.locator(".chat-turn-status")).toContainText("cancelled");
+    await expect(restored.locator(".chat-response")).toContainText("Fixture active");
+    await expect(restored).toHaveCSS("left", "80px");
+    await expect(restored).toHaveCSS("top", "90px");
+  } finally {
+    await freshContext.close();
+  }
 });
 
 test("pointer selection marks a card without changing canvas viewport", async ({
@@ -1302,6 +1427,11 @@ test("chat cards attach selected workspace context explicitly", async ({
     const request = route.request().postDataJSON();
     requests.push(request);
     expect(request.surface).toBe(surfaceName);
+    expect(request.executor).toBe(
+      process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
+        ? "evaluation_fixture"
+        : "codex",
+    );
     expect(request.context).toBe("Only use attached evidence.");
     expect(request.context).not.toContain("SOURCE");
     expect(JSON.stringify(request)).not.toContain("durable context from the board");
@@ -1323,6 +1453,7 @@ test("chat cards attach selected workspace context explicitly", async ({
   await page.getByRole("textbox", { name: "Note", exact: true }).fill("durable context from the board");
   await addObject(page, "chat", { x: 680, y: 80 });
   const chat = page.locator('[data-kind="chat"]');
+  await selectManagedFixture(chat);
   // The two existing cards cover the visible canvas. Dispatching on the canvas
   // itself exercises its creation handler without turning a card click into a
   // drag/focus gesture.
@@ -1365,6 +1496,11 @@ test("execution traces stay visibly transient and outside workspace persistence"
   surfaceName,
 }) => {
   await page.route("**/api/chat", async (route) => {
+    expect(route.request().postDataJSON().executor).toBe(
+      process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
+        ? "evaluation_fixture"
+        : "codex",
+    );
     await new Promise((resolve) => setTimeout(resolve, 800));
     await route.fulfill({
       status: 200,
@@ -1382,6 +1518,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
 
   await addObject(page, "chat", { x: 160, y: 100 });
   const chat = page.locator('[data-kind="chat"]');
+  await selectManagedFixture(chat);
   await expect(page.locator("#save-status")).toHaveText("saved");
   await chat.getByLabel("New chat turn").fill("show the transient trace");
   await chat.getByRole("button", { name: "send", exact: true }).click();
@@ -1440,9 +1577,15 @@ test("execution traces stay visibly transient and outside workspace persistence"
 test("workspace state crosses browser contexts while viewport state does not", async ({
   browser,
   page,
+  request,
   surfaceName,
 }) => {
   await page.route("**/api/chat", async (route) => {
+    expect(route.request().postDataJSON().executor).toBe(
+      process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
+        ? "evaluation_fixture"
+        : "codex",
+    );
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
@@ -1458,10 +1601,14 @@ test("workspace state crosses browser contexts while viewport state does not", a
   await addObject(page, "terminal", { x: 120, y: 110 });
   await addObject(page, "chat", { x: 900, y: 540 });
   const chat = page.locator('[data-kind="chat"]');
+  await selectManagedFixture(chat);
   await chat.getByLabel("New chat turn").fill("persist this thread");
   await chat.getByRole("button", { name: "send", exact: true }).click();
   await expect(chat.locator(".chat-response")).toContainText("durable cross-context answer");
   await expect(page.locator("#save-status")).toHaveText("saved");
+  const persisted = await (await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)).json();
+  const expectedObjects = persisted.objects.map(({ id, kind, title, x, y, width, height, z, content }) =>
+    ({ id, kind, title, x, y, width, height, z, content })).sort((a, b) => a.id.localeCompare(b.id));
 
   await page.locator("#canvas").evaluate((canvas) => canvas.scrollTo(0, 240));
   await expect.poll(() => page.locator("#canvas").evaluate((canvas) => canvas.scrollTop)).toBeGreaterThan(0);
@@ -1482,6 +1629,21 @@ test("workspace state crosses browser contexts while viewport state does not", a
     ).toBeVisible();
     await expect(freshPage.locator('[data-kind="chat"] .chat-response')).toContainText("durable cross-context answer");
     await expect(freshPage.locator('[data-kind="chat"] .chat-turn-status')).toContainText("done · attempt 1");
+    await expect(freshPage.locator(".workspace-object.selected")).toHaveCount(0);
+    const restoredObjects = await freshPage.locator(".workspace-object").evaluateAll((objects) =>
+      objects.map((object) => ({
+        id: object.dataset.objectId,
+        kind: object.dataset.kind,
+        title: object.dataset.title,
+        x: Number(object.dataset.layoutX),
+        y: Number(object.dataset.layoutY),
+        width: Number(object.dataset.layoutWidth),
+        height: Number(object.dataset.layoutHeight),
+        z: Number(object.style.zIndex),
+        content: object.dataset.content,
+      })).sort((a, b) => a.id.localeCompare(b.id)),
+    );
+    expect(restoredObjects).toEqual(expectedObjects);
     await expect.poll(() => freshPage.locator("#canvas").evaluate((canvas) => ({ left: canvas.scrollLeft, top: canvas.scrollTop }))).toEqual({ left: 0, top: 0 });
   } finally {
     await freshContext.close();
@@ -1510,7 +1672,8 @@ test("file rejection state survives reload with its input", async ({
 
 test("file snapshots detect staleness and refresh explicitly across reload", async ({
   page,
-  surfaceName: _surfaceName,
+  request,
+  surfaceName,
 }) => {
   let reads = 0;
   await page.route("**/api/terminal/read", async (route) => {
@@ -1549,6 +1712,13 @@ test("file snapshots detect staleness and refresh explicitly across reload", asy
   await expect(file.locator(".file-snapshot")).toContainText("revision 2 · current");
   await expect(file.locator(".object-output")).toContainText("changed on disk");
   await expect(page.locator("#save-status")).toHaveText("saved");
+  await expect.poll(async () => {
+    const saved = await (
+      await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)
+    ).json();
+    const card = saved.objects.find((object) => object.kind === "file");
+    return card ? JSON.parse(card.content).revision : 0;
+  }).toBe(2);
 
   await page.reload();
   await expect(page.locator('[data-kind="file"] .file-snapshot')).toContainText(

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import path from "node:path";
@@ -62,13 +63,54 @@ test("pair arms are sequential and focus is isolated to the focused arm", async 
     environment: { PIKU_EVAL_FOCUS_EVENTS: "/must/not/leak" }, evaluate,
   });
   assert.deepEqual(calls.map((call) => call.runId), ["pair-one-focused", "pair-one-blind"]);
-  assert.equal(calls[0].focus, focusPath);
+  assert.equal(calls[0].focus, path.join(paired.pairDir, "focus-events.jsonl"));
   assert.equal(calls[1].focus, undefined);
   assert.notEqual(paired.manifest.arms.blind.run_id, paired.manifest.arms.focused.run_id);
   assert.equal(JSON.parse(await readFile(path.join(paired.pairDir, "manifest.json"))).automatic_focus_mutation, false);
   await assert.rejects(runFocusPair({
     pairOrdinal: 1, focusEventsPath: focusPath, pairId: "pair-one", outputRoot: root, evaluate,
   }), /EEXIST/);
+});
+
+test("focus bytes are snapshotted before either arm and remain immutable", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-pair-snapshot-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const focusPath = path.join(root, "events.jsonl");
+  const original = `${JSON.stringify({ event_kind: "proposal", proposal_id: "p1", question: "Original?" })}\n`;
+  await writeFile(focusPath, original);
+  let focusedBytes;
+  const paired = await runFocusPair({
+    pairOrdinal: 0, focusEventsPath: focusPath, pairId: "pair-snapshot", outputRoot: root,
+    evaluate: async ({ environment }) => {
+      if (environment.PIKU_EVAL_RUN_ID.endsWith("-blind"))
+        await writeFile(focusPath, `${JSON.stringify({ event_kind: "proposal", proposal_id: "p2" })}\n`);
+      else focusedBytes = await readFile(environment.PIKU_EVAL_FOCUS_EVENTS, "utf8");
+      return result(environment.PIKU_EVAL_RUN_ID);
+    },
+  });
+  assert.equal(focusedBytes, original);
+  assert.equal(paired.manifest.arms.focused.focus.snapshot_path, "focus-events.jsonl");
+  assert.equal(
+    await readFile(path.join(paired.pairDir, paired.manifest.arms.focused.focus.snapshot_path), "utf8"),
+    original,
+  );
+  assert.equal(
+    paired.manifest.arms.focused.focus.source_sha256,
+    createHash("sha256").update(original).digest("hex"),
+  );
+});
+
+test("pair IDs cannot escape the artifact root", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-pair-id-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const focusPath = path.join(root, "events.jsonl");
+  await writeFile(focusPath, "");
+  for (const pairId of ["../escape", "/tmp/escape", "pair/escape", ".", "pair--escape"]) {
+    await assert.rejects(
+      runFocusPair({ pairOrdinal: 0, focusEventsPath: focusPath, pairId, outputRoot: root }),
+      /pair ID/,
+    );
+  }
 });
 
 test("incomplete arm makes the dossier inconclusive without a winner or score", () => {

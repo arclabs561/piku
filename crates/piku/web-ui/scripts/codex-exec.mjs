@@ -11,6 +11,7 @@ export function codexExecArgs({
   cwd,
   playwright = false,
   playwrightCwd,
+  playwrightOrigin = "http://127.0.0.1:9090",
   model = resolvedCodexModel(),
 }) {
   const args = [
@@ -36,11 +37,16 @@ export function codexExecArgs({
   ];
   if (playwright) {
     if (!playwrightCwd) throw new Error("playwrightCwd is required for a browser judge");
+    const parsedOrigin = new URL(playwrightOrigin);
+    const origin = parsedOrigin.origin;
+    if (parsedOrigin.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(parsedOrigin.hostname)
+      || !parsedOrigin.port)
+      throw new Error("playwrightOrigin must be a loopback HTTP origin with an explicit port");
     args.push(
       "--config", 'mcp_servers.playwright.command="npx"',
       "--config", `mcp_servers.playwright.cwd=${JSON.stringify(playwrightCwd)}`,
       "--config", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
-      "--config", 'mcp_servers.playwright.args=["--no-install","playwright-mcp","--headless","--isolated","--browser","chromium","--allowed-hosts","localhost,127.0.0.1","--allowed-origins","http://localhost:9090;http://127.0.0.1:9090"]',
+      "--config", `mcp_servers.playwright.args=${JSON.stringify(["--no-install", "playwright-mcp", "--headless", "--isolated", "--browser", "chromium", "--allowed-hosts", "localhost,127.0.0.1", "--allowed-origins", origin])}`,
     );
   }
   args.push(prompt);

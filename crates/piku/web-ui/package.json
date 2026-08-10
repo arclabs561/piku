@@ -4,12 +4,13 @@
   "scripts": {
     "build": "esbuild app.js --bundle --format=iife --platform=browser --target=safari17 --outfile=../src/web/app.js --loader:.css=css",
     "test:e2e": "node ./node_modules/@playwright/test/cli.js test",
+    "test:e2e:managed": "node scripts/run-managed-eval.mjs e2e",
     "test:e2e:smoke": "node ./node_modules/@playwright/test/cli.js test e2e/operator-journey.spec.js e2e/workspace.spec.js --grep \"an operator can inspect, contextualize, rerun, and resume|a second blank-canvas click closes the creation menu|Escape dismisses the creation menu|notes drag and persist through the server|corner handles resize, reposition, and persist workspace cards|chat cards persist isolated notebook history and rerun from edited turns\"",
     "test:e2e:headed": "node ./node_modules/@playwright/test/cli.js test --headed",
     "test:harness": "node --test scripts/*.test.mjs",
-    "test:agent": "node scripts/codex-playwright-test.mjs",
-    "test:agent:parallel": "node scripts/parallel-agent-eval.mjs",
-    "test:agent:focus-pair": "node scripts/focus-pair-eval.mjs"
+    "test:agent": "node scripts/run-managed-eval.mjs single",
+    "test:agent:parallel": "node scripts/run-managed-eval.mjs parallel",
+    "test:agent:focus-pair": "node scripts/run-managed-eval.mjs focus-pair"
   },
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",

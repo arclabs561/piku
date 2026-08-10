@@ -18,5 +18,8 @@ test("front porch runs the cheap operator and interaction predicates", () => {
     "drag and persist",
     "corner handles resize",
     "rerun from edited turns",
+    "crosses browser contexts",
+    "fixture cancellation survives fresh context",
+    "crowded desktop cards remain reachable",
   ]) assert.match(frontPorchPattern, new RegExp(behavior));
 });

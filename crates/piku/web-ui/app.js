@@ -2296,8 +2296,9 @@ function updatePageTargetLabels() {
     });
 }
 
+const narrowWorkspaceQuery = window.matchMedia("(max-width: 640px)");
 function narrowWorkspace() {
-  return window.matchMedia("(max-width: 640px)").matches;
+  return narrowWorkspaceQuery.matches;
 }
 
 function layoutWorkspaceForViewport() {
@@ -2342,16 +2343,16 @@ function layoutWorkspaceForViewport() {
 }
 
 let layoutFrame = null;
-let previousNarrowWorkspace = narrowWorkspace();
+narrowWorkspaceQuery.addEventListener("change", (event) => {
+  if (!event.matches) {
+    canvas.scrollTop = 0;
+    canvas.scrollLeft = 0;
+  }
+  layoutWorkspaceForViewport();
+});
 window.addEventListener("resize", () => {
   cancelAnimationFrame(layoutFrame);
   layoutFrame = requestAnimationFrame(() => {
-    const isNarrow = narrowWorkspace();
-    if (previousNarrowWorkspace && !isNarrow) {
-      canvas.scrollTop = 0;
-      canvas.scrollLeft = 0;
-    }
-    previousNarrowWorkspace = isNarrow;
     layoutWorkspaceForViewport();
   });
 });

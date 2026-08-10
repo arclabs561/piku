@@ -14,6 +14,13 @@ export function focusPairOrder(pairOrdinal) {
   return pairOrdinal % 2 === 0 ? [...armNames] : [...armNames].reverse();
 }
 
+export function validatePairId(value) {
+  if (typeof value !== "string" || value.length > 128
+    || !/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(value))
+    throw new TypeError("pair ID must contain only alphanumeric hyphen-separated components");
+  return value;
+}
+
 function digest(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -136,9 +143,11 @@ export async function runFocusPair({
   outputRoot = path.join(repoRoot, ".artifacts", "playwright-agent", "focus-pairs"),
 } = {}) {
   const order = focusPairOrder(pairOrdinal);
+  validatePairId(pairId);
   if (typeof focusEventsPath !== "string" || focusEventsPath.length === 0)
     throw new TypeError("focused arm requires an explicit focus events path");
-  const events = (await readFile(path.resolve(focusEventsPath), "utf8"))
+  const focusBytes = await readFile(path.resolve(focusEventsPath));
+  const events = focusBytes.toString("utf8")
     .split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const promotedProposalIds = new Set(events
     .filter((event) => event.event_kind === "promotion")
@@ -149,12 +158,15 @@ export async function runFocusPair({
   await mkdir(outputRoot, { recursive: true });
   const pairDir = path.join(outputRoot, pairId);
   await mkdir(pairDir, { recursive: false });
+  const focusSnapshotFile = "focus-events.jsonl";
+  const focusSnapshotPath = path.join(pairDir, focusSnapshotFile);
+  await writeFile(focusSnapshotPath, focusBytes, { flag: "wx", mode: 0o600 });
   const results = {};
   const armFailures = [];
   for (const arm of order) {
     const armEnvironment = { ...environment, PIKU_EVAL_RUN_ID: `${pairId}-${arm}` };
     delete armEnvironment.PIKU_EVAL_RESUME_RUN_ID;
-    if (arm === "focused") armEnvironment.PIKU_EVAL_FOCUS_EVENTS = path.resolve(focusEventsPath);
+    if (arm === "focused") armEnvironment.PIKU_EVAL_FOCUS_EVENTS = focusSnapshotPath;
     else delete armEnvironment.PIKU_EVAL_FOCUS_EVENTS;
     try { results[arm] = await evaluate({ environment: armEnvironment, argv: [] }); }
     catch (error) {
@@ -169,13 +181,16 @@ export async function runFocusPair({
   let contract = null;
   try { contract = validatePairedContracts(results.blind, results.focused); }
   catch (error) { confounds.push(error.message); }
-  const focusSourceSha256 = createHash("sha256").update(await readFile(focusEventsPath)).digest("hex");
+  const focusSourceSha256 = createHash("sha256").update(focusBytes).digest("hex");
   const manifest = {
     schema_version: 1, pair_id: pairId, pair_ordinal: pairOrdinal, order,
     arms: Object.fromEntries(armNames.map((arm) => [arm, {
       run_id: results[arm]?.runId ?? `${pairId}-${arm}`,
       artifact_directory: results[arm]?.runDir ?? null,
-      focus: arm === "focused" ? { source_sha256: focusSourceSha256 } : null,
+      focus: arm === "focused" ? {
+        source_sha256: focusSourceSha256,
+        snapshot_path: focusSnapshotFile,
+      } : null,
     }])),
     shared_contract: contract,
     automatic_focus_mutation: false,

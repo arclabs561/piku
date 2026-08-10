@@ -304,9 +304,9 @@ export async function writeSynthesisFocusProposals(record, {
   return { path: proposalPath, proposals };
 }
 
-function invocationArgs({ schemaPath, reportPath, prompt, model, playwright = false, playwrightOutputDir = null }) {
+function invocationArgs({ schemaPath, reportPath, prompt, model, playwright = false, playwrightOutputDir = null, playwrightOrigin = undefined }) {
   const args = codexExecArgs({
-    schemaPath, reportPath, prompt, playwright, playwrightCwd: webUiDir, cwd: repoRoot, model,
+    schemaPath, reportPath, prompt, playwright, playwrightCwd: webUiDir, playwrightOrigin, cwd: repoRoot, model,
   });
   return playwright ? withPlaywrightAuthority(args, playwrightOutputDir) : args;
 }
@@ -355,6 +355,7 @@ export async function buildPromptManifest({
       model: config.model,
       playwright: true,
       playwrightOutputDir: path.join(roleDir, "playwright-output"),
+      playwrightOrigin: baseUrl.toString(),
     });
     return {
       role,
@@ -758,12 +759,12 @@ export function validateSynthesis(report, packets) {
     throw new Error("supported synthesis verdict cannot have limited perspective coverage");
 }
 
-export async function runCodex({ label = "judge", prompt, schemaPath, reportPath, eventsPath, timeoutMs, maxCalls = Infinity, maxSnapshots = Infinity, playwright = false, playwrightOutputDir = null, model = resolvedCodexModel() }) {
+export async function runCodex({ label = "judge", prompt, schemaPath, reportPath, eventsPath, timeoutMs, maxCalls = Infinity, maxSnapshots = Infinity, playwright = false, playwrightOutputDir = null, playwrightOrigin = undefined, model = resolvedCodexModel() }) {
   await mkdir(path.dirname(reportPath), { recursive: true });
   if (playwright && !playwrightOutputDir) throw new Error("playwrightOutputDir is required for a browser judge");
   if (playwright) await mkdir(playwrightOutputDir, { recursive: true });
   const events = createWriteStream(eventsPath, { flags: "wx" });
-  const baseArgs = codexExecArgs({ schemaPath, reportPath, prompt, playwright, playwrightCwd: webUiDir, cwd: repoRoot, model });
+  const baseArgs = codexExecArgs({ schemaPath, reportPath, prompt, playwright, playwrightCwd: webUiDir, playwrightOrigin, cwd: repoRoot, model });
   const args = playwright ? withPlaywrightAuthority(baseArgs, playwrightOutputDir) : baseArgs;
   const child = spawn("codex", args, {
     cwd: repoRoot,
@@ -900,6 +901,7 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
       prompt,
       schemaPath: path.join(webUiDir, "e2e", "explorer-report.schema.json"),
       reportPath, eventsPath, timeoutMs, maxCalls: hardMaxCalls, maxSnapshots, playwright: true, playwrightOutputDir,
+      playwrightOrigin: baseUrl.toString(),
       model,
     });
     if (outcome.reason === "timeout") {
@@ -960,8 +962,8 @@ export async function runEvaluation({
     return { runId: resumeRunId, runStatus: "completed", resumed: true };
   }
   const baseUrl = new URL(environment.PIKU_WEB_URL || "http://127.0.0.1:9090");
-  if (baseUrl.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(baseUrl.hostname) || baseUrl.port !== "9090")
-    throw new Error("PIKU_WEB_URL must be the local Piku server on port 9090");
+  if (baseUrl.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(baseUrl.hostname) || !baseUrl.port)
+    throw new Error("PIKU_WEB_URL must be a loopback HTTP origin with an explicit port");
   const response = await fetchImpl(baseUrl, { signal: AbortSignal.timeout(3_000) });
   if (!response.ok) throw new Error(`Piku returned HTTP ${response.status}`);
   const removed = await cleanupStaleAutomationSurfaces(baseUrl);
@@ -987,6 +989,9 @@ export async function runEvaluation({
   }]));
   const runtime = {
     ...evaluationRuntimeMetadata(repoRoot),
+    evaluation_server_ownership: environment.PIKU_EVAL_SERVER_OWNERSHIP || "external",
+    evaluation_fixture_available: environment.PIKU_EVAL_FIXTURE_AVAILABLE === "true",
+    evaluation_server_origin: baseUrl.origin,
     viewport: { width: 1440, height: 1000 },
     explorer_target_calls: Object.fromEntries(roles.map((role) => [role, explorerConfigs[role].target_calls])),
     explorer_hard_max_calls: explorerHardCallLimit(environment),

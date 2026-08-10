@@ -9,6 +9,9 @@ export const frontPorchPattern = [
   "notes drag and persist through the server",
   "corner handles resize, reposition, and persist workspace cards",
   "chat cards persist isolated notebook history and rerun from edited turns",
+  "workspace state crosses browser contexts while viewport state does not",
+  "managed evaluation fixture cancellation survives fresh context",
+  "crowded desktop cards remain reachable through the object picker",
 ].join("|");
 
 export function frontPorchArgs() {
@@ -34,6 +37,7 @@ export async function runDeterministicFrontPorch({
       ...process.env,
       PIKU_WEB_URL: baseUrl.toString(),
       PLAYWRIGHT_OUTPUT_DIR: path.join(outputDir, "playwright-output"),
+      PIKU_REQUIRE_EVALUATION_FIXTURES: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
