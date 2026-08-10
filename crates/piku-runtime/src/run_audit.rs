@@ -104,6 +104,7 @@ struct TurnState {
     started: Option<u64>,
     started_input_sha256: Option<crate::Sha256Digest>,
     started_input_bytes: Option<usize>,
+    started_input_digest_unavailable: bool,
     completed: Option<u64>,
     context_builds: usize,
     authority_lease: Option<u64>,
@@ -358,6 +359,7 @@ impl<'a> Auditor<'a> {
             }
             ContentRef::Artifact(artifact) => {
                 turn.started_input_bytes = usize::try_from(artifact.bytes).ok();
+                turn.started_input_digest_unavailable = true;
             }
             ContentRef::Unavailable { .. } => {}
         }
@@ -375,7 +377,7 @@ impl<'a> Auditor<'a> {
             unreachable!("request context handler requires request context event")
         };
         audit_content(&mut self.audit.content, context);
-        let (bytes_mismatch, digest_mismatch) = {
+        let (bytes_mismatch, digest_mismatch, digest_unavailable) = {
             let turn = self.turns.entry(turn_id).or_default();
             (
                 turn.started_input_bytes
@@ -383,6 +385,7 @@ impl<'a> Auditor<'a> {
                 turn.started_input_sha256
                     .as_ref()
                     .is_some_and(|digest| digest != composed_input_sha256),
+                turn.started_input_digest_unavailable,
             )
         };
         if bytes_mismatch {
@@ -400,6 +403,16 @@ impl<'a> Auditor<'a> {
                 AuditSeverity::Error,
                 "request_context_input_digest_mismatch",
                 format!("turn {turn_id} request context digest does not match its recorded input"),
+                vec![envelope.sequence],
+            );
+        }
+        if digest_unavailable {
+            self.add_finding(
+                AuditSeverity::Error,
+                "request_context_input_digest_unverifiable",
+                format!(
+                    "turn {turn_id} request context digest cannot be verified against its artifact input"
+                ),
                 vec![envelope.sequence],
             );
         }
@@ -857,7 +870,8 @@ fn event_name(event: &RunEvent) -> &'static str {
 mod tests {
     use super::*;
     use crate::run_record::{
-        ContextManifest, ContextSourceSummary, PermissionDecision, RUN_RECORD_SCHEMA_VERSION,
+        ArtifactRef, ContextManifest, ContextSourceSummary, PermissionDecision,
+        RUN_RECORD_SCHEMA_VERSION,
     };
     use crate::{Sha256Digest, SourceReference, Trust};
 
@@ -1044,6 +1058,47 @@ mod tests {
         assert!(codes.contains(&"request_context_input_bytes_mismatch"));
         assert!(codes.contains(&"request_context_input_digest_mismatch"));
         assert_eq!(audit.content.inline_items, 2);
+    }
+
+    #[test]
+    fn materialized_turn_input_cannot_bypass_request_context_digest_verification() {
+        let input_bytes = 16 * 1024 + 1;
+        let events = vec![
+            envelope(
+                0,
+                RunEvent::TurnStarted {
+                    provider: Some("codex".into()),
+                    model: "model".into(),
+                    input: ContentRef::Artifact(ArtifactRef {
+                        relative_path: "artifacts/00000000-input.txt".into(),
+                        media_type: "text/plain; charset=utf-8".into(),
+                        bytes: input_bytes as u64,
+                    }),
+                },
+            ),
+            envelope(
+                1,
+                RunEvent::RequestContextResolved {
+                    context: inline(""),
+                    sources: Vec::new(),
+                    history_messages: 0,
+                    composed_input_sha256: Sha256Digest::of_bytes(&vec![b'x'; input_bytes]),
+                    composed_input_bytes: input_bytes,
+                },
+            ),
+        ];
+
+        let audit = audit_run_record(&events);
+
+        assert!(!audit.is_structurally_complete());
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| { finding.code == "request_context_input_digest_unverifiable" }));
+        assert!(!audit
+            .findings
+            .iter()
+            .any(|finding| { finding.code == "request_context_input_bytes_mismatch" }));
     }
 
     #[test]

@@ -3324,7 +3324,6 @@ fn page_completion_event(
         "provider": provider,
         "model": model,
         "tool_policy": "none",
-        "tool_calls": [],
         "mutation_actor": "Piku host",
         "verification": verification,
     })
@@ -4063,7 +4062,7 @@ mod tests {
     }
 
     #[test]
-    fn page_completion_records_zero_tool_and_host_mutation_provenance() {
+    fn page_completion_distinguishes_tool_policy_from_unobserved_calls() {
         let event = page_completion_event(
             "main",
             "Page source updated",
@@ -4077,7 +4076,10 @@ mod tests {
         assert_eq!(event["provider"], "fixture-provider");
         assert_eq!(event["model"], "fixture-model");
         assert_eq!(event["tool_policy"], "none");
-        assert_eq!(event["tool_calls"], serde_json::json!([]));
+        assert!(
+            event.get("tool_calls").is_none(),
+            "page execution does not observe provider-emitted tool calls"
+        );
         assert_eq!(event["mutation_actor"], "Piku host");
     }
 

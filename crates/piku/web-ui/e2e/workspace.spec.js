@@ -176,7 +176,8 @@ test("notes drag and persist through the server", async ({
 
 test("corner handles resize, reposition, and persist workspace cards", async ({
   page,
-  surfaceName: _surfaceName,
+  request,
+  surfaceName,
 }) => {
   await addObject(page, "note", { x: 360, y: 240 });
   const note = page.locator('[data-kind="note"]');
@@ -259,7 +260,42 @@ test("corner handles resize, reposition, and persist workspace cards", async ({
     object.offsetLeft + object.offsetWidth <=
       document.querySelector("#canvas").clientWidth - 8,
   )).toBeTruthy();
+
+  const south = await note.locator('[data-resize-corner="se"]').boundingBox();
+  await page.mouse.move(south.x + 5, south.y + 5);
+  await page.mouse.down();
+  await page.mouse.move(south.x + 5, south.y + 5000, { steps: 4 });
+  await page.mouse.up();
+  const southClamped = await note.evaluate((object) => ({
+    x: object.offsetLeft,
+    y: object.offsetTop,
+    width: object.offsetWidth,
+    height: object.offsetHeight,
+    canvasHeight: document.querySelector("#canvas").clientHeight,
+  }));
+  expect(southClamped.height).toBeLessThanOrEqual(1800);
+  expect(southClamped.y + southClamped.height).toBeLessThanOrEqual(
+    southClamped.canvasHeight - 8,
+  );
   await expect(page.locator("#save-status")).toHaveText("saved");
+  await expect.poll(async () => {
+    const data = await (await request.get(
+      `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+    )).json();
+    return data.objects.find((object) => object.kind === "note")?.height;
+  }).toBe(southClamped.height);
+
+  await page.reload();
+  const southRestored = await page.locator('[data-kind="note"]').evaluate(
+    (object) => ({
+      y: object.offsetTop,
+      height: object.offsetHeight,
+    }),
+  );
+  expect(southRestored).toEqual({
+    y: southClamped.y,
+    height: southClamped.height,
+  });
 });
 
 test("repeated creation at one point cascades cards without blocking controls", async ({
@@ -599,6 +635,13 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
   );
   expect(requests).toHaveLength(0);
   await chat.getByLabel("User turn").first().press("Backspace");
+  const composingEnterWasNotCancelled = await chat.getByLabel("User turn")
+    .first().evaluate((field) => field.dispatchEvent(new KeyboardEvent(
+      "keydown",
+      { key: "Enter", bubbles: true, cancelable: true, isComposing: true },
+    )));
+  expect(composingEnterWasNotCancelled).toBeTruthy();
+  expect(requests).toHaveLength(0);
   await chat.getByLabel("User turn").first().press("Enter");
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[0]).toMatchObject({

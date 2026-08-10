@@ -48,6 +48,7 @@ const surfacesEl = document.getElementById("surfaces"),
   newBtn = document.getElementById("new-btn"),
   delBtn = document.getElementById("del-btn"),
   terminalBtn = document.getElementById("terminal-btn");
+const MAX_WORKSPACE_OBJECT_HEIGHT = 1800;
 let active = window.PIKU_BOOTSTRAP.active;
 let creationMenu = null,
   zCounter = 20,
@@ -1091,7 +1092,14 @@ function enableResize(object) {
           nextTop = Math.max(8, Math.min(top + dy, bottom - minHeight));
           nextHeight = bottom - nextTop;
         } else {
-          nextHeight = Math.max(minHeight, height + dy);
+          const maxHeight = Math.max(
+            minHeight,
+            Math.min(
+              MAX_WORKSPACE_OBJECT_HEIGHT,
+              canvas.clientHeight - top - 8,
+            ),
+          );
+          nextHeight = Math.max(minHeight, Math.min(height + dy, maxHeight));
         }
         object.style.left = nextLeft + "px";
         object.style.top = nextTop + "px";
@@ -2065,7 +2073,7 @@ function renderChatTurns(object, state) {
       persistChatNotebook(object, state);
     });
     prompt.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
         runChatNotebook(object, state, index, state.turns.length);
       }
