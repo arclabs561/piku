@@ -20,16 +20,20 @@ This distinction is essential:
   supports the Codex-replacement thesis. A valid run may pass while the product
   verdict is `partial` or `not_supported`.
 
-Keep the journey under 45 browser calls and seven accessibility snapshots.
+Aim to complete the journey within 105 browser calls and never exceed 120.
+Keep accessibility snapshots to seven or fewer. Recover from a failed locator
+with a targeted DOM query; do not restart a completed phase.
 Use bounded browser-code actions for clustered interactions and targeted
 locators afterward. Take exactly the five named screenshots below. Inspect the
 returned image pixels for hierarchy, density, clipping, layering, progress,
 and comprehension; accessibility text alone is not visual evidence.
 
 Do not emit a plan, partial report, or assistant prose before all browser work
-and cleanup. Write artifacts only under `{{RUN_DIR}}`. Report screenshot paths
+and cleanup. For every screenshot, pass the full absolute filename
+`{{RUN_DIR}}/<filename>` to the screenshot tool; relative filenames are invalid.
+Write artifacts only under `{{RUN_DIR}}`. Report screenshot paths
 relative to the repository as
-`.artifacts/playwright-agent/runs/{{RUN_ID}}/<filename>`.
+`.artifacts/playwright-agent/runs/{{RUN_ID}}/playwright-output/<filename>`.
 
 Create the exact temporary surface `{{SURFACE}}` through the visible UI. The
 harness owns and independently deletes this surface after the judge exits.

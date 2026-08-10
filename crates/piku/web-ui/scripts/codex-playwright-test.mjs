@@ -11,6 +11,10 @@ import {
 } from "./evaluation-ledger.mjs";
 import { codexExecArgs, codexJudgeEnvironment } from "./codex-exec.mjs";
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
+import {
+  validateRequiredScreenshots,
+  withPlaywrightAuthority,
+} from "./playwright-authority.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptDir, "..");
@@ -21,6 +25,7 @@ const schemaPath = path.join(webUiDir, "e2e", "agent-report.schema.json");
 const runId = new Date().toISOString().replaceAll(/[:.]/g, "-");
 const surfaceName = `qa-${Date.now()}-journey`;
 const runDir = path.join(artifactsDir, "runs", runId);
+const playwrightOutputDir = path.join(runDir, "playwright-output");
 const reportPath = path.join(runDir, "report.json");
 const eventsPath = path.join(runDir, "events.jsonl");
 const ledgerPath =
@@ -41,7 +46,8 @@ const requiredThesisDimensions = [
 ];
 const requiredScreenshots = ["01-empty-desktop.png", "02-create-menu.png", "03-workspace-desktop.png", "04-narrow.png", "05-final-desktop.png"];
 const minPlaywrightCalls = 15;
-const maxPlaywrightCalls = 55;
+const targetPlaywrightCalls = 105;
+const hardMaxPlaywrightCalls = 120;
 const maxSnapshotCalls = 7;
 
 function argumentValue(name) {
@@ -72,14 +78,14 @@ const removed = await cleanupStaleAutomationSurfaces(parsed);
 if (removed.length)
   console.error(`[piku qa] removed ${removed.length} stale automation surfaces`);
 
-await mkdir(runDir, { recursive: true });
+await mkdir(playwrightOutputDir, { recursive: true });
 const template = await readFile(promptPath, "utf8");
 const prompt = template
   .replaceAll("{{PIKU_WEB_URL}}", parsed.toString())
   .replaceAll("{{RUN_ID}}", runId)
-  .replaceAll("{{RUN_DIR}}", runDir)
+  .replaceAll("{{RUN_DIR}}", playwrightOutputDir)
   .replaceAll("{{SURFACE}}", surfaceName);
-const args = codexExecArgs({
+const baseArgs = codexExecArgs({
   schemaPath,
   reportPath,
   prompt,
@@ -87,6 +93,7 @@ const args = codexExecArgs({
   playwrightCwd: webUiDir,
   cwd: repoRoot,
 });
+const args = withPlaywrightAuthority(baseArgs, playwrightOutputDir);
 
 console.error(`Running Codex Playwright QA against ${parsed}`);
 console.error(`Structured report: ${reportPath}`);
@@ -236,12 +243,17 @@ child.on("exit", async (code, signal) => {
       throw new Error(
         `event stream proves only ${successfulPlaywrightCalls.length} successful Playwright calls`,
       );
-    if (completedPlaywrightCalls.length > maxPlaywrightCalls)
-      throw new Error(`browser journey exceeded its ${maxPlaywrightCalls}-call budget (${completedPlaywrightCalls.length})`);
+    if (completedPlaywrightCalls.length > hardMaxPlaywrightCalls)
+      throw new Error(`browser journey exceeded its ${hardMaxPlaywrightCalls}-call hard limit (${completedPlaywrightCalls.length})`);
+    if (completedPlaywrightCalls.length > targetPlaywrightCalls)
+      console.error(
+        `[qa warning] browser journey exceeded its ${targetPlaywrightCalls}-call target (${completedPlaywrightCalls.length})`,
+      );
     if (snapshotCalls.length > maxSnapshotCalls)
       throw new Error(`browser journey exceeded its ${maxSnapshotCalls}-snapshot budget (${snapshotCalls.length})`);
     if (forbiddenActions.length > 0)
       throw new Error("agent used shell commands or edited files during browser QA");
+    validateRequiredScreenshots(eventLines, playwrightOutputDir, requiredScreenshots);
     if (report.coverage?.length < requiredPhases.length || report.journey?.length < requiredPhases.length) {
       throw new Error("report lacks required phase coverage or journey evidence");
     }

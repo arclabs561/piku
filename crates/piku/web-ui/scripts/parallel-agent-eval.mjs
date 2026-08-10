@@ -9,6 +9,7 @@ import { appendEvaluationRecord, evaluationRecord, evaluationRuntimeMetadata } f
 import { attestedFiles, attestedValue, verifyPromptManifest, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 import { codexExecArgs, codexJudgeEnvironment, resolvedCodexModel } from "./codex-exec.mjs";
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
+import { PLAYWRIGHT_TOOLS, withPlaywrightAuthority } from "./playwright-authority.mjs";
 import {
   canonicalEvaluationFocus,
   evaluationStageToFocusProposals,
@@ -23,13 +24,7 @@ const scenarioId = "web-codex-replacement-thesis";
 const focusFile = "focus.json";
 const focusProposalsFile = "focus-proposals.jsonl";
 const activeChildren = new Set();
-export const PLAYWRIGHT_TOOLS = Object.freeze([
-  "browser_click", "browser_close", "browser_console_messages", "browser_drag",
-  "browser_evaluate", "browser_fill_form", "browser_find", "browser_handle_dialog",
-  "browser_hover", "browser_navigate", "browser_navigate_back", "browser_network_request",
-  "browser_network_requests", "browser_press_key", "browser_resize", "browser_select_option",
-  "browser_snapshot", "browser_take_screenshot", "browser_type", "browser_wait_for", "browser_tabs",
-]);
+export { PLAYWRIGHT_TOOLS, withPlaywrightAuthority } from "./playwright-authority.mjs";
 const playwrightTools = new Set(PLAYWRIGHT_TOOLS);
 
 function stopProcessGroup(child, signal) {
@@ -193,17 +188,6 @@ export function traceAuthorityViolation(contents) {
     if (violation) return violation;
   }
   return null;
-}
-
-export function withPlaywrightAuthority(args, outputDir) {
-  const result = [...args];
-  const settingIndex = result.findIndex((arg) => typeof arg === "string" && arg.startsWith("mcp_servers.playwright.args="));
-  if (settingIndex < 0) throw new Error("Codex arguments lack Playwright MCP configuration");
-  const configured = JSON.parse(result[settingIndex].slice(result[settingIndex].indexOf("=") + 1));
-  configured.push("--output-dir", path.resolve(outputDir));
-  result[settingIndex] = `mcp_servers.playwright.args=${JSON.stringify(configured)}`;
-  result.splice(-1, 0, "--config", `mcp_servers.playwright.enabled_tools=${JSON.stringify(PLAYWRIGHT_TOOLS)}`);
-  return result;
 }
 
 export function renderExplorerPrompt(template, { baseUrl, surface, requestId, playwrightOutputDir, targetCalls, maxSnapshots }) {

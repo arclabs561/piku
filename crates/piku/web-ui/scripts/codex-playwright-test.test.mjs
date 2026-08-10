@@ -12,6 +12,7 @@ import {
   evaluationRuntimeMetadata,
   projectReportIdentity,
 } from "./evaluation-ledger.mjs";
+import { validateRequiredScreenshots } from "./playwright-authority.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptsDir, "..");
@@ -49,6 +50,41 @@ test("agent QA contract evaluates the product thesis, not only UI mechanics", as
   assert.equal(parsedSchema.properties.findings.items.properties.id.pattern, "^f[1-9][0-9]*$");
   for (const field of ["id", "finding_ids", "evidence_ids", "retest_of"])
     assert.ok(parsedSchema.properties.followups.items.required.includes(field));
+});
+
+test("single-agent QA uses the shared bounded Playwright authority", async () => {
+  const runner = await readFile(
+    path.join(scriptsDir, "codex-playwright-test.mjs"),
+    "utf8",
+  );
+
+  assert.match(runner, /from "\.\/playwright-authority\.mjs"/);
+  assert.match(runner, /withPlaywrightAuthority\(baseArgs, playwrightOutputDir\)/);
+  assert.match(runner, /replaceAll\("\{\{RUN_DIR\}\}", playwrightOutputDir\)/);
+  assert.doesNotMatch(runner, /browser_run_code_unsafe/);
+});
+
+test("single-agent QA binds each required screenshot to one absolute producer", () => {
+  const root = "/tmp/piku-single/playwright-output";
+  const event = (filename) => ({
+    type: "item.completed",
+    item: {
+      type: "mcp_tool_call", server: "playwright", tool: "browser_take_screenshot",
+      status: "completed", error: null, arguments: { filename },
+    },
+  });
+  assert.deepEqual(
+    validateRequiredScreenshots([event(`${root}/one.png`)], root, ["one.png"]),
+    [`${root}/one.png`],
+  );
+  assert.throws(
+    () => validateRequiredScreenshots([event("one.png")], root, ["one.png"]),
+    /absolute filenames/,
+  );
+  assert.throws(
+    () => validateRequiredScreenshots([event(`${root}/one.png`), event(`${root}/one.png`)], root, ["one.png"]),
+    /exactly one successful producer/,
+  );
 });
 
 test("parallel evaluation separates causal mechanisms from verdicts", async () => {
