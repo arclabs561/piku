@@ -58,9 +58,10 @@ export function explorerIdentity(runId, role) {
 }
 
 export function explorerCallBudget(role, environment = process.env) {
-  const shared = Number(environment.PIKU_EXPLORER_MAX_CALLS || 48);
+  const configuredShared = environment.PIKU_EXPLORER_MAX_CALLS;
+  const shared = Number(configuredShared || 64);
   if (role !== "recovery") return shared;
-  return Number(environment.PIKU_RECOVERY_MAX_CALLS || Math.max(shared, 48));
+  return Number(environment.PIKU_RECOVERY_MAX_CALLS || configuredShared || 72);
 }
 
 export function explorerHardCallLimit(environment = process.env) {

@@ -450,6 +450,7 @@ test("chat hides executors that only accept page requests", async ({
   page,
   surfaceName,
 }) => {
+  const requests = [];
   await page.route("**/api/executors", async (route) => {
     await route.fulfill({
       status: 200,
@@ -478,12 +479,41 @@ test("chat hides executors that only accept page requests", async ({
       }),
     });
   });
+  await page.route("**/api/chat", async (route) => {
+    const request = route.request().postDataJSON();
+    requests.push(request);
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        { kind: "request_accepted", request_id: "page-capability-request", surface: surfaceName, request_kind: "page" },
+        { kind: "completed", surface: surfaceName, message: "Page source already matched the request", canvas_changed: false, request_kind: "page", provider: "fixture", model: "fixture" },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
   await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
-  await addObject(page, "chat", { x: 240, y: 120 });
+  await addObject(page, "page preview", { x: 1100, y: 120 });
+  await addObject(page, "change workspace or page", { x: 80, y: 500 });
+  await addObject(page, "chat", { x: 80, y: 100 });
   const executor = page.locator('[data-kind="chat"] [aria-label="Chat executor"]');
   await expect(executor).toHaveValue("evaluation_fixture");
   await expect(executor.locator("option")).toHaveCount(1);
   await expect(executor.locator('option[value="provider"]')).toHaveCount(0);
+  const change = page.locator('[data-kind="workspace_task"]'),
+    target = change.getByLabel("Change target"),
+    instruction = change.getByLabel("Change instruction"),
+    send = change.getByRole("button", { name: "send" });
+  await expect(target.locator('option[value="workspace"]')).toHaveAttribute("disabled", "");
+  await expect(send).toBeDisabled();
+  await instruction.fill("must not submit without workspace authority");
+  await instruction.press("Enter");
+  expect(requests).toHaveLength(0);
+  await target.selectOption("page");
+  await expect(send).toBeEnabled();
+  await instruction.fill("make a bounded page edit");
+  await instruction.press("Enter");
+  await expect.poll(() => requests.length).toBe(1);
+  expect(requests[0]).toMatchObject({ kind: "page", executor: "provider" });
 });
 
 test("agent provenance timeline exposes authority, mutation, verification, and metrics", async ({
@@ -1187,6 +1217,42 @@ test("chat cards persist and resume their server thread identity", async ({
     thread_id: threadId,
     history: [],
   });
+});
+
+test("managed evaluation fixture completes and persists ordinary chat output", async ({
+  browser,
+  page,
+  request,
+  surfaceName,
+}) => {
+  test.skip(process.env.PIKU_REQUIRE_EVALUATION_FIXTURES !== "1", "managed evaluator integration probe");
+  const content = JSON.stringify({
+    version: 6,
+    executor: "evaluation_fixture",
+    threadId: "",
+    model: "",
+    context: "",
+    sources: [],
+    turns: [{ id: "complete", prompt: "Preserve this completed output.", response: "", status: "idle", attempt: 0, completedAt: "" }],
+  });
+  const saved = await request.put(`/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`, {
+    data: { objects: [{ id: "managed-complete", kind: "chat", title: "managed complete", x: 96, y: 112, width: 704, height: 544, content }] },
+  });
+  expect(saved.ok()).toBeTruthy();
+  await page.reload();
+  const chat = page.locator('[data-object-id="managed-complete"]');
+  await chat.getByRole("button", { name: "run all", exact: true }).click();
+  await expect(chat.locator(".chat-response")).toContainText("Fixture response: Preserve this completed output.");
+  await expect(chat.locator(".chat-turn-status")).toContainText("done · attempt 1");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+
+  const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const freshPage = await freshContext.newPage();
+  await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+  const restored = freshPage.locator('[data-object-id="managed-complete"]');
+  await expect(restored.locator(".chat-response")).toContainText("Fixture response: Preserve this completed output.");
+  await expect(restored.locator(".chat-turn-status")).toContainText("done · attempt 1");
+  await freshContext.close();
 });
 
 test("a running chat exposes user-owned cancellation", async ({

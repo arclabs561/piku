@@ -21,6 +21,13 @@ console or network failures once, near the end. Record evidence with IDs prefixe
 `recovery:`. Stay below
 {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
+When the evaluation fixture is available, select it before the first turn and
+use it for the whole chat journey. Ordinary prompts return deterministic
+completed output. Use the exact prompt `Take a long time.` only for the final
+turn that must remain active until you cancel it. Do not use an ambient provider
+or infer provider health from configured model labels in this deterministic
+recovery journey.
+
 Record one to eight concise expectation-gap probes in `probes`. For each, state
 the operator intent, the visible outcome expected before acting, the action,
 the observed outcome, its consequence, and the smallest useful next probe.

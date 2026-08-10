@@ -375,6 +375,7 @@ struct ChatRequest {
 enum ChatExecutor {
     Codex,
     EvaluationFixture,
+    PageBroker,
     #[default]
     Provider,
 }
@@ -617,20 +618,16 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
     let codex = codex::readiness();
     let provider = ResolvedProvider::resolve(state.config.provider.as_deref());
     let page_broker = page_broker::PageBroker::is_configured();
-    let provider_model = if page_broker {
-        page_broker::PageBroker::configured_model()
-    } else {
-        provider.as_ref().map_or_else(
-            |_| "unavailable".to_string(),
-            |resolved| {
-                state
-                    .config
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| resolved.default_model.clone())
-            },
-        )
-    };
+    let provider_model = provider.as_ref().map_or_else(
+        |_| "unavailable".to_string(),
+        |resolved| {
+            state
+                .config
+                .model
+                .clone()
+                .unwrap_or_else(|| resolved.default_model.clone())
+        },
+    );
     let provider_request_kinds = provider_request_kinds(provider.is_ok(), page_broker);
     let mut executors = vec![
         ExecutorStatus {
@@ -658,13 +655,25 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             request_kinds: provider_request_kinds,
         },
     ];
+    if page_broker {
+        executors.push(ExecutorStatus {
+            id: "page_broker",
+            available: true,
+            isolated: true,
+            model: page_broker::PageBroker::configured_model(),
+            detail: "Parent-brokered page proposals · chat unavailable".to_string(),
+            workspace_write_available: false,
+            request_kinds: vec!["page"],
+        });
+    }
     if state.evaluation_fixtures {
         executors.push(ExecutorStatus {
             id: "evaluation_fixture",
             available: true,
             isolated: true,
-            model: "deterministic-cancellation".to_string(),
-            detail: "Evaluation-only executor · waits for explicit user cancellation".to_string(),
+            model: "deterministic-chat-fixture".to_string(),
+            detail: "Evaluation-only executor · deterministic completion and cancellation"
+                .to_string(),
             workspace_write_available: false,
             request_kinds: vec!["chat"],
         });
@@ -681,9 +690,11 @@ fn provider_request_kinds(
     page_broker_available: bool,
 ) -> Vec<&'static str> {
     if ambient_provider_available {
-        vec!["chat", "workspace", "page"]
-    } else if page_broker_available {
-        vec!["page"]
+        let mut kinds = vec!["chat", "workspace"];
+        if !page_broker_available {
+            kinds.push("page");
+        }
+        kinds
     } else {
         Vec::new()
     }
@@ -2016,7 +2027,13 @@ async fn run_chat_request(
             .await;
         }
         ChatExecutor::EvaluationFixture => {
-            run_evaluation_fixture_request(state, surface_name, tx).await;
+            run_evaluation_fixture_request(state, surface_name, message, tx).await;
+        }
+        ChatExecutor::PageBroker => {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":"The page broker accepts page changes only"}),
+            );
         }
         ChatExecutor::Provider => {
             run_provider_chat_request(
@@ -2074,6 +2091,7 @@ async fn evaluation_fixture_cancellation_ack(
 async fn run_evaluation_fixture_request(
     state: Arc<AppState>,
     surface_name: String,
+    message: String,
     tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
@@ -2081,9 +2099,24 @@ async fn run_evaluation_fixture_request(
         &tx,
         &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"evaluation_fixture"}),
     );
+    if message != "Take a long time." {
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"evaluation fixture","model":"deterministic-chat-fixture","executor":"evaluation_fixture","sandbox":"no external process","configuration":"opt-in","message":"Producing deterministic evaluation output","request_kind":"chat"}),
+        );
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"text_delta","surface":surface_name,"text":format!("Fixture response: {message}")}),
+        );
+        emit(
+            &tx,
+            &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Fixture answer complete; workspace unchanged","elapsed_seconds":0.0,"canvas_changed":false,"request_kind":"chat","executor":"evaluation_fixture","model":"deterministic-chat-fixture","verification":{"actor":"Piku host","checks":[{"name":"workspace mutation boundary","outcome":"passed","detail":"evaluation fixture cannot mutate workspace state"}]}}),
+        );
+        return;
+    }
     emit(
         &tx,
-        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"evaluation fixture","model":"deterministic-cancellation","executor":"evaluation_fixture","sandbox":"no external process","configuration":"opt-in","message":"Waiting for explicit user cancellation","request_kind":"chat"}),
+        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"evaluation fixture","model":"deterministic-chat-fixture","executor":"evaluation_fixture","sandbox":"no external process","configuration":"opt-in","message":"Waiting for explicit user cancellation","request_kind":"chat"}),
     );
     emit(
         &tx,
@@ -4825,10 +4858,14 @@ mod tests {
     }
 
     #[test]
-    fn broker_only_provider_catalog_exposes_only_page_requests() {
-        assert_eq!(provider_request_kinds(false, true), vec!["page"]);
+    fn ambient_provider_catalog_does_not_claim_brokered_page_requests() {
+        assert!(provider_request_kinds(false, true).is_empty());
         assert_eq!(
             provider_request_kinds(true, true),
+            vec!["chat", "workspace"]
+        );
+        assert_eq!(
+            provider_request_kinds(true, false),
             vec!["chat", "workspace", "page"]
         );
         assert!(provider_request_kinds(false, false).is_empty());

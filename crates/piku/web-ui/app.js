@@ -73,6 +73,7 @@ async function refreshExecutorCatalog() {
   } catch { /* Cards retain explicit backend state if readiness cannot refresh. */ }
   executorCatalogLoaded = true;
   overlay.querySelectorAll('[data-kind="chat"]').forEach((card) => renderChatExecutor(card, card.chatNotebookState));
+  updatePageTargetLabels();
 }
 const executorCatalogReady = refreshExecutorCatalog();
 
@@ -1544,6 +1545,19 @@ function createWorkspaceObject(kind, anchor, restore = null) {
     const runChange = async (message) => {
       message = message.trim();
       if (!message || state.status === "running") return;
+      await executorCatalogReady;
+      const requestKind = scope.value === "page" ? "page" : "workspace",
+        executor = availableExecutorFor(requestKind);
+      if (!executor) {
+        state.target = scope.value;
+        state.status = "error";
+        state.summary = `No available executor accepts ${requestKind} changes.`;
+        state.diff = "";
+        persistChange();
+        renderResult();
+        updatePageTargetLabels();
+        return;
+      }
       state.instruction = message;
       state.target = scope.value;
       state.status = "running";
@@ -1564,7 +1578,7 @@ function createWorkspaceObject(kind, anchor, restore = null) {
           changesPage ? "page" : "workspace",
           null,
           targetId,
-          { runOrdinal: ordinal },
+          { runOrdinal: ordinal, executor: executor.id },
         );
       state.status = result.ok ? "done" : "error";
       state.summary = result.ok ? (result.text || (changesPage ? "Page source updated" : "Workspace updated")) : result.error;
@@ -1712,6 +1726,14 @@ function newChatNotebook() {
 
 function executorSupports(executor, requestKind) {
   return !Array.isArray(executor?.request_kinds) || executor.request_kinds.includes(requestKind);
+}
+
+function availableExecutorFor(requestKind) {
+  return (executorCatalog.executors || []).find((executor) =>
+    executor.available === true &&
+    Array.isArray(executor.request_kinds) &&
+    executor.request_kinds.includes(requestKind),
+  );
 }
 
 function renderChatExecutor(object, state) {
@@ -2289,13 +2311,29 @@ function updatePageTargetLabels() {
     const submit = task.querySelector('.object-form button[type="submit"]');
     const scope = task.querySelector(".change-scope select");
     if (!target || !submit) return;
+    const workspaceOption = scope?.querySelector('option[value="workspace"]'),
+      pageOption = scope?.querySelector('option[value="page"]'),
+      workspaceExecutor = executorCatalogLoaded ? availableExecutorFor("workspace") : null,
+      pageExecutor = executorCatalogLoaded ? availableExecutorFor("page") : null;
+    if (workspaceOption) workspaceOption.disabled = executorCatalogLoaded && !workspaceExecutor;
+    if (pageOption) pageOption.disabled = executorCatalogLoaded && !pageExecutor;
+    if (!executorCatalogLoaded) {
+      target.textContent = "TARGET  checking executor capabilities…";
+      submit.disabled = true;
+      return;
+    }
     if (scope?.value !== "page") {
+      if (!workspaceExecutor) {
+        target.textContent = "TARGET  unavailable · no executor accepts workspace changes";
+        submit.disabled = true;
+        return;
+      }
       target.textContent =
-        "TARGET  this saved workspace · layout and elements only";
+        `TARGET  this saved workspace · layout and elements only · ${workspaceExecutor.id}`;
       submit.disabled = false;
       return;
     }
-    if (page) {
+    if (page && pageExecutor) {
       target.textContent =
         "TARGET  " +
         page.dataset.title +
@@ -2303,8 +2341,11 @@ function updatePageTargetLabels() {
         page.dataset.objectId +
         "  SOURCE  surface " +
         active +
-        " · saved page HTML";
+        ` · saved page HTML · ${pageExecutor.id}`;
       submit.disabled = false;
+    } else if (!pageExecutor) {
+      target.textContent = "TARGET  unavailable · no executor accepts page changes";
+      submit.disabled = true;
     } else {
       target.textContent =
         "TARGET  none  Add or select a page preview before editing.";
