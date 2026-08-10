@@ -8,6 +8,7 @@ import {
   evaluationArtifactPaths,
   managedArtifactDir,
   validateRunId,
+  writeBindingWithoutMaskingChildFailure,
   writeManagedLifecycleBinding,
 } from "./run-managed-eval.mjs";
 
@@ -45,7 +46,7 @@ test("managed lifecycle binding attests final server and parallel manifests with
 
   const before = await readFile(promptManifestPath, "utf8");
   const { bindingPath, binding } = await writeManagedLifecycleBinding({
-    root, artifactDir, mode: "parallel", runId,
+    root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
   });
   assert.equal(await readFile(promptManifestPath, "utf8"), before);
   assert.equal(binding.server.lifecycle.sha256,
@@ -54,10 +55,74 @@ test("managed lifecycle binding attests final server and parallel manifests with
     path.relative(root, manifestPath),
     path.relative(root, promptManifestPath),
   ]);
+  assert.deepEqual(binding.child, { exit_code: 0, exit_signal: null });
+  assert.deepEqual(binding.expected_but_missing, []);
   assert.deepEqual(JSON.parse(await readFile(bindingPath, "utf8")), binding);
   await assert.rejects(writeManagedLifecycleBinding({
-    root, artifactDir, mode: "parallel", runId,
+    root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
   }), /EEXIST/);
+});
+
+test("failed managed runs attest partial artifacts and name expected missing outputs", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "piku-managed-failed-binding-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runId = "failed-run";
+  const artifactDir = managedArtifactDir(root, runId);
+  const serverDir = path.join(artifactDir, "server");
+  const [manifestPath, promptManifestPath] = evaluationArtifactPaths(root, "parallel", runId);
+  await Promise.all([
+    mkdir(serverDir, { recursive: true }),
+    mkdir(path.dirname(manifestPath), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(serverDir, "lifecycle.json"),
+      `${JSON.stringify({ ownership: "managed", status: "stopped" })}\n`),
+    writeFile(path.join(serverDir, "server.log"), "failed run log\n"),
+    writeFile(promptManifestPath, "immutable prompt manifest\n"),
+  ]);
+
+  const { binding } = await writeManagedLifecycleBinding({
+    root, artifactDir, mode: "parallel", runId, outcome: { code: 1, signal: null },
+  });
+  assert.deepEqual(binding.child, { exit_code: 1, exit_signal: null });
+  assert.deepEqual(binding.evaluation_artifacts.map((item) => item.path), [
+    path.relative(root, promptManifestPath),
+  ]);
+  assert.deepEqual(binding.expected_but_missing, [path.relative(root, manifestPath)]);
+});
+
+test("managed bindings preserve signal termination", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "piku-managed-signal-binding-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runId = "signal-run";
+  const artifactDir = managedArtifactDir(root, runId);
+  const serverDir = path.join(artifactDir, "server");
+  await mkdir(serverDir, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(serverDir, "lifecycle.json"),
+      `${JSON.stringify({ ownership: "managed", status: "stopped" })}\n`),
+    writeFile(path.join(serverDir, "server.log"), "signal log\n"),
+  ]);
+  const { binding } = await writeManagedLifecycleBinding({
+    root, artifactDir, mode: "e2e", runId, outcome: { code: null, signal: "SIGTERM" },
+  });
+  assert.deepEqual(binding.child, { exit_code: null, exit_signal: "SIGTERM" });
+});
+
+test("binding errors cannot replace a failed child outcome", async () => {
+  const errors = [];
+  const result = await writeBindingWithoutMaskingChildFailure({
+    outcome: { code: 1, signal: null },
+    writeBinding: async () => { throw new Error("disk full"); },
+    reportError: (message) => errors.push(message),
+  });
+  assert.equal(result, null);
+  assert.deepEqual(errors, ["Could not write managed lifecycle binding: disk full"]);
+  await assert.rejects(writeBindingWithoutMaskingChildFailure({
+    outcome: { code: 0, signal: null },
+    writeBinding: async () => { throw new Error("disk full"); },
+    reportError: () => assert.fail("successful child binding failures must propagate"),
+  }), /disk full/);
 });
 
 test("focus-pair bindings cover the pair dossier and both immutable arm manifests", () => {

@@ -62,29 +62,64 @@ async function fileAttestation(root, filePath) {
   return { path: relative, sha256: createHash("sha256").update(contents).digest("hex") };
 }
 
-export async function writeManagedLifecycleBinding({ root, artifactDir, mode, runId }) {
+async function attestExpectedArtifacts(root, filePaths) {
+  const evaluationArtifacts = [];
+  const expectedMissing = [];
+  for (const filePath of filePaths) {
+    try {
+      evaluationArtifacts.push(await fileAttestation(root, filePath));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const relative = path.relative(root, filePath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
+        throw new Error("managed lifecycle attestation escaped the repository");
+      expectedMissing.push(relative);
+    }
+  }
+  return { evaluationArtifacts, expectedMissing };
+}
+
+export async function writeManagedLifecycleBinding({ root, artifactDir, mode, runId, outcome }) {
   const lifecyclePath = path.join(artifactDir, "server", "lifecycle.json");
   const logPath = path.join(artifactDir, "server", "server.log");
   const lifecycle = JSON.parse(await readFile(lifecyclePath, "utf8"));
   if (lifecycle.ownership !== "managed" || lifecycle.status !== "stopped")
     throw new Error("managed lifecycle binding requires a stopped managed server");
+  if (!outcome || (!Number.isInteger(outcome.code) && !outcome.signal))
+    throw new Error("managed lifecycle binding requires a child outcome");
+  const { evaluationArtifacts, expectedMissing } = await attestExpectedArtifacts(
+    root, evaluationArtifactPaths(root, mode, runId),
+  );
   const binding = {
     schema_version: 1,
     run_id: runId,
     mode,
+    child: {
+      exit_code: outcome.code ?? null,
+      exit_signal: outcome.signal ?? null,
+    },
     server: {
       lifecycle: await fileAttestation(root, lifecyclePath),
       log: await fileAttestation(root, logPath),
     },
-    evaluation_artifacts: await Promise.all(
-      evaluationArtifactPaths(root, mode, runId).map((item) => fileAttestation(root, item)),
-    ),
+    evaluation_artifacts: evaluationArtifacts,
+    expected_but_missing: expectedMissing,
   };
   const bindingPath = path.join(artifactDir, "lifecycle-binding.json");
   await writeFile(bindingPath, `${JSON.stringify(binding, null, 2)}\n`, {
     encoding: "utf8", flag: "wx", mode: 0o600,
   });
   return { bindingPath, binding };
+}
+
+export async function writeBindingWithoutMaskingChildFailure({ outcome, writeBinding, reportError }) {
+  try {
+    return await writeBinding();
+  } catch (error) {
+    if (outcome.code === 0 && !outcome.signal) throw error;
+    reportError(`Could not write managed lifecycle binding: ${error.message}`);
+    return null;
+  }
 }
 
 export async function runManagedEval({ argv = process.argv.slice(2), environment = process.env } = {}) {
@@ -128,13 +163,20 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
       child.once("error", reject);
       child.once("exit", (code, signal) => resolve({ code, signal }));
     });
-    if (outcome.signal) process.kill(process.pid, outcome.signal);
     process.exitCode = outcome.code ?? 1;
   } finally {
     await server.stop();
-    if (server.metadata.ownership === "managed" && outcome?.code === 0 && !outcome.signal)
-      await writeManagedLifecycleBinding({ root: repoRoot, artifactDir, mode, runId });
+    if (server.metadata.ownership === "managed" && outcome) {
+      await writeBindingWithoutMaskingChildFailure({
+        outcome,
+        writeBinding: () => writeManagedLifecycleBinding({
+          root: repoRoot, artifactDir, mode, runId, outcome,
+        }),
+        reportError: (message) => console.error(message),
+      });
+    }
   }
+  if (outcome.signal) process.kill(process.pid, outcome.signal);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
