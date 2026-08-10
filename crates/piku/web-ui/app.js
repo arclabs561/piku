@@ -64,15 +64,17 @@ let executorCatalog = {
     { id: "provider", available: true, isolated: true, model: "configured provider", detail: "Piku provider loop" },
   ],
 };
+let executorCatalogLoaded = false;
 
 async function refreshExecutorCatalog() {
   try {
     const response = await fetch("/api/executors");
     if (response.ok) executorCatalog = await response.json();
   } catch { /* Cards retain explicit backend state if readiness cannot refresh. */ }
+  executorCatalogLoaded = true;
   overlay.querySelectorAll('[data-kind="chat"]').forEach((card) => renderChatExecutor(card, card.chatNotebookState));
 }
-refreshExecutorCatalog();
+const executorCatalogReady = refreshExecutorCatalog();
 
 const terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled !== false;
 if (!terminalEnabled) terminalBtn.hidden = true;
@@ -1569,8 +1571,7 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       const runDiff = changesPage && result.ok && result.canvasChanged !== false
         ? sourceDiff(before, result.pageHtml || currentPageHtml)
         : "";
-      if (runDiff) state.diff = runDiff;
-      if (!changesPage) state.diff = "";
+      state.diff = changesPage ? runDiff : "";
       state.runs.push({
         ordinal,
         target: state.target,
@@ -1709,19 +1710,29 @@ function newChatNotebook() {
   return { version: 6, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
+function executorSupports(executor, requestKind) {
+  return !Array.isArray(executor?.request_kinds) || executor.request_kinds.includes(requestKind);
+}
+
 function renderChatExecutor(object, state) {
   const select = object?.querySelector(".chat-executor-select"),
     status = object?.querySelector(".chat-executor-status");
   if (!select || !status || !state) return;
+  const executors = (executorCatalog.executors || []).filter((executor) => executorSupports(executor, "chat"));
+  if (executorCatalogLoaded && !executors.some((executor) => executor.id === state.executor)) {
+    const fallback = executors.find((executor) => executor.id === executorCatalog.default) || executors[0];
+    state.executor = fallback?.id || "";
+    state.threadId = "";
+  }
   select.replaceChildren();
-  for (const executor of executorCatalog.executors || []) {
+  for (const executor of executors) {
     const option = document.createElement("option");
     option.value = executor.id;
     option.textContent = executor.id;
     select.append(option);
   }
   select.value = state.executor;
-  const executor = (executorCatalog.executors || []).find((item) => item.id === state.executor);
+  const executor = executors.find((item) => item.id === state.executor);
   status.textContent = executor
     ? `${executor.available ? "ready" : "unavailable"} · ${state.model || executor.model} · ${executor.detail}${state.threadId ? " · thread " + state.threadId.slice(0, 8) : ""}`
     : "executor status unavailable";
@@ -2118,8 +2129,10 @@ function renderChatTurns(object, state) {
 
 async function runChatNotebook(object, state, start, end, execution = {}) {
   if (object.dataset.running === "true") return;
+  await executorCatalogReady;
+  renderChatExecutor(object, state);
   const executor = (executorCatalog.executors || []).find((item) => item.id === state.executor);
-  if (!executor?.available) {
+  if (!executor?.available || !executorSupports(executor, "chat")) {
     const status = object.querySelector(".chat-executor-status");
     if (status) status.textContent = `${state.executor} unavailable · choose another executor or restore its credentials`;
     return;

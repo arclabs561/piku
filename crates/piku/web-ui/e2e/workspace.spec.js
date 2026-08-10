@@ -446,6 +446,46 @@ test("new chat cards default to the visible isolated Codex executor", async ({
   );
 });
 
+test("chat hides executors that only accept page requests", async ({
+  page,
+  surfaceName,
+}) => {
+  await page.route("**/api/executors", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        default: "provider",
+        workspace_root: "/tmp/piku-e2e-workspace",
+        executors: [
+          {
+            id: "provider",
+            available: true,
+            isolated: true,
+            model: "page-broker-model",
+            detail: "page proposal broker",
+            request_kinds: ["page"],
+          },
+          {
+            id: "evaluation_fixture",
+            available: true,
+            isolated: true,
+            model: "fixture",
+            detail: "deterministic chat fixture",
+            request_kinds: ["chat"],
+          },
+        ],
+      }),
+    });
+  });
+  await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+  await addObject(page, "chat", { x: 240, y: 120 });
+  const executor = page.locator('[data-kind="chat"] [aria-label="Chat executor"]');
+  await expect(executor).toHaveValue("evaluation_fixture");
+  await expect(executor.locator("option")).toHaveCount(1);
+  await expect(executor.locator('option[value="provider"]')).toHaveCount(0);
+});
+
 test("agent provenance timeline exposes authority, mutation, verification, and metrics", async ({
   page,
   surfaceName,
@@ -1902,8 +1942,7 @@ test("page changes persist an inspectable source diff and rerun control", async 
   await expect(page.locator(".activity-card .activity-identity")).toContainText(
     "attempt #3 · request request-page-3 · session shared-page-session · turn page-turn-3 · completed",
   );
-  await expect(restored.locator(".source-diff")).toContainText("revision 2");
-  await expect(restored.locator(".source-diff")).not.toContainText("revision 3");
+  await expect(restored.locator(".source-diff")).toHaveCount(0);
   const noChangeRun = restored.locator(".change-history li").first();
   await expect(noChangeRun).toContainText("Page source already matched the request");
   await expect(page.locator(".activity-card").last()).toContainText("Done");
