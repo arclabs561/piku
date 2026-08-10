@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
@@ -12,13 +12,15 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use piku_runtime::{
     render_captured_attachments, resolve_captured_attachments, run_turn, AllowAll,
-    CapturedAttachment, ContentBlock, ContextBudget, ContextSourceSummary, ConversationMessage,
-    MessageRole, RunContentRef, RunEvent, RunHandle, RunRecorder, Session, Sha256Digest,
-    SourceReference, TurnResult, UsageRecord,
+    AuthorityLeaseOutcome, CapturedAttachment, ContentBlock, ContextBudget, ContextSourceSummary,
+    ConversationMessage, MessageRole, RunContentRef, RunEvent, RunHandle, RunRecorder,
+    RunToolEffect, Session, Sha256Digest, SourceReference, TurnAuthority as RunTurnAuthority,
+    TurnResult, UsageRecord,
 };
 use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 
@@ -41,6 +43,9 @@ const MODEL_REQUEST_SLOTS: usize = 4;
 const SSE_QUEUE_EVENTS: usize = 128;
 const SSE_CONTROL_RESERVE: usize = 16;
 const MAX_RUN_ID_LEN: usize = 128;
+const WRITE_LEASE_START_WINDOW: Duration = Duration::from_mins(1);
+const WRITE_LEASE_LIFETIME: Duration = Duration::from_mins(5);
+const WRITE_TOOL_PROFILE: &str = "codex_native_workspace_write_v1";
 
 // ---------------------------------------------------------------------------
 // Surface storage
@@ -316,6 +321,8 @@ pub(super) struct AppState {
     pub(super) terminal_slots: Arc<tokio::sync::Semaphore>,
     model_slots: Arc<Semaphore>,
     codex_root: Arc<PathBuf>,
+    write_leases: Arc<write_lease::WriteLeaseStore>,
+    workspace_write_available: bool,
     evaluation_fixtures: bool,
 }
 
@@ -325,7 +332,7 @@ struct ChatMessage {
     content: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ChatRequest {
     message: String,
     surface: Option<String>,
@@ -340,9 +347,15 @@ struct ChatRequest {
     #[serde(default)]
     executor: ChatExecutor,
     thread_id: Option<String>,
+    #[serde(default)]
+    authority: write_lease::Authority,
+    write_lease: Option<String>,
+    lease_turn_id: Option<String>,
+    start_deadline_ms: Option<u64>,
+    expires_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ChatExecutor {
     Codex,
@@ -351,13 +364,32 @@ enum ChatExecutor {
     Provider,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RequestKind {
     Chat,
     #[default]
     Workspace,
     Page,
+}
+
+#[derive(Serialize)]
+struct WriteLeaseGrant {
+    write_lease: String,
+    lease_turn_id: String,
+    start_deadline_ms: u64,
+    expires_at_ms: u64,
+    authority: write_lease::Authority,
+    workspace_root: String,
+    network_enabled: bool,
+    tool_profile: &'static str,
+}
+
+#[derive(Clone)]
+struct TurnAuthority {
+    authority: write_lease::Authority,
+    lease: Option<write_lease::LeaseSummary>,
+    lease_turn_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -403,6 +435,7 @@ struct WebError {
 #[derive(Serialize)]
 struct ExecutorCatalog {
     default: &'static str,
+    workspace_root: String,
     executors: Vec<ExecutorStatus>,
 }
 
@@ -413,6 +446,7 @@ struct ExecutorStatus {
     isolated: bool,
     model: String,
     detail: String,
+    workspace_write_available: bool,
 }
 
 #[derive(Deserialize)]
@@ -457,6 +491,18 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
     };
 
     let workspace_root = std::env::current_dir()?.canonicalize()?;
+    let codex_root = config.config_dir.join("_codex");
+    let workspace_write_available = if codex::readiness().isolated {
+        match codex::probe_workspace_write(&codex_root).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "Codex workspace-write capability disabled");
+                false
+            }
+        }
+    } else {
+        false
+    };
     let state = Arc::new(AppState {
         config: Arc::new(config.clone()),
         surfaces: Arc::new(RwLock::new(SurfacesState {
@@ -468,7 +514,9 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         workspace_root: Arc::new(workspace_root),
         terminal_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         model_slots: Arc::new(Semaphore::new(MODEL_REQUEST_SLOTS)),
-        codex_root: Arc::new(config.config_dir.join("_codex")),
+        codex_root: Arc::new(codex_root),
+        write_leases: Arc::new(write_lease::WriteLeaseStore::default()),
+        workspace_write_available,
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
     });
@@ -482,6 +530,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         )
         .route("/api/surfaces/{name}/workspace", put(update_workspace))
         .route("/api/chat", post(chat_handler))
+        .route("/api/chat/write-lease", post(write_lease_handler))
         .route("/api/executors", get(executor_catalog))
         .route("/api/terminal/read", post(terminal_read_handler))
         .route("/api/terminal/pty", get(pty::terminal_pty_handler))
@@ -524,6 +573,7 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             isolated: codex.isolated,
             model: codex.model.to_string(),
             detail: codex.detail,
+            workspace_write_available: state.workspace_write_available,
         },
         ExecutorStatus {
             id: "provider",
@@ -531,6 +581,7 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             isolated: true,
             model: provider_model,
             detail: "Piku provider loop · explicit provider credentials".to_string(),
+            workspace_write_available: false,
         },
     ];
     if state.evaluation_fixtures {
@@ -540,10 +591,12 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             isolated: true,
             model: "deterministic-cancellation".to_string(),
             detail: "Evaluation-only executor · waits for explicit user cancellation".to_string(),
+            workspace_write_available: false,
         });
     }
     Json(ExecutorCatalog {
         default: "codex",
+        workspace_root: state.workspace_root.display().to_string(),
         executors,
     })
 }
@@ -1382,6 +1435,197 @@ fn terminal_io_error(action: &str, error: &std::io::Error) -> TerminalReadError 
 // API: chat
 // ---------------------------------------------------------------------------
 
+async fn write_lease_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ChatRequest>,
+) -> Response {
+    let surface = surface_name(req.surface.as_deref().unwrap_or("scratch"));
+    let validation = validate_write_request(&state, &req)
+        .and_then(|()| validate_request_message(&req.message).map_err(str::to_string))
+        .and_then(|()| validate_chat_notebook_input(req.context.as_deref(), &req.history))
+        .and_then(|()| validate_codex_thread_id(req.executor, req.thread_id.as_deref()));
+    if let Err(error) = validation {
+        return (StatusCode::BAD_REQUEST, Json(WebError { error })).into_response();
+    }
+    let resolved = match resolve_request_context(&state, &surface, &req).await {
+        Ok(context) => context,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(WebError { error })).into_response();
+        }
+    };
+    let now = match unix_millis(SystemTime::now()) {
+        Ok(now) => now,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WebError {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let lease_turn_id = format!("web-write-{}", crate::new_session_id());
+    let start_deadline_ms =
+        now.saturating_add(u64::try_from(WRITE_LEASE_START_WINDOW.as_millis()).unwrap_or(u64::MAX));
+    let expires_at_ms =
+        now.saturating_add(u64::try_from(WRITE_LEASE_LIFETIME.as_millis()).unwrap_or(u64::MAX));
+    let scope = write_scope(
+        &state,
+        &req,
+        &surface,
+        &resolved,
+        &lease_turn_id,
+        start_deadline_ms,
+        expires_at_ms,
+    );
+    let (nonce, _summary) = match state.write_leases.issue(&scope) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, "write lease issuance rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(WebError {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    Json(WriteLeaseGrant {
+        write_lease: nonce.expose_token(),
+        lease_turn_id,
+        start_deadline_ms,
+        expires_at_ms,
+        authority: write_lease::Authority::WorkspaceWrite,
+        workspace_root: state.workspace_root.display().to_string(),
+        network_enabled: false,
+        tool_profile: WRITE_TOOL_PROFILE,
+    })
+    .into_response()
+}
+
+fn validate_write_request(state: &AppState, req: &ChatRequest) -> Result<(), String> {
+    if req.kind != RequestKind::Chat || req.executor != ChatExecutor::Codex {
+        return Err("write authority is available only for Codex chat turns".to_string());
+    }
+    if req.authority != write_lease::Authority::WorkspaceWrite {
+        return Err("write lease review requires workspace_write authority".to_string());
+    }
+    if req.thread_id.is_some() {
+        return Err(
+            "write review requires a fresh Codex thread built from explicit notebook history"
+                .to_string(),
+        );
+    }
+    if req.write_lease.is_some()
+        || req.lease_turn_id.is_some()
+        || req.start_deadline_ms.is_some()
+        || req.expires_at_ms.is_some()
+    {
+        return Err("write lease review must not include a prior lease".to_string());
+    }
+    let readiness = codex::readiness();
+    if !(readiness.available && readiness.authenticated && readiness.isolated) {
+        return Err("isolated Codex execution is unavailable".to_string());
+    }
+    if !state.workspace_write_available {
+        return Err("Codex workspace-write capability probe did not pass".to_string());
+    }
+    if !state.workspace_root.is_dir() {
+        return Err("workspace root is unavailable".to_string());
+    }
+    Ok(())
+}
+
+async fn resolve_request_context(
+    state: &AppState,
+    surface_name: &str,
+    req: &ChatRequest,
+) -> Result<ResolvedChatContext, String> {
+    if req.kind != RequestKind::Chat {
+        if req.context_source_ids.is_empty() {
+            return Ok(ResolvedChatContext {
+                text: req.context.clone(),
+                sources: Vec::new(),
+            });
+        }
+        return Err("only chat requests accept context source IDs".to_string());
+    }
+    let mut surfaces = state.surfaces.write().await;
+    let root = surfaces.root.clone();
+    let canvas = surfaces
+        .cache
+        .entry(surface_name.to_string())
+        .or_insert_with(|| CanvasState::load(&surface_dir(&root, surface_name)));
+    resolve_chat_context(
+        canvas,
+        surface_name,
+        req.target_id.as_deref(),
+        req.context.as_deref(),
+        &req.context_source_ids,
+    )
+}
+
+fn write_scope(
+    state: &AppState,
+    req: &ChatRequest,
+    surface: &str,
+    resolved: &ResolvedChatContext,
+    lease_turn_id: &str,
+    start_deadline_ms: u64,
+    expires_at_ms: u64,
+) -> write_lease::LeaseScope {
+    let prompt_digest = write_request_digest(req, surface, resolved);
+    let environment_digest = Sha256::digest(
+        b"piku.codex.clean-env.v1:HOME,LANG,LC_ALL,PATH,SHELL,SSL_CERT_DIR,SSL_CERT_FILE,TERM,TMPDIR",
+    )
+    .into();
+    write_lease::LeaseScope {
+        authority: write_lease::Authority::WorkspaceWrite,
+        workspace_root: state.workspace_root.as_ref().clone(),
+        executor: "codex".to_string(),
+        thread_id: req.thread_id.clone().unwrap_or_else(|| "new".to_string()),
+        turn_id: lease_turn_id.to_string(),
+        prompt_digest,
+        start_deadline_ms,
+        expires_at_ms,
+        working_directory: state.workspace_root.as_ref().clone(),
+        environment_digest,
+        network_enabled: false,
+        tool_profile: WRITE_TOOL_PROFILE.to_string(),
+    }
+}
+
+fn write_request_digest(
+    req: &ChatRequest,
+    surface: &str,
+    resolved: &ResolvedChatContext,
+) -> [u8; 32] {
+    let value = serde_json::json!({
+        "schema":"piku.write-request.v1",
+        "surface":surface,
+        "message":req.message,
+        "kind":req.kind,
+        "target_id":req.target_id,
+        "context":resolved.text,
+        "context_sources":resolved.sources,
+        "history":req.history,
+        "executor":req.executor,
+        "thread_id":req.thread_id,
+        "authority":req.authority,
+    });
+    Sha256::digest(serde_json::to_vec(&value).expect("JSON values serialize")).into()
+}
+
+fn unix_millis(time: SystemTime) -> Result<u64, &'static str> {
+    let millis = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock predates the Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| "system clock does not fit in milliseconds")
+}
+
 async fn chat_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
@@ -1392,6 +1636,7 @@ async fn chat_handler(
         .map_err(str::to_string)
         .and_then(|()| validate_chat_notebook_input(req.context.as_deref(), &req.history))
         .and_then(|()| validate_codex_thread_id(req.executor, req.thread_id.as_deref()))
+        .and_then(|()| validate_authority_fields(&req))
         .and_then(|()| {
             if req.executor == ChatExecutor::EvaluationFixture && !state.evaluation_fixtures {
                 Err("evaluation fixture executor is disabled".to_string())
@@ -1409,25 +1654,20 @@ async fn chat_handler(
         sources: Vec::new(),
     };
     if request_error.is_none() {
-        if req.kind != RequestKind::Chat && !req.context_source_ids.is_empty() {
-            request_error = Some("only chat requests accept context source IDs".to_string());
-        } else if req.kind == RequestKind::Chat {
-            let mut surfaces = state.surfaces.write().await;
-            let root = surfaces.root.clone();
-            let canvas = surfaces
-                .cache
-                .entry(surface_name.clone())
-                .or_insert_with(|| CanvasState::load(&surface_dir(&root, &surface_name)));
-            match resolve_chat_context(
-                canvas,
-                &surface_name,
-                req.target_id.as_deref(),
-                req.context.as_deref(),
-                &req.context_source_ids,
-            ) {
-                Ok(context) => resolved_context = context,
-                Err(error) => request_error = Some(error),
-            }
+        match resolve_request_context(&state, &surface_name, &req).await {
+            Ok(context) => resolved_context = context,
+            Err(error) => request_error = Some(error),
+        }
+    }
+    let mut turn_authority = TurnAuthority {
+        authority: write_lease::Authority::ReadOnly,
+        lease: None,
+        lease_turn_id: None,
+    };
+    if request_error.is_none() {
+        match consume_turn_authority(&state, &surface_name, &req, &resolved_context) {
+            Ok(authority) => turn_authority = authority,
+            Err(error) => request_error = Some(error),
         }
     }
     let accepted = request_error.is_none() && {
@@ -1452,6 +1692,7 @@ async fn chat_handler(
                 req.history,
                 req.executor,
                 req.thread_id,
+                turn_authority,
                 tx,
                 permit,
             ));
@@ -1475,6 +1716,82 @@ async fn chat_handler(
             .map(|data| (Ok(Event::default().data(data)), rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn validate_authority_fields(req: &ChatRequest) -> Result<(), String> {
+    match req.authority {
+        write_lease::Authority::ReadOnly => {
+            if req.write_lease.is_some()
+                || req.lease_turn_id.is_some()
+                || req.start_deadline_ms.is_some()
+                || req.expires_at_ms.is_some()
+            {
+                Err("read-only turns must not include write lease fields".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        write_lease::Authority::WorkspaceWrite => {
+            if req.kind != RequestKind::Chat || req.executor != ChatExecutor::Codex {
+                return Err(
+                    "workspace_write authority is available only for Codex chat turns".to_string(),
+                );
+            }
+            if req.write_lease.is_none()
+                || req.lease_turn_id.is_none()
+                || req.start_deadline_ms.is_none()
+                || req.expires_at_ms.is_none()
+            {
+                Err("workspace_write turns require a complete write lease".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn consume_turn_authority(
+    state: &AppState,
+    surface: &str,
+    req: &ChatRequest,
+    resolved: &ResolvedChatContext,
+) -> Result<TurnAuthority, String> {
+    if req.authority == write_lease::Authority::ReadOnly {
+        return Ok(TurnAuthority {
+            authority: write_lease::Authority::ReadOnly,
+            lease: None,
+            lease_turn_id: None,
+        });
+    }
+    let token = req
+        .write_lease
+        .as_deref()
+        .ok_or_else(|| "write lease is missing".to_string())?;
+    let nonce = write_lease::LeaseNonce::parse(token).map_err(|error| error.to_string())?;
+    let lease_turn_id = req
+        .lease_turn_id
+        .as_deref()
+        .ok_or_else(|| "write lease turn identity is missing".to_string())?;
+    let scope = write_scope(
+        state,
+        req,
+        surface,
+        resolved,
+        lease_turn_id,
+        req.start_deadline_ms
+            .ok_or_else(|| "write lease start deadline is missing".to_string())?,
+        req.expires_at_ms
+            .ok_or_else(|| "write lease expiry is missing".to_string())?,
+    );
+    let summary = state
+        .write_leases
+        .consume(nonce, &scope, SystemTime::now())
+        .map_err(|error| error.to_string())?;
+    Ok(TurnAuthority {
+        authority: write_lease::Authority::WorkspaceWrite,
+        lease: Some(summary),
+        lease_turn_id: Some(lease_turn_id.to_string()),
+    })
 }
 
 fn validate_codex_thread_id(executor: ChatExecutor, thread_id: Option<&str>) -> Result<(), String> {
@@ -1505,6 +1822,7 @@ async fn run_model_request(
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
+    turn_authority: TurnAuthority,
     tx: mpsc::Sender<String>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -1521,6 +1839,7 @@ async fn run_model_request(
                 history,
                 executor,
                 thread_id,
+                turn_authority,
                 tx,
             )
             .await;
@@ -1540,6 +1859,7 @@ async fn run_chat_request(
     history: Vec<ChatMessage>,
     executor: ChatExecutor,
     thread_id: Option<String>,
+    turn_authority: TurnAuthority,
     tx: mpsc::Sender<String>,
 ) {
     match executor {
@@ -1553,6 +1873,7 @@ async fn run_chat_request(
                 context_sources,
                 history,
                 thread_id,
+                turn_authority,
                 tx,
             )
             .await;
@@ -1609,12 +1930,23 @@ async fn run_codex_chat_request(
     context_sources: Vec<ContextSourceSummary>,
     history: Vec<ChatMessage>,
     thread_id: Option<String>,
+    turn_authority: TurnAuthority,
     tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
+    let (policy, authority_name, sandbox_name) = match turn_authority.authority {
+        write_lease::Authority::ReadOnly => {
+            (codex::CodexTurnPolicy::ReadOnly, "read_only", "read-only")
+        }
+        write_lease::Authority::WorkspaceWrite => (
+            codex::CodexTurnPolicy::WorkspaceWrite,
+            "workspace_write",
+            "workspace-write",
+        ),
+    };
     emit(
         &tx,
-        &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"codex"}),
+        &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id}),
     );
     let target_exists = {
         let mut surfaces = state.surfaces.write().await;
@@ -1638,7 +1970,8 @@ async fn run_codex_chat_request(
         surface = %surface_name,
         kind = "chat",
         executor = "codex",
-        sandbox = "read-only",
+        sandbox = sandbox_name,
+        authority = authority_name,
         config = "isolated",
         "request accepted"
     );
@@ -1674,6 +2007,36 @@ async fn run_codex_chat_request(
         &mut activity_sink,
         &mut record_error,
     );
+    if let Some(lease) = &turn_authority.lease {
+        let scope_digest = match Sha256Digest::parse(hex_digest(&lease.scope_digest)) {
+            Ok(digest) => digest,
+            Err(error) => {
+                emit(
+                    &tx,
+                    &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("cannot encode write lease scope: {error}")}),
+                );
+                state.surfaces.write().await.running.remove(&surface_name);
+                return;
+            }
+        };
+        append_codex_run_event(
+            &mut recorder,
+            &turn_id,
+            RunEvent::AuthorityLease {
+                authority: RunTurnAuthority::WorkspaceWrite,
+                scope_digest,
+                issued_at_ms: lease.issued_at_ms,
+                expires_at_ms: lease.expires_at_ms,
+                turn_deadline_ms: lease.expires_at_ms,
+                cwd: state.workspace_root.as_ref().clone(),
+                network_access: false,
+                tool_profile: WRITE_TOOL_PROFILE.to_string(),
+                outcome: AuthorityLeaseOutcome::Granted,
+            },
+            &mut activity_sink,
+            &mut record_error,
+        );
+    }
     if !context_sources.is_empty() {
         append_codex_run_event(
             &mut recorder,
@@ -1693,7 +2056,13 @@ async fn run_codex_chat_request(
         state.surfaces.write().await.running.remove(&surface_name);
         return;
     }
-    let (result, browser_disconnected) = {
+    let completed_effects = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let event_effects = Arc::clone(&completed_effects);
+    let deadline_after = turn_authority.lease.as_ref().map(|lease| {
+        let now = unix_millis(SystemTime::now()).unwrap_or(u64::MAX);
+        Duration::from_millis(lease.expires_at_ms.saturating_sub(now))
+    });
+    let (result, browser_disconnected, deadline_elapsed) = {
         let (cancellation, cancellation_rx) = codex::cancellation_channel();
         let run = codex::run_chat_cancellable(
             &state.workspace_root,
@@ -1702,6 +2071,7 @@ async fn run_codex_chat_request(
             context.as_deref(),
             &history,
             thread_id.as_deref(),
+            policy,
             cancellation_rx,
             |event| match event {
                 codex::CodexEvent::Started {
@@ -1727,7 +2097,7 @@ async fn run_codex_chat_request(
                     );
                     emit(
                         &event_tx,
-                        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":"read-only","configuration":"isolated","message":"Answering in an isolated read-only Codex thread","request_kind":"chat"}),
+                        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":sandbox_name,"authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id,"configuration":"isolated","message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answering in an isolated read-only Codex thread"} else {"Running one approved workspace-write Codex turn"},"request_kind":"chat"}),
                     );
                 }
                 codex::CodexEvent::Delta(text) => emit_lossy(
@@ -1754,32 +2124,51 @@ async fn run_codex_chat_request(
                     result,
                     is_error,
                     effects,
-                } => append_codex_run_event(
-                    &mut recorder,
-                    &turn_id,
-                    RunEvent::ToolCompleted {
-                        tool_call_id,
-                        result,
-                        is_error,
-                        effects,
-                        verification: None,
-                    },
-                    &mut activity_sink,
-                    &mut record_error,
-                ),
+                } => {
+                    if let Ok(mut recorded) = event_effects.lock() {
+                        recorded.extend(effects.iter().cloned());
+                    }
+                    append_codex_run_event(
+                        &mut recorder,
+                        &turn_id,
+                        RunEvent::ToolCompleted {
+                            tool_call_id,
+                            result,
+                            is_error,
+                            effects,
+                            verification: None,
+                        },
+                        &mut activity_sink,
+                        &mut record_error,
+                    );
+                }
             },
         );
         tokio::pin!(run);
+        let deadline = async {
+            match deadline_after {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline);
         tokio::select! {
-            result = &mut run => (result, false),
+            result = &mut run => (result, false, false),
             () = tx.closed() => {
                 cancellation.request();
-                (run.as_mut().await, true)
+                (run.as_mut().await, true, false)
+            },
+            () = &mut deadline => {
+                cancellation.request();
+                (run.as_mut().await, false, true)
             },
         }
     };
+    let completed_effects = completed_effects
+        .lock()
+        .map_or_else(|_| Vec::new(), |effects| effects.clone());
     let elapsed = started.elapsed().as_secs_f32();
-    if browser_disconnected {
+    if browser_disconnected || deadline_elapsed {
         if let Err(error) = &result {
             if !error.partial_output().is_empty() {
                 append_codex_run_event(
@@ -1808,7 +2197,10 @@ async fn run_codex_chat_request(
             &mut recorder,
             &turn_id,
             RunEvent::TurnCancelled {
-                reason: if result
+                reason: if deadline_elapsed {
+                    "workspace-write lease deadline elapsed; Codex interruption requested"
+                        .to_string()
+                } else if result
                     .as_ref()
                     .is_err_and(codex::CodexFailure::is_interrupted)
                 {
@@ -1830,12 +2222,23 @@ async fn run_codex_chat_request(
                 "failed to persist cancellation in durable run record"
             );
         }
+        if deadline_elapsed {
+            emit(
+                &tx,
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":"Workspace-write turn deadline elapsed; the lease is consumed and interruption was requested","elapsed_seconds":elapsed,"executor":"codex","authority":authority_name}),
+            );
+        }
         tracing::info!(
             request_id,
             kind = "chat",
             executor = "codex",
             elapsed_seconds = elapsed,
-            "request cancelled after client disconnected"
+            reason = if deadline_elapsed {
+                "lease_deadline"
+            } else {
+                "browser_disconnected"
+            },
+            "request cancelled"
         );
         state.surfaces.write().await.running.remove(&surface_name);
         return;
@@ -1850,6 +2253,9 @@ async fn run_codex_chat_request(
     }
     match result {
         Ok(result) => {
+            let effect_inventory_complete = !completed_effects
+                .iter()
+                .any(|effect| matches!(effect, RunToolEffect::Unattributed { .. }));
             append_codex_run_event(
                 &mut recorder,
                 &turn_id,
@@ -1884,7 +2290,7 @@ async fn run_codex_chat_request(
             }
             emit(
                 &tx,
-                &serde_json::json!({"kind":"completed","surface":surface_name,"message":"Answer complete; canvas unchanged","elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"workspace mutation boundary","outcome":"passed","detail":"saved workspace state was not changed"}]}}),
+                &serde_json::json!({"kind":"completed","surface":surface_name,"message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answer complete; workspace unchanged"} else {"Approved write turn complete; inspect recorded effects"},"elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id,"effects":completed_effects,"model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"authority boundary","outcome":"passed","detail":if policy == codex::CodexTurnPolicy::ReadOnly {"read-only policy applied"} else {"single-use workspace-write lease consumed; network and elevation disabled"}},{"name":"effect inventory","outcome":if effect_inventory_complete {"passed"} else {"indeterminate"},"detail":if effect_inventory_complete {"all reported effects are representable"} else {"one or more native effects remain explicitly unattributed"}}]}}),
             );
             tracing::info!(
                 request_id,
@@ -1950,6 +2356,16 @@ async fn run_codex_chat_request(
         }
     }
     state.surfaces.write().await.running.remove(&surface_name);
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
 }
 
 async fn run_provider_chat_request(
@@ -3147,6 +3563,37 @@ impl OutputSink for WebSink {
                 "label": "Permission decision recorded",
                 "detail": format!("{decision:?}"),
             }),
+            RunEvent::AuthorityLease {
+                authority,
+                expires_at_ms,
+                turn_deadline_ms,
+                cwd,
+                network_access,
+                tool_profile,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": "authority:lease",
+                "phase": "permission",
+                "state": match outcome {
+                    AuthorityLeaseOutcome::Granted => "verified",
+                    AuthorityLeaseOutcome::Denied { .. } | AuthorityLeaseOutcome::Revoked { .. } => "error",
+                },
+                "label": match authority {
+                    RunTurnAuthority::ReadOnly => "Read-only authority recorded",
+                    RunTurnAuthority::WorkspaceWrite => "Workspace-write lease recorded",
+                },
+                "detail": format!(
+                    "cwd {} · network {} · profile {} · starts by {} · expires {} · {:?}",
+                    cwd.display(),
+                    if *network_access { "on" } else { "off" },
+                    tool_profile,
+                    turn_deadline_ms,
+                    expires_at_ms,
+                    outcome,
+                ),
+            }),
             RunEvent::ToolCompleted {
                 tool_call_id,
                 is_error,
@@ -3265,9 +3712,10 @@ mod tests {
         extract_workspace_operations, has_chat_target, has_page_edit_target,
         has_sensitive_path_component, is_allowed_host, is_same_local_origin, open_web_run,
         render_home, resolve_chat_context, resolve_or_find_terminal_file, resolve_terminal_path,
-        sanitize_terminal_text, validate_chat_notebook_input, validate_request_message,
-        validate_run_id, validate_workspace_objects, workspace_input, CanvasState, ChatMessage,
-        TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
+        sanitize_terminal_text, validate_authority_fields, validate_chat_notebook_input,
+        validate_request_message, validate_run_id, validate_workspace_objects, workspace_input,
+        write_request_digest, CanvasState, ChatExecutor, ChatMessage, ChatRequest, RequestKind,
+        ResolvedChatContext, TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
         MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{
@@ -3297,6 +3745,78 @@ mod tests {
             );
         }
         assert!(validate_run_id(&"a".repeat(MAX_RUN_ID_LEN + 1)).is_err());
+    }
+
+    fn chat_request(authority: super::write_lease::Authority) -> ChatRequest {
+        ChatRequest {
+            message: "change one file".into(),
+            surface: Some("scratch".into()),
+            kind: RequestKind::Chat,
+            target_id: Some("chat-1".into()),
+            context: Some("selected context".into()),
+            context_source_ids: Vec::new(),
+            history: vec![ChatMessage {
+                role: "user".into(),
+                content: "prior turn".into(),
+            }],
+            executor: ChatExecutor::Codex,
+            thread_id: Some("thread-1".into()),
+            authority,
+            write_lease: None,
+            lease_turn_id: None,
+            start_deadline_ms: None,
+            expires_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ordinary_chat_defaults_to_read_only_without_lease_fields() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "message":"hello",
+            "kind":"chat",
+            "executor":"codex"
+        }))
+        .unwrap();
+        assert_eq!(request.authority, super::write_lease::Authority::ReadOnly);
+        assert!(validate_authority_fields(&request).is_ok());
+    }
+
+    #[test]
+    fn workspace_write_requires_a_complete_single_use_lease() {
+        let mut request = chat_request(super::write_lease::Authority::WorkspaceWrite);
+        assert!(validate_authority_fields(&request).is_err());
+        request.write_lease = Some("00".repeat(16));
+        request.lease_turn_id = Some("turn-1".into());
+        request.start_deadline_ms = Some(10);
+        request.expires_at_ms = Some(20);
+        assert!(validate_authority_fields(&request).is_ok());
+        request.executor = ChatExecutor::Provider;
+        assert!(validate_authority_fields(&request).is_err());
+    }
+
+    #[test]
+    fn write_request_digest_binds_resolved_context_and_frozen_request() {
+        let request = chat_request(super::write_lease::Authority::WorkspaceWrite);
+        let context = ResolvedChatContext {
+            text: Some("resolved one".into()),
+            sources: Vec::new(),
+        };
+        let original = write_request_digest(&request, "scratch", &context);
+        let mut changed_request = request.clone();
+        changed_request.message = "change two files".into();
+        assert_ne!(
+            original,
+            write_request_digest(&changed_request, "scratch", &context)
+        );
+        let changed_context = ResolvedChatContext {
+            text: Some("resolved two".into()),
+            sources: Vec::new(),
+        };
+        assert_ne!(
+            original,
+            write_request_digest(&request, "scratch", &changed_context)
+        );
+        assert_ne!(original, write_request_digest(&request, "other", &context));
     }
 
     #[test]

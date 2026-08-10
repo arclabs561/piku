@@ -15,9 +15,10 @@ const NONCE_BYTES: usize = 16;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_PROFILE_BYTES: usize = 4 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Authority {
+    #[default]
     ReadOnly,
     WorkspaceWrite,
 }
@@ -118,6 +119,7 @@ impl LeaseScope {
 pub(crate) struct LeaseSummary {
     pub authority: Authority,
     pub scope_digest: [u8; 32],
+    pub issued_at_ms: u64,
     pub start_deadline_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -141,6 +143,7 @@ impl WriteLeaseStore {
         let summary = LeaseSummary {
             authority: scope.authority,
             scope_digest,
+            issued_at_ms: unix_millis(SystemTime::now())?,
             start_deadline_ms: scope.start_deadline_ms,
             expires_at_ms: scope.expires_at_ms,
         };

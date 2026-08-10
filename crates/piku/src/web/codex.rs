@@ -10,11 +10,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
 
-use piku_runtime::{RunContentChange, RunContentRef, RunToolEffect};
+use piku_runtime::{RunContentChange, RunContentRef, RunEffectCategory, RunToolEffect};
 
 use super::ChatMessage;
 
 const DEVELOPER_INSTRUCTIONS: &str = "You are the read-only conversation executor inside Piku. Answer the user's question directly and concisely. The Piku workspace and its files are not implicit context. Do not inspect files, run commands, use tools, or mutate the workspace. Use only the conversation and optional context supplied in this turn.";
+const WRITE_DEVELOPER_INSTRUCTIONS: &str = "You are the workspace-write coding executor inside Piku for one explicitly approved turn. Work only inside the provided workspace root, do not use the network, do not request broader approval, and do not access sibling paths. Use native command and file-change tools as needed. Explain what you changed, what you verified, and any uncertainty.";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     // The installed Codex launcher resolves its binary relative to HOME. Codex
     // configuration still comes exclusively from the explicit CODEX_HOME.
@@ -91,6 +92,41 @@ pub(super) struct CodexResult {
     pub thread_id: String,
     pub turn_id: String,
     pub usage: Option<CodexUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CodexTurnPolicy {
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+impl CodexTurnPolicy {
+    fn thread_sandbox(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+        }
+    }
+
+    fn developer_instructions(self) -> &'static str {
+        match self {
+            Self::ReadOnly => DEVELOPER_INSTRUCTIONS,
+            Self::WorkspaceWrite => WRITE_DEVELOPER_INSTRUCTIONS,
+        }
+    }
+
+    fn turn_sandbox(self, workspace_root: &Path) -> Value {
+        match self {
+            Self::ReadOnly => json!({"type":"readOnly","networkAccess":false}),
+            Self::WorkspaceWrite => json!({
+                "type":"workspaceWrite",
+                "writableRoots":[workspace_root],
+                "networkAccess":false,
+                "excludeSlashTmp":true,
+                "excludeTmpdirEnvVar":true
+            }),
+        }
+    }
 }
 
 /// A native Codex turn failure plus any assistant text received before it.
@@ -170,6 +206,50 @@ pub(super) fn readiness() -> CodexReadiness {
     }
 }
 
+pub(super) async fn probe_workspace_write(codex_root: &Path) -> anyhow::Result<()> {
+    let probe_root = std::env::temp_dir().join(format!(
+        "piku-codex-capability-probe-{}",
+        crate::new_session_id()
+    ));
+    let workspace = probe_root.join("workspace");
+    std::fs::create_dir_all(&workspace).context("create Codex capability probe workspace")?;
+    let inside = workspace.join("inside");
+    let outside = probe_root.join("outside");
+    let result = async {
+        let mut server = CodexServer::spawn(codex_root)?;
+        server.initialize().await?;
+        let read_only = server
+            .exec_probe(&inside, json!({"type":"readOnly","networkAccess":false}))
+            .await?;
+        let read_only_absent = !inside.exists();
+        let policy = CodexTurnPolicy::WorkspaceWrite.turn_sandbox(&workspace);
+        let inside_write = server.exec_probe(&inside, policy.clone()).await?;
+        let outside_write = server.exec_probe(&outside, policy).await?;
+        server.stop().await;
+        let inside_present = inside.exists();
+        let outside_absent = !outside.exists();
+        if read_only != 0
+            && read_only_absent
+            && inside_write == 0
+            && inside_present
+            && outside_write != 0
+            && outside_absent
+        {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Codex workspace-write containment probe failed (read_only_exit={read_only}, read_only_absent={read_only_absent}, inside_exit={inside_write}, inside_present={inside_present}, outside_exit={outside_write}, outside_absent={outside_absent})"
+            ))
+        }
+    }
+    .await;
+    let cleanup = std::fs::remove_dir_all(&probe_root);
+    if let Err(error) = cleanup {
+        tracing::warn!(%error, "failed to remove Codex capability probe workspace");
+    }
+    result
+}
+
 pub(super) async fn run_chat_cancellable<F>(
     workspace_root: &Path,
     codex_root: &Path,
@@ -177,6 +257,7 @@ pub(super) async fn run_chat_cancellable<F>(
     context: Option<&str>,
     history: &[ChatMessage],
     thread_id: Option<&str>,
+    policy: CodexTurnPolicy,
     cancellation: watch::Receiver<bool>,
     on_event: F,
 ) -> Result<CodexResult, CodexFailure>
@@ -190,6 +271,7 @@ where
         context,
         history,
         thread_id,
+        policy,
         Some(cancellation),
         on_event,
     )
@@ -203,6 +285,7 @@ async fn run_chat_inner<F>(
     context: Option<&str>,
     history: &[ChatMessage],
     thread_id: Option<&str>,
+    policy: CodexTurnPolicy,
     mut cancellation: Option<watch::Receiver<bool>>,
     mut on_event: F,
 ) -> Result<CodexResult, CodexFailure>
@@ -212,12 +295,16 @@ where
     let mut server = CodexServer::spawn(codex_root)?;
     server.initialize().await?;
     let (thread, model) = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
-        server.resume_thread(workspace_root, thread_id).await?
+        server
+            .resume_thread(workspace_root, thread_id, policy)
+            .await?
     } else {
-        server.start_thread(workspace_root).await?
+        server.start_thread(workspace_root, policy).await?
     };
     let input = compose_input(message, context, history);
-    let turn_id = server.start_turn(&thread, &input).await?;
+    let turn_id = server
+        .start_turn(&thread, &input, workspace_root, policy)
+        .await?;
     on_event(CodexEvent::Started {
         model: model.clone(),
         thread_id: thread.clone(),
@@ -290,7 +377,7 @@ where
         };
         if message.get("id").is_some() && message.get("method").is_some() {
             return Err(CodexFailure::new(
-                "Codex requested an interactive action outside Piku's read-only contract",
+                "Codex requested an interactive action outside Piku's no-elevation contract",
                 output,
             ));
         }
@@ -428,6 +515,8 @@ impl CodexServer {
                 command.env(key, value);
             }
         }
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().context("start Codex app-server")?;
         let stdin = child.stdin.take().context("open Codex stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("open Codex stdout")?);
@@ -451,14 +540,36 @@ impl CodexServer {
         self.send(json!({"method":"initialized","params":{}})).await
     }
 
-    async fn start_thread(&mut self, workspace_root: &Path) -> anyhow::Result<(String, String)> {
+    async fn exec_probe(&mut self, target: &Path, sandbox_policy: Value) -> anyhow::Result<i32> {
+        self.send(json!({"method":"command/exec","id":20,"params":{
+            "command":["/bin/sh","-c","printf probe > \"$1\"","piku-probe",target],
+            "cwd":target.parent(),
+            "env":{},
+            "sandboxPolicy":sandbox_policy,
+            "timeoutMs":5_000,
+            "outputBytesCap":4_096
+        }}))
+        .await?;
+        let response = self.expect_response(20).await?;
+        response
+            .pointer("/result/exitCode")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| protocol_error(&response, "command/exec probe failed"))
+    }
+
+    async fn start_thread(
+        &mut self,
+        workspace_root: &Path,
+        policy: CodexTurnPolicy,
+    ) -> anyhow::Result<(String, String)> {
         self.send(json!({"method":"thread/start","id":2,"params":{
             "cwd": workspace_root,
-            "sandbox":"read-only",
+            "sandbox":policy.thread_sandbox(),
             "approvalPolicy":"never",
             "personality":"pragmatic",
             "ephemeral":false,
-            "developerInstructions":DEVELOPER_INSTRUCTIONS
+            "developerInstructions":policy.developer_instructions()
         }}))
         .await?;
         let response = self.expect_response(2).await?;
@@ -480,14 +591,15 @@ impl CodexServer {
         &mut self,
         workspace_root: &Path,
         thread_id: &str,
+        policy: CodexTurnPolicy,
     ) -> anyhow::Result<(String, String)> {
         self.send(json!({"method":"thread/resume","id":2,"params":{
             "threadId":thread_id,
             "cwd":workspace_root,
-            "sandbox":"read-only",
+            "sandbox":policy.thread_sandbox(),
             "approvalPolicy":"never",
             "personality":"pragmatic",
-            "developerInstructions":DEVELOPER_INSTRUCTIONS
+            "developerInstructions":policy.developer_instructions()
         }}))
         .await?;
         let response = self.expect_response(2).await?;
@@ -508,8 +620,20 @@ impl CodexServer {
         Ok((resumed_id, model))
     }
 
-    async fn start_turn(&mut self, thread_id: &str, input: &str) -> anyhow::Result<String> {
-        self.send(json!({"method":"turn/start","id":3,"params":{"threadId":thread_id,"input":[{"type":"text","text":input}]}})).await?;
+    async fn start_turn(
+        &mut self,
+        thread_id: &str,
+        input: &str,
+        workspace_root: &Path,
+        policy: CodexTurnPolicy,
+    ) -> anyhow::Result<String> {
+        self.send(json!({"method":"turn/start","id":3,"params":{
+            "threadId":thread_id,
+            "approvalPolicy":"never",
+            "sandboxPolicy":policy.turn_sandbox(workspace_root),
+            "input":[{"type":"text","text":input}]
+        }}))
+        .await?;
         let response = self.expect_response(3).await?;
         response
             .pointer("/result/turn/id")
@@ -566,6 +690,13 @@ impl CodexServer {
     }
 
     async fn stop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
@@ -665,12 +796,19 @@ impl ToolLifecycle {
                 (
                     RunContentRef::Inline { text: output },
                     status != "completed" || exit_code.is_some_and(|code| code != 0),
-                    vec![RunToolEffect::ShellCommand { command, exit_code }],
+                    vec![
+                        RunToolEffect::ShellCommand { command, exit_code },
+                        RunToolEffect::Unattributed {
+                            category: RunEffectCategory::FileSystem,
+                            reason: "a shell command may mutate paths that Codex native events do not enumerate"
+                                .to_string(),
+                        },
+                    ],
                 )
             }
             NativeToolKind::FileChange => {
                 let changes = required_array(&tool.value, "changes", &tool.id)?;
-                let effects = changes.iter().filter_map(file_write_effect).collect();
+                let effects = changes.iter().filter_map(file_change_effect).collect();
                 (
                     RunContentRef::Inline {
                         text: format!("Codex reported {} file changes", changes.len()),
@@ -715,23 +853,30 @@ fn required_array<'a>(
     })
 }
 
-fn file_write_effect(change: &Value) -> Option<RunToolEffect> {
+fn file_change_effect(change: &Value) -> Option<RunToolEffect> {
     let path = change.get("path").and_then(Value::as_str)?;
     let kind = change
         .pointer("/kind/type")
         .or_else(|| change.get("kind"))
         .and_then(Value::as_str)?;
-    let content_change = match kind {
-        "add" | "create" => RunContentChange::Created,
-        "update" | "modify" => RunContentChange::Modified,
-        // Unknown, delete, and rename kinds cannot honestly be represented as
-        // a FileWrite by the current run-record schema.
-        _ => return None,
-    };
-    Some(RunToolEffect::FileWrite {
-        path: PathBuf::from(path),
-        content_change,
-    })
+    match kind {
+        "add" | "create" => Some(RunToolEffect::FileWrite {
+            path: PathBuf::from(path),
+            content_change: RunContentChange::Created,
+        }),
+        "update" | "modify" => Some(RunToolEffect::FileWrite {
+            path: PathBuf::from(path),
+            content_change: RunContentChange::Modified,
+        }),
+        // The current schema cannot encode delete or rename as FileWrite.
+        // Preserve the native report as explicit incomplete attribution.
+        _ => Some(RunToolEffect::Unattributed {
+            category: RunEffectCategory::FileSystem,
+            reason: format!(
+                "Codex reported file change kind {kind} for {path}; this effect is not representable as a file write"
+            ),
+        }),
+    }
 }
 
 fn parse_tool_item(message: &Value) -> Option<NativeToolItem> {
@@ -910,6 +1055,32 @@ mod tests {
     }
 
     #[test]
+    fn turn_policies_are_explicit_and_networkless() {
+        let root = Path::new("/workspace");
+        assert_eq!(
+            CodexTurnPolicy::ReadOnly.turn_sandbox(root),
+            json!({"type":"readOnly","networkAccess":false})
+        );
+        assert_eq!(
+            CodexTurnPolicy::WorkspaceWrite.turn_sandbox(root),
+            json!({
+                "type":"workspaceWrite",
+                "writableRoots":["/workspace"],
+                "networkAccess":false,
+                "excludeSlashTmp":true,
+                "excludeTmpdirEnvVar":true
+            })
+        );
+        assert_eq!(
+            CodexTurnPolicy::WorkspaceWrite.thread_sandbox(),
+            "workspace-write"
+        );
+        assert!(CodexTurnPolicy::WorkspaceWrite
+            .developer_instructions()
+            .contains("one explicitly approved turn"));
+    }
+
+    #[test]
     fn parses_stream_delta_and_failure() {
         assert_eq!(
             parse_stream_event(
@@ -1039,15 +1210,23 @@ mod tests {
         assert!(!is_error);
         assert_eq!(
             effects,
-            vec![RunToolEffect::ShellCommand {
-                command: "cargo test".into(),
-                exit_code: Some(0)
-            }]
+            vec![
+                RunToolEffect::ShellCommand {
+                    command: "cargo test".into(),
+                    exit_code: Some(0)
+                },
+                RunToolEffect::Unattributed {
+                    category: RunEffectCategory::FileSystem,
+                    reason:
+                        "a shell command may mutate paths that Codex native events do not enumerate"
+                            .into(),
+                }
+            ]
         );
     }
 
     #[test]
-    fn file_changes_omit_unrepresentable_deletes_and_renames() {
+    fn file_changes_preserve_unrepresentable_deletes_and_renames_as_unattributed() {
         let changes = json!([
             {"path":"new.rs","kind":{"type":"add"}},
             {"path":"old.rs","kind":{"type":"delete"}},
@@ -1078,6 +1257,14 @@ mod tests {
                 RunToolEffect::FileWrite {
                     path: PathBuf::from("new.rs"),
                     content_change: RunContentChange::Created
+                },
+                RunToolEffect::Unattributed {
+                    category: RunEffectCategory::FileSystem,
+                    reason: "Codex reported file change kind delete for old.rs; this effect is not representable as a file write".into(),
+                },
+                RunToolEffect::Unattributed {
+                    category: RunEffectCategory::FileSystem,
+                    reason: "Codex reported file change kind rename for from.rs; this effect is not representable as a file write".into(),
                 },
                 RunToolEffect::FileWrite {
                     path: PathBuf::from("lib.rs"),

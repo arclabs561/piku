@@ -39,12 +39,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sha2 = { workspace = true }
 getrandom = "0.3"
+nix = { version = "0.31", features = ["fs", "term", "signal"] }
 
 [dev-dependencies]
 async-stream = "0.3"
 tempfile = "3"
 piku-api = { path = "../piku-api" }
-nix = { version = "0.31", features = ["fs", "term", "signal"] }
 rexpect = "0.7"
 serial_test = "3"
 vt100 = "0.16"
