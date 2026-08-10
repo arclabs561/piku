@@ -40,7 +40,7 @@ export function codexExecArgs({
       "--config", 'mcp_servers.playwright.command="npx"',
       "--config", `mcp_servers.playwright.cwd=${JSON.stringify(playwrightCwd)}`,
       "--config", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
-      "--config", 'mcp_servers.playwright.args=["--no-install","playwright-mcp","--headless","--isolated","--browser","chromium","--allowed-hosts","localhost,127.0.0.1","--allowed-origins","http://localhost:9090;http://127.0.0.1:9090","--block-service-workers"]',
+      "--config", 'mcp_servers.playwright.args=["--no-install","playwright-mcp","--headless","--isolated","--browser","chromium","--allowed-hosts","localhost,127.0.0.1","--allowed-origins","http://localhost:9090;http://127.0.0.1:9090"]',
     );
   }
   args.push(prompt);

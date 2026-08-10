@@ -50,6 +50,24 @@ test("loads without host-page errors and exposes the spatial workspace", async (
   expect(errors).toEqual([]);
 });
 
+test("mobile chat composer stays visible within the viewport", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  for (const selector of ["#chat-form", "#input"]) {
+    const element = page.locator(selector);
+    await expect(element).toBeVisible();
+    const box = await element.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(390);
+    expect(box.y + box.height).toBeLessThanOrEqual(844);
+  }
+});
+
 test("a second blank-canvas click closes the creation menu", async ({
   page,
   surfaceName: _surfaceName,
@@ -1404,6 +1422,53 @@ test("file snapshots detect staleness and refresh explicitly across reload", asy
   );
 });
 
+test("loaded file card keeps its snapshot, content, and controls separated", async ({
+  page,
+  surfaceName: _surfaceName,
+}) => {
+  await page.route("**/api/terminal/read", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        path: "README.md",
+        output: "     1  # piku\n     2  deterministic file-card geometry",
+        truncated: false,
+        content_sha256: "c".repeat(64),
+        captured_at: "unix-ms:1000",
+      }),
+    }),
+  );
+
+  await addObject(page, "file", { x: 120, y: 100 });
+  const file = page.locator('[data-kind="file"]');
+  await file.getByLabel("File path or description").fill("README.md");
+  await file.getByRole("button", { name: "open" }).click();
+  await expect(file.locator(".file-snapshot")).toContainText("revision 1 · current");
+
+  const geometry = await file.evaluate((card) => {
+    const bounds = (selector) => {
+      const rect = card.querySelector(selector).getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+    };
+    return {
+      body: bounds(".object-body"),
+      snapshot: bounds(".file-snapshot"),
+      output: bounds(".object-output"),
+      form: bounds(".object-form"),
+    };
+  });
+
+  expect(geometry.snapshot.bottom).toBeLessThanOrEqual(geometry.output.top);
+  expect(geometry.output.bottom).toBeLessThanOrEqual(geometry.form.top);
+  for (const child of [geometry.snapshot, geometry.output, geometry.form]) {
+    expect(child.left).toBeGreaterThanOrEqual(geometry.body.left);
+    expect(child.right).toBeLessThanOrEqual(geometry.body.right);
+    expect(child.top).toBeGreaterThanOrEqual(geometry.body.top);
+    expect(child.bottom).toBeLessThanOrEqual(geometry.body.bottom);
+  }
+});
+
 test("absolute file paths are rejected before a noisy network request", async ({
   page,
   surfaceName: _surfaceName,
@@ -1439,7 +1504,7 @@ test("page changes persist an inspectable source diff and rerun control", async 
         { kind: "run_record_started", request_id: `request-page-${calls}`, surface: surfaceName, run_id: "shared-page-session", turn_id: `page-turn-${calls}`, url: "/run/shared-page-session" },
         { kind: "model_started", surface: surfaceName, provider: "fixture", model: "fixture", message: "Planning", request_kind: "page" },
         { kind: "page_snapshot", target_id: request.target_id, html },
-        { kind: "completed", surface: surfaceName, message: "Page source updated", iterations: 1, elapsed_seconds: 0.1, request_kind: "page", verification: { actor: "Piku host", checks: [{ name: "page source persistence", outcome: "passed", detail: "saved" }] } },
+        { kind: "completed", surface: surfaceName, message: "Page source updated", iterations: 1, elapsed_seconds: 0.1, request_kind: "page", provider: "fixture", model: "fixture", tool_policy: "none", tool_calls: [], mutation_actor: "Piku host", verification: { actor: "Piku host", checks: [{ name: "page source persistence", outcome: "passed", detail: "saved" }] } },
       ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
     });
   });
@@ -1494,19 +1559,29 @@ test("page changes persist an inspectable source diff and rerun control", async 
   const savedChange = JSON.parse(
     persistedChange.objects.find((object) => object.kind === "workspace_task").content,
   );
-  expect(savedChange.version).toBe(4);
+  expect(savedChange.version).toBe(5);
   expect(savedChange.runs[1]).toMatchObject({
     ordinal: 2,
     requestId: "request-page-2",
     runId: "shared-page-session",
     runUrl: "/run/shared-page-session",
     turnId: "page-turn-2",
+    provider: "fixture",
+    model: "fixture",
+    toolPolicy: "none",
+    toolCalls: [],
+    mutationActor: "Piku host",
   });
   await latestRun.getByText("provenance", { exact: true }).click();
   const provenance = latestRun.locator("pre");
   await expect(provenance).toContainText("target: page ·");
   await expect(provenance).toContainText("instruction: revise the heading");
   await expect(provenance).toContainText("result: Page source updated");
+  await expect(provenance).toContainText("provider: fixture");
+  await expect(provenance).toContainText("model: fixture");
+  await expect(provenance).toContainText("tool policy: none");
+  await expect(provenance).toContainText("tool calls: 0");
+  await expect(provenance).toContainText("mutation actor: Piku host");
   await expect(provenance).toContainText("verification actor: Piku host");
   await expect(provenance).toContainText("passed · page source persistence: saved");
   await expect(provenance).toContainText("exact diff:");

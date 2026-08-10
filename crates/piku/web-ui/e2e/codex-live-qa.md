@@ -127,6 +127,19 @@ do not reduce the report to CSS defects. Prefer one root finding over several
 symptoms. A high finding means the representative task cannot be understood,
 controlled, recovered, or safely attributed.
 
+Before recording any finding, reconcile its evidence across modalities:
+
+- A failed locator proves only that the locator failed. It does not prove that
+  the visible control or capability is absent. Check a current screenshot and
+  a targeted DOM predicate before reporting absence.
+- Attribute console errors to their actual origin and observed impact. Treat
+  evaluator-generated errors as compromised evidence, not product defects.
+- If screenshot pixels and a predicate disagree, report the contradiction as
+  compromised evaluation evidence and do not promote it to a product finding.
+- Inspect every saved screenshot yourself during REFLECT. Record visually
+  apparent clipping, overlap, illegible density, or hierarchy failures even
+  when accessibility text remains correct.
+
 Return up to eight structured `followups` to preserve momentum across runs.
 Use `todo` for a concrete harness or evaluation action, `idea` for an unproven
 hypothesis, and `retest` for a prior capability that needs fresh evidence. Give

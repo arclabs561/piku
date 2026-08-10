@@ -46,6 +46,10 @@ test("agent QA contract evaluates the product thesis, not only UI mechanics", as
   assert.match(runner, /supported thesis verdict contradicts dimension evidence/);
   assert.match(prompt, /Number findings locally as `f1`/);
   assert.match(prompt, /`retest_of` only to an exact prior fully scoped obligation ID/);
+  assert.match(prompt, /failed locator proves only that the locator failed/i);
+  assert.match(prompt, /evaluator-generated errors.*compromised evidence/is);
+  assert.match(prompt, /screenshot pixels and a predicate disagree/i);
+  assert.match(prompt, /visually\s+apparent clipping, overlap, illegible density/i);
   const parsedSchema = JSON.parse(schema);
   assert.equal(parsedSchema.properties.findings.items.properties.id.pattern, "^f[1-9][0-9]*$");
   for (const field of ["id", "finding_ids", "evidence_ids", "retest_of"])
@@ -132,7 +136,7 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
   assert.match(tracePrompt, /Execution trace.*transient[\s\S]*not an authored or persisted workspace card/);
   assert.match(tracePrompt, /create a small seeded\s+page[\s\S]*submit a narrow heading-only change/);
   assert.match(tracePrompt, /initial empty-to-document creation is setup, not evidence/);
-  assert.match(tracePrompt, /aggregate console count alone cannot support a finding/i);
+  assert.match(tracePrompt, /aggregate console count alone cannot\s+support a finding/i);
   assert.match(recoveryPrompt, /raw\s+error count or HTTP status[\s\S]*cannot support a product\s+finding/);
   assert.match(recoveryPrompt, /semantic selected-state predicate[^.]*`true`/i);
   assert.match(recoveryPrompt, /selection as transient interaction state/i);
@@ -140,11 +144,8 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
   assert.match(recoveryPrompt, /deterministic delayed-provider fixture/i);
   assert.match(synthesisPrompt, /aggregate console counts or generic DOM article counts/);
   for (const prompt of [tracePrompt, recoveryPrompt, synthesisPrompt]) {
-    assert.match(prompt, /service-worker blocking/);
-    assert.match(prompt, /navigator\.serviceWorker/);
-    assert.match(prompt, /evaluator noise/);
+    assert.match(prompt, /evaluator(?:-generated)? noise/);
     assert.match(prompt, /product impact/);
-    assert.match(prompt, /(?:unrelated|other)\s+`SecurityError`/);
   }
 });
 

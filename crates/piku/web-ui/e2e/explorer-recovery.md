@@ -83,13 +83,8 @@ not promote the negative claim to a finding or hypothesis outcome.
 
 For console or network evidence, capture representative exact messages, source
 URL/origin, timing, and observed product impact. Separate host-page failures from
-sandboxed `about:srcdoc` preview errors and intentional rejected requests. When
-Playwright runs with service-worker blocking, its own init script can raise
-`SecurityError` while reading `navigator.serviceWorker` in an opaque sandboxed
-`about:srcdoc` frame. Preserve the exact message and origin as harness
-provenance, but classify that exact condition as evaluator noise unless separate
-evidence shows product impact. Do not generalize this exception to other
-`SecurityError` messages. A raw error count or HTTP status without this
+sandboxed `about:srcdoc` preview errors, intentional rejected requests, and
+evaluator-generated noise. A raw error count or HTTP status without this
 classification cannot support a product finding.
 
 Delete the surface through the UI and close the browser before returning. Return
