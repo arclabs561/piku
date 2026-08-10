@@ -35,6 +35,13 @@ export function managedTerminalEnabled(mode) {
   return mode === "e2e";
 }
 
+export function managedPageBroker(mode, environment) {
+  if (mode === "e2e" || !environment.OPENROUTER_API_KEY) return null;
+  return {
+    model: environment.PIKU_EVAL_PAGE_MODEL || "openai/gpt-5.6-terra",
+  };
+}
+
 export function evaluationArtifactPaths(root, mode, runId) {
   validateRunId(runId);
   const artifactsRoot = path.join(root, ".artifacts", "playwright-agent");
@@ -140,6 +147,7 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
       repoRoot,
       artifactDir,
       terminalEnabled: managedTerminalEnabled(mode),
+      pageBroker: managedPageBroker(mode, environment),
     });
   let child;
   let outcome;

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { supervisePageBroker } from "./evaluation-page-broker.mjs";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const closeStream = (stream) => new Promise((resolve, reject) => {
@@ -125,6 +126,8 @@ export async function startManagedEvaluationServer({
   timeoutMs = 60_000,
   shutdownGraceMs = 3_000,
   terminalEnabled = false,
+  pageBroker = null,
+  serverBinary = null,
 } = {}) {
   if (!repoRoot || !artifactDir) throw new TypeError("repoRoot and artifactDir are required");
   const serverDir = path.join(artifactDir, "server");
@@ -135,6 +138,12 @@ export async function startManagedEvaluationServer({
   await mkdir(stateDir, { recursive: true });
   const env = evaluationEnvironment(parentEnv, stateDir);
   if (!terminalEnabled) env.PIKU_WEB_DISABLE_TERMINAL = "1";
+  if (pageBroker) {
+    if (typeof pageBroker.model !== "string" || !pageBroker.model)
+      throw new TypeError("pageBroker.model is required");
+    env.PIKU_PAGE_BROKER_FD = "3";
+    env.PIKU_PAGE_BROKER_MODEL = pageBroker.model;
+  }
   await Promise.all([
     mkdir(env.HOME, { recursive: true }),
     mkdir(env.XDG_CACHE_HOME, { recursive: true }),
@@ -144,25 +153,39 @@ export async function startManagedEvaluationServer({
   const workspaceDir = await prepareEvaluationWorkspace(repoRoot, stateDir);
   const log = createWriteStream(logPath, { flags: "wx", mode: 0o600 });
   const startedAt = new Date().toISOString();
-  const child = spawnImpl("cargo", [
-    "run",
-    "--quiet",
-    "--manifest-path",
-    path.join(repoRoot, "Cargo.toml"),
-    "-p",
-    "piku",
-    "--",
-    "web",
-    "--port",
-    "0",
-  ], {
+  const command = serverBinary || "cargo";
+  const args = serverBinary
+    ? ["web", "--port", "0"]
+    : [
+      "run",
+      "--quiet",
+      "--manifest-path",
+      path.join(repoRoot, "Cargo.toml"),
+      "-p",
+      "piku",
+      "--",
+      "web",
+      "--port",
+      "0",
+    ];
+  const child = spawnImpl(command, args, {
     cwd: workspaceDir,
     env: { ...env, PIKU_WEB_READY_FILE: readyPath },
     detached: process.platform !== "win32",
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: pageBroker ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
   });
   child.stdout?.pipe(log, { end: false });
   child.stderr?.pipe(log, { end: false });
+  let closePageBroker = async () => {};
+  if (pageBroker) {
+    const brokerStream = child.stdio?.[3];
+    if (!brokerStream) throw new Error("managed server did not expose page broker fd 3");
+    closePageBroker = supervisePageBroker(brokerStream, {
+      apiKey: parentEnv.OPENROUTER_API_KEY,
+      model: pageBroker.model,
+      fetchImpl: pageBroker.fetchImpl,
+    });
+  }
   let processOutcome = null;
   const terminated = new Promise((resolve) => {
     const settle = (outcome) => {
@@ -190,6 +213,8 @@ export async function startManagedEvaluationServer({
         ownership: "managed",
         fixture_available: true,
         terminal_enabled: terminalEnabled,
+        page_broker_enabled: Boolean(pageBroker),
+        page_broker_model: pageBroker?.model ?? null,
         ready_file: readyPath,
         workspace_root: workspaceDir,
         url: baseUrl.toString(),
@@ -213,6 +238,7 @@ export async function startManagedEvaluationServer({
             stopProcessGroup(child, "SIGKILL", killImpl);
             await terminated;
           }
+          await closePageBroker();
           await closeStream(log);
           await writeFile(lifecyclePath, `${JSON.stringify({
             ...metadata,
@@ -240,6 +266,7 @@ export async function startManagedEvaluationServer({
     stopProcessGroup(child, "SIGKILL", killImpl);
     await terminated;
   }
+  await closePageBroker();
   await closeStream(log);
   await writeFile(lifecyclePath, `${JSON.stringify({
     ownership: "managed",

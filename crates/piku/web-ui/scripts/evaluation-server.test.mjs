@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import {
   connectExternalEvaluationServer,
   startManagedEvaluationServer,
   validateEvaluationOrigin,
 } from "./evaluation-server.mjs";
+
+const execFileAsync = promisify(execFile);
 
 test("evaluation origins require an explicit loopback port", () => {
   assert.equal(validateEvaluationOrigin("http://127.0.0.1:43210").port, "43210");
@@ -43,6 +48,7 @@ test("managed evaluation server verifies fixture readiness and records teardown"
     child.exitCode = null;
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
+    child.stdio = [null, child.stdout, child.stderr, new PassThrough()];
     spawned = { args, child, command, options };
     setTimeout(async () => {
       await writeFile(options.env.PIKU_WEB_READY_FILE, JSON.stringify({
@@ -71,11 +77,20 @@ test("managed evaluation server verifies fixture readiness and records teardown"
         json: async () => ({ executors: [{ id: "evaluation_fixture", available: true }] }),
       }),
       timeoutMs: 1_000,
+      parentEnv: { OPENROUTER_API_KEY: "parent-only-secret" },
+      pageBroker: {
+        model: "anthropic/page-model",
+        fetchImpl: async () => { throw new Error("not called"); },
+      },
     });
     assert.equal(server.baseUrl.port, "43210");
     assert.equal(spawned.options.env.PIKU_NO_DOTENV, "1");
     assert.equal(spawned.options.env.PIKU_WEB_EVALUATION_FIXTURES, "1");
     assert.equal(spawned.options.env.PIKU_WEB_DISABLE_TERMINAL, "1");
+    assert.equal(spawned.options.env.PIKU_PAGE_BROKER_FD, "3");
+    assert.equal(spawned.options.env.PIKU_PAGE_BROKER_MODEL, "anthropic/page-model");
+    assert.equal(spawned.options.env.OPENROUTER_API_KEY, undefined);
+    assert.deepEqual(spawned.options.stdio, ["ignore", "pipe", "pipe", "pipe"]);
     assert.equal(spawned.options.env.HOME, path.join(root, "server", "state", "home"));
     assert.equal(spawned.options.env.XDG_CONFIG_HOME, path.join(root, "server", "state", "config"));
     assert.equal(spawned.options.cwd, path.join(root, "server", "state", "workspace"));
@@ -92,11 +107,14 @@ test("managed evaluation server verifies fixture readiness and records teardown"
       "# Piku managed evaluation workspace\n\nThis workspace contains only deterministic test fixtures.\n",
     );
     await server.stop();
+    assert.equal(spawned.child.stdio[3].destroyed, true);
     const lifecycle = JSON.parse(await readFile(path.join(root, "server", "lifecycle.json"), "utf8"));
     assert.equal(lifecycle.status, "stopped");
     assert.equal(lifecycle.forced, false);
     assert.equal(lifecycle.workspace_root, path.join(root, "server", "state", "workspace"));
     assert.equal(lifecycle.terminal_enabled, false);
+    assert.equal(lifecycle.page_broker_enabled, true);
+    assert.equal(lifecycle.page_broker_model, "anthropic/page-model");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -181,4 +199,103 @@ test("managed evaluation server records a spawn error without waiting for an exi
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("real managed server exchanges a page proposal over inherited fd 3", {
+  skip: process.env.PIKU_BROKER_INTEGRATION !== "1",
+  timeout: 300_000,
+}, async (t) => {
+  const webUiDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const repoRoot = path.resolve(webUiDir, "../../..");
+  const artifactDir = await mkdtemp(path.join(os.tmpdir(), "piku-broker-proof-"));
+  let server;
+  t.after(async () => {
+    if (server) await server.stop();
+    await rm(artifactDir, { recursive: true, force: true });
+  });
+  const targetDir = path.join(artifactDir, "cargo-target");
+  await execFileAsync("cargo", [
+    "build",
+    "--offline",
+    "--locked",
+    "--quiet",
+    "--package",
+    "piku",
+    "--bin",
+    "piku",
+    "--target-dir",
+    targetDir,
+  ], {
+    cwd: repoRoot,
+    env: { ...process.env, CARGO_NET_OFFLINE: "true" },
+    timeout: 240_000,
+  });
+  server = await startManagedEvaluationServer({
+    repoRoot,
+    artifactDir,
+    serverBinary: path.join(targetDir, "debug", "piku"),
+    parentEnv: { ...process.env, OPENROUTER_API_KEY: "proof-only-sentinel" },
+    pageBroker: {
+      model: "proof-model",
+      fetchImpl: async (_url, options) => {
+        assert.equal(options.headers.authorization, "Bearer proof-only-sentinel");
+        return new Response(JSON.stringify({
+          choices: [{
+            message: {
+              content: "I will create the requested marker.\n\n```html\n<!doctype html><html><body><main id=\"broker-proof\">broker round trip</main></body></html>\n```",
+            },
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12 },
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    },
+  });
+  const surface = "broker-proof";
+  let response = await fetch(new URL("/api/surfaces", server.baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: surface }),
+  });
+  assert.equal(response.ok, true);
+  response = await fetch(new URL(`/api/surfaces/${surface}/workspace`, server.baseUrl), {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      objects: [{
+        id: "page-proof",
+        kind: "page_preview",
+        title: "proof page",
+        x: 20,
+        y: 20,
+        width: 600,
+        height: 400,
+        z: 1,
+        content: "",
+      }],
+    }),
+  });
+  assert.equal(response.ok, true, await response.text());
+  response = await fetch(new URL("/api/chat", server.baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: "create the broker proof marker",
+      surface,
+      kind: "page",
+      target_id: "page-proof",
+      history: [],
+      executor: "provider",
+      authority: "read_only",
+    }),
+  });
+  const events = await response.text();
+  assert.match(events, /"kind":"completed"/);
+  response = await fetch(new URL(`/api/surfaces/${surface}`, server.baseUrl));
+  const saved = await response.json();
+  assert.match(saved.html, /broker round trip/);
+  assert.equal(server.metadata.terminal_enabled, false);
+  assert.equal(server.metadata.page_broker_enabled, true);
 });

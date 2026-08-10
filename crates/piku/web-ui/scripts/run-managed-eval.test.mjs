@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   evaluationArtifactPaths,
   managedTerminalEnabled,
+  managedPageBroker,
   managedArtifactDir,
   validateRunId,
   writeBindingWithoutMaskingChildFailure,
@@ -17,6 +18,18 @@ test("model-driven managed judges cannot reach the host terminal", () => {
   assert.equal(managedTerminalEnabled("e2e"), true);
   for (const mode of ["single", "parallel", "focus-pair"])
     assert.equal(managedTerminalEnabled(mode), false);
+});
+
+test("model-driven managed runs use a parent-only page broker when configured", () => {
+  assert.equal(managedPageBroker("e2e", { OPENROUTER_API_KEY: "secret" }), null);
+  assert.equal(managedPageBroker("parallel", {}), null);
+  assert.deepEqual(managedPageBroker("parallel", { OPENROUTER_API_KEY: "secret" }), {
+    model: "openai/gpt-5.6-terra",
+  });
+  assert.deepEqual(managedPageBroker("single", {
+    OPENROUTER_API_KEY: "secret",
+    PIKU_EVAL_PAGE_MODEL: "anthropic/custom",
+  }), { model: "anthropic/custom" });
 });
 
 test("managed run IDs accept only bounded filename components", () => {

@@ -24,6 +24,7 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 piku-tools = { path = "../piku-tools" }
 piku-runtime = { path = "../piku-runtime" }
+piku-api = { path = "../piku-api" }
 crossterm = { workspace = true }
 syntect = { workspace = true }
 unicode-segmentation = { workspace = true }
@@ -44,7 +45,6 @@ nix = { version = "0.31", features = ["fs", "term", "signal"] }
 [dev-dependencies]
 async-stream = "0.3"
 tempfile = "3"
-piku-api = { path = "../piku-api" }
 rexpect = "0.7"
 serial_test = "3"
 vt100 = "0.16"

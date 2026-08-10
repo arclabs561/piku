@@ -27,6 +27,7 @@ use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 use crate::config::PikuConfig;
 
 mod codex;
+mod page_broker;
 mod pty;
 mod write_lease;
 
@@ -461,6 +462,7 @@ struct ExecutorStatus {
     model: String,
     detail: String,
     workspace_write_available: bool,
+    request_kinds: Vec<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -507,6 +509,11 @@ enum WorkspaceOperation {
 // ---------------------------------------------------------------------------
 
 pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
+    if page_broker::PageBroker::is_configured()
+        && std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1")
+    {
+        anyhow::bail!("PIKU_PAGE_BROKER_FD requires PIKU_WEB_DISABLE_TERMINAL=1");
+    }
     let root = surfaces_root(config);
     let _ = std::fs::create_dir_all(&root);
 
@@ -609,16 +616,26 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
 async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCatalog> {
     let codex = codex::readiness();
     let provider = ResolvedProvider::resolve(state.config.provider.as_deref());
-    let provider_model = provider.as_ref().map_or_else(
-        |_| "unavailable".to_string(),
-        |resolved| {
-            state
-                .config
-                .model
-                .clone()
-                .unwrap_or_else(|| resolved.default_model.clone())
-        },
-    );
+    let page_broker = page_broker::PageBroker::is_configured();
+    let provider_model = if page_broker {
+        state
+            .config
+            .model
+            .clone()
+            .unwrap_or_else(page_broker::PageBroker::configured_model)
+    } else {
+        provider.as_ref().map_or_else(
+            |_| "unavailable".to_string(),
+            |resolved| {
+                state
+                    .config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| resolved.default_model.clone())
+            },
+        )
+    };
+    let provider_request_kinds = provider_request_kinds(provider.is_ok(), page_broker);
     let mut executors = vec![
         ExecutorStatus {
             id: "codex",
@@ -627,14 +644,22 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             model: codex.model.to_string(),
             detail: codex.detail,
             workspace_write_available: state.workspace_write_available,
+            request_kinds: vec!["chat"],
         },
         ExecutorStatus {
             id: "provider",
-            available: provider.is_ok(),
+            available: !provider_request_kinds.is_empty(),
             isolated: true,
             model: provider_model,
-            detail: "Piku provider loop · explicit provider credentials".to_string(),
+            detail: if provider.is_ok() {
+                "Piku provider loop · explicit provider credentials".to_string()
+            } else if page_broker {
+                "Parent-brokered page proposals · chat unavailable".to_string()
+            } else {
+                "Piku provider loop · credentials unavailable".to_string()
+            },
             workspace_write_available: false,
+            request_kinds: provider_request_kinds,
         },
     ];
     if state.evaluation_fixtures {
@@ -645,6 +670,7 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             model: "deterministic-cancellation".to_string(),
             detail: "Evaluation-only executor · waits for explicit user cancellation".to_string(),
             workspace_write_available: false,
+            request_kinds: vec!["chat"],
         });
     }
     Json(ExecutorCatalog {
@@ -652,6 +678,19 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
         workspace_root: state.workspace_root.display().to_string(),
         executors,
     })
+}
+
+fn provider_request_kinds(
+    ambient_provider_available: bool,
+    page_broker_available: bool,
+) -> Vec<&'static str> {
+    if ambient_provider_available {
+        vec!["chat", "workspace", "page"]
+    } else if page_broker_available {
+        vec!["page"]
+    } else {
+        Vec::new()
+    }
 }
 
 async fn local_request_guard(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -952,12 +991,50 @@ fn validate_workspace_objects(objects: &[WorkspaceObject]) -> Result<(), String>
     Ok(())
 }
 
+#[cfg(test)]
 fn has_page_edit_target(objects: &[WorkspaceObject], target_id: Option<&str>) -> bool {
-    target_id.is_some_and(|target| {
-        objects
-            .iter()
-            .any(|object| object.id == target && object.kind == WorkspaceObjectKind::PagePreview)
-    })
+    page_edit_target(objects, target_id).is_some()
+}
+
+fn page_edit_target<'a>(
+    objects: &'a [WorkspaceObject],
+    target_id: Option<&str>,
+) -> Option<&'a WorkspaceObject> {
+    let target = target_id?;
+    objects
+        .iter()
+        .find(|object| object.id == target && object.kind == WorkspaceObjectKind::PagePreview)
+}
+
+#[derive(Debug, Clone)]
+struct PageEditBinding {
+    target: WorkspaceObject,
+    html: String,
+}
+
+impl PageEditBinding {
+    fn matches(&self, state: &CanvasState) -> bool {
+        state.html == self.html
+            && page_edit_target(&state.objects, Some(&self.target.id)) == Some(&self.target)
+    }
+}
+
+fn reject_stale_page_edit(tx: &mpsc::Sender<String>, surface_name: &str, request_id: &str) {
+    emit(
+        tx,
+        &serde_json::json!({
+            "kind":"failed",
+            "surface":surface_name,
+            "message":"Page changed while the proposal was running; review the current preview and try again"
+        }),
+    );
+    tracing::warn!(
+        request_id,
+        surface = %surface_name,
+        kind = "page",
+        conflict = "stale_target",
+        "request rejected"
+    );
 }
 
 fn has_chat_target(objects: &[WorkspaceObject], target_id: Option<&str>) -> bool {
@@ -2969,7 +3046,7 @@ async fn run_canvas_request(
         &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name}),
     );
 
-    let resolved = match ResolvedProvider::resolve(state.config.provider.as_deref()) {
+    let broker = match page_broker::PageBroker::from_env().await {
         Ok(provider) => provider,
         Err(error) => {
             emit(
@@ -2981,31 +3058,65 @@ async fn run_canvas_request(
             return;
         }
     };
-    let model = state
-        .config
-        .model
-        .as_deref()
-        .unwrap_or(&resolved.default_model)
-        .to_string();
-    let provider_name = resolved.name().to_string();
-    let (mut session, existing_html, page_target_exists) = {
+    let resolved = if broker.is_none() {
+        match ResolvedProvider::resolve(state.config.provider.as_deref()) {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                emit(
+                    &tx,
+                    &serde_json::json!({"kind":"failed","surface":surface_name,"message":format!("provider error: {error}")}),
+                );
+                tracing::error!(request_id, kind = "page", %error, "provider unavailable");
+                state.surfaces.write().await.running.remove(&surface_name);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let default_model = broker.as_ref().map_or_else(
+        || {
+            resolved
+                .as_ref()
+                .expect("resolved provider exists without broker")
+                .default_model
+                .clone()
+        },
+        |_| page_broker::PageBroker::configured_model(),
+    );
+    let model = state.config.model.clone().unwrap_or(default_model);
+    let provider: &dyn piku_runtime::Provider = broker.as_ref().map_or_else(
+        || {
+            resolved
+                .as_ref()
+                .expect("resolved provider exists without broker")
+                .as_provider()
+        },
+        |broker| broker,
+    );
+    let provider_name = provider.name().to_string();
+    let (mut session, existing_html, page_target) = {
         let mut surfaces = state.surfaces.write().await;
         let root = surfaces.root.clone();
         let entry = surfaces
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&surface_dir(&root, &surface_name)));
-        let target_exists = has_page_edit_target(&entry.objects, target_id.as_deref());
-        (entry.session.clone(), entry.html.clone(), target_exists)
+        let target = page_edit_target(&entry.objects, target_id.as_deref()).cloned();
+        (entry.session.clone(), entry.html.clone(), target)
     };
-    if !page_target_exists {
+    let Some(page_target) = page_target else {
         emit(
             &tx,
             &serde_json::json!({"kind":"failed","surface":surface_name,"message":"Page edit target is missing or is not a page preview"}),
         );
         state.surfaces.write().await.running.remove(&surface_name);
         return;
-    }
+    };
+    let page_binding = PageEditBinding {
+        target: page_target,
+        html: existing_html.clone(),
+    };
     if existing_html.chars().count() > MAX_CANVAS_ARTIFACT_CHARS {
         emit(
             &tx,
@@ -3053,7 +3164,7 @@ async fn run_canvas_request(
         let result = run_turn(
             &input,
             session,
-            resolved.as_provider(),
+            provider,
             &model,
             &canvas_system_prompt(),
             Vec::new(),
@@ -3096,6 +3207,11 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
+        if !page_binding.matches(entry) {
+            reject_stale_page_edit(&tx, &surface_name, &request_id);
+            surfaces.running.remove(&surface_name);
+            return;
+        }
         let mut candidate = entry.clone();
         candidate.html.clone_from(&canvas_html);
         candidate.session = session;
@@ -3155,6 +3271,11 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
+        if !page_binding.matches(entry) {
+            reject_stale_page_edit(&tx, &surface_name, &request_id);
+            surfaces.running.remove(&surface_name);
+            return;
+        }
         let mut candidate = entry.clone();
         candidate.session = session;
         candidate.messages.push(ChatMessage {
@@ -3205,6 +3326,11 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
+        if !page_binding.matches(entry) {
+            reject_stale_page_edit(&tx, &surface_name, &request_id);
+            surfaces.running.remove(&surface_name);
+            return;
+        }
         let mut candidate = entry.clone();
         candidate.session = session;
         candidate.messages.push(ChatMessage {
@@ -3270,6 +3396,11 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
+        if !page_binding.matches(entry) {
+            reject_stale_page_edit(&tx, &surface_name, &request_id);
+            surfaces.running.remove(&surface_name);
+            return;
+        }
         entry.session = session;
         entry.messages.push(ChatMessage {
             role: "user".into(),
@@ -3309,6 +3440,11 @@ async fn run_canvas_request(
             .cache
             .entry(surface_name.clone())
             .or_insert_with(|| CanvasState::load(&dir));
+        if !page_binding.matches(entry) {
+            reject_stale_page_edit(&tx, &surface_name, &request_id);
+            surfaces.running.remove(&surface_name);
+            return;
+        }
         entry.session = session;
         entry.messages.push(ChatMessage {
             role: "user".into(),
@@ -3990,13 +4126,14 @@ mod tests {
         ensure_default_surface, execute_terminal_read, extract_canvas_html, extract_canvas_noop,
         extract_partial_canvas_html, extract_workspace_operations, has_chat_target,
         has_page_edit_target, has_sensitive_path_component, is_allowed_host, is_same_local_origin,
-        open_web_run, page_completion_event, render_home, resolve_chat_context,
-        resolve_or_find_terminal_file, resolve_terminal_path, sanitize_terminal_text,
-        validate_authority_fields, validate_chat_notebook_input, validate_request_message,
-        validate_run_id, validate_workspace_objects, workspace_input, write_request_digest,
-        CanvasNoopStatus, CanvasState, ChatExecutor, ChatMessage, ChatRequest, RequestKind,
-        ResolvedChatContext, TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
-        MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
+        open_web_run, page_completion_event, provider_request_kinds, render_home,
+        resolve_chat_context, resolve_or_find_terminal_file, resolve_terminal_path,
+        sanitize_terminal_text, validate_authority_fields, validate_chat_notebook_input,
+        validate_request_message, validate_run_id, validate_workspace_objects, workspace_input,
+        write_request_digest, CanvasNoopStatus, CanvasState, ChatExecutor, ChatMessage,
+        ChatRequest, PageEditBinding, RequestKind, ResolvedChatContext, TerminalReadRequest,
+        WebSink, WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS,
+        MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{
         read_run_record, ContentBlock, ConversationMessage, OutputSink, RunEvent, Session,
@@ -4651,6 +4788,53 @@ mod tests {
         assert!(!has_page_edit_target(&objects, None));
         assert!(!has_page_edit_target(&objects, Some("note-1")));
         assert!(!has_page_edit_target(&objects, Some("missing")));
+    }
+
+    #[test]
+    fn page_edit_binding_rejects_replaced_target_or_source() {
+        let preview = WorkspaceObject {
+            id: "page-preview-1".to_string(),
+            kind: WorkspaceObjectKind::PagePreview,
+            title: "landing".to_string(),
+            x: 32.0,
+            y: 32.0,
+            width: 960.0,
+            height: 680.0,
+            z: 1,
+            content: String::new(),
+        };
+        let binding = PageEditBinding {
+            target: preview.clone(),
+            html: "<main>before</main>".to_string(),
+        };
+        let original = CanvasState {
+            html: binding.html.clone(),
+            objects: vec![preview.clone()],
+            ..CanvasState::default()
+        };
+        assert!(binding.matches(&original));
+
+        let mut replaced_target = original.clone();
+        replaced_target.objects[0].title = "replacement".to_string();
+        assert!(!binding.matches(&replaced_target));
+
+        let mut removed_target = original.clone();
+        removed_target.objects.clear();
+        assert!(!binding.matches(&removed_target));
+
+        let mut changed_source = original;
+        changed_source.html = "<main>newer</main>".to_string();
+        assert!(!binding.matches(&changed_source));
+    }
+
+    #[test]
+    fn broker_only_provider_catalog_exposes_only_page_requests() {
+        assert_eq!(provider_request_kinds(false, true), vec!["page"]);
+        assert_eq!(
+            provider_request_kinds(true, true),
+            vec!["chat", "workspace", "page"]
+        );
+        assert!(provider_request_kinds(false, false).is_empty());
     }
 
     #[test]
