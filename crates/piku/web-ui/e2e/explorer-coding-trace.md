@@ -32,6 +32,12 @@ Record only observed evidence, with IDs
 prefixed `coding_trace:`. Do not add a file card or make a separate chat request.
 Stay below {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
+Record one to eight concise expectation-gap probes in `probes`. For each, state
+the operator intent, the visible outcome expected before acting, the action,
+the observed outcome, its consequence, and the smallest useful next probe.
+This is bounded observational self-talk, not hidden chain-of-thought. Preserve
+surprises and disconfirmed expectations, and bind every probe to evidence.
+
 Before acting, state at least one falsifiable mechanism hypothesis in the
 structured report: what UI mechanism should make attribution understandable,
 what observation it predicts, and what observation would falsify it. After the

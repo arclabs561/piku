@@ -21,6 +21,12 @@ console or network failures once, near the end. Record evidence with IDs prefixe
 `recovery:`. Stay below
 {{MAX_CALLS}} Playwright calls and {{MAX_SNAPSHOTS}} snapshots.
 
+Record one to eight concise expectation-gap probes in `probes`. For each, state
+the operator intent, the visible outcome expected before acting, the action,
+the observed outcome, its consequence, and the smallest useful next probe.
+This is bounded observational self-talk, not hidden chain-of-thought. Preserve
+surprises and disconfirmed expectations, and bind every probe to evidence.
+
 Before reload, select a named card and record a semantic selected-state predicate
 as `true`; a border color or screenshot alone is insufficient. Treat focus and
 selection as transient interaction state unless the product explicitly documents

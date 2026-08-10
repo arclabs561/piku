@@ -46,6 +46,15 @@ Use this representative task throughout the journey:
 
 Complete exactly these phases in order:
 
+For each phase, use a concise expectation-gap probe in the structured journey:
+`intent` says what you are trying to accomplish, `expected_outcome` records the
+visible response you expect before acting, `actions` records what you actually
+did, `observation` records what actually happened, `consequence` explains the
+operator impact, and `next_probe` names the smallest follow-up that could
+disambiguate surprise. This is bounded observational self-talk, not a request
+for hidden chain-of-thought. Preserve disconfirmed expectations; they are often
+the most useful usability evidence.
+
 1. ORIENT — At 1440x1000, arrive without prior product explanation. Capture
    `01-empty-desktop.png`. State what work the surface appears to support, what
    is merely implied, and whether the next action is obvious.

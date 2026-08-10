@@ -21,6 +21,26 @@
       "required": ["width", "height", "device_scale_factor", "color_scheme", "canvas_scroll_x", "canvas_scroll_y"]
     },
     "summary": { "type": "string", "minLength": 1 },
+    "probes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^p[1-9][0-9]*$" },
+          "intent": { "type": "string", "minLength": 1 },
+          "expected_outcome": { "type": "string", "minLength": 1 },
+          "action": { "type": "string", "minLength": 1 },
+          "observed_outcome": { "type": "string", "minLength": 1 },
+          "consequence": { "type": "string", "minLength": 1 },
+          "next_probe": { "type": "string", "minLength": 1 },
+          "evidence_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        },
+        "required": ["id", "intent", "expected_outcome", "action", "observed_outcome", "consequence", "next_probe", "evidence_ids"]
+      }
+    },
     "causal_assessment": {
       "type": "object",
       "additionalProperties": false,
@@ -102,7 +122,7 @@
       }
     }
   },
-  "required": ["perspective", "surface", "request_id", "status", "viewport", "summary", "causal_assessment", "evidence", "findings", "followups"],
+  "required": ["perspective", "surface", "request_id", "status", "viewport", "summary", "probes", "causal_assessment", "evidence", "findings", "followups"],
   "$defs": {
     "hypothesis": {
       "type": "object",

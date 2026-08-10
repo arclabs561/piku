@@ -406,6 +406,7 @@ test("trace authority fails closed for unsafe, unknown, and malformed events", (
 test("explorer causal citations and producer provenance fail closed", () => {
   const base = {
     evidence: [{ id: "coding_trace:one", kind: "predicate", artifact: null, artifact_metadata: null }],
+    probes: [{ id: "p1", evidence_ids: ["coding_trace:one"] }],
     findings: [],
     followups: [],
     causal_assessment: {
@@ -599,6 +600,7 @@ async function writeResumeFixture(root, runId, statuses = { coding_trace: "compl
       perspective: role,
       request_id: `${runId}:${role}`,
       evidence: [{ id: evidenceId, kind: "predicate", artifact: null, artifact_metadata: null }],
+      probes: [{ id: "p1", evidence_ids: [evidenceId] }],
       findings: [],
       followups: [],
       causal_assessment: {

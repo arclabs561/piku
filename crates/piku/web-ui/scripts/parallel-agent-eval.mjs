@@ -10,6 +10,7 @@ import { attestedFiles, attestedValue, verifyPromptManifest, writePromptManifest
 import { codexExecArgs, codexJudgeEnvironment, resolvedCodexModel } from "./codex-exec.mjs";
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
 import { PLAYWRIGHT_TOOLS, withPlaywrightAuthority } from "./playwright-authority.mjs";
+import { runDeterministicFrontPorch } from "./deterministic-front-porch.mjs";
 import {
   canonicalEvaluationFocus,
   evaluationStageToFocusProposals,
@@ -548,6 +549,11 @@ export function renderBoundedSynthesisPrompt(template, validated) {
 export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl") } = {}) {
   if (!runId || safeRunId(runId) !== runId) throw new Error("resume run ID is invalid");
   const runDir = path.join(repoRoot, ".artifacts", "playwright-agent", "parallel", runId);
+  await runDeterministicFrontPorch({
+    baseUrl,
+    webUiDir,
+    outputDir: path.join(runDir, "front-porch"),
+  });
   const validated = await loadValidatedExplorerRun(runDir, runId);
   if (validated.manifest.synthesis?.status !== "timeout")
     throw new Error("synthesis resume is allowed only after a recorded synthesis timeout");
@@ -673,12 +679,18 @@ function validateReportIdentities(report) {
 
 export function validateExplorerReport(report) {
   validateReportIdentities(report);
+  if (!Array.isArray(report.probes) || report.probes.length === 0)
+    throw new Error("explorer report lacks expectation-gap probes");
   const known = new Set(report.evidence.map((item) => item.id));
   if (known.size !== report.evidence.length) throw new Error("explorer report contains duplicate evidence IDs");
   if (report.findings.flatMap((item) => item.evidence_ids).some((id) => !known.has(id)))
     throw new Error("explorer finding cites unknown evidence");
   if (report.followups.flatMap((item) => item.evidence_ids).some((id) => !known.has(id)))
     throw new Error("explorer followup cites unknown evidence");
+  if (report.probes.flatMap((item) => item.evidence_ids).some((id) => !known.has(id)))
+    throw new Error("explorer expectation-gap probe cites unknown evidence");
+  if (new Set(report.probes.map((item) => item.id)).size !== report.probes.length)
+    throw new Error("explorer report contains duplicate probe IDs");
   validateCausalAssessment(report.causal_assessment, known);
   for (const item of report.evidence.filter((candidate) => candidate.kind === "screenshot")) {
     if (typeof item.artifact !== "string" || item.artifact.length === 0)

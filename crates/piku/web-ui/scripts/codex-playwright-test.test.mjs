@@ -51,6 +51,10 @@ test("agent QA contract evaluates the product thesis, not only UI mechanics", as
   assert.match(prompt, /screenshot pixels and a predicate disagree/i);
   assert.match(prompt, /visually\s+apparent clipping, overlap, illegible density/i);
   const parsedSchema = JSON.parse(schema);
+  for (const field of ["intent", "expected_outcome", "actions", "observation", "consequence", "next_probe"])
+    assert.ok(parsedSchema.properties.journey.items.required.includes(field));
+  assert.match(prompt, /expectation-gap probe/i);
+  assert.match(prompt, /bounded observational self-talk/i);
   assert.equal(parsedSchema.properties.findings.items.properties.id.pattern, "^f[1-9][0-9]*$");
   for (const field of ["id", "finding_ids", "evidence_ids", "retest_of"])
     assert.ok(parsedSchema.properties.followups.items.required.includes(field));
@@ -123,6 +127,14 @@ test("parallel evaluation separates causal mechanisms from verdicts", async () =
     for (const unsupported of ["oneOf", "anyOf", "allOf"])
       assert.doesNotMatch(serialized, new RegExp(`"${unsupported}"`));
   }
+  assert.ok(explorerSchema.required.includes("probes"));
+  for (const field of ["intent", "expected_outcome", "action", "observed_outcome", "consequence", "next_probe", "evidence_ids"])
+    assert.ok(explorerSchema.properties.probes.items.required.includes(field));
+  for (const prompt of [tracePrompt, recoveryPrompt]) {
+    assert.match(prompt, /expectation-gap probes/i);
+    assert.match(prompt, /bounded observational self-talk/i);
+  }
+  assert.match(synthesisPrompt, /do not treat a probe alone as proof/i);
   assert.match(synthesisPrompt, /none may substitute for mechanism\s+evidence/);
   assert.match(synthesisPrompt, /Do not infer source-level causation/);
   for (const field of ["producer_event_id", "producer_tool"])

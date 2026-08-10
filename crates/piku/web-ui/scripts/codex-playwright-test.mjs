@@ -15,6 +15,7 @@ import {
   validateRequiredScreenshots,
   withPlaywrightAuthority,
 } from "./playwright-authority.mjs";
+import { runDeterministicFrontPorch } from "./deterministic-front-porch.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptDir, "..");
@@ -79,6 +80,11 @@ if (removed.length)
   console.error(`[piku qa] removed ${removed.length} stale automation surfaces`);
 
 await mkdir(playwrightOutputDir, { recursive: true });
+await runDeterministicFrontPorch({
+  baseUrl: parsed,
+  webUiDir,
+  outputDir: path.join(runDir, "front-porch"),
+});
 const template = await readFile(promptPath, "utf8");
 const prompt = template
   .replaceAll("{{PIKU_WEB_URL}}", parsed.toString())

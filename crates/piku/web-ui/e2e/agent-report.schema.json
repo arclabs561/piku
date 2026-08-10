@@ -27,19 +27,31 @@
             "enum": ["ORIENT", "DISCOVER", "CONSTRUCT", "MANIPULATE", "TRUST", "STRESS", "REFLOW", "REFLECT"]
           },
           "intent": { "type": "string" },
+          "expected_outcome": { "type": "string" },
           "actions": {
             "type": "array",
             "minItems": 1,
             "items": { "type": "string" }
           },
           "observation": { "type": "string" },
+          "consequence": { "type": "string" },
+          "next_probe": { "type": "string" },
           "evidence": {
             "type": "array",
             "minItems": 1,
             "items": { "type": "string" }
           }
         },
-        "required": ["phase", "intent", "actions", "observation", "evidence"]
+        "required": [
+          "phase",
+          "intent",
+          "expected_outcome",
+          "actions",
+          "observation",
+          "consequence",
+          "next_probe",
+          "evidence"
+        ]
       }
     },
     "design_assessment": {
