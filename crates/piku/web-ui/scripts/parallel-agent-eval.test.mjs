@@ -69,7 +69,7 @@ test("explorers get working budgets inside a separate hard runaway limit", () =>
   assert.equal(explorerCallBudget("recovery", {}), 48);
   assert.equal(explorerCallBudget("recovery", { PIKU_EXPLORER_MAX_CALLS: "50" }), 50);
   assert.equal(explorerCallBudget("recovery", { PIKU_RECOVERY_MAX_CALLS: "44" }), 44);
-  assert.equal(explorerHardCallLimit({}), 64);
+  assert.equal(explorerHardCallLimit({}), 80);
   assert.equal(explorerHardCallLimit({ PIKU_EXPLORER_HARD_MAX_CALLS: "72" }), 72);
 });
 
@@ -504,6 +504,9 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   ]);
   assert.match(source, /Promise\.all\(roles\.map/);
   assert.match(source, /budget_exceeded/);
+  assert.match(source, /event\.type === "item\.started"/);
+  assert.match(source, /calls >= maxCalls/);
+  assert.match(source, /nextSnapshot && snapshots >= maxSnapshots/);
   assert.match(source, /stopWithFallback/);
   assert.match(source, /progress calls=/);
   assert.match(source, /process\.kill\(-child\.pid/);

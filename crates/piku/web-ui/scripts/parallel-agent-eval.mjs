@@ -64,7 +64,7 @@ export function explorerCallBudget(role, environment = process.env) {
 }
 
 export function explorerHardCallLimit(environment = process.env) {
-  return Number(environment.PIKU_EXPLORER_HARD_MAX_CALLS || 64);
+  return Number(environment.PIKU_EXPLORER_HARD_MAX_CALLS || 80);
 }
 
 export function explorerReportOutcome(report) {
@@ -798,6 +798,13 @@ export async function runCodex({ label = "judge", prompt, schemaPath, reportPath
       if (violation) {
         stopWithFallback(violation);
         return;
+      }
+      if (event.type === "item.started" && event.item?.type === "mcp_tool_call" && event.item.server === "playwright") {
+        const nextSnapshot = event.item.tool === "browser_snapshot";
+        if (calls >= maxCalls || (nextSnapshot && snapshots >= maxSnapshots)) {
+          stopWithFallback("budget_exceeded");
+          return;
+        }
       }
       if (event.type === "item.completed" && event.item?.type === "mcp_tool_call" && event.item.server === "playwright") {
         calls += 1;
