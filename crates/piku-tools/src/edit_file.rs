@@ -106,7 +106,10 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         let new_content = content.replace(&old_string_normalized, &new_string_normalized);
         let count = content.matches(old_string_normalized.as_str()).count();
         if count == 0 {
-            return ToolResult::error(format!("edit_file: old_string not found in {}", p.path));
+            return ToolResult::error(format!(
+                "edit_file: old_string not found in {} — read {} with read_file first to see the exact content, then include more surrounding context in old_string. Your old_string was: {:?}",
+                p.path, p.path, &p.old_string[..p.old_string.len().min(200)]
+            ));
         }
         let final_content = restore(new_content);
         let content_change = if final_content == raw {
@@ -130,8 +133,8 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     let count = content.matches(old_string_normalized.as_str()).count();
     match count {
         0 => ToolResult::error(format!(
-            "edit_file: old_string not found in {}",
-            p.path
+            "edit_file: old_string not found in {} — read {} with read_file first to get exact whitespace. Your old_string was: {:?}",
+            p.path, p.path, &p.old_string[..p.old_string.len().min(200)]
         )),
         1 => {
             let new_content = content.replacen(&old_string_normalized, &new_string_normalized, 1);

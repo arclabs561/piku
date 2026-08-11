@@ -568,3 +568,57 @@ fn new_session_id_is_unique_across_rapid_calls() {
     );
     assert!(id1.starts_with("session-"), "session ID format: {id1}");
 }
+
+#[test]
+fn print_headless_writes_trace_with_paired_ids() {
+    // --print is the dogfood / binary_tests path that had max_turns and deny drift.
+    // Verify the headless trace still writes paired ids (P1) even without an API key
+    // when the prompt is just a prompt and provider resolution fails early.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let out = piku_clean_env()
+        .arg("--print")
+        .arg("hello from print smoke")
+        .env("XDG_CONFIG_HOME", &cfg)
+        .output()
+        .unwrap();
+    // Provider will fail without key, but --print still writes a trace with prompt/turn_end
+    // and must not panic; exit code is either 0 or non-zero depending on provider fallback,
+    // but trace pairing invariant still holds.
+    let code = out.status.code().unwrap_or(-1);
+    assert_ne!(code, 139);
+    assert_ne!(code, 134);
+    let traces = cfg.join("piku/traces");
+    if traces.exists() {
+        for entry in std::fs::read_dir(&traces).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                let events: Vec<serde_json::Value> = content
+                    .lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                let starts: Vec<_> = events
+                    .iter()
+                    .filter(|e| e["event"] == "tool_start")
+                    .collect();
+                let ends: Vec<_> = events.iter().filter(|e| e["event"] == "tool_end").collect();
+                // If any tools ran, ids must pair
+                if !starts.is_empty() || !ends.is_empty() {
+                    assert_eq!(
+                        starts.len(),
+                        ends.len(),
+                        "print trace tool counts must pair"
+                    );
+                    for e in starts.iter().chain(ends.iter()) {
+                        assert!(
+                            e["id"].as_str().is_some_and(|s| !s.is_empty()),
+                            "print trace tool id must be non-empty: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

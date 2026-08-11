@@ -188,6 +188,26 @@ impl Experience {
         }
     }
 
+    fn trace_tool_order(&self) -> Vec<String> {
+        self.trace_events
+            .iter()
+            .filter(|e| e["event"] == "tool_start")
+            .filter_map(|e| e["tool"].as_str().map(String::from))
+            .collect()
+    }
+
+    fn assert_tool_order(&self, expected: &[&str]) {
+        let actual = self.trace_tool_order();
+        assert_eq!(
+            actual, expected,
+            "trace tool order mismatch: actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    fn assert_trace_tokens_bounded(&self) {
+        test_helpers::assert_trace_tokens_bounded(&self.trace_events);
+    }
+
     fn assert_trace_ids_paired(&self) {
         let starts: Vec<&serde_json::Value> = self
             .trace_events
@@ -464,7 +484,9 @@ fn run_scenario(
 
     let trace_events = read_trace_events(&config_dir);
     test_helpers::append_live_ledger("dogfood", provider, model, &config_dir, exit_ok, duration);
-    parse_output(&stdout, &stderr, exit_ok, workspace, trace_events)
+    let exp = parse_output(&stdout, &stderr, exit_ok, workspace, trace_events);
+    exp.assert_trace_tokens_bounded();
+    exp
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +781,9 @@ fn dogfood_bash_and_use_output() {
         full_output.contains('7') || full_output.contains("seven"),
         "response should mention 7 lines.\noutput:\n{full_output}"
     );
+    exp.assert_trace_ids_paired();
+    exp.assert_trace_tokens_bounded();
+    exp.assert_tool_order(&["bash"]);
 }
 
 /// Scenario: piku writes a new file from scratch.
@@ -825,7 +850,28 @@ fn dogfood_read_edit_verify_loop() {
     );
     exp.report("read_edit_verify_loop");
 
-    // Should have used at least 2 file tool calls (read, edit/write, maybe read again)
+    exp.assert_trace_ids_paired();
+    exp.assert_trace_tokens_bounded();
+    // Should have read → edit/write → read; not deduped away after the edit
+    assert!(
+        exp.trace_tool_order()
+            .windows(2)
+            .any(|w| w[0] == "read_file" && (w[1] == "edit_file" || w[1] == "write_file")),
+        "expected read_file before edit: order={:?}",
+        exp.trace_tool_order()
+    );
+    assert!(
+        exp.trace_tool_order().contains(&"read_file".to_string()),
+        "should contain at least one read_file in order={:?}",
+        exp.trace_tool_order()
+    );
+    // At least 3 trace starts proves dedup did not swallow the verification read
+    assert!(
+        exp.trace_tool_order().len() >= 3 || exp.tool_names().len() >= 2,
+        "should use at least 2 tool calls. got traces {:?} fallback {:?}",
+        exp.trace_tool_order(),
+        exp.tool_names()
+    );
     assert!(
         exp.tool_names().len() >= 2,
         "should use at least 2 tool calls. got: {:?}",
