@@ -105,7 +105,13 @@ impl OutputSink for QuietSink {
 
     fn on_tool_start(&mut self, _tool_name: &str, _tool_id: &str, _input: &serde_json::Value) {}
 
-    fn on_tool_end(&mut self, _tool_name: &str, _result: &str, _is_error: bool) -> PostToolAction {
+    fn on_tool_end(
+        &mut self,
+        _tool_name: &str,
+        _tool_id: &str,
+        _result: &str,
+        _is_error: bool,
+    ) -> PostToolAction {
         PostToolAction::Continue
     }
 

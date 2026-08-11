@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -133,6 +134,7 @@ fn bound_stream(bytes: &[u8], label: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub async fn execute(params: serde_json::Value) -> ToolResult {
     let p: BashParams = match serde_json::from_value(params) {
@@ -148,32 +150,59 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
     // any command runs, causing spurious timeouts on short timeout_ms values.
     // Users who need login shell behaviour can prefix: `bash -lc '...'`.
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&p.command).kill_on_drop(true);
+    cmd.arg("-c")
+        .arg(&p.command)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // On Unix, put the child in its own process group so that on timeout we
     // can SIGKILL the entire group (kills grandchildren too).
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let fut = cmd.output();
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return attach_verification(
+                ToolResult::error(format!("bash: spawn failed: {e}")).with_effect(
+                    ToolEffect::ShellCommand {
+                        command: p.command.clone(),
+                        exit_code: None,
+                    },
+                ),
+                p.purpose,
+                verification_description,
+                VerificationStatus::Indeterminate {
+                    reason: VerificationIndeterminate::SpawnFailed,
+                },
+            );
+        }
+    };
+    let process_group = child.id();
+    let fut = child.wait_with_output();
 
     match timeout(timeout_duration, fut).await {
-        Err(_) => attach_verification(
-            ToolResult::error(format!(
-                "bash: command timed out after {}ms: {}",
-                p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-                p.command
-            ))
-            .with_effect(ToolEffect::ShellCommand {
-                command: p.command.clone(),
-                exit_code: None,
-            }),
-            p.purpose,
-            verification_description,
-            VerificationStatus::Indeterminate {
-                reason: VerificationIndeterminate::TimedOut,
-            },
-        ),
+        Err(_) => {
+            #[cfg(unix)]
+            kill_process_group(process_group);
+            attach_verification(
+                ToolResult::error(format!(
+                    "bash: command timed out after {}ms: {}",
+                    p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+                    p.command
+                ))
+                .with_effect(ToolEffect::ShellCommand {
+                    command: p.command.clone(),
+                    exit_code: None,
+                }),
+                p.purpose,
+                verification_description,
+                VerificationStatus::Indeterminate {
+                    reason: VerificationIndeterminate::TimedOut,
+                },
+            )
+        }
         Ok(Err(e)) => attach_verification(
             ToolResult::error(format!("bash: spawn failed: {e}")).with_effect(
                 ToolEffect::ShellCommand {
@@ -232,6 +261,19 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
             )
         }
     }
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group: Option<u32>) {
+    let Some(process_group) = process_group.and_then(|id| i32::try_from(id).ok()) else {
+        return;
+    };
+    // A negative PID directs SIGKILL to the process group created above.
+    // Ignore ESRCH: the direct child may have exited while the timeout fired.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-process_group),
+        nix::sys::signal::Signal::SIGKILL,
+    );
 }
 
 fn attach_verification(

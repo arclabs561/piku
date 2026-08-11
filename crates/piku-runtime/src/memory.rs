@@ -101,10 +101,15 @@ fn truncate_memory(raw: &str) -> String {
     };
 
     if truncated_by_lines.len() > MAX_BYTES {
-        // Truncate at last newline before MAX_BYTES
-        let cutoff = truncated_by_lines[..MAX_BYTES]
+        // First find a character boundary, then prefer the last newline before it.
+        // String slicing at an arbitrary byte offset panics when it splits UTF-8.
+        let mut boundary = MAX_BYTES;
+        while !truncated_by_lines.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let cutoff = truncated_by_lines[..boundary]
             .rfind('\n')
-            .unwrap_or(MAX_BYTES);
+            .unwrap_or(boundary);
         let mut out = truncated_by_lines[..cutoff].to_string();
         out.push_str("\n\n[memory truncated at byte limit]");
         out
@@ -288,6 +293,15 @@ mod tests {
 
     fn tempdir() -> TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn truncate_at_byte_limit_preserves_utf8_boundaries() {
+        let raw = format!("{}é", "a".repeat(MAX_BYTES - 1));
+        let truncated = truncate_memory(&raw);
+        assert!(truncated.starts_with(&"a".repeat(MAX_BYTES - 1)));
+        assert!(!truncated.contains('é'));
+        assert!(truncated.ends_with("[memory truncated at byte limit]"));
     }
 
     #[test]

@@ -596,7 +596,7 @@ mod session_resume {
             self.text.push_str(t);
         }
         fn on_tool_start(&mut self, _: &str, _: &str, _: &serde_json::Value) {}
-        fn on_tool_end(&mut self, _: &str, _: &str, _: bool) -> PostToolAction {
+        fn on_tool_end(&mut self, _: &str, _: &str, _: &str, _: bool) -> PostToolAction {
             PostToolAction::Continue
         }
         fn on_permission_denied(&mut self, _: &str, _: &str) {}

@@ -115,7 +115,13 @@ impl OutputSink for CollectSink {
         self.tool_starts.push((name.to_string(), id.to_string()));
     }
 
-    fn on_tool_end(&mut self, name: &str, result: &str, is_error: bool) -> PostToolAction {
+    fn on_tool_end(
+        &mut self,
+        name: &str,
+        _tool_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> PostToolAction {
         self.tool_ends
             .push((name.to_string(), result.to_string(), is_error));
 

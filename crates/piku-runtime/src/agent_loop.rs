@@ -50,7 +50,13 @@ pub trait OutputSink: Send {
     fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value);
     /// Called after a tool completes. Return `PostToolAction::ReplaceAndExec`
     /// to trigger a self-update before the loop continues.
-    fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction;
+    fn on_tool_end(
+        &mut self,
+        tool_name: &str,
+        tool_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> PostToolAction;
     fn on_permission_denied(&mut self, tool_name: &str, reason: &str);
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32);
     /// Called when a user interjection is injected mid-turn (so the sink
@@ -313,7 +319,7 @@ async fn run_turn_inner(
                             let embed_config = crate::embed_memory::EmbedConfig::from_env();
                             let flag = extraction_in_flight.clone();
                             flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            tokio::task::spawn_local(async move {
+                            tokio::spawn(async move {
                                 let mut store = crate::embed_memory::MemoryStore::load(&store_path);
                                 let n = crate::embed_memory::extract_and_store(
                                     &transcript,
@@ -426,7 +432,7 @@ async fn run_turn_inner(
             if !advertised_tool_names.contains(tool_name) {
                 let msg = format!("{tool_name} is not available in this mode");
                 sink.on_tool_start(tool_name, tool_use_id, params);
-                sink.on_tool_end(tool_name, &msg, true);
+                sink.on_tool_end(tool_name, tool_use_id, &msg, true);
                 session.push(ConversationMessage::tool_result(
                     tool_use_id.clone(),
                     msg.clone(),
@@ -453,7 +459,7 @@ async fn run_turn_inner(
                 );
                 if let crate::hooks::HookDecision::Deny(reason) = hook_result.decision {
                     sink.on_tool_start(tool_name, tool_use_id, params);
-                    sink.on_tool_end(tool_name, &reason, true);
+                    sink.on_tool_end(tool_name, tool_use_id, &reason, true);
                     session.push(ConversationMessage::tool_result(
                         tool_use_id.clone(),
                         format!("Blocked by hook: {reason}"),
@@ -519,7 +525,7 @@ async fn run_turn_inner(
                          The result hasn't changed — try a different approach."
                     );
                     sink.on_tool_start(tool_name, tool_use_id, params);
-                    sink.on_tool_end(tool_name, &dedup_msg, true);
+                    sink.on_tool_end(tool_name, tool_use_id, &dedup_msg, true);
                     session.push(ConversationMessage::tool_result(
                         tool_use_id.clone(),
                         dedup_msg.clone(),
@@ -807,7 +813,7 @@ async fn run_turn_inner(
                 output
             };
 
-            let action = sink.on_tool_end(tool_name, &output, is_error);
+            let action = sink.on_tool_end(tool_name, tool_use_id, &output, is_error);
             if !is_error && matches!(tool_name.as_str(), "write_file" | "edit_file" | "bash") {
                 seen_tool_calls.clear();
             }

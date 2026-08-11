@@ -248,6 +248,7 @@ mod agent_loop {
         fn on_tool_end(
             &mut self,
             tool_name: &str,
+            _tool_id: &str,
             _result: &str,
             is_error: bool,
         ) -> crate::agent_loop::PostToolAction {
@@ -546,7 +547,13 @@ mod agent_loop_extended {
         fn on_tool_start(&mut self, n: &str, _: &str, _: &serde_json::Value) {
             self.tool_starts.push(n.to_string());
         }
-        fn on_tool_end(&mut self, n: &str, _: &str, e: bool) -> crate::agent_loop::PostToolAction {
+        fn on_tool_end(
+            &mut self,
+            n: &str,
+            _: &str,
+            _: &str,
+            e: bool,
+        ) -> crate::agent_loop::PostToolAction {
             self.tool_ends.push((n.to_string(), e));
             crate::agent_loop::PostToolAction::Continue
         }

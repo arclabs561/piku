@@ -562,8 +562,14 @@ impl OutputSink for RecordingSink<'_> {
         self.inner.on_tool_start(tool_name, tool_id, input);
     }
 
-    fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
-        self.inner.on_tool_end(tool_name, result, is_error)
+    fn on_tool_end(
+        &mut self,
+        tool_name: &str,
+        tool_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> PostToolAction {
+        self.inner.on_tool_end(tool_name, tool_id, result, is_error)
     }
 
     fn on_permission_denied(&mut self, tool_name: &str, reason: &str) {

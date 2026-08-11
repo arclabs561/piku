@@ -10,8 +10,8 @@ use std::env;
 use std::io::{self, Write};
 
 use piku_runtime::{
-    build_system_prompt, run_turn, AllowAll, OutputSink, RunHandle, RunRecorder, Session,
-    TurnResult,
+    build_system_prompt, run_turn, OutputSink, PermissionOutcome, PermissionPrompter,
+    PermissionRequest, RunHandle, RunRecorder, Session, TurnResult,
 };
 use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
@@ -289,7 +289,7 @@ async fn run_single_shot(
     } else {
         all_tool_definitions()
     };
-    let prompter = AllowAll;
+    let prompter = ConfiguredAllowAll::new(&config.deny);
     let traces_dir = config.traces_dir();
     std::fs::create_dir_all(&traces_dir).ok();
     let trace = TraceWriter::open(&traces_dir, &session_id);
@@ -310,7 +310,7 @@ async fn run_single_shot(
             tool_defs,
             &prompter,
             recording_sink,
-            None,
+            config.max_turns,
             None,
         )
         .await;
@@ -357,10 +357,34 @@ async fn run_single_shot(
     tui_repl::run_tui_repl_with_session(config, Some(session), result.usage).await
 }
 
+struct ConfiguredAllowAll {
+    deny_rules: Vec<String>,
+}
+
+impl ConfiguredAllowAll {
+    fn new(deny_rules: &[String]) -> Self {
+        Self {
+            deny_rules: deny_rules.to_vec(),
+        }
+    }
+}
+
+impl PermissionPrompter for ConfiguredAllowAll {
+    fn decide(&self, _req: &PermissionRequest) -> PermissionOutcome {
+        PermissionOutcome::Allow
+    }
+
+    fn denies(&self, tool_name: &str, params: &serde_json::Value) -> Option<String> {
+        self.deny_rules
+            .iter()
+            .find(|pattern| piku::config::matches_tool_pattern(pattern, tool_name, params))
+            .map(|pattern| format!("denied by settings.toml rule: {pattern}"))
+    }
+}
+
 struct StdoutSink {
     stdout: io::Stdout,
     trace: TraceWriter,
-    pending_tool_id: std::collections::HashMap<String, String>,
     md: piku::markdown::StreamingMarkdown,
 }
 
@@ -369,7 +393,6 @@ impl StdoutSink {
         Self {
             stdout: io::stdout(),
             trace,
-            pending_tool_id: std::collections::HashMap::new(),
             md: piku::markdown::StreamingMarkdown::new_stdout(),
         }
     }
@@ -400,11 +423,15 @@ impl OutputSink for StdoutSink {
         let _ = self.stdout.flush();
 
         self.trace.tool_start(tool_name, tool_id, input);
-        self.pending_tool_id
-            .insert(tool_name.to_string(), tool_id.to_string());
     }
 
-    fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
+    fn on_tool_end(
+        &mut self,
+        tool_name: &str,
+        tool_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> PostToolAction {
         let tag = if is_error {
             "\x1b[31merr\x1b[0m"
         } else {
@@ -421,8 +448,7 @@ impl OutputSink for StdoutSink {
         );
         let _ = self.stdout.flush();
 
-        let tool_id = self.pending_tool_id.remove(tool_name).unwrap_or_default();
-        self.trace.tool_end(tool_name, &tool_id, result, !is_error);
+        self.trace.tool_end(tool_name, tool_id, result, !is_error);
 
         if tool_name == "bash" {
             if let Some(new_binary) = self_update::detect_self_build(result, !is_error) {

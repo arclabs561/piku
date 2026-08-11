@@ -963,8 +963,14 @@ impl OutputSink for TuiSink {
         let _ = self.stdout.flush();
     }
 
-    fn on_tool_end(&mut self, tool_name: &str, result: &str, is_error: bool) -> PostToolAction {
-        self.trace.tool_end(tool_name, "", result, !is_error);
+    fn on_tool_end(
+        &mut self,
+        tool_name: &str,
+        tool_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> PostToolAction {
+        self.trace.tool_end(tool_name, tool_id, result, !is_error);
         let preview = format_tool_result(tool_name, result, is_error);
         if !preview.is_empty() {
             self.println(&preview);

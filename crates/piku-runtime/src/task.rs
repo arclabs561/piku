@@ -170,6 +170,7 @@ impl crate::agent_loop::OutputSink for DevNullSink {
     fn on_tool_end(
         &mut self,
         _tool_name: &str,
+        _tool_id: &str,
         _result: &str,
         _is_error: bool,
     ) -> crate::agent_loop::PostToolAction {
