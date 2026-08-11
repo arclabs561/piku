@@ -394,12 +394,10 @@ pub fn assert_trace_tokens_bounded(trace_events: &[serde_json::Value]) {
             has_compaction = true;
         }
     }
-    if max_input > 1_000_000 && !has_compaction {
-        panic!(
-            "token blowout: input_tokens={} without compaction_applied — cap or compact must fire (see live transcript 2006149↑)",
-            max_input
-        );
-    }
+    assert!(
+        max_input <= 1_000_000 || has_compaction,
+        "token blowout: input_tokens={max_input} without compaction_applied — cap or compact must fire (see live transcript 2006149↑)"
+    );
 }
 
 #[cfg(test)]
