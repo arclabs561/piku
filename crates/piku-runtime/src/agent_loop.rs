@@ -2037,6 +2037,7 @@ fn extract_last_assistant_text(session: &crate::session::Session) -> String {
 }
 
 /// Execute `agent_status`: poll or list tasks.
+#[must_use]
 pub fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> (String, bool) {
     let task_id = params.get("task_id").and_then(|v| v.as_str());
     if let Some(id_str) = task_id {
@@ -2091,6 +2092,7 @@ pub fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry)
 }
 
 /// Execute `agent_join`: block until a task completes.
+#[must_use]
 pub async fn execute_agent_join(
     params: &serde_json::Value,
     registry: &TaskRegistry,
