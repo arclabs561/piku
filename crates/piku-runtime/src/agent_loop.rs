@@ -627,13 +627,8 @@ async fn run_turn_inner(
                     .unwrap_or("");
                 let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
 
-                if goal.trim().is_empty() || approach.trim().is_empty() {
-                    (
-                        "record_attempt requires non-empty 'goal' and 'approach'".to_string(),
-                        true,
-                    )
-                } else if let Some(existing_id) = attempt_id {
-                    // Updating an existing attempt's outcome
+                if let Some(existing_id) = attempt_id {
+                    // Update path: goal/approach not required — just outcome + detail.
                     let outcome = params
                         .get("outcome")
                         .and_then(|v| v.as_str())
@@ -647,12 +642,24 @@ async fn run_turn_inner(
                         "failure" => crate::embed_memory::Outcome::Failure,
                         _ => crate::embed_memory::Outcome::Pending,
                     };
-                    if store.record_outcome(existing_id, outcome_enum, detail) {
+                    if store.valid_count() == 0 {
+                        (
+                            format!(
+                                "attempt {existing_id} not found — no attempts recorded yet. Omit attempt_id to create a new attempt with goal and approach."
+                            ),
+                            true,
+                        )
+                    } else if store.record_outcome(existing_id, outcome_enum, detail) {
                         let _ = store.save(&store_path);
                         (format!("attempt {existing_id} updated: {outcome}"), false)
                     } else {
                         (format!("attempt {existing_id} not found"), true)
                     }
+                } else if goal.trim().is_empty() || approach.trim().is_empty() {
+                    (
+                        "record_attempt requires non-empty 'goal' and 'approach' (omit attempt_id when creating)".to_string(),
+                        true,
+                    )
                 } else {
                     // Creating a new attempt -- need to embed the approach
                     let embed_config = crate::embed_memory::EmbedConfig::from_env();
@@ -2030,9 +2037,12 @@ fn extract_last_assistant_text(session: &crate::session::Session) -> String {
 }
 
 /// Execute `agent_status`: poll or list tasks.
-fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> (String, bool) {
+pub fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> (String, bool) {
     let task_id = params.get("task_id").and_then(|v| v.as_str());
     if let Some(id_str) = task_id {
+        if id_str.trim().is_empty() {
+            return ("agent_status: task_id must be non-empty".to_string(), true);
+        }
         let id = crate::task::AgentTaskId(id_str.to_string());
         match registry.status(&id) {
             Some(entry) => {
@@ -2081,10 +2091,16 @@ fn execute_agent_status(params: &serde_json::Value, registry: &TaskRegistry) -> 
 }
 
 /// Execute `agent_join`: block until a task completes.
-async fn execute_agent_join(params: &serde_json::Value, registry: &TaskRegistry) -> (String, bool) {
+pub async fn execute_agent_join(
+    params: &serde_json::Value,
+    registry: &TaskRegistry,
+) -> (String, bool) {
     let Some(id_str) = params.get("task_id").and_then(|v| v.as_str()) else {
         return ("agent_join requires task_id".to_string(), true);
     };
+    if id_str.trim().is_empty() {
+        return ("agent_join: task_id must be non-empty".to_string(), true);
+    }
     let timeout_secs = params
         .get("timeout_secs")
         .and_then(serde_json::Value::as_u64)

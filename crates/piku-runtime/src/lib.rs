@@ -42,7 +42,7 @@ pub use context::{
 pub use embed_memory::{
     build_extraction_transcript, default_store_path, embed_text, embed_text_with_config,
     extract_and_store, extract_memories, format_retrieved_memories, EmbedBackend, EmbedConfig,
-    MemoryEntry, MemoryJudgment, MemoryStore, RetrievedMemory,
+    MemoryEntry, MemoryJudgment, MemoryStore, Outcome, RetrievedMemory,
 };
 pub use hooks::{HookConfig, HookRegistry};
 pub use memory::{

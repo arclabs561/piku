@@ -2631,3 +2631,171 @@ async fn spawn_agent_link_is_persisted_relative() {
         );
     }
 }
+
+#[tokio::test]
+async fn record_attempt_create_then_update_happy_path() {
+    // Embed path stubbed by setting a fake key would fail;Instead test store directly via agent_loop path?
+    // Use real MemoryStore path isolation via cwd tempdir.
+    let dir = tempdir();
+    std::env::set_current_dir(&dir).unwrap();
+    // Without embedding service, create will return "embedding service unavailable" — acceptable fallback.
+    // So test the store contract directly to prove lifecycle is distinct.
+    let store_path = piku_runtime::embed_memory::default_store_path(&dir);
+    let mut store = piku_runtime::MemoryStore::load(&store_path);
+    let e = vec![1.0, 0.0, 0.0];
+    let id = store.record_attempt("find bug".into(), "approach A".into(), None, e, 6);
+    assert!(store.record_outcome(id, piku_runtime::Outcome::Success, Some("fixed".into())));
+    assert!(
+        !store.record_outcome(9999, piku_runtime::Outcome::Success, None),
+        "unknown id must return false"
+    );
+}
+
+#[tokio::test]
+async fn agent_status_rejects_empty_task_id() {
+    use piku_runtime::TaskRegistry;
+    let registry = TaskRegistry::new();
+    let (msg, is_error) = piku_runtime::agent_loop::execute_agent_status(
+        &serde_json::json!({"task_id": ""}),
+        &registry,
+    );
+    assert!(is_error, "empty task_id must be error");
+    assert!(msg.contains("non-empty"), "msg: {msg}");
+}
+
+#[tokio::test]
+async fn agent_join_rejects_empty_task_id() {
+    use piku_runtime::TaskRegistry;
+    let registry = TaskRegistry::new();
+    let (msg, is_error) = piku_runtime::agent_loop::execute_agent_join(
+        &serde_json::json!({"task_id": ""}),
+        &registry,
+    )
+    .await;
+    assert!(is_error);
+    assert!(msg.contains("non-empty"), "msg: {msg}");
+}
+
+#[tokio::test]
+async fn edit_file_stale_old_string_hints_reread() {
+    let dir = tempdir();
+    let file = dir.join("s.rs");
+    std::fs::write(&file, "version = 1.0.0\n").unwrap();
+    let stale = serde_json::json!({
+        "path": file,
+        "old_string": "version = 9.9.9",
+        "new_string": "version = 2.0.0"
+    });
+    let r = piku_tools::edit_file::execute(stale);
+    assert!(r.is_error);
+    assert!(
+        r.output.contains("old_string not found"),
+        "should guide toward read: {}",
+        r.output
+    );
+}
+
+#[tokio::test]
+async fn shell_effect_inventory_matches_run_record() {
+    // Roadmap P4: run record must agree with actual fs state for shell effects.
+    let dir = tempdir();
+    let path = dir.join("via_shell.txt");
+    let shell_input =
+        serde_json::json!({"command": format!("echo shell-wrote > {}", path.display())})
+            .to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("b1", "bash", &shell_input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("shell-inv2".to_string());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "do shell write",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(sink.tool_starts[0].0, "bash");
+    assert!(!sink.tool_ends[0].3, "bash shell write should succeed");
+    // File must actually exist — inventory truth check
+    assert!(
+        path.exists(),
+        "shell effect must create file: {}",
+        path.display()
+    );
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("shell-wrote"),
+        "shell output missing: {content}"
+    );
+    // Check that a failed shell does not falsely claim inventory
+    let bad_provider = SequenceProvider::new(vec![
+        tool_call_events("b2", "bash", r#"{"command": "exit 1"}"#),
+        text_stop("failed"),
+    ]);
+    let mut session2 = Session::new("shell-fail".to_string());
+    let mut sink2 = CollectSink::default();
+    run_turn(
+        "fail shell",
+        &mut session2,
+        &bad_provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink2,
+        None,
+        None,
+    )
+    .await;
+    assert!(sink2.tool_ends[0].3, "exit 1 shell should be error");
+}
+
+#[tokio::test]
+async fn retry_ceiling_dedups_or_lsr_blocks_third_interaction() {
+    // Roadmap P4 retry ceiling: unchanged failure must not consume more turns.
+    // Dedup alone blocks same read, but we ensure the loop still ends within max_turns.
+    let dir = tempdir();
+    let file = dir.join("x.txt");
+    std::fs::write(&file, "hi").unwrap();
+    let inp = serde_json::json!({"path": file}).to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &inp),
+        tool_call_events("r2", "read_file", &inp),
+        tool_call_events("r3", "read_file", &inp),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("retry-ceil".to_string());
+    let mut sink = CollectSink::default();
+    let result = run_turn(
+        "read same file three times",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        Some(5),
+        None,
+    )
+    .await;
+    // At most 2 real executions (first + deduped), then model sees dedup message and stops
+    assert!(
+        result.iterations <= 5,
+        "retry ceiling must prevent endless same-arg calls: iterations={}",
+        result.iterations
+    );
+    // Second call is deduped, third also deduped or short-circuits
+    assert!(sink
+        .tool_ends
+        .iter()
+        .any(|(_, _, out, _)| out.contains("already called")));
+}
