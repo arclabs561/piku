@@ -2283,55 +2283,53 @@ async fn trace_ids_unique_per_turn() {
     // First iteration returns two tool calls; second iteration ends.
 
     // Manually craft two ToolUse in one iteration
-    let provider2 = ScriptedProvider::new({
-        let mut events = Vec::new();
-        events.push(piku_api::Event::ToolUseStart {
+    let provider2 = ScriptedProvider::new(vec![
+        piku_api::Event::ToolUseStart {
             id: "toolu_a".into(),
             name: "read_file".into(),
-        });
-        events.push(piku_api::Event::ToolUseDelta {
+        },
+        piku_api::Event::ToolUseDelta {
             id: "toolu_a".into(),
             partial_json: ia.clone(),
-        });
-        events.push(piku_api::Event::ToolUseEnd {
+        },
+        piku_api::Event::ToolUseEnd {
             id: "toolu_a".into(),
-        });
-        events.push(piku_api::Event::ToolUseStart {
+        },
+        piku_api::Event::ToolUseStart {
             id: "toolu_b".into(),
             name: "read_file".into(),
-        });
-        events.push(piku_api::Event::ToolUseDelta {
+        },
+        piku_api::Event::ToolUseDelta {
             id: "toolu_b".into(),
             partial_json: ib.clone(),
-        });
-        events.push(piku_api::Event::ToolUseEnd {
+        },
+        piku_api::Event::ToolUseEnd {
             id: "toolu_b".into(),
-        });
-        events.push(piku_api::Event::MessageStop {
+        },
+        piku_api::Event::MessageStop {
             stop_reason: piku_api::StopReason::ToolUse,
-        });
-        events.push(piku_api::Event::UsageDelta {
+        },
+        piku_api::Event::UsageDelta {
             usage: piku_api::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 30,
                 ..Default::default()
             },
-        });
-        events.push(piku_api::Event::TextDelta {
+        },
+        piku_api::Event::TextDelta {
             text: "done".into(),
-        });
-        events.push(piku_api::Event::MessageStop {
+        },
+        piku_api::Event::MessageStop {
             stop_reason: piku_api::StopReason::EndTurn,
-        });
-        events.push(piku_api::Event::UsageDelta {
+        },
+        piku_api::Event::UsageDelta {
             usage: piku_api::TokenUsage {
                 input_tokens: 50,
                 output_tokens: 20,
                 ..Default::default()
             },
-        });
-        events
-    });
+        },
+    ]);
 
     let mut session = Session::new("trace-unique".to_string());
     let mut sink = CollectSink::default();
