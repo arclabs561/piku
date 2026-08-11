@@ -97,9 +97,9 @@ impl Provider for SequenceProvider {
 #[derive(Default)]
 struct CollectSink {
     text: String,
-    tool_starts: Vec<(String, String)>,     // (name, id)
-    tool_ends: Vec<(String, String, bool)>, // (name, output, is_error)
-    denied: Vec<(String, String)>,          // (name, reason)
+    tool_starts: Vec<(String, String)>,             // (name, id)
+    tool_ends: Vec<(String, String, String, bool)>, // (name, id, output, is_error)
+    denied: Vec<(String, String)>,                  // (name, reason)
     turn_complete: Option<(TokenUsage, u32)>,
     /// If set, return `ReplaceAndExec` for the next `tool_end` that matches
     trigger_replace_for_tool: Option<String>,
@@ -118,12 +118,16 @@ impl OutputSink for CollectSink {
     fn on_tool_end(
         &mut self,
         name: &str,
-        _tool_id: &str,
+        tool_id: &str,
         result: &str,
         is_error: bool,
     ) -> PostToolAction {
-        self.tool_ends
-            .push((name.to_string(), result.to_string(), is_error));
+        self.tool_ends.push((
+            name.to_string(),
+            tool_id.to_string(),
+            result.to_string(),
+            is_error,
+        ));
 
         if let Some(trigger) = &self.trigger_replace_for_tool {
             if name == trigger {
@@ -278,8 +282,8 @@ async fn e2e_reads_file_via_tool() {
 
     // Tool succeeded
     assert_eq!(sink.tool_ends.len(), 1);
-    assert!(!sink.tool_ends[0].2, "read_file should not error");
-    assert!(sink.tool_ends[0].1.contains("Rust project"));
+    assert!(!sink.tool_ends[0].3, "read_file should not error");
+    assert!(sink.tool_ends[0].2.contains("Rust project"));
 
     // Final text was produced
     assert!(sink.text.contains("Rust project description"));
@@ -398,9 +402,9 @@ async fn e2e_reads_file_and_answers_with_unique_value() {
 
     assert_eq!(sink.tool_starts.len(), 1);
     assert_eq!(sink.tool_starts[0].0, "read_file");
-    assert!(!sink.tool_ends[0].2, "read_file should succeed");
+    assert!(!sink.tool_ends[0].3, "read_file should succeed");
     assert!(
-        sink.tool_ends[0].1.contains(secret),
+        sink.tool_ends[0].2.contains(secret),
         "tool output should include the seeded token"
     );
     assert!(
@@ -452,10 +456,10 @@ async fn e2e_write_then_read_file() {
     assert_eq!(sink.tool_starts[1].0, "read_file");
 
     // write succeeded
-    assert!(!sink.tool_ends[0].2);
+    assert!(!sink.tool_ends[0].3);
     // read succeeded and returned the content
-    assert!(!sink.tool_ends[1].2);
-    assert!(sink.tool_ends[1].1.contains("hello from piku"));
+    assert!(!sink.tool_ends[1].3);
+    assert!(sink.tool_ends[1].2.contains("hello from piku"));
 
     // file actually exists on disk
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello from piku");
@@ -502,7 +506,7 @@ async fn e2e_edit_file_surgical() {
     )
     .await;
 
-    assert!(!sink.tool_ends[0].2, "edit should succeed");
+    assert!(!sink.tool_ends[0].3, "edit should succeed");
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("new"), "file should have been edited");
     assert!(!content.contains("old"), "old string should be gone");
@@ -553,12 +557,12 @@ async fn e2e_read_edit_verify_loop() {
         .collect();
     assert_eq!(tool_names, ["read_file", "edit_file", "read_file"]);
     assert!(
-        sink.tool_ends.iter().all(|(_, _, is_error)| !is_error),
+        sink.tool_ends.iter().all(|(_, _, _, is_error)| !is_error),
         "all tools should succeed: {:?}",
         sink.tool_ends
     );
     assert!(
-        sink.tool_ends[2].1.contains("version = 2.0.0"),
+        sink.tool_ends[2].2.contains("version = 2.0.0"),
         "verification read should see the new version"
     );
 
@@ -630,7 +634,7 @@ pub fn multiply(a: i32, b: i32) -> i32 {
     .await;
 
     assert_eq!(sink.tool_ends[0].0, "edit_file");
-    assert!(!sink.tool_ends[0].2, "edit_file should succeed");
+    assert!(!sink.tool_ends[0].3, "edit_file should succeed");
 
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("pub fn add"), "add should be preserved");
@@ -731,7 +735,7 @@ async fn e2e_permission_denied_stops_tool_not_loop() {
     assert!(sink
         .tool_ends
         .iter()
-        .any(|(n, _, e)| n == "read_file" && !e));
+        .any(|(n, _, _, e)| n == "read_file" && !e));
 
     // final response produced
     assert!(sink.text.contains("bash was denied"));
@@ -776,7 +780,7 @@ async fn e2e_unadvertised_tool_call_is_not_executed() {
         !target.exists(),
         "unadvertised write_file must not create files"
     );
-    assert!(sink.tool_ends.iter().any(|(name, output, is_error)| {
+    assert!(sink.tool_ends.iter().any(|(name, _, output, is_error)| {
         name == "write_file" && *is_error && output.contains("not available")
     }));
     assert!(sink.text.contains("write_file was blocked"));
@@ -906,14 +910,14 @@ async fn e2e_glob_and_grep_codebase() {
     // glob found files
     let glob_result = &sink.tool_ends[0];
     assert_eq!(glob_result.0, "glob");
-    assert!(!glob_result.2);
-    assert!(glob_result.1.contains(".rs"));
+    assert!(!glob_result.3);
+    assert!(glob_result.2.contains(".rs"));
 
     // grep found functions
     let grep_result = &sink.tool_ends[1];
     assert_eq!(grep_result.0, "grep");
-    assert!(!grep_result.2);
-    assert!(grep_result.1.contains("fn "));
+    assert!(!grep_result.3);
+    assert!(grep_result.2.contains("fn "));
 }
 
 #[tokio::test]
@@ -1039,24 +1043,24 @@ pub fn print_sum(values: &[i32]) {
         ]
     );
     assert!(
-        sink.tool_ends.iter().all(|(_, _, is_error)| !is_error),
+        sink.tool_ends.iter().all(|(_, _, _, is_error)| !is_error),
         "all tools should succeed: {:?}",
         sink.tool_ends
     );
     assert!(
-        sink.tool_ends[1].1.matches("compute_total").count() >= 3,
+        sink.tool_ends[1].2.matches("compute_total").count() >= 3,
         "initial grep should find definition and call sites: {}",
-        sink.tool_ends[1].1
+        sink.tool_ends[1].2
     );
     assert!(
-        sink.tool_ends[5].1.matches("sum_items").count() >= 3,
+        sink.tool_ends[5].2.matches("sum_items").count() >= 3,
         "new-name grep should find definition and call sites: {}",
-        sink.tool_ends[5].1
+        sink.tool_ends[5].2
     );
     assert!(
-        sink.tool_ends[6].1.contains("(no matches)"),
+        sink.tool_ends[6].2.contains("(no matches)"),
         "old-name verification grep should find no matches: {}",
-        sink.tool_ends[6].1
+        sink.tool_ends[6].2
     );
 
     for path in [&lib_path, &main_path, &utils_path] {
@@ -1110,8 +1114,8 @@ async fn e2e_bash_runs_real_command() {
     .await;
 
     assert_eq!(sink.tool_ends[0].0, "bash");
-    assert!(!sink.tool_ends[0].2, "bash should succeed");
-    assert!(sink.tool_ends[0].1.contains("hello from bash"));
+    assert!(!sink.tool_ends[0].3, "bash should succeed");
+    assert!(sink.tool_ends[0].2.contains("hello from bash"));
     assert!(dir.join("output.txt").exists());
 }
 
@@ -1401,23 +1405,23 @@ async fn regression_bug_f_multi_tool_oai_delta_naming_second_tool_gets_params() 
     // CRITICAL: neither tool should have errored
     // Before the fix, __tc_1 deltas were dropped → empty params → read_file error
     assert!(
-        !sink.tool_ends[0].2,
+        !sink.tool_ends[0].3,
         "first read_file should succeed (not error). output: {}",
-        sink.tool_ends[0].1
+        sink.tool_ends[0].2
     );
     assert!(
-        !sink.tool_ends[1].2,
+        !sink.tool_ends[1].3,
         "second read_file should succeed (not error with empty params). output: {}",
-        sink.tool_ends[1].1
+        sink.tool_ends[1].2
     );
 
     // Both reads should return actual content
     assert!(
-        sink.tool_ends[0].1.contains("content of file 1"),
+        sink.tool_ends[0].2.contains("content of file 1"),
         "first read should return file1 content"
     );
     assert!(
-        sink.tool_ends[1].1.contains("content of file 2"),
+        sink.tool_ends[1].2.contains("content of file 2"),
         "second read should return file2 content (before fix this would be empty params error)"
     );
 }
@@ -1748,7 +1752,7 @@ pub mod cli;
     .await;
 
     assert!(
-        !sink.tool_ends.is_empty() && !sink.tool_ends[0].2,
+        !sink.tool_ends.is_empty() && !sink.tool_ends[0].3,
         "edit_file should succeed: {:?}",
         sink.tool_ends.first()
     );
@@ -1825,18 +1829,18 @@ impl Bar {
     .await;
 
     // First edit: must fail with ambiguity error
-    assert!(sink.tool_ends[0].2, "first edit should error (ambiguous)");
+    assert!(sink.tool_ends[0].3, "first edit should error (ambiguous)");
     assert!(
-        sink.tool_ends[0].1.contains("ambiguous") || sink.tool_ends[0].1.contains("matched"),
+        sink.tool_ends[0].2.contains("ambiguous") || sink.tool_ends[0].2.contains("matched"),
         "error should say 'ambiguous': {}",
-        sink.tool_ends[0].1
+        sink.tool_ends[0].2
     );
 
     // Second edit: must succeed
     assert!(
-        !sink.tool_ends[1].2,
+        !sink.tool_ends[1].3,
         "second edit should succeed: {}",
-        sink.tool_ends[1].1
+        sink.tool_ends[1].2
     );
 
     let final_content = std::fs::read_to_string(&target).unwrap();
@@ -2208,13 +2212,422 @@ async fn regression_anthropic_tool_args_survive_a_leading_text_block() {
 
     assert_eq!(sink.tool_ends.len(), 1, "the tool should execute");
     assert!(
-        !sink.tool_ends[0].2,
+        !sink.tool_ends[0].3,
         "read_file errored, so its arguments were dropped: {}",
-        sink.tool_ends[0].1
+        sink.tool_ends[0].2
     );
     assert!(
-        sink.tool_ends[0].1.contains("the file content"),
+        sink.tool_ends[0].2.contains("the file content"),
         "read_file did not read the requested path: {}",
-        sink.tool_ends[0].1
+        sink.tool_ends[0].2
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: trace contract — tui headless sink lost tool_id, now recovered
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trace_tool_ids_are_paired_and_nonempty() {
+    let dir = tempdir();
+    let path = dir.join("hello.txt");
+    std::fs::write(&path, "hello from phase1").unwrap();
+    let input = serde_json::json!({"path": path}).to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("toolu_1", "read_file", &input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("trace-pair".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "read hello",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_starts.len(), 1);
+    assert_eq!(sink.tool_ends.len(), 1);
+    // CollectSink now stores (name, id, output, is_error) — gate the invariant
+    // that was violated in live trace session-1786455101…: every tool_end had ""
+    let (s_name, s_id) = &sink.tool_starts[0];
+    let (e_name, e_id, _out, _is_err) = &sink.tool_ends[0];
+    assert_eq!(s_name, e_name, "name mismatch");
+    assert!(!s_id.is_empty(), "tool_start id empty");
+    assert!(
+        !e_id.is_empty(),
+        "tool_end id empty — regression of trace fidelity bug"
+    );
+    assert_eq!(s_id, e_id, "tool_start and tool_end ids must pair");
+}
+
+#[tokio::test]
+async fn trace_ids_unique_per_turn() {
+    let dir = tempdir();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    let ia = serde_json::json!({"path": a}).to_string();
+    let ib = serde_json::json!({"path": b}).to_string();
+
+    // First iteration returns two tool calls; second iteration ends.
+
+    // Manually craft two ToolUse in one iteration
+    let provider2 = ScriptedProvider::new({
+        let mut events = Vec::new();
+        events.push(piku_api::Event::ToolUseStart {
+            id: "toolu_a".into(),
+            name: "read_file".into(),
+        });
+        events.push(piku_api::Event::ToolUseDelta {
+            id: "toolu_a".into(),
+            partial_json: ia.clone(),
+        });
+        events.push(piku_api::Event::ToolUseEnd {
+            id: "toolu_a".into(),
+        });
+        events.push(piku_api::Event::ToolUseStart {
+            id: "toolu_b".into(),
+            name: "read_file".into(),
+        });
+        events.push(piku_api::Event::ToolUseDelta {
+            id: "toolu_b".into(),
+            partial_json: ib.clone(),
+        });
+        events.push(piku_api::Event::ToolUseEnd {
+            id: "toolu_b".into(),
+        });
+        events.push(piku_api::Event::MessageStop {
+            stop_reason: piku_api::StopReason::ToolUse,
+        });
+        events.push(piku_api::Event::UsageDelta {
+            usage: piku_api::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+                ..Default::default()
+            },
+        });
+        events.push(piku_api::Event::TextDelta {
+            text: "done".into(),
+        });
+        events.push(piku_api::Event::MessageStop {
+            stop_reason: piku_api::StopReason::EndTurn,
+        });
+        events.push(piku_api::Event::UsageDelta {
+            usage: piku_api::TokenUsage {
+                input_tokens: 50,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        });
+        events
+    });
+
+    let mut session = Session::new("trace-unique".to_string());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "read both",
+        &mut session,
+        &provider2,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_starts.len(), 2);
+    assert_eq!(sink.tool_ends.len(), 2);
+    let ids: std::collections::HashSet<_> = sink.tool_starts.iter().map(|(_, id)| id).collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "tool ids must be unique within a turn: {ids:?}"
+    );
+    for (_, s_id) in &sink.tool_starts {
+        assert!(!s_id.is_empty());
+    }
+    for (_, e_id, _, _) in &sink.tool_ends {
+        assert!(!e_id.is_empty());
+    }
+}
+// Phase 2: headless deny + max_turns through check_permission (what was missed in main.rs)
+
+#[tokio::test]
+async fn headless_configured_deny_blocks_new_file_write() {
+    // Live transcript had settings.toml deny["write_file"] but headless AllowAll bypassed it.
+    // Simulate ConfiguredAllowAll via a prompter that denies write_file — same contract as
+    // piku::config::matches_tool_pattern used by ConfiguredAllowAll in main.rs.
+    use piku_runtime::permission::{PermissionOutcome, PermissionPrompter, PermissionRequest};
+
+    struct ConfiguredDenyWrite;
+    impl PermissionPrompter for ConfiguredDenyWrite {
+        fn decide(&self, _req: &PermissionRequest) -> PermissionOutcome {
+            PermissionOutcome::Allow
+        }
+        fn denies(&self, tool_name: &str, _params: &serde_json::Value) -> Option<String> {
+            if tool_name == "write_file" {
+                Some("denied by settings.toml rule: write_file".to_string())
+            } else {
+                None
+            }
+        }
+    }
+
+    let dir = tempdir();
+    let target = dir.join("greeter.rs");
+    let write_input = serde_json::json!({"path": target, "content": "hello"}).to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("toolu_w", "write_file", &write_input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("headless-deny".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "write greeter",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &ConfiguredDenyWrite,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        sink.denied.len(),
+        1,
+        "deny via denies() should fire without prompt"
+    );
+    assert_eq!(
+        sink.tool_starts.len(),
+        0,
+        "denied tool must not reach on_tool_start"
+    );
+    assert!(!target.exists(), "file must not be created when denied");
+}
+
+#[tokio::test]
+async fn headless_deny_still_wins_after_allow_decide() {
+    // Regression: allow-all per-turn state (decide returns Allow) must not outrank a deny rule.
+    use piku_runtime::permission::{PermissionOutcome, PermissionPrompter, PermissionRequest};
+
+    struct DenyWriteAllowAll;
+    impl PermissionPrompter for DenyWriteAllowAll {
+        fn decide(&self, _req: &PermissionRequest) -> PermissionOutcome {
+            PermissionOutcome::Allow
+        }
+        fn denies(&self, tool_name: &str, _params: &serde_json::Value) -> Option<String> {
+            if tool_name == "write_file" {
+                Some("denied by settings.toml rule: write_file".to_string())
+            } else {
+                None
+            }
+        }
+    }
+
+    let dir = tempdir();
+    let target = dir.join("x.txt");
+    let input = serde_json::json!({"path": target, "content": "hi"}).to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("toolu_w", "write_file", &input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("deny-wins".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "write x",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &DenyWriteAllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.denied.len(), 1);
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn headless_max_turns_cap_is_honored() {
+    // main.rs:310 was None -> always 20 turns regardless of config.max_turns.
+    let input = serde_json::json!({}).to_string();
+    let provider = ScriptedProvider::new(tool_call_events("c1", "list_dir", &input));
+    let mut session = Session::new("max-turns-cap".to_string());
+    let mut sink = CollectSink::default();
+
+    let result = run_turn(
+        "loop",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        Some(2),
+        None,
+    )
+    .await;
+
+    assert_eq!(result.iterations, 2, "max_turns must cap provider loop");
+    assert_eq!(sink.tool_starts.len(), 2);
+    assert_eq!(sink.tool_ends.len(), 2);
+}
+
+#[tokio::test]
+async fn dedup_allows_reread_after_edit() {
+    // agent_loop.rs: seen_tool_calls dedup for read_file/glob/grep/list_dir.
+    // Before fix, read_file(same args) after edit_file was deduped. Now writes clear the set.
+    let dir = tempdir();
+    let file = dir.join("v.txt");
+    std::fs::write(&file, "version = 1.0.0\n").unwrap();
+    let read_input = serde_json::json!({"path": file}).to_string();
+    let edit_input = serde_json::json!({
+        "path": file,
+        "old_string": "1.0.0",
+        "new_string": "2.0.0"
+    })
+    .to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &read_input),
+        tool_call_events("e1", "edit_file", &edit_input),
+        tool_call_events("r2", "read_file", &read_input),
+        text_stop("verified 2.0.0"),
+    ]);
+
+    let mut session = Session::new("dedup-reread".to_string());
+    let mut sink = CollectSink::default();
+
+    run_turn(
+        "read edit reread",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    // All three tool calls should execute; the second read must not be deduped.
+    assert_eq!(sink.tool_starts.len(), 3, "second read was wrongly deduped");
+    assert_eq!(sink.tool_ends.len(), 3);
+    assert!(
+        sink.tool_ends[2].2.contains("2.0.0"),
+        "reread should see edited content: {}",
+        sink.tool_ends[2].2
+    );
+    assert!(
+        !sink
+            .tool_ends
+            .iter()
+            .any(|(_, _, out, _)| out.contains("already called")),
+        "dedup message should not appear for post-edit reread"
+    );
+}
+
+#[tokio::test]
+async fn dedup_still_blocks_immediate_duplicate_read() {
+    let dir = tempdir();
+    let file = dir.join("v.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let inp = serde_json::json!({"path": file}).to_string();
+
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &inp),
+        tool_call_events("r2", "read_file", &inp),
+        text_stop("done"),
+    ]);
+
+    let mut session = Session::new("dedup-dup".to_string());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "dup read",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    // Second identical read with no intervening write should be deduped.
+    assert_eq!(sink.tool_starts.len(), 2);
+    assert!(
+        sink.tool_ends[1].2.contains("already called") || sink.tool_ends[1].3,
+        "duplicate read should be deduped"
+    );
+}
+
+// Phase 4a: spawn lifecycle — durable link must exist, no absolute path leak (task.rs:317)
+
+#[tokio::test]
+async fn spawn_agent_link_is_persisted_relative() {
+    use piku_runtime::TaskRegistry;
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let runs = dir.path().join("runs");
+    let links = dir.path().join("links");
+    let registry = TaskRegistry::with_persistence("parent-1", &sessions, &runs, &links);
+    // Register but do not run — just check evidence contract (same as task.rs unit test but adds relative-path gate)
+    let id = registry.register("persist-check".into(), "check link".into(), 1, None);
+    registry.persist_evidence_link(&id).unwrap();
+    let ev = registry.evidence(&id).unwrap();
+    let raw = std::fs::read_to_string(&ev.link_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["parent_session_id"], "parent-1");
+    // child_refs_relative_to_parent must not return absolute leak when parent_run_path present
+    let registry2 = TaskRegistry::with_persistence_run_path(
+        "parent-1",
+        &sessions,
+        &runs,
+        &links,
+        Some(runs.join("parent-1.jsonl")),
+    );
+    let id2 = registry2.register("child2".into(), "x".into(), 1, None);
+    // If not under expected dir, relative refs fail closed — None is acceptable, absolute is not.
+    if let Some((rel_run, rel_session)) =
+        registry2.child_refs_relative_to_parent(&format!("subagent-{id2}"))
+    {
+        assert!(
+            !rel_run.is_absolute(),
+            "child run ref leaked absolute path: {rel_run:?}"
+        );
+        assert!(
+            !rel_session.is_absolute(),
+            "child session ref leaked absolute path: {rel_session:?}"
+        );
+    }
 }

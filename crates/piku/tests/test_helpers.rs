@@ -381,3 +381,51 @@ fn append_json_line(path: &Path, record: &serde_json::Value) {
         Err(err) => eprintln!("failed to open live ledger {}: {err}", path.display()),
     }
 }
+
+pub fn assert_trace_tokens_bounded(trace_events: &[serde_json::Value]) {
+    // Mirrors eval lens: blowout without compaction signal is a harness miss.
+    let mut max_input: u64 = 0;
+    let mut has_compaction = false;
+    for e in trace_events {
+        if e["event"] == "turn_end" {
+            max_input = max_input.max(e["input_tokens"].as_u64().unwrap_or(0));
+        }
+        if e["event"] == "compaction_applied" {
+            has_compaction = true;
+        }
+    }
+    if max_input > 1_000_000 && !has_compaction {
+        panic!("token blowout: input_tokens={max_input} without compaction_applied — cap or compact must fire (see live transcript 2006149↑)");
+    }
+}
+
+#[cfg(test)]
+mod ledger_token_tests {
+    use super::*;
+
+    #[test]
+    fn blowout_without_compaction_fails() {
+        let events = vec![
+            serde_json::json!({"event":"turn_end","input_tokens":2_006_149_u64,"iterations":20_u64}),
+        ];
+        let r = std::panic::catch_unwind(|| assert_trace_tokens_bounded(&events));
+        assert!(r.is_err(), "should panic on blowout without compaction");
+    }
+
+    #[test]
+    fn blowout_with_compaction_passes() {
+        let events = vec![
+            serde_json::json!({"event":"compaction_applied","before_messages":20_u64,"after_messages":10_u64}),
+            serde_json::json!({"event":"turn_end","input_tokens":2_006_149_u64,"iterations":20_u64}),
+        ];
+        assert_trace_tokens_bounded(&events);
+    }
+
+    #[test]
+    fn modest_tokens_pass_without_compaction() {
+        let events = vec![
+            serde_json::json!({"event":"turn_end","input_tokens":80_000_u64,"iterations":2_u64}),
+        ];
+        assert_trace_tokens_bounded(&events);
+    }
+}

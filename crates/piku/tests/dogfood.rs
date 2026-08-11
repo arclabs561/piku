@@ -187,6 +187,54 @@ impl Experience {
             trace_names.contains(&name)
         }
     }
+
+    fn assert_trace_ids_paired(&self) {
+        let starts: Vec<&serde_json::Value> = self
+            .trace_events
+            .iter()
+            .filter(|e| e["event"] == "tool_start")
+            .collect();
+        let ends: Vec<&serde_json::Value> = self
+            .trace_events
+            .iter()
+            .filter(|e| e["event"] == "tool_end")
+            .collect();
+        if starts.is_empty() && ends.is_empty() {
+            return;
+        }
+        assert_eq!(
+            starts.len(),
+            ends.len(),
+            "trace tool_start/tool_end count mismatch: starts={} ends={}",
+            starts.len(),
+            ends.len()
+        );
+        let mut start_ids = std::collections::HashSet::new();
+        for e in &starts {
+            let id = e["id"].as_str().unwrap_or("");
+            assert!(!id.is_empty(), "tool_start id must not be empty: {e}");
+            assert!(
+                start_ids.insert(id.to_string()),
+                "duplicate tool_start id: {id}"
+            );
+        }
+        let mut end_ids = std::collections::HashSet::new();
+        for e in &ends {
+            let id = e["id"].as_str().unwrap_or("");
+            assert!(
+                !id.is_empty(),
+                "tool_end id empty — regression of trace fidelity bug: {e}"
+            );
+            assert!(
+                end_ids.insert(id.to_string()),
+                "duplicate tool_end id: {id}"
+            );
+        }
+        assert_eq!(
+            start_ids, end_ids,
+            "tool_start and tool_end ids must pair exactly"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,4 +1231,5 @@ fn dogfood_trace_file_is_written() {
         event_types.contains(&"tool_start"),
         "trace should contain tool_start events. events: {event_types:?}"
     );
+    exp.assert_trace_ids_paired();
 }
