@@ -842,7 +842,9 @@ function nextActivityPosition() {
   };
 }
 function placeActivity(card, anchor) {
-  const peers = [...overlay.querySelectorAll(".activity-card")].filter((peer) => peer !== card),
+  const peers = [
+    ...overlay.querySelectorAll(".activity-card:not(.embedded), .workspace-object"),
+  ].filter((peer) => peer !== card),
     width = card.offsetWidth || 544,
     candidates = [[anchor.x, anchor.y]];
   for (const peer of peers) {
@@ -883,9 +885,9 @@ function rectsOverlap(a, b, gap = 12) {
   );
 }
 function resolveNewObjectPosition(object, anchor) {
-  const peers = [...overlay.querySelectorAll(".workspace-object")].filter(
-    (peer) => peer !== object,
-  );
+  const peers = [
+    ...overlay.querySelectorAll(".workspace-object, .activity-card:not(.embedded)"),
+  ].filter((peer) => peer !== object);
   if (!peers.length) return;
   const width = object.offsetWidth,
     height = object.offsetHeight,

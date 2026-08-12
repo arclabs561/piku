@@ -627,6 +627,22 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
   );
   await expect(activity.locator(".activity-metrics")).toContainText("errors 0");
   await expect(page.locator('[data-kind="page_preview"] iframe')).toBeVisible();
+
+  const activityBox = await activity.boundingBox();
+  expect(activityBox).not.toBeNull();
+  await page.locator("#canvas").dispatchEvent("click", {
+    clientX: activityBox.x + 24,
+    clientY: activityBox.y + 24,
+  });
+  await page.getByRole("button", { name: "chat", exact: true }).click();
+  const chatBox = await page.locator('[data-kind="chat"]').boundingBox();
+  expect(chatBox).not.toBeNull();
+  const overlapsActivity =
+    activityBox.x < chatBox.x + chatBox.width &&
+    activityBox.x + activityBox.width > chatBox.x &&
+    activityBox.y < chatBox.y + chatBox.height &&
+    activityBox.y + activityBox.height > chatBox.y;
+  expect(overlapsActivity).toBeFalsy();
 });
 
 test("failed chat provenance keeps the workspace boundary and exposes the error", async ({
