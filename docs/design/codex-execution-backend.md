@@ -99,9 +99,10 @@ stores only the opaque thread ID and visible execution metadata. Edited reruns
 start a new native thread; an appended turn resumes the existing one.
 
 The app-server child receives an allowlisted environment rather than Piku's
-complete process environment. The allowlist contains process-launch and TLS
-plumbing, including `HOME` because the installed Codex launcher resolves its
-binary there. `CODEX_HOME` is then set explicitly to the private Piku root.
+complete process environment. The allowlist contains only process-launch and
+TLS plumbing. Both `HOME` and `CODEX_HOME` point at the private Piku Codex root;
+the operator home is not inherited because launch wrappers may use it to
+rehydrate provider credentials or configuration.
 Provider credentials and agent configuration variables are not inherited.
 App-server stderr is projected into structured Piku diagnostics so launch
 failures name the broken boundary instead of collapsing into a generic exit.

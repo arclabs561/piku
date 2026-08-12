@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "policy_id": "piku.codex.workspace-write.v1",
+  "thread_sandbox": "workspace-write",
+  "approval_policy": "never",
+  "network_access": false,
+  "exclude_slash_tmp": true,
+  "exclude_tmpdir_env_var": true,
+  "synthetic_home": true,
+  "child_env_allowlist": [
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "TMPDIR"
+  ]
+}

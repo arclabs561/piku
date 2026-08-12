@@ -17,9 +17,6 @@ use super::ChatMessage;
 const DEVELOPER_INSTRUCTIONS: &str = "You are the read-only conversation executor inside Piku. Answer the user's question directly and concisely. The Piku workspace and its files are not implicit context. Do not inspect files, run commands, use tools, or mutate the workspace. Use only the conversation and optional context supplied in this turn.";
 const WRITE_DEVELOPER_INSTRUCTIONS: &str = "You are the workspace-write coding executor inside Piku for one explicitly approved turn. Work only inside the provided workspace root, do not use the network, do not request broader approval, and do not access sibling paths. Use native command and file-change tools as needed. Explain what you changed, what you verified, and any uncertainty.";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
-    // The installed Codex launcher resolves its binary relative to HOME. Codex
-    // configuration still comes exclusively from the explicit CODEX_HOME.
-    "HOME",
     "LANG",
     "LC_ALL",
     "PATH",
@@ -29,8 +26,13 @@ const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "TERM",
     "TMPDIR",
 ];
+const LAUNCH_POLICY_JSON: &str = include_str!("codex-launch-policy.json");
 const INTERRUPT_RESPONSE_ID: u64 = 4;
 const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
+pub(super) fn launch_policy() -> Value {
+    serde_json::from_str(LAUNCH_POLICY_JSON).expect("embedded Codex launch policy is valid JSON")
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CodexCancellation {
@@ -189,6 +191,7 @@ impl From<anyhow::Error> for CodexFailure {
 }
 
 pub(super) fn readiness() -> CodexReadiness {
+    let _launch_policy = launch_policy();
     let available = command_exists("codex");
     let authenticated = codex_auth_path().is_some_and(|path| path.is_file());
     let isolated = available && authenticated;
@@ -461,6 +464,7 @@ impl CodexServer {
             .env_clear()
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_root)
+            .env("HOME", codex_root)
             .current_dir(codex_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1335,6 +1339,7 @@ mod tests {
     fn child_environment_excludes_credentials_and_agent_configuration() {
         assert!(CHILD_ENV_ALLOWLIST.contains(&"PATH"));
         for forbidden in [
+            "HOME",
             "OPENROUTER_API_KEY",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
@@ -1343,5 +1348,24 @@ mod tests {
         ] {
             assert!(!CHILD_ENV_ALLOWLIST.contains(&forbidden));
         }
+    }
+
+    #[test]
+    fn embedded_launch_policy_matches_the_production_boundary() {
+        let policy = launch_policy();
+        assert_eq!(policy["schema_version"], 1);
+        assert_eq!(policy["policy_id"], "piku.codex.workspace-write.v1");
+        assert_eq!(policy["thread_sandbox"], "workspace-write");
+        assert_eq!(policy["approval_policy"], "never");
+        assert_eq!(policy["network_access"], false);
+        assert_eq!(policy["exclude_slash_tmp"], true);
+        assert_eq!(policy["exclude_tmpdir_env_var"], true);
+        assert_eq!(policy["synthetic_home"], true);
+        let allowlist = policy["child_env_allowlist"].as_array().unwrap();
+        let expected = CHILD_ENV_ALLOWLIST
+            .iter()
+            .map(|key| Value::String((*key).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(allowlist, &expected);
     }
 }

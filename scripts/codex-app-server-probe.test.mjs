@@ -153,6 +153,18 @@ if (process.argv[2] !== "--fake-server") test("sends explicit sandbox policies a
   const result = await withFake("pass");
   assert.equal(result.ok, true);
   assert.equal(result.codexVersion, "codex-cli fake-1");
+  assert.equal(result.launchPolicy.policy_id, "piku.codex.workspace-write.v1");
+  assert.equal(result.launchPolicy.synthetic_home, true);
+  assert.deepEqual(result.launchPolicy.child_env_allowlist, [
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "TMPDIR",
+  ]);
   assert.deepEqual(result.protocol.readOnly, { passed: true, exitCode: 1, sentinelAbsent: true });
   assert.equal(result.protocol.workspaceWrite.passed, true);
 });

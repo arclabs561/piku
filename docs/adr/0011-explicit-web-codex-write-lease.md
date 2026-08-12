@@ -121,3 +121,10 @@ advertise or issue workspace-write authority until the complete probe and a
 real held-out mutation journey satisfy this ADR's gates. Before/after workspace
 inventory and explicit attribution of concurrent or partial effects also
 remain required.
+
+Production and probe launch policy now share one checked-in contract. Both
+`HOME` and `CODEX_HOME` are the private Piku Codex directory, preventing an
+operator-home launch wrapper from rehydrating credentials or configuration
+that the probe did not observe. This closes launch-policy drift but is not an
+attestation by itself; the network, elevation, version, and host gates above
+still keep workspace write disabled.

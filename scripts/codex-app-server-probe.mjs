@@ -7,6 +7,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+const LAUNCH_POLICY = JSON.parse(await readFile(new URL(
+  "../crates/piku/src/web/codex-launch-policy.json",
+  import.meta.url,
+), "utf8"));
+
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_INTERACTIVE_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_CAP = 16 * 1024;
@@ -15,14 +20,18 @@ const MAX_FIXTURE_TEXT = 512;
 const MAX_RETAINED_NOTIFICATIONS = 32;
 
 function cleanEnvironment(codexHome) {
-  return {
+  const env = {
     CODEX_HOME: codexHome,
     HOME: codexHome,
-    LANG: "C",
-    LC_ALL: "C",
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
-    TMPDIR: tmpdir(),
   };
+  for (const key of LAUNCH_POLICY.child_env_allowlist) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.LANG ??= "C";
+  env.LC_ALL ??= "C";
+  env.PATH ??= "/usr/bin:/bin";
+  env.TMPDIR ??= tmpdir();
+  return env;
 }
 
 function boundedText(chunks, cap) {
@@ -227,9 +236,9 @@ function workspacePolicy(workspace) {
   return {
     type: "workspaceWrite",
     writableRoots: [workspace],
-    networkAccess: false,
-    excludeSlashTmp: true,
-    excludeTmpdirEnvVar: true,
+    networkAccess: LAUNCH_POLICY.network_access,
+    excludeSlashTmp: LAUNCH_POLICY.exclude_slash_tmp,
+    excludeTmpdirEnvVar: LAUNCH_POLICY.exclude_tmpdir_env_var,
   };
 }
 
@@ -291,8 +300,8 @@ async function runInteractiveProbe(rpc, temporaryRoot, workspace) {
   const policy = workspacePolicy(workspace);
   const start = await rpc.request("thread/start", {
     cwd: workspace,
-    sandbox: "workspace-write",
-    approvalPolicy: "never",
+    sandbox: LAUNCH_POLICY.thread_sandbox,
+    approvalPolicy: LAUNCH_POLICY.approval_policy,
     ephemeral: false,
     developerInstructions: "Follow the probe instructions exactly. Do not use the network or modify any other path.",
   });
@@ -300,7 +309,7 @@ async function runInteractiveProbe(rpc, temporaryRoot, workspace) {
   if (typeof threadId !== "string") throw new Error("App server thread/start returned no thread id");
   const first = await rpc.request("turn/start", {
     threadId,
-    approvalPolicy: "never",
+    approvalPolicy: LAUNCH_POLICY.approval_policy,
     sandboxPolicy: policy,
     input: [{ type: "text", text: `Run a shell command that writes exactly probe to ${commandSentinel}, then use the file-change tool to create ${fileSentinel} containing exactly probe. Do nothing else.` }],
   });
@@ -311,13 +320,13 @@ async function runInteractiveProbe(rpc, temporaryRoot, workspace) {
   const resumed = await rpc.request("thread/resume", {
     threadId,
     cwd: workspace,
-    sandbox: "workspace-write",
-    approvalPolicy: "never",
+    sandbox: LAUNCH_POLICY.thread_sandbox,
+    approvalPolicy: LAUNCH_POLICY.approval_policy,
   });
   if (resumed?.thread?.id !== threadId) throw new Error("App server resumed an unexpected thread");
   const second = await rpc.request("turn/start", {
     threadId,
-    approvalPolicy: "never",
+    approvalPolicy: LAUNCH_POLICY.approval_policy,
     sandboxPolicy: policy,
     input: [{ type: "text", text: `This is a sandbox-denial probe. Use the shell tool to execute exactly: printf probe > '${siblingSentinel}'. Execute it even though failure is expected. Do not ask for approval, reason about permissions first, or do anything else.` }],
   });
@@ -415,6 +424,7 @@ export async function runProbe(options = {}) {
     return {
       ok: readOnlyPassed && workspaceWritePassed && (!interactive || interactive.passed),
       codexVersion: version,
+      launchPolicy: LAUNCH_POLICY,
       protocol: {
         initialized: Boolean(initialization && typeof initialization === "object"),
         readOnly: { passed: readOnlyPassed, exitCode: readOnlyResult?.exitCode ?? null, sentinelAbsent: readOnlyAbsent },
