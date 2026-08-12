@@ -152,6 +152,50 @@ report backend readiness using booleans and stable reasons, never values.
 - Do not send user files or cards to either executor unless the user selected
   them as context or the active capability explicitly requires them.
 
+## Authority layers
+
+Piku uses “capability” in the object-capability sense: an unforgeable value
+both names authority and permits its use. Linux capabilities are different:
+they split privileges historically held by root into per-thread sets. Dropping
+their bounding and ambient sets is useful hardening, but it does not confine an
+ordinary same-user process to one workspace ([capabilities(7)][linux-caps]).
+
+Keep three layers separate:
+
+1. **Application authority.** Typed attestations and single-use leases decide
+   whether Piku may request one write turn. Authority is explicit, attenuated,
+   non-ambient, and unavailable after consumption.
+2. **Execution containment.** The OS must enforce filesystem, network,
+   process, and privilege boundaries. On Linux, `no_new_privs`, Landlock,
+   namespaces, and seccomp are complementary: Landlock restrictions stack and
+   pass to descendants, while seccomp reduces syscall surface and explicitly
+   is not a complete sandbox ([Landlock][landlock], [seccomp][seccomp]). A
+   launcher such as bubblewrap assembles these primitives but is only as safe
+   as its concrete policy ([bubblewrap][bubblewrap]).
+3. **Runtime evidence.** eBPF/LSM systems can observe and sometimes enforce
+   actual process, file, and network activity. They are a valuable independent
+   witness, not the authority token itself. Tetragon also warns that signal
+   termination may occur after an operation; inline denial is stronger
+   ([Tetragon enforcement][tetragon]).
+
+Other agent systems reinforce the same division. GitHub documents sandbox and
+firewall coverage gaps, Deno warns that subprocess permission escapes its
+runtime permission model, and MCP recommends a host broker that retains
+credentials and authorizes each tool call ([Copilot firewall][copilot],
+[Deno permissions][deno], [MCP client security][mcp]). Piku should therefore
+prefer a host-held narrow capability plus a descendant-enforced OS boundary
+and independent evidence, rather than treating prompts, policy fields, or
+telemetry as enforcement.
+
+[linux-caps]: https://man7.org/linux/man-pages/man7/capabilities.7.html
+[landlock]: https://docs.kernel.org/userspace-api/landlock.html
+[seccomp]: https://docs.kernel.org/userspace-api/seccomp_filter.html
+[bubblewrap]: https://github.com/containers/bubblewrap
+[tetragon]: https://tetragon.io/docs/concepts/enforcement/
+[copilot]: https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-firewall
+[deno]: https://docs.deno.com/runtime/fundamentals/security/
+[mcp]: https://modelcontextprotocol.io/docs/develop/clients/client-best-practices
+
 ## Implementation plan
 
 1. Add a read-only backend readiness endpoint and visible selector. This is
