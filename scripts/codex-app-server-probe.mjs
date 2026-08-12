@@ -515,7 +515,7 @@ export async function writeAttestation(target, result) {
   const temporary = `${target}.tmp-${process.pid}`;
   await writeFile(temporary, `${JSON.stringify(attestation, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, target);
-  return attestation;
+  return { attestation, complete: attestation.passed_gates.length === Object.keys(gates).length };
 }
 
 async function main() {
@@ -529,9 +529,9 @@ async function main() {
     if (known.length !== args.length || (attestationIndex >= 0 && !attestationPath))
       throw new Error("Usage: codex-app-server-probe.mjs [--interactive] [--attestation ABSOLUTE_PATH]");
     const result = await runProbe({ interactive });
-    if (attestationPath) await writeAttestation(attestationPath, result);
+    const written = attestationPath ? await writeAttestation(attestationPath, result) : null;
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    process.exitCode = result.ok ? 0 : 1;
+    process.exitCode = result.ok && (!written || written.complete) ? 0 : 1;
   } catch (error) {
     process.stdout.write(`${JSON.stringify({ ok: false, error: error.message })}\n`);
     process.exitCode = 1;

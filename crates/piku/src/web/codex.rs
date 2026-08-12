@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
@@ -35,6 +36,10 @@ pub(super) fn launch_policy() -> Value {
 }
 
 pub(super) fn workspace_write_attestation(codex_root: &Path) -> Result<(), &'static str> {
+    let attestation = codex_root.join("workspace-write-attestation.json");
+    if !attestation.is_file() {
+        return Err("workspace-write attestation is unavailable");
+    }
     let mut command = std::process::Command::new("codex");
     command
         .env_clear()
@@ -46,17 +51,38 @@ pub(super) fn workspace_write_attestation(codex_root: &Path) -> Result<(), &'sta
             command.env(key, value);
         }
     }
-    let output = command
-        .output()
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
         .map_err(|_| "Codex version probe is unavailable")?;
-    if !output.status.success() || output.stdout.len() > 256 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| "Codex version probe failed")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Codex version probe timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or("Codex version probe has no output")?
+        .take(257)
+        .read_to_end(&mut stdout)
+        .map_err(|_| "Codex version probe failed")?;
+    if !status.success() || stdout.len() > 256 {
         return Err("Codex version probe failed");
     }
-    let version = std::str::from_utf8(&output.stdout)
+    let version = std::str::from_utf8(&stdout)
         .map_err(|_| "Codex version probe returned invalid text")?
         .trim();
     super::codex_attestation::verify(
-        &codex_root.join("workspace-write-attestation.json"),
+        &attestation,
         LAUNCH_POLICY_JSON.as_bytes(),
         version,
         SystemTime::now(),

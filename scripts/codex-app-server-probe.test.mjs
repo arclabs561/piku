@@ -246,7 +246,8 @@ if (process.argv[2] !== "--fake-server") test("attestation records exact evidenc
     const authFile = path.join(directory, "auth.json");
     await writeFile(authFile, "{}", { mode: 0o600 });
     const result = await withFake("pass", { interactive: true, authFile });
-    await writeAttestation(target, result);
+    const written = await writeAttestation(target, result);
+    assert.equal(written.complete, false);
     const attestation = JSON.parse(await readFile(target, "utf8"));
     assert.equal(attestation.schema, "piku.codex-write-attestation.v1");
     assert.ok(attestation.passed_gates.includes("command_write_inside"));
