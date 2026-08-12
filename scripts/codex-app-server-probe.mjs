@@ -154,6 +154,11 @@ class RpcClient {
         this.failAll("App server returned invalid JSON");
         return;
       }
+      if (message.id !== undefined && typeof message.method === "string") {
+        this.child.kill("SIGKILL");
+        this.failAll("App server requested an interactive action outside the no-elevation contract");
+        return;
+      }
       if (message.id === undefined) {
         const itemType = message.params?.item?.type;
         const retain = message.method === "turn/completed"
@@ -190,6 +195,11 @@ class RpcClient {
       pending.reject(new Error(message));
     }
     this.pending.clear();
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(message));
+    }
+    this.waiters = [];
   }
 
   request(method, params) {

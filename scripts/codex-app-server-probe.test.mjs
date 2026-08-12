@@ -30,6 +30,10 @@ if (process.argv[2] === "--fake-server") {
         const request = JSON.parse(line);
         if (request.method === "initialized") continue;
         if (request.method === "initialize") {
+          if (mode === "server-request") {
+            process.stdout.write(`${JSON.stringify({ id: 91, method: "item/requestApproval", params: {} })}\n`);
+            continue;
+          }
           const authFile = path.join(process.env.CODEX_HOME ?? "", "auth.json");
           const credentialEnvPresent = Object.keys(process.env)
             .some((key) => /(?:API_KEY|TOKEN|SECRET|AUTHORIZATION)$/i.test(key));
@@ -230,6 +234,13 @@ if (process.argv[2] !== "--fake-server") test("RPC errors identify the method wi
     assert.ok(error.message.length < 350);
     return true;
   });
+});
+
+if (process.argv[2] !== "--fake-server") test("fails closed on an unexpected server request", async () => {
+  await assert.rejects(
+    withFake("server-request"),
+    /interactive action outside the no-elevation contract/,
+  );
 });
 
 if (process.argv[2] !== "--fake-server") test("bounds app-server response time and removes temporary state", async () => {
