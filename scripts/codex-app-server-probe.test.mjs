@@ -106,11 +106,15 @@ if (process.argv[2] === "--fake-server") {
             notify("item/started", { threadId: "fake-thread", turnId, item: { id: "file-1", type: "fileChange", status: "inProgress", changes: [{ path: fileTarget, kind: "add" }] } });
             await writeFile(fileTarget, "probe");
             notify("item/completed", { threadId: "fake-thread", turnId, item: { id: "file-1", type: "fileChange", status: "completed", changes: [{ path: fileTarget, kind: "add" }] } });
-          } else {
+          } else if (interactiveTurn === 2) {
             const siblingTarget = path.join(path.dirname(interactiveWorkspace), "interactive-sibling-sentinel");
             if (!text.includes(siblingTarget)) throw new Error("unexpected second turn prompt");
             notify("item/started", { threadId: "fake-thread", turnId, item: { ...itemBase, id: "command-2", type: "commandExecution", command: `write ${siblingTarget}`, status: "inProgress" } });
             notify("item/completed", { threadId: "fake-thread", turnId, item: { ...itemBase, id: "command-2", type: "commandExecution", command: `write ${siblingTarget}`, status: "failed", exitCode: 1, aggregatedOutput: "denied" } });
+          } else {
+            if (!text.includes("createConnection")) throw new Error("unexpected third turn prompt");
+            notify("item/started", { threadId: "fake-thread", turnId, item: { ...itemBase, id: "command-3", type: "commandExecution", command: "network probe", status: "inProgress" } });
+            notify("item/completed", { threadId: "fake-thread", turnId, item: { ...itemBase, id: "command-3", type: "commandExecution", command: "network probe", status: "failed", exitCode: 1, aggregatedOutput: "denied" } });
           }
           notify("turn/completed", { threadId: "fake-thread", turn: { id: turnId, status: "completed" } });
           continue;
@@ -210,11 +214,15 @@ if (process.argv[2] !== "--fake-server") test("interactive probe copies auth but
       },
       { passed: true, insideWritten: true, siblingDenied: true, turnsCompleted: true },
     );
+    assert.equal(result.interactive.networkDenied, true);
+    assert.equal(result.interactive.networkAcceptedConnections, 0);
     assert.deepEqual(result.interactive.fixtures.map(({ event, type }) => ({ event, type })), [
       { event: "item/started", type: "commandExecution" },
       { event: "item/completed", type: "commandExecution" },
       { event: "item/started", type: "fileChange" },
       { event: "item/completed", type: "fileChange" },
+      { event: "item/started", type: "commandExecution" },
+      { event: "item/completed", type: "commandExecution" },
       { event: "item/started", type: "commandExecution" },
       { event: "item/completed", type: "commandExecution" },
     ]);
