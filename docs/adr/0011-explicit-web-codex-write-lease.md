@@ -3,7 +3,7 @@
 ---
 status: proposed
 date: 2026-08-09
-verified: 2026-08-09
+verified: 2026-08-12
 extends:
   - 0009
 governs:
@@ -103,3 +103,21 @@ read-only, native elevation is denied, the writable root is canonical,
 network remains disabled, cancellation reaches quiescence, sibling paths are
 not writable through the enforced boundary, and concurrent unmatched changes
 remain explicitly unattributed.
+
+## Update (2026-08-12)
+
+The lease store, explicit browser approval flow, isolated Codex turn policy,
+native command and file-change projection, durable authority event, deadline,
+and cancellation path now exist. Ordinary chat remains read-only and the human
+PTY remains separate.
+
+The decision remains proposed because its acceptance probe is incomplete. The
+implemented lower-level `command/exec` probe did not exercise thread start,
+resume, a real write turn, network denial, native elevation denial, or a
+version-pinned Codex contract. It incorrectly enabled the browser action and
+allowed completion evidence to call network denial passed. Piku now fails
+closed: the lease implementation stays in place, but the browser does not
+advertise or issue workspace-write authority until the complete probe and a
+real held-out mutation journey satisfy this ADR's gates. Before/after workspace
+inventory and explicit attribution of concurrent or partial effects also
+remain required.

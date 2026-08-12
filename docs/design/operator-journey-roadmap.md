@@ -1,6 +1,6 @@
 # Operator journey roadmap
 
-Status: proposal
+Status: implementing
 
 Baseline: `97b37f3` on `main`
 
@@ -66,18 +66,25 @@ rebuilt:
 - Markdown, KaTeX, Mermaid, light/dark themes, and stable cross-surface
   evaluation identities.
 
-The critical missing bridge is repository mutation. Web Codex is intentionally
-read-only, page prompts cannot change repository files, and the human PTY is an
-ambient interactive shell whose bytes are neither model context nor durable run
-evidence. The runtime can already represent file, shell, permission, and
-verification events, but the web journey cannot produce those events today.
+The repository-mutation bridge is partially implemented behind a fail-closed
+gate. Piku has a single-use per-turn lease, an explicit browser review surface,
+Codex workspace-write wiring, native command and file-change projection,
+deadline/cancellation handling, and durable authority/effect records. Ordinary
+chat remains read-only, page prompts cannot change repository files, and the
+human PTY remains a separate ambient operator shell.
+
+The browser write action stays disabled until the version-pinned app-server
+probe exercises thread start, resume, a real turn, writable-root containment,
+network denial, and native elevation denial. A held-out repository mutation
+journey and before/after effect inventory are also still missing.
 
 ## Decisions before implementation
 
 ### 1. Repository mutation approval
 
-The accepted executor direction is Codex workspace-write under Piku-owned
-approval. The remaining decision is approval granularity.
+The accepted direction is Codex workspace-write under Piku-owned approval.
+ADR 0011 chose a revocable, single-use, per-turn lease; its implementation is
+present but its acceptance gates remain open.
 
 Options:
 
@@ -98,10 +105,7 @@ the only first path risks approval fatigue and cannot reliably predeclare every
 edit in an iterative coding turn. Option 3 is safe but does not satisfy the
 inspectable-agent product thesis.
 
-This needs an ADR before implementation because the lease becomes a shared
-authority contract for web, CLI, and TUI consumers. The ADR must distinguish a
-permission lease from process containment. It must not call workspace scoping a
-sandbox.
+ADR 0011 records this contract and distinguishes permission from containment.
 
 ### 2. File-card freshness
 
@@ -372,4 +376,3 @@ The next cohesive change is Phase 0 plus the Phase 1 ADR. Do not implement
 write-enabled Codex until that ADR defines approval, workspace, environment,
 network, cancellation, effect-recording, and file-freshness semantics, and the
 held-out scenario demonstrably fails only at the missing mutation boundary.
-

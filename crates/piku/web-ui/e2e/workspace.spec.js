@@ -1899,16 +1899,27 @@ test("absolute file paths are rejected before a noisy network request", async ({
   expect(requests).toBe(0);
 });
 
-test("page changes persist an inspectable source diff and rerun control", async ({
+test("page change history persists an inspectable narrow diff and rerun control", async ({
   page,
   request,
   surfaceName,
 }) => {
   let calls = 0;
+  const pageHtml = (revision) => [
+    "<!doctype html>",
+    "<html><body>",
+    '<header data-preserve="masthead">Acme</header>',
+    "<main>",
+    `<h1>revision ${revision}</h1>`,
+    '<button data-preserve="cta">Run</button>',
+    "</main>",
+    '<footer data-preserve="legal">Terms</footer>',
+    "</body></html>",
+  ].join("\n");
   await page.route("**/api/chat", async (route) => {
     calls += 1;
     const request = route.request().postDataJSON();
-    const html = `<!doctype html><html><body><main>revision ${calls}</main></body></html>`;
+    const html = pageHtml(calls);
     const noChange = calls === 3;
     await route.fulfill({
       status: 200,
@@ -1986,6 +1997,9 @@ test("page changes persist an inspectable source diff and rerun control", async 
     toolCalls: [],
     mutationActor: "Piku host",
   });
+  expect(savedChange.runs[1].diff).toContain("revision 1");
+  expect(savedChange.runs[1].diff).toContain("revision 2");
+  expect(savedChange.runs[1].diff).not.toContain("data-preserve");
   await latestRun.getByText("provenance", { exact: true }).click();
   const provenance = latestRun.locator("pre");
   await expect(provenance).toContainText("target: page ·");

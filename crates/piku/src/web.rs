@@ -523,17 +523,11 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
 
     let workspace_root = std::env::current_dir()?.canonicalize()?;
     let codex_root = config.config_dir.join("_codex");
-    let workspace_write_available = if codex::readiness().isolated {
-        match codex::probe_workspace_write(&codex_root).await {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "Codex workspace-write capability disabled");
-                false
-            }
-        }
-    } else {
-        false
-    };
+    // ADR 0011 requires a version-pinned proof of the real thread start,
+    // resume, turn, writable-root, network, and elevation boundaries. The
+    // standalone probe has not established that complete contract yet, so the
+    // browser must remain fail-closed even though the lease machinery exists.
+    let workspace_write_available = false;
     let terminal_enabled =
         std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1");
     let state = Arc::new(AppState {
@@ -1678,7 +1672,10 @@ fn validate_write_request(state: &AppState, req: &ChatRequest) -> Result<(), Str
         return Err("isolated Codex execution is unavailable".to_string());
     }
     if !state.workspace_write_available {
-        return Err("Codex workspace-write capability probe did not pass".to_string());
+        return Err(
+            "Codex workspace-write remains disabled until its complete containment probe passes"
+                .to_string(),
+        );
     }
     if !state.workspace_root.is_dir() {
         return Err("workspace root is unavailable".to_string());
@@ -4419,8 +4416,10 @@ mod tests {
             .expect("patch is valid")
             .expect("patch changes source");
 
-        assert!(updated.contains("background:#fafafa"));
-        assert!(updated.contains("<h1>Test</h1><button>Run</button>"));
+        assert_eq!(
+            updated,
+            "<style>body{background:#fafafa;color:#171714}</style><main><h1>Test</h1><button>Run</button></main>"
+        );
     }
 
     #[test]

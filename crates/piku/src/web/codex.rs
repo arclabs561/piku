@@ -206,50 +206,6 @@ pub(super) fn readiness() -> CodexReadiness {
     }
 }
 
-pub(super) async fn probe_workspace_write(codex_root: &Path) -> anyhow::Result<()> {
-    let probe_root = std::env::temp_dir().join(format!(
-        "piku-codex-capability-probe-{}",
-        crate::new_session_id()
-    ));
-    let workspace = probe_root.join("workspace");
-    std::fs::create_dir_all(&workspace).context("create Codex capability probe workspace")?;
-    let inside = workspace.join("inside");
-    let outside = probe_root.join("outside");
-    let result = async {
-        let mut server = CodexServer::spawn(codex_root)?;
-        server.initialize().await?;
-        let read_only = server
-            .exec_probe(&inside, json!({"type":"readOnly","networkAccess":false}))
-            .await?;
-        let read_only_absent = !inside.exists();
-        let policy = CodexTurnPolicy::WorkspaceWrite.turn_sandbox(&workspace);
-        let inside_write = server.exec_probe(&inside, policy.clone()).await?;
-        let outside_write = server.exec_probe(&outside, policy).await?;
-        server.stop().await;
-        let inside_present = inside.exists();
-        let outside_absent = !outside.exists();
-        if read_only != 0
-            && read_only_absent
-            && inside_write == 0
-            && inside_present
-            && outside_write != 0
-            && outside_absent
-        {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "Codex workspace-write containment probe failed (read_only_exit={read_only}, read_only_absent={read_only_absent}, inside_exit={inside_write}, inside_present={inside_present}, outside_exit={outside_write}, outside_absent={outside_absent})"
-            ))
-        }
-    }
-    .await;
-    let cleanup = std::fs::remove_dir_all(&probe_root);
-    if let Err(error) = cleanup {
-        tracing::warn!(%error, "failed to remove Codex capability probe workspace");
-    }
-    result
-}
-
 pub(super) async fn run_chat_cancellable<F>(
     workspace_root: &Path,
     codex_root: &Path,
@@ -538,24 +494,6 @@ impl CodexServer {
         self.send(json!({"method":"initialize","id":1,"params":{"clientInfo":{"name":"piku","title":"Piku","version":env!("CARGO_PKG_VERSION")}}})).await?;
         self.expect_response(1).await?;
         self.send(json!({"method":"initialized","params":{}})).await
-    }
-
-    async fn exec_probe(&mut self, target: &Path, sandbox_policy: Value) -> anyhow::Result<i32> {
-        self.send(json!({"method":"command/exec","id":20,"params":{
-            "command":["/bin/sh","-c","printf probe > \"$1\"","piku-probe",target],
-            "cwd":target.parent(),
-            "env":{},
-            "sandboxPolicy":sandbox_policy,
-            "timeoutMs":5_000,
-            "outputBytesCap":4_096
-        }}))
-        .await?;
-        let response = self.expect_response(20).await?;
-        response
-            .pointer("/result/exitCode")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| protocol_error(&response, "command/exec probe failed"))
     }
 
     async fn start_thread(

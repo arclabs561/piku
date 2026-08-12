@@ -295,7 +295,10 @@ test("real managed server exchanges a page proposal over inherited fd 3", {
   assert.match(events, /"kind":"completed"/);
   response = await fetch(new URL(`/api/surfaces/${surface}`, server.baseUrl));
   const saved = await response.json();
-  assert.match(saved.html, /broker round trip/);
+  assert.equal(
+    saved.html,
+    '<!doctype html><html><body><main id="broker-proof">broker round trip</main></body></html>',
+  );
   assert.equal(server.metadata.terminal_enabled, false);
   assert.equal(server.metadata.page_broker_enabled, true);
 });
