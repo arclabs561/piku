@@ -1251,7 +1251,7 @@ test("managed evaluation fixture completes and persists ordinary chat output", a
     model: "",
     context: "",
     sources: [],
-    turns: [{ id: "complete", prompt: "Preserve this completed output.", response: "", status: "idle", attempt: 0, completedAt: "" }],
+    turns: [],
   });
   const saved = await request.put(`/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`, {
     data: { objects: [{ id: "managed-complete", kind: "chat", title: "managed complete", x: 96, y: 112, width: 704, height: 544, content }] },
@@ -1259,8 +1259,10 @@ test("managed evaluation fixture completes and persists ordinary chat output", a
   expect(saved.ok()).toBeTruthy();
   await page.reload();
   const chat = page.locator('[data-object-id="managed-complete"]');
-  await chat.getByRole("button", { name: "run all", exact: true }).click();
+  await chat.getByLabel("New chat turn").fill("Preserve this completed output.");
+  await chat.getByLabel("New chat turn").press("Enter");
   await expect(chat.locator(".chat-response")).toContainText("Fixture response: Preserve this completed output.");
+  await expect(chat.locator(".chat-response")).toBeInViewport();
   await expect(chat.locator(".chat-turn-status")).toContainText("done · attempt 1");
   await expect(page.locator("#save-status")).toHaveText("saved");
 
@@ -1269,6 +1271,7 @@ test("managed evaluation fixture completes and persists ordinary chat output", a
   await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
   const restored = freshPage.locator('[data-object-id="managed-complete"]');
   await expect(restored.locator(".chat-response")).toContainText("Fixture response: Preserve this completed output.");
+  await expect(restored.locator(".chat-response")).toBeInViewport();
   await expect(restored.locator(".chat-turn-status")).toContainText("done · attempt 1");
   await freshContext.close();
 });

@@ -139,6 +139,8 @@ export async function attestEvidenceArtifacts(report, roleDir, allowedOutputDir 
     if (!details.isFile()) throw new Error(`evidence artifact is not a regular file: ${item.id}`);
     const sourceBytes = await readFile(artifactPath);
     const mediaType = artifactMediaType(artifactPath, sourceBytes);
+    if (mediaType === "image/png" && item.kind !== "screenshot")
+      throw new Error(`PNG evidence must be classified as a screenshot: ${item.id}`);
     if (item.kind === "screenshot" && mediaType !== "image/png")
       throw new Error(`screenshot evidence is not a PNG: ${item.id}`);
     let producer = null;

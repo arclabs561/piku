@@ -8,7 +8,9 @@ The run manifest and append-only historical ledger are at:
 {{LEDGER}}
 
 Treat explorer observations as claims, not chain of thought. Inspect every
-manifest-indexed screenshot that a load-bearing visual claim cites. Use current
+manifest-indexed screenshot, including images not cited by a proposed finding,
+for clipping, overlap, truncation, illegible density, hidden output, and weak
+interaction affordances. Use current
 packet evidence for the verdict; the historical ledger is context for recurring
 obligations only and must not anchor or vote on the current verdict. Cite only
 evidence IDs present in the current packets. A completed packet may still have

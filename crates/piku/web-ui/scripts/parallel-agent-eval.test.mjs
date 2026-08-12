@@ -126,6 +126,18 @@ test("artifact attestation records digest, size, and media type", async (t) => {
   });
 });
 
+test("PNG artifacts cannot bypass screenshot producer validation", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-evidence-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const artifact = path.join(root, "screen.png");
+  await writeFile(artifact, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const report = { evidence: [{ id: "coding_trace:screen", kind: "predicate", artifact }] };
+  await assert.rejects(
+    attestEvidenceArtifacts(report, root, root, `${screenshotEvent(artifact)}\n`),
+    /must be classified as a screenshot/,
+  );
+});
+
 test("artifact attestation rejects paths outside the explorer directory", async (t) => {
   const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-evidence-"));
   t.after(() => rm(root, { recursive: true, force: true }));

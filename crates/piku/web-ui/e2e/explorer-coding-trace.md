@@ -54,6 +54,11 @@ window.innerWidth/innerHeight, devicePixelRatio, prefers-color-scheme, and the
 canvas scroll offsets. Return the final values in `viewport`. Distinguish saved
 canvas geometry from viewport-relative screenshot geometry.
 
+Inspect every saved screenshot as a complete interface, not only as evidence
+for the intended provenance claim. Record visible clipping, overlap,
+truncation, illegible density, hidden output, or undiscoverable manipulation
+affordances even when the main journey succeeds.
+
 Capture final provenance and geometry predicates in a dedicated,
 non-destructive `browser_evaluate` call before cleanup. Do not combine evidence
 capture, surface deletion, dialog handling, or browser close in one compound

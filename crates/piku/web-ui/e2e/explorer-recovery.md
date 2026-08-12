@@ -86,6 +86,11 @@ Do not combine verification, surface deletion, dialog handling, or browser close
 inside one compound tool call. A cleanup result cannot substitute for the
 post-reload evidence result.
 
+For every completed chat turn, distinguish the serialized response from the
+rendered response. Record stored text, rendered text, visibility, response and
+card bounds, and the chat scroller's client height, scroll height, and scroll
+position. Stored text alone does not prove that an operator can see the output.
+
 For every negative UI claim such as “no error,” “no stale state,” or “no
 cancelled marker,” enumerate the exact visible text and status values captured
 from the relevant card or control. Inspect the complete visible status/error
