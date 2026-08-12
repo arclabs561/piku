@@ -588,6 +588,12 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
   await expect(activity.locator(".activity-identity")).toContainText(
     "attempt #1 · request request-fixture-1 · session pending · completed",
   );
+  const identityFits = await activity.locator(".activity-identity").evaluate(
+    (node) => node.scrollWidth <= node.clientWidth &&
+      node.getBoundingClientRect().right <=
+        node.closest(".activity-card").getBoundingClientRect().right,
+  );
+  expect(identityFits).toBeTruthy();
   await expect(activity.locator(".activity-boundary")).toHaveText(
     "selected page source",
   );
@@ -796,12 +802,24 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
   );
 
   await chat.getByLabel("New chat turn").fill("Summarize it.");
+  const composerEnterWasNotCancelled = await chat.getByLabel("New chat turn")
+    .evaluate((field) => field.dispatchEvent(new KeyboardEvent(
+      "keydown",
+      { key: "Enter", bubbles: true, cancelable: true, isComposing: true },
+    )));
+  expect(composerEnterWasNotCancelled).toBeTruthy();
+  expect(requests).toHaveLength(2);
+  await chat.getByLabel("New chat turn").press("Shift+Enter");
+  await expect(chat.getByLabel("New chat turn")).toHaveValue("Summarize it.\n");
+  await chat.getByLabel("New chat turn").press("Backspace");
   await chat.getByLabel("New chat turn").press("Enter");
   await expect.poll(() => requests.length).toBe(3);
   await expect(chat.locator(".chat-turn")).toHaveCount(3);
   await expect(chat.locator(".chat-turn-status").last()).toContainText(
     "done · attempt 1",
   );
+  await expect(chat.locator(".chat-response").last()).toContainText("answer 3");
+  await expect(chat.locator(".chat-response").last()).toBeInViewport();
 
   await expect
     .poll(async () => {

@@ -2055,7 +2055,7 @@ function renderChatNotebook(object) {
     runChatNotebook(object, state, index, index + 1);
   });
   body.querySelector(".chat-composer textarea").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       body.querySelector(".chat-composer").requestSubmit();
     }
@@ -2151,15 +2151,18 @@ function renderChatTurns(object, state) {
 
 async function runChatNotebook(object, state, start, end, execution = {}) {
   if (object.dataset.running === "true") return;
+  object.dataset.running = "true";
+  renderChatTurns(object, state);
   await executorCatalogReady;
   renderChatExecutor(object, state);
   const executor = (executorCatalog.executors || []).find((item) => item.id === state.executor);
   if (!executor?.available || !executorSupports(executor, "chat")) {
     const status = object.querySelector(".chat-executor-status");
     if (status) status.textContent = `${state.executor} unavailable · choose another executor or restore its credentials`;
+    delete object.dataset.running;
+    renderChatTurns(object, state);
     return;
   }
-  object.dataset.running = "true";
   object.chatAbortController = new AbortController();
   const transientActivities = new Map();
   const continuingNativeThread =
@@ -2268,7 +2271,22 @@ async function runChatNotebook(object, state, start, end, execution = {}) {
     });
     renderChatTurns(object, state);
     restoreChatActivities(object, transientActivities);
+    revealChatTurn(object, state.turns[Math.min(end, state.turns.length) - 1]?.id);
     persistChatNotebook(object, state);
+  }
+}
+
+function revealChatTurn(object, turnId) {
+  if (!turnId) return;
+  const scroller = object.querySelector(".chat-turns");
+  const cell = scroller?.querySelector(
+    '[data-turn-id="' + CSS.escape(turnId) + '"]',
+  );
+  if (!scroller || !cell) return;
+  const cellBottom = cell.offsetTop + cell.offsetHeight;
+  const visibleBottom = scroller.scrollTop + scroller.clientHeight;
+  if (cellBottom > visibleBottom) {
+    scroller.scrollTop = cellBottom - scroller.clientHeight;
   }
 }
 
