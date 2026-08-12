@@ -51,7 +51,25 @@ const TEST_ROWS: u16 = 24;
 const TEST_COLS: u16 = 80;
 
 fn isolated_config_home() -> PathBuf {
-    std::env::temp_dir().join(format!("piku-tui-smoke-{}", std::process::id()))
+    smoke_temp_root().join(format!("piku-tui-smoke-{}", std::process::id()))
+}
+
+fn smoke_temp_root() -> PathBuf {
+    // macOS's per-user TMPDIR can be backed by File Provider and has caused
+    // PTY children to stall before their first paint. /tmp is the stable local
+    // scratch boundary used only by this disposable harness.
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+fn smoke_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(smoke_temp_root()).expect("tempdir")
 }
 
 fn piku_binary() -> PathBuf {
@@ -71,7 +89,7 @@ struct Pty {
 
 impl Pty {
     fn spawn() -> Self {
-        Self::spawn_in(std::env::temp_dir().as_path())
+        Self::spawn_in(&smoke_temp_root())
     }
 
     fn spawn_in(cwd: &std::path::Path) -> Self {
@@ -317,7 +335,7 @@ fn ctrl_d_on_empty_prompt_exits_cleanly() {
 #[serial]
 #[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn read_only_flag_starts_read_only_tui() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = smoke_tempdir();
     let blocked_path = tmp.path().join("should-not-exist");
     let mut pty = Pty::spawn_with_args(tmp.path(), ["--read-only"]);
     let banner = pty.wait_for("read-only", Duration::from_secs(5));
@@ -469,7 +487,7 @@ fn hooks_slash_command_renders() {
 #[serial]
 #[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn hooks_config_loads_from_project_file() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = smoke_tempdir();
     std::fs::create_dir_all(tmp.path().join(".piku")).unwrap();
     let hooks_json = serde_json::json!({
         "PreToolUse": [{
@@ -572,7 +590,7 @@ fn pty_resize_does_not_panic() {
 #[serial]
 #[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
 fn sigterm_restores_terminal_before_exit() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = smoke_tempdir();
     let mut cmd = Command::new(piku_binary());
     cmd.current_dir(tmp.path())
         .env_clear()
@@ -670,7 +688,7 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
         }
     });
 
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = smoke_tempdir();
     let mut cmd = Command::new(piku_binary());
     cmd.current_dir(tmp.path())
         .env_clear()
@@ -825,7 +843,7 @@ fn header_is_pinned_and_shows_version_on_launch() {
         "tui_smoke",
         "local",
         "none",
-        std::env::temp_dir().as_path(),
+        &smoke_temp_root(),
         true,
         started.elapsed(),
     );
@@ -835,7 +853,7 @@ fn header_is_pinned_and_shows_version_on_launch() {
 fn tui_ledger_record_satisfies_the_runtime_envelope() {
     let record = test_helpers::build_live_ledger_record(
         test_helpers::EvaluationSurface::Tui,
-        std::env::temp_dir().as_path(),
+        &smoke_temp_root(),
         "tui_smoke",
         "local",
         "none",
