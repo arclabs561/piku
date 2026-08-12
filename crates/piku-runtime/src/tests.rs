@@ -10,6 +10,18 @@ mod session {
         assert_eq!(s.id, "test-1");
         assert!(s.messages.is_empty());
         assert_eq!(s.version, 1);
+        assert_eq!(s.provider, None);
+        assert_eq!(s.model, None);
+    }
+
+    #[test]
+    fn default_session_contains_no_run_state() {
+        let s = Session::default();
+        assert_eq!(s.version, 0);
+        assert!(s.id.is_empty());
+        assert!(s.messages.is_empty());
+        assert_eq!(s.provider, None);
+        assert_eq!(s.model, None);
     }
 
     #[test]

@@ -342,6 +342,23 @@ mod tests {
     }
 
     #[test]
+    fn authority_defaults_to_read_only() {
+        assert_eq!(Authority::default(), Authority::ReadOnly);
+    }
+
+    #[test]
+    fn default_store_contains_no_lease() {
+        let store = WriteLeaseStore::default();
+        let nonce = LeaseNonce([0x5a; NONCE_BYTES]);
+
+        assert_eq!(
+            store.consume(nonce, &scope(), now(NOW_MS)),
+            Err(LeaseError::UnknownOrConsumed)
+        );
+        assert!(!store.revoke(nonce).unwrap());
+    }
+
+    #[test]
     fn digest_is_stable() {
         assert_eq!(scope().digest().unwrap(), scope().digest().unwrap());
     }
