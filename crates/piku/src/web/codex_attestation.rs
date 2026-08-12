@@ -31,12 +31,21 @@ struct Attestation {
     passed_gates: Vec<String>,
 }
 
+/// Proof that the current Codex runtime passed every required write gate.
+///
+/// The private field prevents callers from manufacturing write authority
+/// without passing `verify`.
+#[derive(Debug)]
+pub(super) struct VerifiedWriteAttestation {
+    _verified: (),
+}
+
 pub(super) fn verify(
     path: &Path,
     launch_policy: &[u8],
     codex_version: &str,
     now: SystemTime,
-) -> Result<(), &'static str> {
+) -> Result<VerifiedWriteAttestation, &'static str> {
     let bytes = std::fs::read(path).map_err(|_| "workspace-write attestation is unavailable")?;
     let attestation: Attestation =
         serde_json::from_slice(&bytes).map_err(|_| "workspace-write attestation is invalid")?;
@@ -75,7 +84,7 @@ pub(super) fn verify(
     if passed != required {
         return Err("workspace-write attestation has incomplete gates");
     }
-    Ok(())
+    Ok(VerifiedWriteAttestation { _verified: () })
 }
 
 #[cfg(test)]
@@ -106,14 +115,14 @@ mod tests {
             serde_json::to_vec(&fixture(policy, 10_000_000)).unwrap(),
         )
         .unwrap();
-        assert_eq!(verify(&path, policy, "codex-cli test", now), Ok(()));
+        assert!(verify(&path, policy, "codex-cli test", now).is_ok());
 
         let mut incomplete = fixture(policy, 10_000_000);
         incomplete["passed_gates"] = serde_json::json!(["initialized"]);
         std::fs::write(&path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
         assert_eq!(
-            verify(&path, policy, "codex-cli test", now),
-            Err("workspace-write attestation has incomplete gates")
+            verify(&path, policy, "codex-cli test", now).unwrap_err(),
+            "workspace-write attestation has incomplete gates"
         );
     }
 
@@ -124,22 +133,22 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_hours(192);
         std::fs::write(&path, serde_json::to_vec(&fixture(b"policy", 0)).unwrap()).unwrap();
         assert_eq!(
-            verify(&path, b"other", "codex-cli test", now),
-            Err("workspace-write attestation does not match the launch policy")
+            verify(&path, b"other", "codex-cli test", now).unwrap_err(),
+            "workspace-write attestation does not match the launch policy"
         );
         assert_eq!(
-            verify(&path, b"policy", "codex-cli test", now),
-            Err("workspace-write attestation is stale")
+            verify(&path, b"policy", "codex-cli test", now).unwrap_err(),
+            "workspace-write attestation is stale"
         );
         assert_eq!(
-            verify(&path, b"policy", "other version", UNIX_EPOCH),
-            Err("workspace-write attestation does not match this runtime")
+            verify(&path, b"policy", "other version", UNIX_EPOCH).unwrap_err(),
+            "workspace-write attestation does not match this runtime"
         );
 
         std::fs::write(&path, serde_json::to_vec(&fixture(b"policy", 1)).unwrap()).unwrap();
         assert_eq!(
-            verify(&path, b"policy", "codex-cli test", UNIX_EPOCH),
-            Err("workspace-write attestation is dated in the future")
+            verify(&path, b"policy", "codex-cli test", UNIX_EPOCH).unwrap_err(),
+            "workspace-write attestation is dated in the future"
         );
     }
 }

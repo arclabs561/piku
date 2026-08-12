@@ -37,7 +37,9 @@ pub(super) fn launch_policy() -> Value {
     serde_json::from_str(LAUNCH_POLICY_JSON).expect("embedded Codex launch policy is valid JSON")
 }
 
-pub(super) fn workspace_write_attestation(codex_root: &Path) -> Result<(), &'static str> {
+pub(super) fn workspace_write_attestation(
+    codex_root: &Path,
+) -> Result<super::codex_attestation::VerifiedWriteAttestation, &'static str> {
     let attestation = codex_root.join("workspace-write-attestation.json");
     if !attestation.is_file() {
         return Err("workspace-write attestation is unavailable");

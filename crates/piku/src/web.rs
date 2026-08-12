@@ -336,7 +336,7 @@ pub(super) struct AppState {
     model_slots: Arc<Semaphore>,
     codex_root: Arc<PathBuf>,
     write_leases: Arc<write_lease::WriteLeaseStore>,
-    workspace_write_available: bool,
+    workspace_write_attestation: Option<Arc<codex_attestation::VerifiedWriteAttestation>>,
     terminal_enabled: bool,
     evaluation_fixtures: bool,
     fixture_cancellation_acks: Arc<RwLock<HashMap<String, Instant>>>,
@@ -403,10 +403,36 @@ struct WriteLeaseGrant {
 }
 
 #[derive(Clone)]
-struct TurnAuthority {
-    authority: write_lease::Authority,
-    lease: Option<write_lease::LeaseSummary>,
-    lease_turn_id: Option<String>,
+enum TurnAuthority {
+    ReadOnly,
+    WorkspaceWrite {
+        lease: write_lease::LeaseSummary,
+        lease_turn_id: String,
+        _attestation: Arc<codex_attestation::VerifiedWriteAttestation>,
+    },
+}
+
+impl TurnAuthority {
+    fn authority(&self) -> write_lease::Authority {
+        match self {
+            Self::ReadOnly => write_lease::Authority::ReadOnly,
+            Self::WorkspaceWrite { .. } => write_lease::Authority::WorkspaceWrite,
+        }
+    }
+
+    fn lease(&self) -> Option<&write_lease::LeaseSummary> {
+        match self {
+            Self::ReadOnly => None,
+            Self::WorkspaceWrite { lease, .. } => Some(lease),
+        }
+    }
+
+    fn lease_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::ReadOnly => None,
+            Self::WorkspaceWrite { lease_turn_id, .. } => Some(lease_turn_id),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -526,11 +552,11 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
     let codex_root = config.config_dir.join("_codex");
     // Availability is derived from one local, versioned attestation bound to
     // the exact launch policy. Missing or incomplete proof stays fail-closed.
-    let workspace_write_available = match codex::workspace_write_attestation(&codex_root) {
-        Ok(()) => true,
+    let workspace_write_attestation = match codex::workspace_write_attestation(&codex_root) {
+        Ok(attestation) => Some(Arc::new(attestation)),
         Err(reason) => {
             tracing::info!(reason, "Codex workspace-write remains unavailable");
-            false
+            None
         }
     };
     let terminal_enabled =
@@ -548,7 +574,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         model_slots: Arc::new(Semaphore::new(MODEL_REQUEST_SLOTS)),
         codex_root: Arc::new(codex_root),
         write_leases: Arc::new(write_lease::WriteLeaseStore::default()),
-        workspace_write_available,
+        workspace_write_attestation,
         terminal_enabled,
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
@@ -635,7 +661,7 @@ async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCa
             isolated: codex.isolated,
             model: codex.model.to_string(),
             detail: codex.detail,
-            workspace_write_available: state.workspace_write_available,
+            workspace_write_available: state.workspace_write_attestation.is_some(),
             request_kinds: vec!["chat"],
         },
         ExecutorStatus {
@@ -1676,7 +1702,7 @@ fn validate_write_request(state: &AppState, req: &ChatRequest) -> Result<(), Str
     if !(readiness.available && readiness.authenticated && readiness.isolated) {
         return Err("isolated Codex execution is unavailable".to_string());
     }
-    if !state.workspace_write_available {
+    if state.workspace_write_attestation.is_none() {
         return Err(
             "Codex workspace-write remains disabled until its complete containment probe passes"
                 .to_string(),
@@ -1809,11 +1835,7 @@ async fn chat_handler(
             Err(error) => request_error = Some(error),
         }
     }
-    let mut turn_authority = TurnAuthority {
-        authority: write_lease::Authority::ReadOnly,
-        lease: None,
-        lease_turn_id: None,
-    };
+    let mut turn_authority = TurnAuthority::ReadOnly;
     if request_error.is_none() {
         match consume_turn_authority(&state, &surface_name, &req, &resolved_context) {
             Ok(authority) => turn_authority = authority,
@@ -1907,11 +1929,7 @@ fn consume_turn_authority(
     resolved: &ResolvedChatContext,
 ) -> Result<TurnAuthority, String> {
     if req.authority == write_lease::Authority::ReadOnly {
-        return Ok(TurnAuthority {
-            authority: write_lease::Authority::ReadOnly,
-            lease: None,
-            lease_turn_id: None,
-        });
+        return Ok(TurnAuthority::ReadOnly);
     }
     let token = req
         .write_lease
@@ -1937,10 +1955,14 @@ fn consume_turn_authority(
         .write_leases
         .consume(nonce, &scope, SystemTime::now())
         .map_err(|error| error.to_string())?;
-    Ok(TurnAuthority {
-        authority: write_lease::Authority::WorkspaceWrite,
-        lease: Some(summary),
-        lease_turn_id: Some(lease_turn_id.to_string()),
+    let attestation = state.workspace_write_attestation.clone().ok_or_else(|| {
+        "Codex workspace-write remains disabled until its complete containment probe passes"
+            .to_string()
+    })?;
+    Ok(TurnAuthority::WorkspaceWrite {
+        lease: summary,
+        lease_turn_id: lease_turn_id.to_string(),
+        _attestation: attestation,
     })
 }
 
@@ -2163,7 +2185,7 @@ async fn run_codex_chat_request(
     tx: mpsc::Sender<String>,
 ) {
     let request_id = crate::new_session_id();
-    let (policy, authority_name, sandbox_name) = match turn_authority.authority {
+    let (policy, authority_name, sandbox_name) = match turn_authority.authority() {
         write_lease::Authority::ReadOnly => {
             (codex::CodexTurnPolicy::ReadOnly, "read_only", "read-only")
         }
@@ -2175,7 +2197,7 @@ async fn run_codex_chat_request(
     };
     emit(
         &tx,
-        &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id}),
+        &serde_json::json!({"kind":"request_accepted","request_id":request_id,"surface":surface_name,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id()}),
     );
     let target_exists = {
         let mut surfaces = state.surfaces.write().await;
@@ -2237,7 +2259,7 @@ async fn run_codex_chat_request(
         &mut activity_sink,
         &mut record_error,
     );
-    if let Some(lease) = &turn_authority.lease {
+    if let Some(lease) = turn_authority.lease() {
         let scope_digest = match Sha256Digest::parse(hex_digest(&lease.scope_digest)) {
             Ok(digest) => digest,
             Err(error) => {
@@ -2292,7 +2314,7 @@ async fn run_codex_chat_request(
     }
     let completed_effects = Arc::new(std::sync::Mutex::new(Vec::new()));
     let event_effects = Arc::clone(&completed_effects);
-    let deadline_after = turn_authority.lease.as_ref().map(|lease| {
+    let deadline_after = turn_authority.lease().map(|lease| {
         let now = unix_millis(SystemTime::now()).unwrap_or(u64::MAX);
         Duration::from_millis(lease.expires_at_ms.saturating_sub(now))
     });
@@ -2326,7 +2348,7 @@ async fn run_codex_chat_request(
                     debug_assert_eq!(input, composed_input);
                     emit(
                         &event_tx,
-                        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":sandbox_name,"authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id,"configuration":"isolated","message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answering in an isolated read-only Codex thread"} else {"Running one approved workspace-write Codex turn"},"request_kind":"chat"}),
+                        &serde_json::json!({"kind":"model_started","surface":surface_name,"provider":"codex","model":model,"executor":"codex","thread_id":thread_id,"turn_id":native_turn_id,"sandbox":sandbox_name,"authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id(),"configuration":"isolated","message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answering in an isolated read-only Codex thread"} else {"Running one approved workspace-write Codex turn"},"request_kind":"chat"}),
                     );
                 }
                 codex::CodexEvent::Delta(text) => emit_lossy(
@@ -2519,7 +2541,7 @@ async fn run_codex_chat_request(
             }
             emit(
                 &tx,
-                &serde_json::json!({"kind":"completed","surface":surface_name,"message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answer complete; workspace unchanged"} else {"Approved write turn complete; inspect recorded effects"},"elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id,"effects":completed_effects,"model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"authority boundary","outcome":"passed","detail":if policy == codex::CodexTurnPolicy::ReadOnly {"read-only policy applied"} else {"single-use workspace-write lease consumed; network and elevation disabled"}},{"name":"effect inventory","outcome":if effect_inventory_complete {"passed"} else {"indeterminate"},"detail":if effect_inventory_complete {"all reported effects are representable"} else {"one or more native effects remain explicitly unattributed"}}]}}),
+                &serde_json::json!({"kind":"completed","surface":surface_name,"message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answer complete; workspace unchanged"} else {"Approved write turn complete; inspect recorded effects"},"elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id(),"effects":completed_effects,"model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"authority boundary","outcome":"passed","detail":if policy == codex::CodexTurnPolicy::ReadOnly {"read-only policy applied"} else {"verified containment attestation and single-use workspace-write lease applied"}},{"name":"effect inventory","outcome":if effect_inventory_complete {"passed"} else {"indeterminate"},"detail":if effect_inventory_complete {"all reported effects are representable"} else {"one or more native effects remain explicitly unattributed"}}]}}),
             );
             tracing::info!(
                 request_id,
