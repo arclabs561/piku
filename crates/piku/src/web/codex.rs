@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context};
@@ -32,6 +32,35 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
 
 pub(super) fn launch_policy() -> Value {
     serde_json::from_str(LAUNCH_POLICY_JSON).expect("embedded Codex launch policy is valid JSON")
+}
+
+pub(super) fn workspace_write_attestation(codex_root: &Path) -> Result<(), &'static str> {
+    let mut command = std::process::Command::new("codex");
+    command
+        .env_clear()
+        .arg("--version")
+        .env("CODEX_HOME", codex_root)
+        .env("HOME", codex_root);
+    for key in CHILD_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let output = command
+        .output()
+        .map_err(|_| "Codex version probe is unavailable")?;
+    if !output.status.success() || output.stdout.len() > 256 {
+        return Err("Codex version probe failed");
+    }
+    let version = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "Codex version probe returned invalid text")?
+        .trim();
+    super::codex_attestation::verify(
+        &codex_root.join("workspace-write-attestation.json"),
+        LAUNCH_POLICY_JSON.as_bytes(),
+        version,
+        SystemTime::now(),
+    )
 }
 
 #[derive(Debug, Clone)]

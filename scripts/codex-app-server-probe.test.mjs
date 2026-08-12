@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runProbe } from "./codex-app-server-probe.mjs";
+import { runProbe, writeAttestation } from "./codex-app-server-probe.mjs";
 
 const test = process.argv[2] === "--fake-server" ? null : (await import("node:test")).test;
 
@@ -117,6 +117,10 @@ if (process.argv[2] === "--fake-server") {
           continue;
         }
         const { command, cwd, sandboxPolicy } = request.params;
+        if (command[1] === "-e" && command[2]?.includes("createConnection")) {
+          reply(request.id, { exitCode: 1, stdout: "", stderr: "denied" });
+          continue;
+        }
         const target = command.at(-1);
         const inside = path.dirname(target) === cwd;
         const validCommon = Array.isArray(command) && command.length === 4
@@ -167,6 +171,7 @@ if (process.argv[2] !== "--fake-server") test("sends explicit sandbox policies a
   ]);
   assert.deepEqual(result.protocol.readOnly, { passed: true, exitCode: 1, sentinelAbsent: true });
   assert.equal(result.protocol.workspaceWrite.passed, true);
+  assert.deepEqual(result.protocol.network, { passed: true, exitCode: 1, accepted: 0 });
 });
 
 if (process.argv[2] !== "--fake-server") test("fails closed when a denied command reports success", async () => {
@@ -232,4 +237,22 @@ if (process.argv[2] !== "--fake-server") test("bounds app-server response time a
   await assert.rejects(withFake("timeout", { timeoutMs: 50 }), /timed out/);
   const after = await readdir(tmpdir());
   assert.deepEqual(after.filter((name) => name.startsWith("piku-codex-probe-") && !before.has(name)), []);
+});
+
+if (process.argv[2] !== "--fake-server") test("attestation records exact evidence and keeps unproven gates false", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "piku-attestation-test-"));
+  const target = path.join(directory, "workspace-write-attestation.json");
+  try {
+    const authFile = path.join(directory, "auth.json");
+    await writeFile(authFile, "{}", { mode: 0o600 });
+    const result = await withFake("pass", { interactive: true, authFile });
+    await writeAttestation(target, result);
+    const attestation = JSON.parse(await readFile(target, "utf8"));
+    assert.equal(attestation.schema, "piku.codex-write-attestation.v1");
+    assert.ok(attestation.passed_gates.includes("command_write_inside"));
+    assert.ok(attestation.passed_gates.includes("network_denied"));
+    assert.ok(!attestation.passed_gates.includes("elevation_denied"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

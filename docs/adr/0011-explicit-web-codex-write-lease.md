@@ -128,3 +128,11 @@ operator-home launch wrapper from rehydrating credentials or configuration
 that the probe did not observe. This closes launch-policy drift but is not an
 attestation by itself; the network, elevation, version, and host gates above
 still keep workspace write disabled.
+
+The probe can now write a private, atomic attestation bound to the exact Piku
+version, Codex version, host, architecture, launch-policy digest, time, and
+named gates. Piku accepts only the complete current gate set. The deterministic
+network gate makes a positive connection attempt to a probe-owned loopback
+listener and requires both a denied command and zero accepted connections.
+Native elevation remains unproven, so generated attestations remain incomplete
+and the browser remains read-only.

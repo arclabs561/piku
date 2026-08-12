@@ -27,6 +27,7 @@ use piku_runtime::{OutputSink, PostToolAction, ResolvedProvider, TokenUsage};
 use crate::config::PikuConfig;
 
 mod codex;
+mod codex_attestation;
 mod page_broker;
 mod pty;
 mod write_lease;
@@ -523,11 +524,15 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
 
     let workspace_root = std::env::current_dir()?.canonicalize()?;
     let codex_root = config.config_dir.join("_codex");
-    // ADR 0011 requires a version-pinned proof of the real thread start,
-    // resume, turn, writable-root, network, and elevation boundaries. The
-    // standalone probe has not established that complete contract yet, so the
-    // browser must remain fail-closed even though the lease machinery exists.
-    let workspace_write_available = false;
+    // Availability is derived from one local, versioned attestation bound to
+    // the exact launch policy. Missing or incomplete proof stays fail-closed.
+    let workspace_write_available = match codex::workspace_write_attestation(&codex_root) {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::info!(reason, "Codex workspace-write remains unavailable");
+            false
+        }
+    };
     let terminal_enabled =
         std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1");
     let state = Arc::new(AppState {

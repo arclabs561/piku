@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { arch, platform, tmpdir } from "node:os";
+import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const LAUNCH_POLICY = JSON.parse(await readFile(new URL(
+const LAUNCH_POLICY_BYTES = await readFile(new URL(
   "../crates/piku/src/web/codex-launch-policy.json",
   import.meta.url,
-), "utf8"));
+));
+const LAUNCH_POLICY = JSON.parse(LAUNCH_POLICY_BYTES.toString("utf8"));
+const WORKSPACE_MANIFEST = await readFile(new URL("../Cargo.toml", import.meta.url), "utf8");
+const PIKU_VERSION = WORKSPACE_MANIFEST.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+if (!PIKU_VERSION) throw new Error("Could not resolve the Piku workspace version");
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_INTERACTIVE_TIMEOUT_MS = 120_000;
@@ -227,6 +233,35 @@ function writeCommand(target) {
   ];
 }
 
+function networkCommand(port) {
+  return [
+    process.execPath,
+    "-e",
+    "const s=require('node:net').createConnection({host:'127.0.0.1',port:Number(process.argv[1])});s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1))",
+    String(port),
+  ];
+}
+
+async function loopbackProbe(exec) {
+  let accepted = 0;
+  const server = createServer((socket) => {
+    accepted += 1;
+    socket.destroy();
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Loopback probe has no port");
+    const result = await exec(networkCommand(address.port), workspacePolicy("$WORKSPACE"));
+    return { passed: validExecResult(result) && result.exitCode !== 0 && accepted === 0, exitCode: result?.exitCode ?? null, accepted };
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
 function validExecResult(result) {
   return result && Number.isInteger(result.exitCode)
     && typeof result.stdout === "string" && typeof result.stderr === "string";
@@ -397,9 +432,9 @@ export async function runProbe(options = {}) {
     });
     rpc.notify("initialized");
 
-    const exec = (command, sandboxPolicy) => rpc.request("command/exec", {
+    const exec = (command, sandboxPolicy, cwd = workspace) => rpc.request("command/exec", {
       command,
-      cwd: workspace,
+      cwd,
       env: { CODEX_HOME: codexHome, HOME: codexHome },
       sandboxPolicy,
       timeoutMs,
@@ -411,6 +446,7 @@ export async function runProbe(options = {}) {
     });
     const insideResult = await exec(writeCommand(workspaceSentinel), workspacePolicy(workspace));
     const outsideResult = await exec(writeCommand(siblingSentinel), workspacePolicy(workspace));
+    const network = await loopbackProbe((command) => exec(command, workspacePolicy(workspace)));
     const resultsValid = [readOnlyResult, insideResult, outsideResult].every(validExecResult);
     const readOnlyAbsent = !(await exists(readOnlySentinel));
     const insidePresent = await exists(workspaceSentinel);
@@ -422,7 +458,7 @@ export async function runProbe(options = {}) {
       ? await runInteractiveProbe(rpc, temporaryRoot, workspace)
       : undefined;
     return {
-      ok: readOnlyPassed && workspaceWritePassed && (!interactive || interactive.passed),
+      ok: readOnlyPassed && workspaceWritePassed && network.passed && (!interactive || interactive.passed),
       codexVersion: version,
       launchPolicy: LAUNCH_POLICY,
       protocol: {
@@ -435,6 +471,7 @@ export async function runProbe(options = {}) {
           outsideExitCode: outsideResult?.exitCode ?? null,
           outsideSentinelAbsent: outsideAbsent,
         },
+        network,
       },
       ...(interactive ? { interactive } : {}),
     };
@@ -444,11 +481,55 @@ export async function runProbe(options = {}) {
   }
 }
 
+export async function writeAttestation(target, result) {
+  if (!path.isAbsolute(target)) throw new Error("Attestation path must be absolute");
+  const interactive = result.interactive ?? {};
+  const fixtures = interactive.fixtures ?? [];
+  const lifecycle = (type) => fixtures.some((item) => item.type === type && item.event === "item/started")
+    && fixtures.some((item) => item.type === type && item.event === "item/completed");
+  const gates = {
+    initialized: result.protocol?.initialized === true,
+    thread_started: interactive.turnsCompleted === true,
+    thread_resumed: interactive.turnsCompleted === true,
+    turn_completed: interactive.turnsCompleted === true,
+    command_write_inside: interactive.insideWritten === true && lifecycle("commandExecution"),
+    file_change_inside: interactive.insideWritten === true && lifecycle("fileChange"),
+    sibling_write_denied: interactive.siblingDenied === true,
+    // These stay false until the live probe makes positive attempts. Merely
+    // serializing policy fields is not proof.
+    network_denied: result.protocol?.network?.passed === true,
+    elevation_denied: false,
+    native_lifecycle_observed: lifecycle("commandExecution") && lifecycle("fileChange"),
+  };
+  const attestation = {
+    schema: "piku.codex-write-attestation.v1",
+    piku_version: PIKU_VERSION,
+    codex_version: result.codexVersion,
+    host_os: ({ darwin: "macos", win32: "windows" })[platform()] ?? platform(),
+    host_arch: arch(),
+    launch_policy_sha256: createHash("sha256").update(LAUNCH_POLICY_BYTES).digest("hex"),
+    probed_at_unix_ms: Date.now(),
+    passed_gates: Object.entries(gates).filter(([, passed]) => passed).map(([name]) => name),
+  };
+  await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.tmp-${process.pid}`;
+  await writeFile(temporary, `${JSON.stringify(attestation, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, target);
+  return attestation;
+}
+
 async function main() {
   try {
     const args = process.argv.slice(2);
-    if (args.some((arg) => arg !== "--interactive")) throw new Error("Usage: codex-app-server-probe.mjs [--interactive]");
-    const result = await runProbe({ interactive: args.includes("--interactive") });
+    const interactive = args.includes("--interactive");
+    const attestationIndex = args.indexOf("--attestation");
+    const attestationPath = attestationIndex >= 0 ? args[attestationIndex + 1] : null;
+    const known = args.filter((arg, index) => arg === "--interactive"
+      || arg === "--attestation" || index === attestationIndex + 1);
+    if (known.length !== args.length || (attestationIndex >= 0 && !attestationPath))
+      throw new Error("Usage: codex-app-server-probe.mjs [--interactive] [--attestation ABSOLUTE_PATH]");
+    const result = await runProbe({ interactive });
+    if (attestationPath) await writeAttestation(attestationPath, result);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     process.exitCode = result.ok ? 0 : 1;
   } catch (error) {
