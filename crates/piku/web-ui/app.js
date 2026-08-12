@@ -45,6 +45,7 @@ const canvas = document.getElementById("canvas"),
 const surfacesEl = document.getElementById("surfaces"),
   objectPicker = document.getElementById("object-picker"),
   saveStatus = document.getElementById("save-status"),
+  reflowNotice = document.getElementById("reflow-notice"),
   newBtn = document.getElementById("new-btn"),
   delBtn = document.getElementById("del-btn"),
   terminalBtn = document.getElementById("terminal-btn");
@@ -81,7 +82,7 @@ const terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled !== false;
 if (!terminalEnabled) terminalBtn.hidden = true;
 
 function viewportKey(surface) {
-  return `piku:viewport:${surface}`;
+  return `piku:viewport:${surface}:${narrowWorkspace() ? "narrow" : "desktop"}`;
 }
 function saveViewport(surface = active) {
   try {
@@ -998,6 +999,7 @@ function objectShell(kind, title, anchor, restore) {
   const titleId = "workspace-object-title-" + crypto.randomUUID();
   object.className = "workspace-object " + kind + "-object";
   object.setAttribute("aria-labelledby", titleId);
+  object.dataset.persistence = "durable";
   object.dataset.kind = kind;
   object.dataset.objectId =
     (restore && restore.id) || "object-" + crypto.randomUUID();
@@ -1012,14 +1014,16 @@ function objectShell(kind, title, anchor, restore) {
     '<header class="object-handle"><strong id="' + titleId + '">' +
     esc(object.dataset.title) +
     '</strong><span class="object-kind">' +
-    esc(kind) +
+    esc(kind) + " · durable" +
     '</span><button class="object-close" type="button" aria-label="Close ' +
     esc(kind) +
     '">×</button></header><div class="object-body"></div>' +
-    ["nw", "ne", "sw", "se"].map((corner) =>
+    ["nw", "ne", "sw"].map((corner) =>
       '<span class="object-resize-handle object-resize-' + corner +
       '" data-resize-corner="' + corner + '" aria-hidden="true"></span>',
-    ).join("");
+    ).join("") +
+    '<button class="object-resize-handle object-resize-se" type="button" ' +
+    'data-resize-corner="se" aria-label="Resize ' + esc(object.dataset.title) + '"></button>';
   overlay.append(object);
   if (restore) {
     if (restore.width) object.style.width = restore.width + "px";
@@ -1132,6 +1136,46 @@ function enableResize(object) {
       handle.addEventListener("pointermove", move);
       handle.addEventListener("pointerup", stop);
       handle.addEventListener("pointercancel", stop);
+    });
+    handle.addEventListener("keydown", (event) => {
+      if (handle.dataset.resizeCorner !== "se" || object.dataset.responsive === "stacked")
+        return;
+      const directions = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1],
+      };
+      const direction = directions[event.key];
+      if (!direction) return;
+      event.preventDefault();
+      event.stopPropagation();
+      selectWorkspaceObject(object);
+      const step = event.shiftKey ? 64 : 16;
+      const styles = getComputedStyle(object);
+      const minWidth = parseFloat(styles.minWidth) || 288;
+      const minHeight = parseFloat(styles.minHeight) || 128;
+      const left = parseFloat(object.style.left) || 8;
+      const top = parseFloat(object.style.top) || 8;
+      const maxHeight = Math.max(
+        minHeight,
+        Math.min(MAX_WORKSPACE_OBJECT_HEIGHT, canvas.clientHeight - top - 8),
+      );
+      object.style.width = Math.max(
+        minWidth,
+        Math.min(object.offsetWidth + direction[0] * step, canvas.clientWidth - left - 8),
+      ) + "px";
+      object.style.height = Math.max(
+        minHeight,
+        Math.min(object.offsetHeight + direction[1] * step, maxHeight),
+      ) + "px";
+      object.dataset.layoutWidth = String(object.offsetWidth);
+      object.dataset.layoutHeight = String(object.offsetHeight);
+      handle.setAttribute(
+        "aria-label",
+        `Resize ${object.dataset.title} · ${object.offsetWidth} by ${object.offsetHeight} pixels`,
+      );
+      saveWorkspaceLayout();
     });
   }
 }
@@ -2386,7 +2430,8 @@ function layoutWorkspaceForViewport() {
   if (narrowWorkspace()) {
     const viewportWidth = Math.min(canvas.clientWidth, window.innerWidth);
     const width = Math.max(288, viewportWidth - 16);
-    let top = 8;
+    const noticeHeight = reflowNotice.hidden ? 0 : reflowNotice.offsetHeight;
+    let top = noticeHeight + 8;
     for (const object of objects) {
       object.dataset.responsive = "stacked";
       object.querySelector(".object-handle").title =
@@ -2422,11 +2467,10 @@ function layoutWorkspaceForViewport() {
 
 let layoutFrame = null;
 narrowWorkspaceQuery.addEventListener("change", (event) => {
-  if (!event.matches) {
-    canvas.scrollTop = 0;
-    canvas.scrollLeft = 0;
-  }
+  canvas.scrollTop = 0;
+  canvas.scrollLeft = 0;
   layoutWorkspaceForViewport();
+  restoreViewport(active);
 });
 window.addEventListener("resize", () => {
   cancelAnimationFrame(layoutFrame);

@@ -385,6 +385,19 @@ textarea:focus-visible {
   touch-action: none;
 }
 
+button.object-resize-handle {
+  margin: 0;
+  padding: 0;
+  border-radius: 0;
+  cursor: nwse-resize;
+}
+
+button.object-resize-handle:focus-visible {
+  outline: 3px solid var(--color-accent-fg);
+  outline-offset: 2px;
+  opacity: 1;
+}
+
 .object-resize-nw {
   top: -2px;
   left: -2px;

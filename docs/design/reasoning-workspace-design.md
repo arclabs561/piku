@@ -277,11 +277,13 @@ cells remain read-only proposals.
 ### Spatial object creation and intent
 
 A blank-canvas click opens a host-owned creation palette rather than assuming
-that typing means “change the canvas.” The initial object types are `chat`,
-`canvas change`, `terminal`, and `file`. Objects can be moved by their exposed
-header, resized with the browser resize affordance, raised by interaction, and
-closed explicitly. Geometry and object kind persist per surface in browser
-storage; terminal output and file contents do not.
+that typing means “change the canvas.” The object types are `chat`, workspace
+or page change, `terminal`, `file`, `note`, and page preview. Objects can be
+moved by their exposed header, resized by pointer or keyboard, raised by
+interaction, and closed explicitly. Identity, geometry, z-order, and bounded
+object content persist on the server per surface. Browser storage retains only
+viewport position as a local convenience. A terminal card persists, but its
+live PTY process and output remain transient.
 
 Intent is enforced at the request boundary. A chat request uses a separate
 conversation session and a system prompt with no filesystem, shell, network,

@@ -127,13 +127,49 @@ test("authored workspace cards keep visible accessible names after reload", asyn
   await addObject(page, "change workspace or page", { x: 80, y: 600 });
 
   const names = ["note", "chat", "change"];
-  for (const name of names)
+  for (const name of names) {
     await expect(page.getByRole("article", { name, exact: true })).toHaveCount(1);
+    await expect(page.getByRole("article", { name, exact: true }))
+      .toHaveAttribute("data-persistence", "durable");
+  }
 
   await expect(page.locator("#save-status")).toHaveText("saved");
   await page.reload();
   for (const name of names)
     await expect(page.getByRole("article", { name, exact: true })).toHaveCount(1);
+});
+
+test("keyboard resize is named, bounded, and persisted", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  await addObject(page, "note", { x: 120, y: 100 });
+  const note = page.locator('[data-kind="note"]');
+  const resize = note.getByRole("button", { name: "Resize note" });
+  const before = await note.boundingBox();
+  await resize.focus();
+  await resize.press("ArrowRight");
+  await resize.press("Shift+ArrowDown");
+  const after = await note.boundingBox();
+  expect(after.width).toBe(before.width + 16);
+  expect(after.height).toBe(before.height + 64);
+  await expect(resize).toHaveAttribute(
+    "aria-label",
+    `Resize note · ${after.width} by ${after.height} pixels`,
+  );
+  await expect(page.locator("#save-status")).toHaveText("saved");
+  await expect.poll(async () => {
+    const data = await (await request.get(
+      `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+    )).json();
+    const stored = data.objects.find((object) => object.kind === "note");
+    return [stored?.width, stored?.height];
+  }).toEqual([after.width, after.height]);
+  await page.reload();
+  const restored = await page.locator('[data-kind="note"]').boundingBox();
+  expect(restored.width).toBe(after.width);
+  expect(restored.height).toBe(after.height);
 });
 
 test("notes drag and persist through the server", async ({
@@ -2184,10 +2220,13 @@ test("narrow layout keeps every object handle reachable without overlap", async 
     }),
   );
   expect(boxes).toHaveLength(3);
+  const noticeBottom = await page.locator("#reflow-notice").evaluate(
+    (notice) => notice.getBoundingClientRect().bottom,
+  );
   for (const box of boxes) {
     expect(box.left).toBeGreaterThanOrEqual(0);
     expect(box.right).toBeLessThanOrEqual(390);
-    expect(box.handleTop).toBeGreaterThanOrEqual(0);
+    expect(box.handleTop).toBeGreaterThanOrEqual(noticeBottom + 8);
   }
   const ordered = [...boxes].sort((a, b) => a.top - b.top);
   expect(ordered[1].top).toBeGreaterThanOrEqual(ordered[0].bottom);
