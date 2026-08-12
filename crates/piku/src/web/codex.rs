@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read as _;
+#[cfg(unix)]
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
@@ -68,12 +70,26 @@ pub(super) fn workspace_write_attestation(codex_root: &Path) -> Result<(), &'sta
         std::thread::sleep(Duration::from_millis(20));
     };
     let mut stdout = Vec::new();
-    child
+    let child_stdout = child
         .stdout
         .take()
-        .ok_or("Codex version probe has no output")?
+        .ok_or("Codex version probe has no output")?;
+    #[cfg(unix)]
+    nix::fcntl::fcntl(
+        child_stdout.as_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(|_| "Codex version probe failed")?;
+    child_stdout
         .take(257)
         .read_to_end(&mut stdout)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|_| "Codex version probe failed")?;
     if !status.success() || stdout.len() > 256 {
         return Err("Codex version probe failed");

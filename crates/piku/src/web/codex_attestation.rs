@@ -56,7 +56,11 @@ pub(super) fn verify(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock is before the Unix epoch")?
         .as_millis();
-    let age_ms = now_ms.saturating_sub(u128::from(attestation.probed_at_unix_ms));
+    let probed_at_ms = u128::from(attestation.probed_at_unix_ms);
+    if probed_at_ms > now_ms {
+        return Err("workspace-write attestation is dated in the future");
+    }
+    let age_ms = now_ms - probed_at_ms;
     if age_ms > MAX_AGE.as_millis() {
         return Err("workspace-write attestation is stale");
     }
@@ -130,6 +134,12 @@ mod tests {
         assert_eq!(
             verify(&path, b"policy", "other version", UNIX_EPOCH),
             Err("workspace-write attestation does not match this runtime")
+        );
+
+        std::fs::write(&path, serde_json::to_vec(&fixture(b"policy", 1)).unwrap()).unwrap();
+        assert_eq!(
+            verify(&path, b"policy", "codex-cli test", UNIX_EPOCH),
+            Err("workspace-write attestation is dated in the future")
         );
     }
 }
