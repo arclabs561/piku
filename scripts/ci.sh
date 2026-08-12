@@ -53,12 +53,9 @@ test_() {
 # fast and they pass in ~15s, whereas under full-workspace concurrency they
 # starve and stall. `#[serial]` keeps them one-at-a-time within the binary.
 #
-# They pass in ~15s on an idle machine and starve indefinitely on a busy one,
-# so the stage is bounded. Without a bound `just check` hangs rather than
-# failing, which is worse than a red gate: the run produces no verdict at all
-# and the person waiting cannot tell a stall from slow tests. On timeout the
-# message says the machine was busy, because that is what a timeout here means
-# and reading it as a piku failure sends someone debugging the wrong thing.
+# They normally pass in ~15s, but PTY/process teardown is an OS boundary and
+# must remain bounded. Without a bound `just check` can hang rather than fail,
+# producing no verdict and hiding which stage needs investigation.
 pty() {
   local seconds="${PIKU_PTY_TIMEOUT_SECS:-240}"
   local runner=""
@@ -77,7 +74,7 @@ pty() {
   # --foreground so the tests keep the terminal they need for a PTY.
   "$runner" --foreground "$seconds" cargo test --test tui_smoke -p piku -- --ignored --test-threads=1 || status=$?
   if (( status == 124 )); then
-    printf 'pty: no result after %ss. These tests need an idle machine; rerun scripts/ci.sh pty alone, or raise PIKU_PTY_TIMEOUT_SECS.\n' "$seconds" >&2
+    printf 'pty: no result after %ss; a PTY child or harness teardown did not complete. Rerun scripts/ci.sh pty alone to isolate the failing stage.\n' "$seconds" >&2
   fi
   return "$status"
 }

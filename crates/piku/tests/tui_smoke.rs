@@ -251,8 +251,34 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Detached drop — rexpect's kill loop can hang on zombies.
-        let () = self.send(b"\x04"); // Ctrl-D
+        // Never delegate teardown to rexpect's blocking Drop loop. A test can
+        // finish while piku is still handling a turn, where Ctrl-D is input
+        // rather than an exit request. Signal and reap the child within a
+        // fixed bound so an earlier test stage cannot turn this suite into an
+        // unbounded gate.
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+
+        let _ = self._proc.signal(Signal::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match self._proc.status() {
+                Some(WaitStatus::StillAlive) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Some(_) | None => return,
+            }
+        }
+        let _ = self._proc.signal(Signal::SIGKILL);
+        let kill_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < kill_deadline {
+            match self._proc.status() {
+                Some(WaitStatus::StillAlive) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Some(_) | None => return,
+            }
+        }
     }
 }
 
