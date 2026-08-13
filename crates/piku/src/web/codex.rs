@@ -424,12 +424,8 @@ where
                 .await
                 .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
         };
-        if message.get("id").is_some() && message.get("method").is_some() {
-            return Err(CodexFailure::new(
-                "Codex requested an interactive action outside Piku's no-elevation contract",
-                output,
-            ));
-        }
+        reject_server_request(&message)
+            .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?;
         if apply_stream_event(
             parse_stream_event(&message),
             &mut output,
@@ -713,11 +709,7 @@ impl CodexServer {
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 return Ok(message);
             }
-            if message.get("id").is_some() && message.get("method").is_some() {
-                return Err(anyhow!(
-                    "Codex requested an unauthorized interactive action"
-                ));
-            }
+            reject_server_request(&message)?;
         }
     }
 
@@ -982,6 +974,15 @@ fn interrupt_request(thread_id: &str, turn_id: &str) -> Value {
     }})
 }
 
+fn reject_server_request(message: &Value) -> anyhow::Result<()> {
+    if message.get("id").is_some() && message.get("method").is_some() {
+        return Err(anyhow!(
+            "Codex requested an interactive action outside Piku's no-elevation contract"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct InterruptTracker {
     acknowledged: bool,
@@ -997,11 +998,7 @@ impl InterruptTracker {
             self.acknowledged = true;
             return Ok(self.interrupted);
         }
-        if message.get("id").is_some() && message.get("method").is_some() {
-            return Err(anyhow!(
-                "Codex requested an unauthorized interactive action"
-            ));
-        }
+        reject_server_request(message)?;
         if parse_stream_event(message) == StreamEvent::Interrupted {
             self.interrupted = true;
             return Ok(self.acknowledged);
@@ -1370,9 +1367,25 @@ mod tests {
         let error = tracker
             .observe(&json!({"id":91,"method":"item/tool/call","params":{}}))
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unauthorized interactive action"));
+        assert!(error.to_string().contains("no-elevation contract"));
+    }
+
+    #[test]
+    fn server_request_classifier_accepts_responses_and_notifications_only() {
+        assert!(reject_server_request(&json!({"id":2,"result":{}})).is_ok());
+        assert!(reject_server_request(&json!({
+            "method":"turn/completed",
+            "params":{"turn":{"status":"completed"}}
+        }))
+        .is_ok());
+        assert!(reject_server_request(&json!({
+            "id":91,
+            "method":"item/tool/call",
+            "params":{}
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("no-elevation contract"));
     }
 
     #[tokio::test]
