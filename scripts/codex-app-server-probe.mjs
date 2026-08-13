@@ -17,6 +17,7 @@ const LAUNCH_POLICY = JSON.parse(LAUNCH_POLICY_BYTES.toString("utf8"));
 const WORKSPACE_MANIFEST = await readFile(new URL("../Cargo.toml", import.meta.url), "utf8");
 const PIKU_VERSION = WORKSPACE_MANIFEST.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 if (!PIKU_VERSION) throw new Error("Could not resolve the Piku workspace version");
+const RUST_HOST_ARCH = ({ arm64: "aarch64", x64: "x86_64", ia32: "x86" })[arch()] ?? arch();
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_INTERACTIVE_TIMEOUT_MS = 120_000;
@@ -605,7 +606,7 @@ export async function writeAttestation(target, result) {
     codex_executable_path: executableIdentity.path,
     codex_executable_sha256: executableIdentity.sha256,
     host_os: ({ darwin: "macos", win32: "windows" })[platform()] ?? platform(),
-    host_arch: arch(),
+    host_arch: RUST_HOST_ARCH,
     launch_policy_sha256: createHash("sha256").update(LAUNCH_POLICY_BYTES).digest("hex"),
     probed_at_unix_ms: Date.now(),
     passed_gates: Object.entries(gates).filter(([, passed]) => passed).map(([name]) => name),
