@@ -1303,6 +1303,85 @@ test("chat cards persist and resume their server thread identity", async ({
   });
 });
 
+test("switching chat executors clears prior model and thread identity", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  await page.route("**/api/executors", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        default: "codex",
+        workspace_root: "/tmp/piku-e2e-workspace",
+        executors: [
+          {
+            id: "codex",
+            available: true,
+            isolated: true,
+            model: "codex-default",
+            detail: "read-only coding agent",
+            request_kinds: ["chat"],
+          },
+          {
+            id: "provider",
+            available: true,
+            isolated: true,
+            model: "provider-default",
+            detail: "direct provider chat",
+            request_kinds: ["chat"],
+          },
+        ],
+      }),
+    });
+  });
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [{
+          id: "executor-switch",
+          kind: "chat",
+          title: "executor switch",
+          x: 80,
+          y: 90,
+          width: 704,
+          height: 544,
+          content: JSON.stringify({
+            version: 7,
+            executor: "codex",
+            threadId: "019fe300-0000-7000-8000-000000000001",
+            model: "prior-run-model",
+            context: "",
+            sources: [],
+            turns: [],
+          }),
+        }],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+
+  await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+  const chat = page.locator('[data-object-id="executor-switch"]');
+  await expect(chat.locator(".chat-executor-status")).toContainText("prior-run-model");
+  await expect(chat.locator(".chat-executor-status")).toContainText("thread 019fe300");
+  await chat.getByLabel("Chat executor").selectOption("provider");
+  await expect(chat.locator(".chat-executor-status")).toContainText("provider-default");
+  await expect(chat.locator(".chat-executor-status")).not.toContainText("prior-run-model");
+  await expect(chat.locator(".chat-executor-status")).not.toContainText("thread 019fe300");
+  await expect(page.locator("#save-status")).toHaveText("saved");
+
+  const persisted = await (await request.get(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}`,
+  )).json();
+  const notebook = JSON.parse(
+    persisted.objects.find((object) => object.id === "executor-switch").content,
+  );
+  expect(notebook).toMatchObject({ executor: "provider", model: "", threadId: "" });
+});
+
 test("managed evaluation fixture completes and persists ordinary chat output", async ({
   browser,
   page,

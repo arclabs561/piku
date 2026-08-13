@@ -2108,6 +2108,8 @@ function renderChatNotebook(object) {
   renderChatExecutor(object, state);
   body.querySelector(".chat-executor-select").addEventListener("change", (event) => {
     state.executor = event.currentTarget.value;
+    state.threadId = "";
+    state.model = "";
     state.turns.forEach((turn) => {
       if (turn.response) turn.status = "stale";
     });
