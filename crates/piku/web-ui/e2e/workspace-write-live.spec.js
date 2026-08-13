@@ -1,4 +1,4 @@
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { expect, test } from "@playwright/test";
@@ -6,6 +6,7 @@ import { expect, test } from "@playwright/test";
 test.describe.configure({ timeout: 240_000 });
 
 test("a reviewed Codex turn mutates only the held-out workspace and preserves evidence", async ({
+  browser,
   page,
   request,
 }, testInfo) => {
@@ -15,6 +16,13 @@ test("a reviewed Codex turn mutates only the held-out workspace and preserves ev
   const artifactDir = process.env.PIKU_WRITE_ARTIFACT_DIR;
   expect(fixtureRoot, "runner must provide the isolated fixture root").toBeTruthy();
   expect(artifactDir, "runner must provide a durable artifact directory").toBeTruthy();
+
+  let journeyStarted = false;
+  const resultPath = path.join(artifactDir, "result.json");
+  const writeResult = (result) => writeFile(resultPath, JSON.stringify({
+    schema: "piku.workspace-write-live-result.v1",
+    ...result,
+  }, null, 2) + "\n");
 
   const executors = await (await request.get("/api/executors")).json();
   expect(executors.workspace_root).toBe(await realpath(fixtureRoot));
@@ -26,6 +34,7 @@ test("a reviewed Codex turn mutates only the held-out workspace and preserves ev
   const surface = `write-live-${Date.now()}`;
   expect((await request.post("/api/surfaces", { data: { name: surface } })).ok()).toBeTruthy();
   try {
+    journeyStarted = true;
     await page.goto(`/?surface=${encodeURIComponent(surface)}`);
     expect(page.viewportSize()).toEqual({ width: 1280, height: 720 });
     await page.locator("#canvas").click({ position: { x: 260, y: 180 } });
@@ -62,6 +71,36 @@ test("a reviewed Codex turn mutates only the held-out workspace and preserves ev
     const restored = page.locator('[data-kind="chat"]');
     await expect(restored.locator(".chat-write-state")).toContainText("lease consumed");
     await expect(restored.locator(".chat-write-state")).toContainText("held-out.txt");
+    await writeResult({
+      status: "completed",
+      failure_class: "none",
+      last_completed_phase: "reload_evidence",
+      screenshot: true,
+      evidence_ids: [
+        "write-live:exact-bytes",
+        "write-live:host-observed-effect",
+        "write-live:durable-run-link",
+        "write-live:reload-persistence",
+        "write-live:screenshot",
+      ],
+      findings: [],
+      followups: [],
+      browser_name: browser.browserType().name(),
+      browser_version: browser.version(),
+    });
+  } catch (error) {
+    await writeResult({
+      status: journeyStarted ? "product_failure" : "harness_failure",
+      failure_class: journeyStarted ? "write_journey_product_failure" : "write_live_preflight_failure",
+      last_completed_phase: journeyStarted ? "journey_started" : "preflight",
+      screenshot: false,
+      evidence_ids: [],
+      findings: journeyStarted ? [{ id: "f1", summary: String(error.message || error).slice(0, 500) }] : [],
+      followups: [],
+      browser_name: browser.browserType().name(),
+      browser_version: browser.version(),
+    });
+    throw error;
   } finally {
     await request.delete(`/api/surfaces/${encodeURIComponent(surface)}`);
   }

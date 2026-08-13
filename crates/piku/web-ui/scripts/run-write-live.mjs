@@ -7,6 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { appendEvaluationRecord } from "./evaluation-ledger.mjs";
+import { writeLiveEvaluationRecord } from "./write-live-ledger.mjs";
+
 const execute = promisify(execFile);
 
 const uiRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -20,6 +23,8 @@ const configRoot = path.join(temporary, "config");
 const codexRoot = path.join(configRoot, "piku", "_codex");
 const runId = new Date().toISOString().replaceAll(":", "-");
 const artifactDir = path.join(repoRoot, ".artifacts", "workspace-write-live", runId);
+const ledgerPath = process.env.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-write-live.jsonl");
+const startedAt = Date.now();
 
 async function freePort() {
   return await new Promise((resolve, reject) => {
@@ -48,6 +53,7 @@ const harnessSha256 = createHash("sha256")
   .update(await readFile(fileURLToPath(import.meta.url)))
   .update(await readFile(path.join(uiRoot, "e2e", "workspace-write-live.spec.js")))
   .digest("hex");
+const playwrightVersion = JSON.parse(await readFile(path.join(uiRoot, "node_modules", "@playwright", "test", "package.json"), "utf8")).version;
 
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
@@ -126,7 +132,38 @@ try {
     fixture: "held-out.txt",
     failure: failure?.message || null,
   }, null, 2) + "\n");
-  await rm(temporary, { recursive: true, force: true });
+  let result = null;
+  try {
+    result = JSON.parse(await readFile(path.join(artifactDir, "result.json"), "utf8"));
+  } catch {}
+  const record = writeLiveEvaluationRecord({
+    runId,
+    artifactDir,
+    repoRoot,
+    result,
+    runnerFailure: failure,
+    durationMs: Date.now() - startedAt,
+    runtime: {
+      subject_version: pikuVersion,
+      subject_revision: subjectRevision,
+      subject_dirty: subjectDirty,
+      piku_binary_sha256: binarySha256,
+      harness_sha256: harnessSha256,
+      evaluator_runtime: "playwright",
+      evaluator_version: playwrightVersion,
+      explorer_model: attestation.codex_version,
+      evaluation_contract: "piku-evaluation-v2",
+      attestation_schema: attestation.schema,
+      viewport: "1280x720",
+      browser_name: result?.browser_name || "unknown",
+      browser_version: result?.browser_version || "unknown",
+    },
+  });
+  try {
+    await appendEvaluationRecord(ledgerPath, record);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 if (failure) throw failure;

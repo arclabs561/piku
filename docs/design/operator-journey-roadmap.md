@@ -85,6 +85,9 @@ persisted authority evidence, and tears down the server and fixture. Each run
 writes a versioned manifest, bounded server log, and viewport screenshot below
 `.artifacts/workspace-write-live/`. The executable and harness digests remain
 authoritative when concurrent work makes the source checkout dirty.
+It also appends one causally classified v2 stage to the shared live-evaluation
+ledger, including the Playwright and browser versions. Product assertion
+failures remain distinct from harness, infrastructure, and timeout outcomes.
 
 ## Decisions before implementation
 
