@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runProbe, writeAttestation } from "./codex-app-server-probe.mjs";
@@ -268,10 +269,59 @@ if (process.argv[2] !== "--fake-server") test("attestation records exact evidenc
     const written = await writeAttestation(target, result);
     assert.equal(written.complete, false);
     const attestation = JSON.parse(await readFile(target, "utf8"));
-    assert.equal(attestation.schema, "piku.codex-write-attestation.v1");
+    assert.equal(attestation.schema, "piku.codex-write-attestation.v2");
+    assert.equal(attestation.codex_executable_path, result.executableIdentity.path);
+    assert.match(attestation.codex_executable_sha256, /^[a-f0-9]{64}$/);
     assert.ok(attestation.passed_gates.includes("command_write_inside"));
     assert.ok(attestation.passed_gates.includes("network_denied"));
     assert.ok(!attestation.passed_gates.includes("elevation_denied"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+if (process.argv[2] !== "--fake-server") test("canonicalizes the exact native executable used by the probe", async (context) => {
+  if (process.platform === "win32") return context.skip("symlink creation is not generally available");
+  const directory = await mkdtemp(path.join(tmpdir(), "piku-executable-test-"));
+  try {
+    const alias = path.join(directory, "codex-alias");
+    await symlink(process.execPath, alias);
+    const result = await runProbe(fakeOptions("pass", { executable: alias }));
+    assert.equal(result.executableIdentity.path, await realpath(process.execPath));
+    assert.match(result.executableIdentity.sha256, /^[a-f0-9]{64}$/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+if (process.argv[2] !== "--fake-server") test("attestation rejects wrappers and executable replacement", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "piku-executable-test-"));
+  try {
+    const wrapper = path.join(directory, "codex-wrapper");
+    await writeFile(wrapper, "#!/bin/sh\nexit 0\n");
+    await chmod(wrapper, 0o700);
+    await assert.rejects(
+      runProbe(fakeOptions("pass", { executable: wrapper })),
+      /native payload, not a wrapper script/,
+    );
+
+    const payload = path.join(directory, path.basename(process.execPath));
+    await copyFile(process.execPath, payload);
+    await chmod(payload, 0o700);
+    const result = await withFake("pass");
+    result.executableIdentity = {
+      path: await realpath(payload),
+      sha256: createHash("sha256").update(await readFile(payload)).digest("hex"),
+    };
+    await writeFile(payload, Buffer.from("MZchanged payload"));
+    await assert.rejects(
+      writeAttestation(path.join(directory, "attestation.json"), result),
+      /changed after the probe/,
+    );
+    await assert.rejects(
+      writeAttestation(path.join(directory, "missing-identity.json"), {}),
+      /explicitly resolved Codex executable/,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

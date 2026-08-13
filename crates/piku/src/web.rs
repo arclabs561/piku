@@ -408,7 +408,7 @@ enum TurnAuthority {
     WorkspaceWrite {
         lease: write_lease::LeaseSummary,
         lease_turn_id: String,
-        _attestation: Arc<codex_attestation::VerifiedWriteAttestation>,
+        attestation: Arc<codex_attestation::VerifiedWriteAttestation>,
     },
 }
 
@@ -431,6 +431,13 @@ impl TurnAuthority {
         match self {
             Self::ReadOnly => None,
             Self::WorkspaceWrite { lease_turn_id, .. } => Some(lease_turn_id),
+        }
+    }
+
+    fn write_attestation(&self) -> Option<&codex_attestation::VerifiedWriteAttestation> {
+        match self {
+            Self::ReadOnly => None,
+            Self::WorkspaceWrite { attestation, .. } => Some(attestation),
         }
     }
 }
@@ -1962,7 +1969,7 @@ fn consume_turn_authority(
     Ok(TurnAuthority::WorkspaceWrite {
         lease: summary,
         lease_turn_id: lease_turn_id.to_string(),
-        _attestation: attestation,
+        attestation,
     })
 }
 
@@ -2328,6 +2335,7 @@ async fn run_codex_chat_request(
             &history,
             thread_id.as_deref(),
             policy,
+            turn_authority.write_attestation(),
             cancellation_rx,
             |event| match event {
                 codex::CodexEvent::Started {

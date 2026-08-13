@@ -44,7 +44,16 @@ pub(super) fn workspace_write_attestation(
     if !attestation.is_file() {
         return Err("workspace-write attestation is unavailable");
     }
-    let mut command = std::process::Command::new("codex");
+    super::codex_attestation::verify(
+        &attestation,
+        LAUNCH_POLICY_JSON.as_bytes(),
+        SystemTime::now(),
+        |executable| codex_version(executable, codex_root),
+    )
+}
+
+fn codex_version(executable: &Path, codex_root: &Path) -> Result<String, &'static str> {
+    let mut command = std::process::Command::new(executable);
     command
         .env_clear()
         .arg("--version")
@@ -98,13 +107,9 @@ pub(super) fn workspace_write_attestation(
     }
     let version = std::str::from_utf8(&stdout)
         .map_err(|_| "Codex version probe returned invalid text")?
-        .trim();
-    super::codex_attestation::verify(
-        &attestation,
-        LAUNCH_POLICY_JSON.as_bytes(),
-        version,
-        SystemTime::now(),
-    )
+        .trim()
+        .to_string();
+    Ok(version)
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +295,7 @@ pub(super) async fn run_chat_cancellable<F>(
     history: &[ChatMessage],
     thread_id: Option<&str>,
     policy: CodexTurnPolicy,
+    write_attestation: Option<&super::codex_attestation::VerifiedWriteAttestation>,
     cancellation: watch::Receiver<bool>,
     on_event: F,
 ) -> Result<CodexResult, CodexFailure>
@@ -304,6 +310,7 @@ where
         history,
         thread_id,
         policy,
+        write_attestation,
         Some(cancellation),
         on_event,
     )
@@ -318,13 +325,23 @@ async fn run_chat_inner<F>(
     history: &[ChatMessage],
     thread_id: Option<&str>,
     policy: CodexTurnPolicy,
+    write_attestation: Option<&super::codex_attestation::VerifiedWriteAttestation>,
     mut cancellation: Option<watch::Receiver<bool>>,
     mut on_event: F,
 ) -> Result<CodexResult, CodexFailure>
 where
     F: FnMut(CodexEvent),
 {
-    let mut server = CodexServer::spawn(codex_root)?;
+    let executable = match policy {
+        CodexTurnPolicy::ReadOnly => None,
+        CodexTurnPolicy::WorkspaceWrite => Some(
+            write_attestation
+                .ok_or_else(|| anyhow!("workspace-write requires verified Codex attestation"))?
+                .executable()
+                .map_err(anyhow::Error::msg)?,
+        ),
+    };
+    let mut server = CodexServer::spawn(codex_root, executable)?;
     server.initialize().await?;
     let (thread, model) = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
         server
@@ -525,14 +542,14 @@ struct CodexServer {
 }
 
 impl CodexServer {
-    fn spawn(codex_root: &Path) -> anyhow::Result<Self> {
+    fn spawn(codex_root: &Path, executable: Option<&Path>) -> anyhow::Result<Self> {
         let auth = codex_auth_path()
             .filter(|path| path.is_file())
             .ok_or_else(|| {
                 anyhow!("Codex authentication is unavailable; run `codex login` first")
             })?;
         prepare_codex_home(codex_root, &auth)?;
-        let mut command = Command::new("codex");
+        let mut command = Command::new(executable.unwrap_or_else(|| Path::new("codex")));
         command
             .env_clear()
             .args(["app-server", "--listen", "stdio://"])

@@ -2,8 +2,8 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants, createReadStream } from "node:fs";
+import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { arch, platform, tmpdir } from "node:os";
 import { createServer } from "node:net";
 import path from "node:path";
@@ -24,6 +24,43 @@ const DEFAULT_OUTPUT_CAP = 16 * 1024;
 const MAX_FIXTURES = 8;
 const MAX_FIXTURE_TEXT = 512;
 const MAX_RETAINED_NOTIFICATIONS = 32;
+
+function isNativeExecutableMagic(bytes) {
+  if (bytes.length < 4) return false;
+  const magic = bytes.readUInt32BE(0);
+  return (bytes[0] === 0x7f && bytes.subarray(1, 4).toString("ascii") === "ELF")
+    || bytes.subarray(0, 2).toString("ascii") === "MZ"
+    || [
+      0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe,
+      0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca,
+    ].includes(magic);
+}
+
+async function sha256File(target) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(target)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function resolveExecutableIdentity(executable) {
+  if (!path.isAbsolute(executable)) {
+    throw new Error("Codex executable must be an absolute native payload path");
+  }
+  const canonicalPath = await realpath(executable);
+  const metadata = await stat(canonicalPath);
+  if (!metadata.isFile()) throw new Error("Codex executable must be a regular file");
+  const handle = await open(canonicalPath, "r");
+  try {
+    const bytes = Buffer.alloc(4);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (!isNativeExecutableMagic(bytes.subarray(0, bytesRead))) {
+      throw new Error("Codex executable must be a native payload, not a wrapper script");
+    }
+  } finally {
+    await handle.close();
+  }
+  return { path: canonicalPath, sha256: await sha256File(canonicalPath) };
+}
 
 function cleanEnvironment(codexHome) {
   const env = {
@@ -453,7 +490,11 @@ async function runInteractiveProbe(rpc, temporaryRoot, workspace) {
 }
 
 export async function runProbe(options = {}) {
-  const executable = options.executable ?? "codex";
+  const requestedExecutable = options.executable ?? "codex";
+  const executableIdentity = path.isAbsolute(requestedExecutable)
+    ? await resolveExecutableIdentity(requestedExecutable)
+    : null;
+  const executable = executableIdentity?.path ?? requestedExecutable;
   const prefixArgs = options.prefixArgs ?? [];
   const timeoutMs = options.timeoutMs
     ?? (options.interactive ? DEFAULT_INTERACTIVE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
@@ -510,6 +551,7 @@ export async function runProbe(options = {}) {
     return {
       ok: readOnlyPassed && workspaceWritePassed && network.passed && (!interactive || interactive.passed),
       codexVersion: version,
+      ...(executableIdentity ? { executableIdentity } : {}),
       launchPolicy: LAUNCH_POLICY,
       protocol: {
         initialized: Boolean(initialization && typeof initialization === "object"),
@@ -533,6 +575,14 @@ export async function runProbe(options = {}) {
 
 export async function writeAttestation(target, result) {
   if (!path.isAbsolute(target)) throw new Error("Attestation path must be absolute");
+  if (!result.executableIdentity) {
+    throw new Error("Attestation requires an explicitly resolved Codex executable");
+  }
+  const executableIdentity = await resolveExecutableIdentity(result.executableIdentity.path);
+  if (executableIdentity.path !== result.executableIdentity.path
+    || executableIdentity.sha256 !== result.executableIdentity.sha256) {
+    throw new Error("Codex executable changed after the probe");
+  }
   const interactive = result.interactive ?? {};
   const fixtures = interactive.fixtures ?? [];
   const lifecycle = (type) => fixtures.some((item) => item.type === type && item.event === "item/started")
@@ -552,9 +602,11 @@ export async function writeAttestation(target, result) {
     native_lifecycle_observed: lifecycle("commandExecution") && lifecycle("fileChange"),
   };
   const attestation = {
-    schema: "piku.codex-write-attestation.v1",
+    schema: "piku.codex-write-attestation.v2",
     piku_version: PIKU_VERSION,
     codex_version: result.codexVersion,
+    codex_executable_path: executableIdentity.path,
+    codex_executable_sha256: executableIdentity.sha256,
     host_os: ({ darwin: "macos", win32: "windows" })[platform()] ?? platform(),
     host_arch: arch(),
     launch_policy_sha256: createHash("sha256").update(LAUNCH_POLICY_BYTES).digest("hex"),
@@ -574,11 +626,17 @@ async function main() {
     const interactive = args.includes("--interactive");
     const attestationIndex = args.indexOf("--attestation");
     const attestationPath = attestationIndex >= 0 ? args[attestationIndex + 1] : null;
+    const executableIndex = args.indexOf("--executable");
+    const executable = executableIndex >= 0 ? args[executableIndex + 1] : null;
     const known = args.filter((arg, index) => arg === "--interactive"
-      || arg === "--attestation" || index === attestationIndex + 1);
-    if (known.length !== args.length || (attestationIndex >= 0 && !attestationPath))
-      throw new Error("Usage: codex-app-server-probe.mjs [--interactive] [--attestation ABSOLUTE_PATH]");
-    const result = await runProbe({ interactive });
+      || arg === "--attestation" || index === attestationIndex + 1
+      || arg === "--executable" || index === executableIndex + 1);
+    if (known.length !== args.length || (attestationIndex >= 0 && !attestationPath)
+      || (executableIndex >= 0 && !executable)
+      || (attestationPath && !executable)) {
+      throw new Error("Usage: codex-app-server-probe.mjs [--interactive] [--executable ABSOLUTE_NATIVE_PATH --attestation ABSOLUTE_PATH]");
+    }
+    const result = await runProbe({ interactive, ...(executable ? { executable } : {}) });
     const written = attestationPath ? await writeAttestation(attestationPath, result) : null;
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     process.exitCode = result.ok && (!written || written.complete) ? 0 : 1;
