@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use futures_util::Stream;
 use piku_api::{ApiError, Event, MessageRequest, Provider, StopReason, TokenUsage, ToolDefinition};
 use piku_runtime::{
-    build_system_prompt, read_run_record, run_turn, AllowAll, OutputSink, PostToolAction,
-    RecordingSink, RunContentChange, RunEvent, RunRecorder, RunToolEffect, Session,
-    VerificationStatus,
+    audit_run_record, build_system_prompt, read_run_record, run_turn, run_turn_with_registry,
+    AllowAll, CancelFlag, OutputSink, PostToolAction, RecordingSink, RunContentChange, RunEvent,
+    RunRecorder, RunToolEffect, Session, TaskRegistry, VerificationStatus,
 };
 use piku_tools::all_tool_definitions;
 
@@ -1235,20 +1235,29 @@ async fn e2e_stream_error_session_not_corrupted() {
     let provider = ErrorMidStream;
     let mut session = Session::new("e2e-11".to_string());
     let mut sink = CollectSink::default();
+    let dir = tempdir();
+    let record_path = dir.join("run.jsonl");
+    let mut recorder = RunRecorder::open(&record_path, &session.id).unwrap();
 
-    let result = run_turn(
-        "this will error mid-stream",
-        &mut session,
-        &provider,
-        "m",
-        &[],
-        vec![],
-        &AllowAll,
-        &mut sink,
-        None,
-        None,
-    )
-    .await;
+    let result = {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, "turn-0");
+        let result = run_turn(
+            "this will error mid-stream",
+            &mut session,
+            &provider,
+            "m",
+            &[],
+            vec![],
+            &AllowAll,
+            &mut recording_sink,
+            None,
+            None,
+        )
+        .await;
+        assert!(recording_sink.take_record_error().is_none());
+        result
+    };
+    drop(recorder);
 
     assert!(result.stream_error.is_some());
     // Only the user message — no corrupted assistant message
@@ -1257,6 +1266,90 @@ async fn e2e_stream_error_session_not_corrupted() {
         1,
         "session should only have user message"
     );
+    let events = read_run_record(record_path).unwrap();
+    assert!(matches!(
+        events.last().map(|envelope| &envelope.event),
+        Some(RunEvent::TurnFailed { class, .. }) if class == "provider_stream"
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                RunEvent::TurnCompleted { .. }
+                    | RunEvent::TurnFailed { .. }
+                    | RunEvent::TurnCancelled { .. }
+            ))
+            .count(),
+        1
+    );
+    let audit = audit_run_record(&events);
+    assert!(audit.is_structurally_complete(), "{:?}", audit.findings);
+    assert_eq!(audit.completed_turn_count, 0);
+    assert_eq!(audit.failed_turn_count, 1);
+    assert_eq!(audit.cancelled_turn_count, 0);
+}
+
+#[tokio::test]
+async fn e2e_cancelled_turn_records_one_cancelled_terminal() {
+    let provider = ScriptedProvider::new(text_stop("must not be requested"));
+    let mut session = Session::new("e2e-cancelled".to_string());
+    let mut sink = CollectSink::default();
+    let dir = tempdir();
+    let record_path = dir.join("run.jsonl");
+    let mut recorder = RunRecorder::open(&record_path, &session.id).unwrap();
+    let cancel_flag: CancelFlag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let registry = TaskRegistry::new();
+
+    let result = {
+        let mut recording_sink = RecordingSink::new(&mut sink, &mut recorder, "turn-0");
+        let result = run_turn_with_registry(
+            "cancel before provider execution",
+            &mut session,
+            &provider,
+            "m",
+            &[],
+            vec![],
+            &AllowAll,
+            &mut recording_sink,
+            None,
+            None,
+            &registry,
+            0,
+            &[],
+            None,
+            Some(&cancel_flag),
+        )
+        .await;
+        assert!(recording_sink.take_record_error().is_none());
+        result
+    };
+    drop(recorder);
+
+    assert!(result.cancelled);
+    assert!(result.stream_error.is_none());
+    let events = read_run_record(record_path).unwrap();
+    assert!(matches!(
+        events.last().map(|envelope| &envelope.event),
+        Some(RunEvent::TurnCancelled { .. })
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                RunEvent::TurnCompleted { .. }
+                    | RunEvent::TurnFailed { .. }
+                    | RunEvent::TurnCancelled { .. }
+            ))
+            .count(),
+        1
+    );
+    let audit = audit_run_record(&events);
+    assert!(audit.is_structurally_complete(), "{:?}", audit.findings);
+    assert_eq!(audit.completed_turn_count, 0);
+    assert_eq!(audit.failed_turn_count, 0);
+    assert_eq!(audit.cancelled_turn_count, 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -373,6 +373,23 @@ mod agent_loop {
             events.last().map(|event| &event.event),
             Some(crate::run_record::RunEvent::TurnCompleted { .. })
         ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope.event,
+                    crate::run_record::RunEvent::TurnCompleted { .. }
+                        | crate::run_record::RunEvent::TurnFailed { .. }
+                        | crate::run_record::RunEvent::TurnCancelled { .. }
+                ))
+                .count(),
+            1
+        );
+        let audit = crate::run_audit::audit_run_record(&events);
+        assert!(audit.is_structurally_complete(), "{:?}", audit.findings);
+        assert_eq!(audit.completed_turn_count, 1);
+        assert_eq!(audit.failed_turn_count, 0);
+        assert_eq!(audit.cancelled_turn_count, 0);
     }
 
     #[tokio::test]

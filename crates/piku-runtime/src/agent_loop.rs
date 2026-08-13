@@ -244,6 +244,11 @@ async fn run_turn_inner(
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 cancelled = true;
                 sink.on_text("\n\x1b[2m[cancelled by user]\x1b[0m\n");
+                if iterations == 0 {
+                    sink.on_run_event(&crate::run_record::RunEvent::ContextUnavailable {
+                        reason: "cancelled before provider request".to_string(),
+                    });
+                }
                 break;
             }
         }
@@ -904,13 +909,25 @@ async fn run_turn_inner(
     } else {
         "end_turn"
     };
-    sink.on_run_event(&crate::run_record::RunEvent::TurnCompleted {
-        usage: Some(crate::run_record::UsageRecord {
-            input_tokens: u64::from(tracker.cumulative.input_tokens),
-            output_tokens: u64::from(tracker.cumulative.output_tokens),
-        }),
-        stop_reason: Some(completion_reason.to_string()),
-    });
+    let terminal = if cancelled {
+        crate::run_record::RunEvent::TurnCancelled {
+            reason: "cancelled by user".to_string(),
+        }
+    } else if let Some(message) = &stream_error {
+        crate::run_record::RunEvent::TurnFailed {
+            class: "provider_stream".to_string(),
+            message: message.clone(),
+        }
+    } else {
+        crate::run_record::RunEvent::TurnCompleted {
+            usage: Some(crate::run_record::UsageRecord {
+                input_tokens: u64::from(tracker.cumulative.input_tokens),
+                output_tokens: u64::from(tracker.cumulative.output_tokens),
+            }),
+            stop_reason: Some(completion_reason.to_string()),
+        }
+    };
+    sink.on_run_event(&terminal);
 
     // Context pressure: clamped input_tokens / model_window. We only need
     // ~2 significant figures for a 0-1 ratio, so u32→f32 precision loss
