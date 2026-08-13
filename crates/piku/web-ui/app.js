@@ -364,6 +364,7 @@ async function submitMessage(
     reportedAuthority = "",
     reportedEffects = [],
     observedEffects = [],
+    observedEffectsReported = false,
     toolPolicy = "unknown",
     toolCalls = null,
     mutationActor = "unknown",
@@ -603,6 +604,7 @@ async function submitMessage(
             if (typeof event.authority === "string") reportedAuthority = event.authority;
             reportedEffects = summarizeEffects(event.effects);
             observedEffects = summarizeEffects(event.observed_effects);
+            observedEffectsReported = Array.isArray(event.observed_effects);
             const changed = event.canvas_changed !== false;
             terminalWrite(
               "complete  [" +
@@ -727,6 +729,7 @@ async function submitMessage(
     authority: reportedAuthority,
     effects: reportedEffects,
     observedEffects,
+    observedEffectsReported,
     toolPolicy,
     toolCalls,
     mutationActor,
@@ -1696,7 +1699,7 @@ function parseChatNotebook(content) {
   try {
     const value = JSON.parse(content || "");
     if (
-      [1, 2, 3, 4, 5, 6].includes(value?.version) &&
+      [1, 2, 3, 4, 5, 6, 7].includes(value?.version) &&
       typeof value.context === "string" &&
       Array.isArray(value.turns)
     ) {
@@ -1739,6 +1742,19 @@ function parseChatNotebook(content) {
               value.version >= 6 && typeof turn.serverTurnId === "string"
                 ? turn.serverTurnId
                 : "",
+            writeView:
+              value.version >= 7 && turn.writeView && typeof turn.writeView === "object"
+                ? {
+                    state: ["idle", "pending", "active", "consumed", "failed"].includes(turn.writeView.state)
+                      ? turn.writeView.state
+                      : "failed",
+                    detail: typeof turn.writeView.detail === "string" ? turn.writeView.detail : "write evidence unavailable",
+                    authority: typeof turn.writeView.authority === "string" ? turn.writeView.authority : "authority outcome unreported",
+                    effects: Array.isArray(turn.writeView.effects) ? turn.writeView.effects.filter((item) => typeof item === "string").slice(0, 12) : [],
+                    observedEffects: Array.isArray(turn.writeView.observedEffects) ? turn.writeView.observedEffects.filter((item) => typeof item === "string").slice(0, 12) : [],
+                    observedEffectsReported: turn.writeView.observedEffectsReported === true,
+                  }
+                : null,
             status: ["idle", "running", "done", "stale", "error", "cancelled"].includes(
               turn.status,
             )
@@ -1750,7 +1766,7 @@ function parseChatNotebook(content) {
         ];
       });
       return {
-        version: 6,
+        version: 7,
         executor: value.version >= 3 && ["codex", "provider", "evaluation_fixture"].includes(value.executor)
           ? value.executor
           : "provider",
@@ -1770,11 +1786,11 @@ function parseChatNotebook(content) {
   } catch {
     // Older chat cards had no structured content.
   }
-  return { version: 6, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 7, executor: "provider", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function newChatNotebook() {
-  return { version: 6, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
+  return { version: 7, executor: executorCatalog.default || "codex", threadId: "", model: "", context: "", sources: [], turns: [] };
 }
 
 function executorSupports(executor, requestKind) {
@@ -1860,18 +1876,18 @@ function frozenWriteRequest(object, state, index) {
   });
 }
 
-function writeTurnView(object, turnId) {
-  object.writeTurnViews ||= new Map();
-  if (!object.writeTurnViews.has(turnId)) {
-    object.writeTurnViews.set(turnId, {
+function writeTurnView(turn) {
+  if (!turn.writeView || typeof turn.writeView !== "object") {
+    turn.writeView = {
       state: "idle",
       detail: "read-only · no write lease requested",
       authority: "read-only",
       effects: [],
       observedEffects: [],
-    });
+      observedEffectsReported: false,
+    };
   }
-  return object.writeTurnViews.get(turnId);
+  return turn.writeView;
 }
 
 function renderWriteTurnView(cell, view) {
@@ -1882,9 +1898,9 @@ function renderWriteTurnView(cell, view) {
   const effects = Array.isArray(view.effects) && view.effects.length
     ? ` · reported effects: ${view.effects.join(", ")}`
     : "";
-  const observed = Array.isArray(view.observedEffects) && view.observedEffects.length
-    ? ` · host observed: ${view.observedEffects.join(", ")}`
-    : "";
+  const observed = view.observedEffectsReported
+    ? ` · host observed: ${view.observedEffects.length ? view.observedEffects.join(", ") : "no authoring-file changes"}`
+    : " · host observation unavailable";
   panel.textContent = `${view.authority} · lease ${view.state} · ${view.detail}${effects}${observed}`;
 }
 
@@ -1926,7 +1942,7 @@ function reviewWriteDialog(request) {
 async function reviewWriteTurn(object, state, index) {
   const turn = state.turns[index];
   if (!turn?.prompt.trim() || object.dataset.running === "true") return;
-  const view = writeTurnView(object, turn.id);
+  const view = writeTurnView(turn);
   const root = workspaceWriteRoot();
   const executor = workspaceWriteExecutor(state);
   if (state.executor !== "codex" || !executor?.workspace_write_available || !root) {
@@ -1937,6 +1953,7 @@ async function reviewWriteTurn(object, state, index) {
       : !root
         ? "server did not report a canonical workspace; no lease requested"
         : "Codex native sandbox attestation is unavailable; no lease requested";
+    await persistChatNotebook(object, state, true);
     renderChatTurns(object, state);
     return;
   }
@@ -1945,6 +1962,7 @@ async function reviewWriteTurn(object, state, index) {
   view.state = "pending";
   view.authority = "requested authority workspace-write";
   view.detail = "requesting a single-use lease";
+  await persistChatNotebook(object, state, true);
   renderChatTurns(object, state);
   try {
     const response = await fetch("/api/chat/write-lease", {
@@ -1961,6 +1979,7 @@ async function reviewWriteTurn(object, state, index) {
     view.state = "active";
     view.authority = "lease authority workspace-write";
     view.detail = "single-use lease issued; submitting frozen request";
+    await persistChatNotebook(object, state, true);
     renderChatTurns(object, state);
     await runChatNotebook(object, state, index, index + 1, {
       frozenRequest: request,
@@ -1976,6 +1995,7 @@ async function reviewWriteTurn(object, state, index) {
     view.state = "failed";
     view.authority = "read-only";
     view.detail = `write turn not started: ${error.message}`;
+    await persistChatNotebook(object, state, true);
     renderChatTurns(object, state);
   }
 }
@@ -2152,7 +2172,7 @@ function renderChatTurns(object, state) {
     prompt.value = turn.prompt;
     prompt.disabled = running;
     renderMarkdown(cell.querySelector(".chat-response"), turn.response);
-    renderWriteTurnView(cell, writeTurnView(object, turn.id));
+    renderWriteTurnView(cell, writeTurnView(turn));
     cell.querySelectorAll("button").forEach((button) => {
       button.disabled = running;
     });
@@ -2160,7 +2180,7 @@ function renderChatTurns(object, state) {
     const writeExecutor = workspaceWriteExecutor(state);
     writeReview.disabled = running || state.executor !== "codex" || !writeExecutor?.workspace_write_available;
     if (!writeExecutor?.workspace_write_available)
-      writeReview.title = "Workspace-write review is unavailable until Codex containment passes";
+      writeReview.title = "Workspace-write review is unavailable until a current Codex sandbox attestation passes";
     prompt.addEventListener("input", () => {
       turn.prompt = prompt.value;
       for (let next = index; next < state.turns.length; next += 1) {
@@ -2295,6 +2315,7 @@ async function runChatNotebook(object, state, start, end, execution = {}) {
           : `lease consumed; ${result.error || "turn failed"}`;
         execution.writeView.effects = result.effects || [];
         execution.writeView.observedEffects = result.observedEffects || [];
+        execution.writeView.observedEffectsReported = result.observedEffectsReported === true;
       }
       if (result.threadId) state.threadId = result.threadId;
       if (result.model) state.model = result.model;

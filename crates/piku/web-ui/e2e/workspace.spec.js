@@ -1023,6 +1023,13 @@ test("write review freezes one turn while ordinary notebook actions stay read-on
   };
   await expect.poll(persistedObjects).toContain("Update the reviewed file only.");
   expect(await persistedObjects()).not.toContain("single-use-test-token");
+  await page.reload();
+  await expect(page.locator('[data-kind="chat"] .chat-write-state')).toContainText(
+    "lease consumed",
+  );
+  await expect(page.locator('[data-kind="chat"] .chat-write-state')).toContainText(
+    "host observed: file_modify:README.md",
+  );
 });
 
 test("chat notebook parsing drops invalid turns and repairs duplicate identities", async ({
@@ -1734,7 +1741,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
   expect(completed.objects).toHaveLength(1);
   expect(completed.objects.some((object) => object.kind === "activity")).toBeFalsy();
   const savedNotebook = JSON.parse(completed.objects[0].content);
-  expect(savedNotebook.version).toBe(6);
+  expect(savedNotebook.version).toBe(7);
   expect(savedNotebook.turns[0].runId).toBe("durable-trace-run");
   expect(savedNotebook.turns[0].runUrl).toBe("/run/durable-trace-run");
   expect(savedNotebook.turns[0].requestId).toBe("trace-contract");
