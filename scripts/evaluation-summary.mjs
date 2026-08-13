@@ -34,6 +34,10 @@ for (const file of files) {
     }
     const errors = evaluationEnvelopeErrors(row);
     if (errors.length) quarantined.push({ source, errors });
+    else if (
+      row.schema_version === 1 &&
+      !Object.hasOwn(row, "record_kind") && !Object.hasOwn(row, "stage_id")
+    ) legacyRows.push({ source, row });
     else {
       rowOrder.set(row, rows.length);
       rows.push(row);

@@ -153,6 +153,13 @@ test("summary separates legacy rows and quarantines invalid versioned rows", asy
       [
         JSON.stringify(envelope({ run_id: "valid" })),
         JSON.stringify({ run_id: "old-cli", result: "success" }),
+        JSON.stringify({
+          ...envelope({ run_id: "versioned-v1" }),
+          schema_version: 1,
+          record_kind: undefined,
+          stage_id: undefined,
+          finding_refs: undefined,
+        }),
         JSON.stringify(envelope({ run_id: "invalid", run_status: "banana" })),
         "{not-json",
         "null",
@@ -166,13 +173,13 @@ test("summary separates legacy rows and quarantines invalid versioned rows", asy
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.runs, 1);
     assert.equal(summary.records, 1);
-    assert.equal(summary.legacy_records, 1);
+    assert.equal(summary.legacy_records, 2);
     assert.equal(summary.quarantined_records, 4);
-    assert.match(summary.quarantine[0].source, /mixed\.jsonl:3$/);
+    assert.match(summary.quarantine[0].source, /mixed\.jsonl:4$/);
     assert.ok(summary.quarantine[0].errors.some((error) => error.includes("run_status")));
-    assert.match(summary.quarantine[1].source, /mixed\.jsonl:4$/);
-    assert.match(summary.quarantine[2].source, /mixed\.jsonl:5$/);
-    assert.match(summary.quarantine[3].source, /mixed\.jsonl:6$/);
+    assert.match(summary.quarantine[1].source, /mixed\.jsonl:5$/);
+    assert.match(summary.quarantine[2].source, /mixed\.jsonl:6$/);
+    assert.match(summary.quarantine[3].source, /mixed\.jsonl:7$/);
     assert.ok(summary.quarantine[3].errors.some((error) => error.includes("stage_id is required")));
   } finally {
     await rm(directory, { recursive: true });

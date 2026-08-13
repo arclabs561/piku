@@ -163,10 +163,16 @@ export function evaluationEnvelopeErrors(record) {
   }
   if (Object.hasOwn(record, "record_kind") && !RECORD_KINDS.has(record.record_kind))
     errors.push("record_kind must be run, stage, or amendment");
-  if (!Object.hasOwn(record, "record_kind")) errors.push("record_kind is required");
+  if (record.schema_version >= 2 && !Object.hasOwn(record, "record_kind"))
+    errors.push("record_kind is required");
   if (Object.hasOwn(record, "stage_id") && !nonEmptyString(record.stage_id))
     errors.push("stage_id must be a non-empty string");
-  if (!Object.hasOwn(record, "stage_id")) errors.push("stage_id is required");
+  if (record.schema_version >= 2 && !Object.hasOwn(record, "stage_id"))
+    errors.push("stage_id is required");
+  if (record.schema_version === 1 && Object.hasOwn(record, "record_kind") &&
+      !Object.hasOwn(record, "stage_id")) errors.push("stage_id is required with record_kind");
+  if (record.schema_version === 1 && Object.hasOwn(record, "stage_id") &&
+      !Object.hasOwn(record, "record_kind")) errors.push("record_kind is required with stage_id");
   if (record.record_kind === "amendment") validateAmendment(record, errors);
   return errors;
 }
