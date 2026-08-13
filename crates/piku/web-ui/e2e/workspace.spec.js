@@ -955,6 +955,7 @@ test("write review freezes one turn while ordinary notebook actions stay read-on
         canvas_changed: false,
         authority: write ? "workspace_write" : "read_only",
         effects: write ? [{ kind: "file_write", path: "README.md" }] : [],
+        observed_effects: write ? [{ kind: "file_modify", path: "README.md" }] : [],
       },
     ];
     await route.fulfill({
@@ -1009,6 +1010,9 @@ test("write review freezes one turn while ordinary notebook actions stay read-on
   );
   await expect(chat.locator(".chat-write-state")).toContainText(
     "file_write:README.md",
+  );
+  await expect(chat.locator(".chat-write-state")).toContainText(
+    "host observed: file_modify:README.md",
   );
   await expect(chat.getByRole("button", { name: "review write turn" })).toBeVisible();
   const persistedObjects = async () => {

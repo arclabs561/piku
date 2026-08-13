@@ -314,6 +314,18 @@ delBtn.addEventListener("click", async () => {
 terminalBtn.addEventListener("click", () =>
   terminalEnabled && createWorkspaceObject("terminal", { x: 24, y: 24 }),
 );
+
+function summarizeEffects(effects) {
+  if (!Array.isArray(effects)) return [];
+  return effects.slice(0, 12).map((effect) => {
+    if (typeof effect === "string") return effect;
+    if (!effect || typeof effect !== "object") return "unclassified";
+    return [effect.effect || effect.kind, effect.path, effect.command, effect.category]
+      .filter((value) => typeof value === "string" && value)
+      .join(":") || "unclassified";
+  });
+}
+
 async function submitMessage(
   msg,
   anchor,
@@ -351,6 +363,7 @@ async function submitMessage(
     outcomeMessage = "",
     reportedAuthority = "",
     reportedEffects = [],
+    observedEffects = [],
     toolPolicy = "unknown",
     toolCalls = null,
     mutationActor = "unknown",
@@ -588,15 +601,8 @@ async function submitMessage(
             if (typeof event.mutation_actor === "string") mutationActor = event.mutation_actor;
             if (typeof event.canvas_changed === "boolean") canvasChanged = event.canvas_changed;
             if (typeof event.authority === "string") reportedAuthority = event.authority;
-            if (Array.isArray(event.effects)) {
-              reportedEffects = event.effects.slice(0, 12).map((effect) => {
-                if (typeof effect === "string") return effect;
-                if (!effect || typeof effect !== "object") return "unclassified";
-                return [effect.effect || effect.kind, effect.path, effect.command, effect.category]
-                  .filter((value) => typeof value === "string" && value)
-                  .join(":") || "unclassified";
-              });
-            }
+            reportedEffects = summarizeEffects(event.effects);
+            observedEffects = summarizeEffects(event.observed_effects);
             const changed = event.canvas_changed !== false;
             terminalWrite(
               "complete  [" +
@@ -720,6 +726,7 @@ async function submitMessage(
     verification,
     authority: reportedAuthority,
     effects: reportedEffects,
+    observedEffects,
     toolPolicy,
     toolCalls,
     mutationActor,
@@ -1861,6 +1868,7 @@ function writeTurnView(object, turnId) {
       detail: "read-only · no write lease requested",
       authority: "read-only",
       effects: [],
+      observedEffects: [],
     });
   }
   return object.writeTurnViews.get(turnId);
@@ -1874,7 +1882,10 @@ function renderWriteTurnView(cell, view) {
   const effects = Array.isArray(view.effects) && view.effects.length
     ? ` · reported effects: ${view.effects.join(", ")}`
     : "";
-  panel.textContent = `${view.authority} · lease ${view.state} · ${view.detail}${effects}`;
+  const observed = Array.isArray(view.observedEffects) && view.observedEffects.length
+    ? ` · host observed: ${view.observedEffects.join(", ")}`
+    : "";
+  panel.textContent = `${view.authority} · lease ${view.state} · ${view.detail}${effects}${observed}`;
 }
 
 function workspaceWriteRoot() {
@@ -2283,6 +2294,7 @@ async function runChatNotebook(object, state, start, end, execution = {}) {
           ? "turn completed; lease cannot be reused"
           : `lease consumed; ${result.error || "turn failed"}`;
         execution.writeView.effects = result.effects || [];
+        execution.writeView.observedEffects = result.observedEffects || [];
       }
       if (result.threadId) state.threadId = result.threadId;
       if (result.model) state.model = result.model;
