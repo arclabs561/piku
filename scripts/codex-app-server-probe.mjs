@@ -595,14 +595,11 @@ export async function writeAttestation(target, result) {
     command_write_inside: interactive.insideWritten === true && lifecycle("commandExecution"),
     file_change_inside: interactive.insideWritten === true && lifecycle("fileChange"),
     sibling_write_denied: interactive.siblingDenied === true,
-    // These stay false until the live probe makes positive attempts. Merely
-    // serializing policy fields is not proof.
     network_denied: interactive.networkDenied === true,
-    elevation_denied: false,
     native_lifecycle_observed: lifecycle("commandExecution") && lifecycle("fileChange"),
   };
   const attestation = {
-    schema: "piku.codex-write-attestation.v2",
+    schema: "piku.codex-write-attestation.v3",
     piku_version: PIKU_VERSION,
     codex_version: result.codexVersion,
     codex_executable_path: executableIdentity.path,

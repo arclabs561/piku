@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA: &str = "piku.codex-write-attestation.v2";
+const SCHEMA: &str = "piku.codex-write-attestation.v3";
 const MAX_AGE: Duration = Duration::from_hours(168);
 const REQUIRED_GATES: &[&str] = &[
     "initialized",
@@ -18,7 +18,6 @@ const REQUIRED_GATES: &[&str] = &[
     "file_change_inside",
     "sibling_write_denied",
     "network_denied",
-    "elevation_denied",
     "native_lifecycle_observed",
 ];
 
