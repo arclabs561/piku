@@ -23,6 +23,12 @@ web-harness:
 web-e2e url="http://127.0.0.1:9090":
     cd crates/piku/web-ui && PIKU_WEB_URL={{url}} npm run test:e2e
 
+# Build Piku, launch an isolated held-out repository, and drive one real
+# reviewed Codex write through the browser. Requires a current write attestation.
+web-write-live:
+    RUSTC_WRAPPER= cargo build -p piku
+    cd crates/piku/web-ui && npm run test:e2e:write-live
+
 # Run a full Codex + Playwright user journey against the rendered workspace.
 # The agent manipulates the page, observes screenshots, challenges its own
 # findings, and leaves a structured report plus JSONL tool evidence.

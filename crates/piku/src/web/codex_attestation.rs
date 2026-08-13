@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Read as _;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -7,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA: &str = "piku.codex-write-attestation.v4";
+const SCHEMA: &str = "piku.codex-write-attestation.v5";
 const MAX_AGE: Duration = Duration::from_hours(168);
 const REQUIRED_GATES: &[&str] = &[
     "initialized",
@@ -31,6 +32,7 @@ struct Attestation {
     host_os: String,
     host_arch: String,
     launch_policy_sha256: String,
+    child_environment: BTreeMap<String, String>,
     child_environment_sha256: String,
     probed_at_unix_ms: u64,
     passed_gates: Vec<String>,
@@ -44,6 +46,7 @@ struct Attestation {
 pub(super) struct VerifiedWriteAttestation {
     executable: PathBuf,
     executable_sha256: String,
+    child_environment: BTreeMap<String, String>,
 }
 
 impl VerifiedWriteAttestation {
@@ -53,12 +56,15 @@ impl VerifiedWriteAttestation {
         }
         Ok(&self.executable)
     }
+
+    pub(super) fn child_environment(&self) -> &BTreeMap<String, String> {
+        &self.child_environment
+    }
 }
 
 pub(super) fn verify<F>(
     path: &Path,
     launch_policy: &[u8],
-    child_environment_sha256: &str,
     now: SystemTime,
     version_probe: F,
 ) -> Result<VerifiedWriteAttestation, &'static str>
@@ -80,8 +86,30 @@ where
     if attestation.launch_policy_sha256 != digest {
         return Err("workspace-write attestation does not match the launch policy");
     }
-    if attestation.child_environment_sha256 != child_environment_sha256 {
-        return Err("workspace-write attestation does not match the child environment");
+    let environment_bytes = serde_json::to_vec(&attestation.child_environment)
+        .map_err(|_| "workspace-write attestation child environment is invalid")?;
+    if format!("{:x}", Sha256::digest(environment_bytes)) != attestation.child_environment_sha256 {
+        return Err("workspace-write attestation child environment digest does not match");
+    }
+    const ALLOWED_ENVIRONMENT: &[&str] = &[
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TMPDIR",
+    ];
+    if !["LANG", "LC_ALL", "PATH", "TMPDIR"]
+        .iter()
+        .all(|key| attestation.child_environment.contains_key(*key))
+        || attestation
+            .child_environment
+            .keys()
+            .any(|key| !ALLOWED_ENVIRONMENT.contains(&key.as_str()))
+    {
+        return Err("workspace-write attestation child environment is invalid");
     }
     let now_ms = now
         .duration_since(UNIX_EPOCH)
@@ -135,6 +163,7 @@ where
     Ok(VerifiedWriteAttestation {
         executable,
         executable_sha256: attestation.codex_executable_sha256,
+        child_environment: attestation.child_environment,
     })
 }
 
@@ -190,6 +219,12 @@ mod tests {
     use super::*;
 
     fn fixture(policy: &[u8], now_ms: u64, executable: &Path) -> serde_json::Value {
+        let environment = BTreeMap::from([
+            ("LANG".to_string(), "C".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+        ]);
         serde_json::json!({
             "schema": SCHEMA,
             "piku_version": env!("CARGO_PKG_VERSION"),
@@ -199,7 +234,8 @@ mod tests {
             "host_os": std::env::consts::OS,
             "host_arch": std::env::consts::ARCH,
             "launch_policy_sha256": format!("{:x}", Sha256::digest(policy)),
-            "child_environment_sha256": "environment",
+            "child_environment_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&environment).unwrap())),
+            "child_environment": environment,
             "probed_at_unix_ms": now_ms,
             "passed_gates": REQUIRED_GATES
         })
@@ -218,19 +254,13 @@ mod tests {
         )
         .unwrap();
         set_private(&path);
-        assert!(verify(&path, policy, "environment", now, |_| Ok(
-            "codex-cli test".to_string()
-        ))
-        .is_ok());
+        assert!(verify(&path, policy, now, |_| Ok("codex-cli test".to_string())).is_ok());
 
         let mut incomplete = fixture(policy, 10_000_000, &executable);
         incomplete["passed_gates"] = serde_json::json!(["initialized"]);
         std::fs::write(&path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
         assert_eq!(
-            verify(&path, policy, "environment", now, |_| Ok(
-                "codex-cli test".to_string()
-            ))
-            .unwrap_err(),
+            verify(&path, policy, now, |_| Ok("codex-cli test".to_string())).unwrap_err(),
             "workspace-write attestation has incomplete gates"
         );
     }
@@ -248,21 +278,15 @@ mod tests {
         .unwrap();
         set_private(&path);
         assert_eq!(
-            verify(&path, b"other", "environment", now, |_| Ok(
-                "codex-cli test".to_string()
-            ))
-            .unwrap_err(),
+            verify(&path, b"other", now, |_| Ok("codex-cli test".to_string())).unwrap_err(),
             "workspace-write attestation does not match the launch policy"
         );
         assert_eq!(
-            verify(&path, b"policy", "environment", now, |_| Ok(
-                "codex-cli test".to_string()
-            ))
-            .unwrap_err(),
+            verify(&path, b"policy", now, |_| Ok("codex-cli test".to_string())).unwrap_err(),
             "workspace-write attestation is stale"
         );
         assert_eq!(
-            verify(&path, b"policy", "environment", UNIX_EPOCH, |_| Ok(
+            verify(&path, b"policy", UNIX_EPOCH, |_| Ok(
                 "other version".to_string()
             ))
             .unwrap_err(),
@@ -275,7 +299,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verify(&path, b"policy", "environment", UNIX_EPOCH, |_| Ok(
+            verify(&path, b"policy", UNIX_EPOCH, |_| Ok(
                 "codex-cli test".to_string()
             ))
             .unwrap_err(),
@@ -300,7 +324,6 @@ mod tests {
         let authority = verify(
             &path,
             policy,
-            "environment",
             UNIX_EPOCH + Duration::from_secs(10_000),
             |_| Ok("codex-cli test".to_string()),
         )
@@ -314,32 +337,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_environment_drift_and_unsafe_permissions() {
+    fn rejects_environment_digest_drift_and_unsafe_permissions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attestation.json");
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut invalid = fixture(b"policy", 10_000_000, &executable);
+        invalid["child_environment_sha256"] = serde_json::json!("changed");
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        set_private(&path);
+        assert_eq!(
+            verify(&path, b"policy", now, |_| Ok("codex-cli test".to_string())).unwrap_err(),
+            "workspace-write attestation child environment digest does not match"
+        );
         std::fs::write(
             &path,
             serde_json::to_vec(&fixture(b"policy", 10_000_000, &executable)).unwrap(),
         )
         .unwrap();
-        set_private(&path);
-        assert_eq!(
-            verify(&path, b"policy", "changed", now, |_| Ok(
-                "codex-cli test".to_string()
-            ))
-            .unwrap_err(),
-            "workspace-write attestation does not match the child environment"
-        );
         #[cfg(unix)]
         {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert_eq!(
-                verify(&path, b"policy", "environment", now, |_| Ok(
-                    "codex-cli test".to_string()
-                ))
-                .unwrap_err(),
+                verify(&path, b"policy", now, |_| Ok("codex-cli test".to_string())).unwrap_err(),
                 "workspace-write attestation permissions are unsafe"
             );
         }

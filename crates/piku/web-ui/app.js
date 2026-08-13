@@ -317,13 +317,25 @@ terminalBtn.addEventListener("click", () =>
 
 function summarizeEffects(effects) {
   if (!Array.isArray(effects)) return [];
-  return effects.slice(0, 12).map((effect) => {
+  const summarized = effects.slice(0, 6).map((effect) => {
     if (typeof effect === "string") return effect;
     if (!effect || typeof effect !== "object") return "unclassified";
-    return [effect.effect || effect.kind, effect.path, effect.command, effect.category]
-      .filter((value) => typeof value === "string" && value)
-      .join(":") || "unclassified";
+    const kind = effect.effect || effect.kind || effect.category || "unclassified";
+    if (typeof effect.path === "string" && effect.path) {
+      const root = workspaceWriteRoot().replace(/\/$/, "");
+      const displayPath = root && effect.path.startsWith(root + "/")
+        ? effect.path.slice(root.length + 1)
+        : effect.path;
+      return `${kind}:${displayPath}`;
+    }
+    if (typeof effect.command === "string" && effect.command) {
+      const command = effect.command.replace(/\s+/g, " ").trim();
+      return `${kind}: ${command.slice(0, 72)}${command.length > 72 ? "…" : ""}`;
+    }
+    return String(kind);
   });
+  if (effects.length > summarized.length) summarized.push(`+${effects.length - summarized.length} more`);
+  return summarized;
 }
 
 async function submitMessage(
@@ -1895,13 +1907,24 @@ function renderWriteTurnView(cell, view) {
   if (!panel) return;
   panel.dataset.state = view.state;
   panel.hidden = view.state === "idle";
-  const effects = Array.isArray(view.effects) && view.effects.length
-    ? ` · reported effects: ${view.effects.join(", ")}`
-    : "";
+  const row = (label, value) => {
+    const line = document.createElement("div");
+    const heading = document.createElement("strong");
+    heading.textContent = label;
+    line.append(heading, document.createTextNode(value));
+    return line;
+  };
+  const reported = Array.isArray(view.effects) && view.effects.length
+    ? view.effects.join(" · ")
+    : "none reported";
   const observed = view.observedEffectsReported
-    ? ` · host observed: ${view.observedEffects.length ? view.observedEffects.join(", ") : "no authoring-file changes"}`
-    : " · host observation unavailable";
-  panel.textContent = `${view.authority} · lease ${view.state} · ${view.detail}${effects}${observed}`;
+    ? view.observedEffects.length ? view.observedEffects.join(" · ") : "no authoring-file changes"
+    : "unavailable";
+  panel.replaceChildren(
+    row("authority", `${view.authority} · lease ${view.state} · ${view.detail}`),
+    row("agent reported", reported),
+    row("host observed", observed),
+  );
 }
 
 function workspaceWriteRoot() {
@@ -2228,6 +2251,9 @@ function renderChatTurns(object, state) {
 
 async function runChatNotebook(object, state, start, end, execution = {}) {
   if (object.dataset.running === "true") return;
+  // The server validates that chat requests target a persisted chat notebook.
+  // Flush creation and edits before a fast Enter can race the debounced save.
+  await persistChatNotebook(object, state, true);
   object.dataset.running = "true";
   renderChatTurns(object, state);
   await executorCatalogReady;

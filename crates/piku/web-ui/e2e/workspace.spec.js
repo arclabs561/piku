@@ -1012,7 +1012,10 @@ test("write review freezes one turn while ordinary notebook actions stay read-on
     "file_write:README.md",
   );
   await expect(chat.locator(".chat-write-state")).toContainText(
-    "host observed: file_modify:README.md",
+    "host observed",
+  );
+  await expect(chat.locator(".chat-write-state")).toContainText(
+    "file_modify:README.md",
   );
   await expect(chat.getByRole("button", { name: "review write turn" })).toBeVisible();
   const persistedObjects = async () => {
@@ -1028,7 +1031,7 @@ test("write review freezes one turn while ordinary notebook actions stay read-on
     "lease consumed",
   );
   await expect(page.locator('[data-kind="chat"] .chat-write-state')).toContainText(
-    "host observed: file_modify:README.md",
+    "file_modify:README.md",
   );
 });
 

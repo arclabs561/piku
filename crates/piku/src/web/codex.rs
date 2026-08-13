@@ -9,7 +9,6 @@ use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
@@ -48,13 +47,12 @@ pub(super) fn workspace_write_attestation(
     super::codex_attestation::verify(
         &attestation,
         LAUNCH_POLICY_JSON.as_bytes(),
-        &child_environment_sha256(),
         SystemTime::now(),
         |executable| codex_version(executable, codex_root),
     )
 }
 
-fn child_environment_sha256() -> String {
+fn child_environment() -> std::collections::BTreeMap<String, String> {
     let mut environment = std::collections::BTreeMap::new();
     for key in CHILD_ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(key) {
@@ -73,8 +71,7 @@ fn child_environment_sha256() -> String {
     environment
         .entry("TMPDIR".into())
         .or_insert_with(|| std::env::temp_dir().to_string_lossy().into_owned());
-    let bytes = serde_json::to_vec(&environment).expect("child environment is serializable");
-    format!("{:x}", Sha256::digest(bytes))
+    environment
 }
 
 fn codex_version(executable: &Path, codex_root: &Path) -> Result<String, &'static str> {
@@ -357,16 +354,18 @@ async fn run_chat_inner<F>(
 where
     F: FnMut(CodexEvent),
 {
-    let executable = match policy {
-        CodexTurnPolicy::ReadOnly => None,
-        CodexTurnPolicy::WorkspaceWrite => Some(
-            write_attestation
-                .ok_or_else(|| anyhow!("workspace-write requires verified Codex attestation"))?
-                .executable()
-                .map_err(anyhow::Error::msg)?,
-        ),
+    let (executable, environment) = match policy {
+        CodexTurnPolicy::ReadOnly => (None, child_environment()),
+        CodexTurnPolicy::WorkspaceWrite => {
+            let attestation = write_attestation
+                .ok_or_else(|| anyhow!("workspace-write requires verified Codex attestation"))?;
+            (
+                Some(attestation.executable().map_err(anyhow::Error::msg)?),
+                attestation.child_environment().clone(),
+            )
+        }
     };
-    let mut server = CodexServer::spawn(codex_root, executable)?;
+    let mut server = CodexServer::spawn(codex_root, executable, &environment)?;
     let result = async {
         server.initialize().await?;
         let (thread, model) = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty())
@@ -565,7 +564,11 @@ struct CodexServer {
 }
 
 impl CodexServer {
-    fn spawn(codex_root: &Path, executable: Option<&Path>) -> anyhow::Result<Self> {
+    fn spawn(
+        codex_root: &Path,
+        executable: Option<&Path>,
+        environment: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
         let auth = codex_auth_path()
             .filter(|path| path.is_file())
             .ok_or_else(|| {
@@ -583,10 +586,8 @@ impl CodexServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for key in CHILD_ENV_ALLOWLIST {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
+        for (key, value) in environment {
+            command.env(key, value);
         }
         #[cfg(unix)]
         command.process_group(0);

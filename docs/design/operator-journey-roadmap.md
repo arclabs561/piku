@@ -78,6 +78,14 @@ Generate the private attestation with
 rejected. The attestation is drift and sandbox evidence, not a hostile
 same-user security boundary.
 
+`just web-write-live` owns the first held-out mutation probe. It builds Piku,
+creates an isolated temporary workspace, launches its own server, drives the
+real review flow through Playwright, verifies exact file bytes, reloads the
+persisted authority evidence, and tears down the server and fixture. Each run
+writes a versioned manifest, bounded server log, and viewport screenshot below
+`.artifacts/workspace-write-live/`. The executable and harness digests remain
+authoritative when concurrent work makes the source checkout dirty.
+
 ## Decisions before implementation
 
 ### 1. Repository mutation approval

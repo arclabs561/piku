@@ -981,6 +981,20 @@ button.object-resize-handle:focus-visible {
   font-size: var(--text-small);
 }
 
+.chat-write-state > div {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: 8px;
+  padding-block: 2px;
+  overflow-wrap: anywhere;
+}
+
+.chat-write-state strong {
+  color: var(--color-fg-muted);
+  font: inherit;
+  font-weight: 600;
+}
+
 .chat-write-state[data-state="pending"],
 .chat-write-state[data-state="active"] {
   color: var(--color-attention-fg);
