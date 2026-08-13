@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
@@ -47,9 +48,33 @@ pub(super) fn workspace_write_attestation(
     super::codex_attestation::verify(
         &attestation,
         LAUNCH_POLICY_JSON.as_bytes(),
+        &child_environment_sha256(),
         SystemTime::now(),
         |executable| codex_version(executable, codex_root),
     )
+}
+
+fn child_environment_sha256() -> String {
+    let mut environment = std::collections::BTreeMap::new();
+    for key in CHILD_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            environment.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    environment
+        .entry("LANG".into())
+        .or_insert_with(|| "C".into());
+    environment
+        .entry("LC_ALL".into())
+        .or_insert_with(|| "C".into());
+    environment
+        .entry("PATH".into())
+        .or_insert_with(|| "/usr/bin:/bin".into());
+    environment
+        .entry("TMPDIR".into())
+        .or_insert_with(|| std::env::temp_dir().to_string_lossy().into_owned());
+    let bytes = serde_json::to_vec(&environment).expect("child environment is serializable");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn codex_version(executable: &Path, codex_root: &Path) -> Result<String, &'static str> {

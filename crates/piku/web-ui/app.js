@@ -1925,7 +1925,7 @@ async function reviewWriteTurn(object, state, index) {
       ? "write review requires the Codex executor"
       : !root
         ? "server did not report a canonical workspace; no lease requested"
-        : "Codex workspace-write containment is unavailable; no lease requested";
+        : "Codex native sandbox attestation is unavailable; no lease requested";
     renderChatTurns(object, state);
     return;
   }

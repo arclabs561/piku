@@ -111,16 +111,13 @@ native command and file-change projection, durable authority event, deadline,
 and cancellation path now exist. Ordinary chat remains read-only and the human
 PTY remains separate.
 
-The decision remains proposed because its acceptance probe is incomplete. The
-implemented lower-level `command/exec` probe did not exercise thread start,
-resume, a real write turn, network denial, native elevation denial, or a
-version-pinned Codex contract. It incorrectly enabled the browser action and
-allowed completion evidence to call network denial passed. Piku now fails
-closed: the lease implementation stays in place, but the browser does not
-advertise or issue workspace-write authority until the complete probe and a
-real held-out mutation journey satisfy this ADR's gates. Before/after workspace
-inventory and explicit attribution of concurrent or partial effects also
-remain required.
+The browser action is now enabled only after a current native Codex payload
+passes the versioned sandbox probe. The probe exercises thread start and
+resume, real command and file-change turns, workspace and sibling writes, and
+a positive loopback network attempt. Piku independently rejects every
+server-initiated request under its no-elevation adapter contract. Every write
+turn also records bounded before/after content hashes for authoring files,
+including partial, failed, and cancelled outcomes.
 
 Production and probe launch policy now share one checked-in contract. Both
 `HOME` and `CODEX_HOME` are the private Piku Codex directory, preventing an
@@ -129,10 +126,9 @@ that the probe did not observe. This closes launch-policy drift but is not an
 attestation by itself; the network, elevation, version, and host gates above
 still keep workspace write disabled.
 
-The probe can now write a private, atomic attestation bound to the exact Piku
-version, Codex version, host, architecture, launch-policy digest, time, and
-named gates. Piku accepts only the complete current gate set. The deterministic
-network gate makes a positive connection attempt to a probe-owned loopback
-listener and requires both a denied command and zero accepted connections.
-Native elevation remains unproven, so generated attestations remain incomplete
-and the browser remains read-only.
+The private atomic attestation is bound to the exact Piku and Codex versions,
+native payload digest, host, architecture, launch policy, effective allowlisted
+child environment, time, and live gate set. On Unix, Piku also requires an
+owner-only attestation and immediate private directory. This proves the tested
+Codex sandbox and Piku adapter contract; it is not OS-level containment against
+a hostile process running as the same user.

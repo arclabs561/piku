@@ -269,10 +269,11 @@ if (process.argv[2] !== "--fake-server") test("attestation records only live pro
     const written = await writeAttestation(target, result);
     assert.equal(written.complete, true);
     const attestation = JSON.parse(await readFile(target, "utf8"));
-    assert.equal(attestation.schema, "piku.codex-write-attestation.v3");
+    assert.equal(attestation.schema, "piku.codex-write-attestation.v4");
     assert.equal(attestation.host_arch, ({ arm64: "aarch64", x64: "x86_64", ia32: "x86" })[process.arch] ?? process.arch);
     assert.equal(attestation.codex_executable_path, result.executableIdentity.path);
     assert.match(attestation.codex_executable_sha256, /^[a-f0-9]{64}$/);
+    assert.match(attestation.child_environment_sha256, /^[a-f0-9]{64}$/);
     assert.ok(attestation.passed_gates.includes("command_write_inside"));
     assert.ok(attestation.passed_gates.includes("network_denied"));
     assert.ok(!attestation.passed_gates.includes("elevation_denied"));

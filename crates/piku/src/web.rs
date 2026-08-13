@@ -1713,7 +1713,7 @@ fn validate_write_request(state: &AppState, req: &ChatRequest) -> Result<(), Str
     }
     if state.workspace_write_attestation.is_none() {
         return Err(
-            "Codex workspace-write remains disabled until its complete containment probe passes"
+            "Codex workspace-write is unavailable until a current native sandbox attestation passes"
                 .to_string(),
         );
     }
@@ -1965,7 +1965,7 @@ fn consume_turn_authority(
         .consume(nonce, &scope, SystemTime::now())
         .map_err(|error| error.to_string())?;
     let attestation = state.workspace_write_attestation.clone().ok_or_else(|| {
-        "Codex workspace-write remains disabled until its complete containment probe passes"
+        "Codex workspace-write is unavailable until a current native sandbox attestation passes"
             .to_string()
     })?;
     Ok(TurnAuthority::WorkspaceWrite {

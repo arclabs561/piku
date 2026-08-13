@@ -50,6 +50,11 @@ web-agent-focus-pair focus pair_ordinal="0" url="http://127.0.0.1:9090":
 codex-sandbox-probe:
     node scripts/codex-app-server-probe.mjs
 
+# Generate the private, versioned browser write attestation with an explicitly
+# selected native Codex payload. Wrapper scripts are rejected.
+codex-write-attest executable:
+    node scripts/codex-app-server-probe.mjs --interactive --executable "{{executable}}" --attestation "${XDG_CONFIG_HOME:-$HOME/.config}/piku/_codex/workspace-write-attestation.json"
+
 # Inspect or mutate the private append-only focus ledger through its single
 # authoritative validator. Remaining arguments are passed to the Node CLI.
 eval-focus *args:

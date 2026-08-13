@@ -1,5 +1,4 @@
 //! Single-use authority leases for write-capable web turns.
-#![allow(dead_code)] // Route wiring follows the containment probe.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -193,6 +192,7 @@ impl WriteLeaseStore {
         Ok(lease.summary)
     }
 
+    #[allow(dead_code)] // Explicit revocation route is a separate operator-control slice.
     pub(crate) fn revoke(&self, nonce: LeaseNonce) -> Result<bool, LeaseError> {
         Ok(self
             .leases

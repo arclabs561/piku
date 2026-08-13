@@ -66,17 +66,17 @@ rebuilt:
 - Markdown, KaTeX, Mermaid, light/dark themes, and stable cross-surface
   evaluation identities.
 
-The repository-mutation bridge is partially implemented behind a fail-closed
-gate. Piku has a single-use per-turn lease, an explicit browser review surface,
-Codex workspace-write wiring, native command and file-change projection,
-deadline/cancellation handling, and durable authority/effect records. Ordinary
-chat remains read-only, page prompts cannot change repository files, and the
-human PTY remains a separate ambient operator shell.
+The repository-mutation bridge is available only after a current native Codex
+payload passes Piku's versioned sandbox probe. Piku issues a single-use
+per-turn lease through an explicit browser review surface, records native tool
+events, and independently inventories host-observed authoring-file changes.
+Ordinary chat remains read-only, page prompts cannot change repository files,
+and the human PTY remains a separate ambient operator shell.
 
-The browser write action stays disabled until the version-pinned app-server
-probe exercises thread start, resume, a real turn, writable-root containment,
-network denial, and native elevation denial. A held-out repository mutation
-journey and before/after effect inventory are also still missing.
+Generate the private attestation with
+`just codex-write-attest /absolute/path/to/native/codex`. Wrapper scripts are
+rejected. The attestation is drift and sandbox evidence, not a hostile
+same-user security boundary.
 
 ## Decisions before implementation
 

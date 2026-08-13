@@ -78,6 +78,14 @@ function cleanEnvironment(codexHome) {
   return env;
 }
 
+function childEnvironmentSha256() {
+  const environment = cleanEnvironment("private-codex-home");
+  delete environment.CODEX_HOME;
+  delete environment.HOME;
+  const canonical = Object.fromEntries(Object.entries(environment).sort(([left], [right]) => left.localeCompare(right)));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function boundedText(chunks, cap) {
   return Buffer.concat(chunks).subarray(0, cap).toString("utf8");
 }
@@ -600,7 +608,7 @@ export async function writeAttestation(target, result) {
     native_lifecycle_observed: lifecycle("commandExecution") && lifecycle("fileChange"),
   };
   const attestation = {
-    schema: "piku.codex-write-attestation.v3",
+    schema: "piku.codex-write-attestation.v4",
     piku_version: PIKU_VERSION,
     codex_version: result.codexVersion,
     codex_executable_path: executableIdentity.path,
@@ -608,6 +616,7 @@ export async function writeAttestation(target, result) {
     host_os: ({ darwin: "macos", win32: "windows" })[platform()] ?? platform(),
     host_arch: RUST_HOST_ARCH,
     launch_policy_sha256: createHash("sha256").update(LAUNCH_POLICY_BYTES).digest("hex"),
+    child_environment_sha256: childEnvironmentSha256(),
     probed_at_unix_ms: Date.now(),
     passed_gates: Object.entries(gates).filter(([, passed]) => passed).map(([name]) => name),
   };
