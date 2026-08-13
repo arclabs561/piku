@@ -2172,7 +2172,7 @@ function renderChatTurns(object, state) {
     cell.className = "chat-turn";
     cell.dataset.turnId = turn.id;
     cell.innerHTML =
-      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><a class="chat-turn-run" target="_blank" rel="noopener" hidden>inspect session record</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="review-write">review write turn</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-write-state" role="status" hidden></div><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
+      '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><details class="chat-turn-evidence" hidden><summary>session evidence</summary><div class="chat-turn-evidence-body"><iframe loading="lazy"></iframe><a class="chat-turn-run" target="_blank" rel="noopener">open full record</a></div></details><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="review-write">review write turn</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-write-state" role="status" hidden></div><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
     cell.querySelector(".chat-turn-index").textContent =
       "IN [" + (index + 1) + "]";
     const attempt = Number(turn.attempt) || 0;
@@ -2180,16 +2180,25 @@ function renderChatTurns(object, state) {
       (turn.status || "idle") +
       (attempt ? " · attempt " + attempt : "") +
       (turn.completedAt ? " · " + turn.completedAt : "");
-    const runLink = cell.querySelector(".chat-turn-run");
+    const evidence = cell.querySelector(".chat-turn-evidence");
+    const runLink = evidence.querySelector(".chat-turn-run");
     if (turn.runUrl || turn.runId) {
-      runLink.href = turn.runUrl || "/run/" + encodeURIComponent(turn.runId);
-      runLink.textContent = "inspect session record";
+      const url = turn.runUrl || "/run/" + encodeURIComponent(turn.runId);
+      runLink.href = url;
       runLink.title = [
         turn.requestId ? `request ${turn.requestId}` : "",
         turn.runId ? `session ${turn.runId}` : "",
         turn.serverTurnId ? `turn ${turn.serverTurnId}` : "",
       ].filter(Boolean).join(" · ");
-      runLink.hidden = false;
+      evidence.hidden = false;
+      evidence.addEventListener("toggle", () => {
+        if (!evidence.open) return;
+        const frame = evidence.querySelector("iframe");
+        if (!frame.src) {
+          frame.src = url;
+          frame.title = `Saved session evidence for ${turn.runId || turn.id}`;
+        }
+      });
     }
     const prompt = cell.querySelector("textarea");
     prompt.value = turn.prompt;

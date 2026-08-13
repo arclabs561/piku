@@ -1688,6 +1688,11 @@ test("execution traces stay visibly transient and outside workspace persistence"
   request,
   surfaceName,
 }) => {
+  await page.route("**/run/durable-trace-run", (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html",
+    body: "<!doctype html><title>saved evidence</title><main>durable session evidence</main>",
+  }));
   await page.route("**/api/chat", async (route) => {
     expect(route.request().postDataJSON().executor).toBe(
       process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
@@ -1754,9 +1759,12 @@ test("execution traces stay visibly transient and outside workspace persistence"
   const restored = page.locator('[data-kind="chat"]');
   await expect(restored).toHaveCount(1);
   await expect(restored.locator(".activity-card")).toHaveCount(0);
-  const restoredRun = restored.locator(".chat-turn-run");
+  const restoredEvidence = restored.locator(".chat-turn-evidence");
+  await expect(restoredEvidence).toBeVisible();
+  await restoredEvidence.locator("summary").click();
+  const restoredRun = restoredEvidence.locator(".chat-turn-run");
   await expect(restoredRun).toBeVisible();
-  await expect(restoredRun).toHaveText("inspect session record");
+  await expect(restoredRun).toHaveText("open full record");
   await expect(restoredRun).toHaveAttribute(
     "title",
     "request trace-contract · session durable-trace-run · turn web-chat-trace-contract",
@@ -1765,6 +1773,18 @@ test("execution traces stay visibly transient and outside workspace persistence"
     "href",
     "/run/durable-trace-run",
   );
+  const frame = restoredEvidence.locator("iframe");
+  await expect(frame).toHaveAttribute("src", "/run/durable-trace-run");
+  await expect(frame.contentFrame().locator("main")).toHaveText("durable session evidence");
+  await restoredEvidence.locator("summary").click();
+  await expect(restoredEvidence).not.toHaveAttribute("open", "");
+  await restoredEvidence.locator("summary").click();
+  await expect(frame.contentFrame().locator("main")).toHaveText("durable session evidence");
+  const afterEvidence = await (
+    await request.get(`/api/surfaces/${encodeURIComponent(surfaceName)}`)
+  ).json();
+  expect(afterEvidence.objects).toHaveLength(1);
+  expect(afterEvidence.objects[0].kind).toBe("chat");
 });
 
 test("workspace state crosses browser contexts while viewport state does not", async ({

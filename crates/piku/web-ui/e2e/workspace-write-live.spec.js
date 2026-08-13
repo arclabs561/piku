@@ -47,7 +47,7 @@ test("a reviewed Codex turn mutates only the held-out workspace and preserves ev
     await expect(evidence).toContainText("lease consumed", { timeout: 120_000 });
     await expect(evidence).toContainText("host observed");
     await expect(evidence).toContainText("held-out.txt");
-    await expect(chat.locator(".chat-turn-run")).toBeVisible();
+    await expect(chat.locator(".chat-turn-evidence")).toBeVisible();
     expect(await readFile(path.join(fixtureRoot, "held-out.txt"), "utf8")).toBe("after\n");
 
     const screenshot = path.join(artifactDir, "workspace-write-complete.png");

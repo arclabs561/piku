@@ -1057,6 +1057,39 @@ button.object-resize-handle:focus-visible {
 .activity-run-link:hover {
   text-decoration: underline;
 }
+.chat-turn-evidence {
+  position: relative;
+}
+.chat-turn-evidence > summary {
+  cursor: pointer;
+  color: var(--color-accent-fg);
+  font: 600 var(--text-small)/1 var(--font-mono);
+  list-style: none;
+}
+.chat-turn-evidence > summary::-webkit-details-marker {
+  display: none;
+}
+.chat-turn-evidence-body {
+  position: absolute;
+  z-index: 8;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(42rem, calc(100vw - 48px));
+  padding: 8px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius);
+  background: var(--color-glass-strong);
+  box-shadow: var(--shadow-floating);
+}
+.chat-turn-evidence iframe {
+  display: block;
+  width: 100%;
+  height: min(28rem, 56vh);
+  margin-bottom: 8px;
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius);
+  background: var(--color-canvas-default);
+}
 .chat-turn textarea {
   display: block;
   width: 100%;
