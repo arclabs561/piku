@@ -480,6 +480,7 @@ async function submitMessage(
               event.turn_id || runId,
               "verified",
             );
+            await options.onRunRecord?.({ runId, runUrl, turnId, requestId });
           } else if (event.kind === "model_started") {
             if (event.thread_id) threadId = event.thread_id;
             if (event.provider) executorProvider = event.provider;
@@ -2335,6 +2336,13 @@ async function runChatNotebook(object, state, start, end, execution = {}) {
             threadId: state.threadId,
             signal: object.chatAbortController.signal,
             activityHost,
+            onRunRecord: async (identity) => {
+              turn.runId = identity.runId || "";
+              turn.runUrl = identity.runUrl || "";
+              turn.requestId = identity.requestId || turn.requestId || "";
+              turn.serverTurnId = identity.turnId || "";
+              await persistChatNotebook(object, state, true);
+            },
             request: execution.frozenRequest,
             writeLease: execution.writeLease,
           };

@@ -1740,6 +1740,14 @@ test("execution traces stay visibly transient and outside workspace persistence"
   ).json();
   expect(whileQueued.objects).toHaveLength(1);
   expect(whileQueued.objects[0]).toMatchObject({ kind: "chat" });
+  const queuedNotebook = JSON.parse(whileQueued.objects[0].content);
+  expect(queuedNotebook.turns[0]).toMatchObject({
+    runId: "durable-trace-run",
+    runUrl: "/run/durable-trace-run",
+    requestId: "trace-contract",
+    serverTurnId: "web-chat-trace-contract",
+    status: "running",
+  });
 
   await expect(chat.locator(".chat-response")).toContainText("trace complete");
   await expect(page.locator("#save-status")).toHaveText("saved");
