@@ -41,6 +41,8 @@ pub struct RunAudit {
     pub unattributed_effect_count: usize,
     pub files_created: usize,
     pub files_modified: usize,
+    #[serde(default)]
+    pub files_deleted: usize,
     pub file_writes_unchanged: usize,
     pub file_writes_unknown: usize,
     pub verification_count: usize,
@@ -162,6 +164,7 @@ impl<'a> Auditor<'a> {
                 unattributed_effect_count: 0,
                 files_created: 0,
                 files_modified: 0,
+                files_deleted: 0,
                 file_writes_unchanged: 0,
                 file_writes_unknown: 0,
                 verification_count: 0,
@@ -643,12 +646,24 @@ impl<'a> Auditor<'a> {
         }
         self.audit.tool_effect_count += effects.len();
         for effect in effects {
-            let Some((path, content_change)) = (match effect {
+            match effect {
                 ToolEffect::FileWrite {
                     path,
                     content_change,
-                } => Some((path, content_change)),
-                ToolEffect::ShellCommand { .. } => None,
+                } => {
+                    match content_change {
+                        ContentChange::Created => self.audit.files_created += 1,
+                        ContentChange::Modified => self.audit.files_modified += 1,
+                        ContentChange::Unchanged => self.audit.file_writes_unchanged += 1,
+                        ContentChange::Unknown => self.audit.file_writes_unknown += 1,
+                    }
+                    self.audit_effect_path(tool_call_id, envelope.sequence, path);
+                }
+                ToolEffect::FileDelete { path } => {
+                    self.audit.files_deleted += 1;
+                    self.audit_effect_path(tool_call_id, envelope.sequence, path);
+                }
+                ToolEffect::ShellCommand { .. } => {}
                 ToolEffect::Unattributed { reason, .. } => {
                     self.audit.unattributed_effect_count += 1;
                     if reason.trim().is_empty() {
@@ -661,24 +676,7 @@ impl<'a> Auditor<'a> {
                             vec![envelope.sequence],
                         );
                     }
-                    None
                 }
-            }) else {
-                continue;
-            };
-            match content_change {
-                ContentChange::Created => self.audit.files_created += 1,
-                ContentChange::Modified => self.audit.files_modified += 1,
-                ContentChange::Unchanged => self.audit.file_writes_unchanged += 1,
-                ContentChange::Unknown => self.audit.file_writes_unknown += 1,
-            }
-            if path.as_os_str().is_empty() {
-                self.add_finding(
-                    AuditSeverity::Error,
-                    "empty_effect_path",
-                    format!("tool call {tool_call_id} reports an empty effect path"),
-                    vec![envelope.sequence],
-                );
             }
         }
         if let Some(verification) = verification {
@@ -698,6 +696,17 @@ impl<'a> Auditor<'a> {
                     vec![envelope.sequence],
                 );
             }
+        }
+    }
+
+    fn audit_effect_path(&mut self, tool_call_id: &str, sequence: u64, path: &std::path::Path) {
+        if path.as_os_str().is_empty() {
+            self.add_finding(
+                AuditSeverity::Error,
+                "empty_effect_path",
+                format!("tool call {tool_call_id} reports an empty effect path"),
+                vec![sequence],
+            );
         }
     }
 
@@ -1170,13 +1179,16 @@ mod tests {
                     tool_call_id,
                     result: inline("observed result"),
                     is_error: !matches!(status, VerificationStatus::Passed),
-                    effects: (index == 1)
-                        .then(|| ToolEffect::FileWrite {
+                    effects: match index {
+                        1 => vec![ToolEffect::FileWrite {
                             path: "partial.txt".into(),
                             content_change: ContentChange::Created,
-                        })
-                        .into_iter()
-                        .collect(),
+                        }],
+                        2 => vec![ToolEffect::FileDelete {
+                            path: "obsolete.txt".into(),
+                        }],
+                        _ => Vec::new(),
+                    },
                     verification: Some(VerificationRecord {
                         description: format!("check {index}"),
                         status,
@@ -1195,12 +1207,77 @@ mod tests {
         let audit = audit_run_record(&events);
 
         assert!(audit.is_structurally_complete());
-        assert_eq!(audit.tool_effect_count, 1);
+        assert_eq!(audit.tool_effect_count, 2);
         assert_eq!(audit.files_created, 1);
+        assert_eq!(audit.files_deleted, 1);
         assert_eq!(audit.verification_count, 3);
         assert_eq!(audit.verification_passed, 1);
         assert_eq!(audit.verification_failed, 1);
         assert_eq!(audit.verification_indeterminate, 1);
+    }
+
+    #[test]
+    fn rejects_empty_paths_for_writes_and_deletes() {
+        let mut events = vec![envelope(
+            0,
+            RunEvent::TurnStarted {
+                provider: Some("test".into()),
+                model: "model".into(),
+                input: inline("mutate files"),
+            },
+        )];
+        for (index, effect) in [
+            ToolEffect::FileWrite {
+                path: "".into(),
+                content_change: ContentChange::Modified,
+            },
+            ToolEffect::FileDelete { path: "".into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = 1 + u64::try_from(index).unwrap() * 2;
+            let tool_call_id = format!("tool-{index}");
+            events.push(envelope(
+                sequence,
+                RunEvent::ToolStarted {
+                    tool_call_id: tool_call_id.clone(),
+                    name: "filesystem".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ));
+            events.push(envelope(
+                sequence + 1,
+                RunEvent::ToolCompleted {
+                    tool_call_id,
+                    result: inline("done"),
+                    is_error: false,
+                    effects: vec![effect],
+                    verification: None,
+                },
+            ));
+        }
+        events.push(envelope(
+            5,
+            RunEvent::TurnCompleted {
+                usage: None,
+                stop_reason: Some("complete".into()),
+            },
+        ));
+
+        let audit = audit_run_record(&events);
+
+        assert!(!audit.is_structurally_complete());
+        assert_eq!(audit.files_modified, 1);
+        assert_eq!(audit.files_deleted, 1);
+        assert_eq!(
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.code == "empty_effect_path")
+                .count(),
+            2
+        );
     }
 
     #[test]

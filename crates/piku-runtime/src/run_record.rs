@@ -22,8 +22,9 @@ use piku_api::TokenUsage;
 /// context sources. Version 5 records turn-scoped authority leases and effects
 /// that an executor cannot attribute to a concrete target. The reader remains
 /// compatible with earlier records. Version 6 records the exact Piku-resolved
-/// request context and the digest of the composed model input.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 6;
+/// request context and the digest of the composed model input. Version 7 adds
+/// a typed file deletion effect.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 7;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -298,6 +299,9 @@ pub enum ToolEffect {
     FileWrite {
         path: PathBuf,
         content_change: ContentChange,
+    },
+    FileDelete {
+        path: PathBuf,
     },
     ShellCommand {
         command: String,
@@ -937,7 +941,7 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&event).unwrap();
-        assert!(encoded.contains(r#""schema_version":6"#));
+        assert!(encoded.contains(&format!(r#""schema_version":{RUN_RECORD_SCHEMA_VERSION}"#)));
         assert!(encoded.contains(r#""context":{"storage":"inline","text":""}"#));
         assert_eq!(
             serde_json::from_str::<RunEventEnvelope>(&encoded).unwrap(),
@@ -1223,10 +1227,15 @@ mod tests {
                     text: "tests passed".to_string(),
                 },
                 is_error: false,
-                effects: vec![ToolEffect::FileWrite {
-                    path: PathBuf::from("src/lib.rs"),
-                    content_change: ContentChange::Modified,
-                }],
+                effects: vec![
+                    ToolEffect::FileWrite {
+                        path: PathBuf::from("src/lib.rs"),
+                        content_change: ContentChange::Modified,
+                    },
+                    ToolEffect::FileDelete {
+                        path: PathBuf::from("src/obsolete.rs"),
+                    },
+                ],
                 verification: Some(VerificationRecord {
                     description: "unit tests".to_string(),
                     status: VerificationStatus::Passed,
@@ -1237,6 +1246,8 @@ mod tests {
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: RunEventEnvelope = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, event);
+        assert!(encoded.contains(r#""effect":"file_delete""#));
+        assert!(encoded.contains("src/obsolete.rs"));
     }
 
     #[test]

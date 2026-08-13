@@ -30,6 +30,7 @@ mod codex;
 mod codex_attestation;
 mod page_broker;
 mod pty;
+mod workspace_inventory;
 mod write_lease;
 
 const MAX_CANVAS_INSTRUCTION_CHARS: usize = 20_000;
@@ -51,6 +52,7 @@ const FIXTURE_CANCELLATION_ACK_TTL: Duration = Duration::from_mins(1);
 const WRITE_LEASE_START_WINDOW: Duration = Duration::from_mins(1);
 const WRITE_LEASE_LIFETIME: Duration = Duration::from_mins(5);
 const WRITE_TOOL_PROFILE: &str = "codex_native_workspace_write_v1";
+const WORKSPACE_INVENTORY_TOOL_ID: &str = "piku-workspace-inventory";
 
 // ---------------------------------------------------------------------------
 // Surface storage
@@ -2319,6 +2321,26 @@ async fn run_codex_chat_request(
         state.surfaces.write().await.running.remove(&surface_name);
         return;
     }
+    let workspace_before = if policy == codex::CodexTurnPolicy::WorkspaceWrite {
+        append_codex_run_event(
+            &mut recorder,
+            &turn_id,
+            RunEvent::ToolStarted {
+                tool_call_id: WORKSPACE_INVENTORY_TOOL_ID.to_string(),
+                name: "piku.workspace_effect_inventory".to_string(),
+                arguments: serde_json::json!({
+                    "scope": "workspace authoring files excluding .git, node_modules, and target",
+                    "observation": "before_and_after_content_hashes"
+                }),
+            },
+            &mut activity_sink,
+            &mut record_error,
+        );
+        let root = state.workspace_root.as_ref().clone();
+        Some(tokio::task::spawn_blocking(move || workspace_inventory::capture(&root)).await)
+    } else {
+        None
+    };
     let completed_effects = Arc::new(std::sync::Mutex::new(Vec::new()));
     let event_effects = Arc::clone(&completed_effects);
     let deadline_after = turn_authority.lease().map(|lease| {
@@ -2423,6 +2445,45 @@ async fn run_codex_chat_request(
             },
         }
     };
+    let observed_effects = match workspace_before {
+        Some(Ok(before)) => {
+            let root = state.workspace_root.as_ref().clone();
+            match tokio::task::spawn_blocking(move || workspace_inventory::capture(&root)).await {
+                Ok(after) => workspace_inventory::diff(before, after),
+                Err(_) => vec![RunToolEffect::Unattributed {
+                    category: piku_runtime::RunEffectCategory::FileSystem,
+                    reason: "host workspace inventory failed after the turn".to_string(),
+                }],
+            }
+        }
+        Some(Err(_)) => vec![RunToolEffect::Unattributed {
+            category: piku_runtime::RunEffectCategory::FileSystem,
+            reason: "host workspace inventory failed before the turn".to_string(),
+        }],
+        None => Vec::new(),
+    };
+    if policy == codex::CodexTurnPolicy::WorkspaceWrite {
+        append_codex_run_event(
+            &mut recorder,
+            &turn_id,
+            RunEvent::ToolCompleted {
+                tool_call_id: WORKSPACE_INVENTORY_TOOL_ID.to_string(),
+                result: RunContentRef::Inline {
+                    text: format!(
+                        "Piku observed {} authoring-file effects during the turn",
+                        observed_effects.len()
+                    ),
+                },
+                is_error: observed_effects
+                    .iter()
+                    .any(|effect| matches!(effect, RunToolEffect::Unattributed { .. })),
+                effects: observed_effects.clone(),
+                verification: None,
+            },
+            &mut activity_sink,
+            &mut record_error,
+        );
+    }
     let completed_effects = completed_effects
         .lock()
         .map_or_else(|_| Vec::new(), |effects| effects.clone());
@@ -2484,7 +2545,7 @@ async fn run_codex_chat_request(
         if deadline_elapsed {
             emit(
                 &tx,
-                &serde_json::json!({"kind":"failed","surface":surface_name,"message":"Workspace-write turn deadline elapsed; the lease is consumed and interruption was requested","elapsed_seconds":elapsed,"executor":"codex","authority":authority_name}),
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":"Workspace-write turn deadline elapsed; the lease is consumed and interruption was requested","elapsed_seconds":elapsed,"executor":"codex","authority":authority_name,"effects":completed_effects,"observed_effects":observed_effects}),
             );
         }
         tracing::info!(
@@ -2512,7 +2573,7 @@ async fn run_codex_chat_request(
     }
     match result {
         Ok(result) => {
-            let effect_inventory_complete = !completed_effects
+            let effect_inventory_complete = !observed_effects
                 .iter()
                 .any(|effect| matches!(effect, RunToolEffect::Unattributed { .. }));
             append_codex_run_event(
@@ -2549,7 +2610,7 @@ async fn run_codex_chat_request(
             }
             emit(
                 &tx,
-                &serde_json::json!({"kind":"completed","surface":surface_name,"message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answer complete; workspace unchanged"} else {"Approved write turn complete; inspect recorded effects"},"elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id(),"effects":completed_effects,"model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"authority boundary","outcome":"passed","detail":if policy == codex::CodexTurnPolicy::ReadOnly {"read-only policy applied"} else {"verified containment attestation and single-use workspace-write lease applied"}},{"name":"effect inventory","outcome":if effect_inventory_complete {"passed"} else {"indeterminate"},"detail":if effect_inventory_complete {"all reported effects are representable"} else {"one or more native effects remain explicitly unattributed"}}]}}),
+                &serde_json::json!({"kind":"completed","surface":surface_name,"message":if policy == codex::CodexTurnPolicy::ReadOnly {"Answer complete under read-only policy"} else {"Approved write turn complete; inspect reported and observed effects"},"elapsed_seconds":elapsed,"canvas_changed":false,"request_kind":"chat","executor":"codex","authority":authority_name,"lease_turn_id":turn_authority.lease_turn_id(),"effects":completed_effects,"observed_effects":observed_effects,"model":result.model,"thread_id":result.thread_id,"turn_id":result.turn_id,"verification":{"actor":"Piku host","checks":[{"name":"authority boundary","outcome":"passed","detail":if policy == codex::CodexTurnPolicy::ReadOnly {"read-only policy applied"} else {"verified Codex sandbox probe and single-use workspace-write lease applied"}},{"name":"workspace observation","outcome":if policy == codex::CodexTurnPolicy::ReadOnly {"not_run"} else if effect_inventory_complete {"passed"} else {"indeterminate"},"detail":if policy == codex::CodexTurnPolicy::ReadOnly {"host filesystem observation was not needed for this read-only turn"} else if effect_inventory_complete {"before-and-after content hashes captured host-observed authoring-file changes during the turn; .git, node_modules, and target are outside this inventory scope"} else {"host observation was incomplete; unattributed authoring-file effects are preserved"}}]}}),
             );
             tracing::info!(
                 request_id,
@@ -2610,7 +2671,7 @@ async fn run_codex_chat_request(
             );
             emit(
                 &tx,
-                &serde_json::json!({"kind":"failed","surface":surface_name,"message":error.to_string(),"elapsed_seconds":elapsed,"executor":"codex"}),
+                &serde_json::json!({"kind":"failed","surface":surface_name,"message":error.to_string(),"elapsed_seconds":elapsed,"executor":"codex","effects":completed_effects,"observed_effects":observed_effects}),
             );
         }
     }

@@ -342,114 +342,116 @@ where
         ),
     };
     let mut server = CodexServer::spawn(codex_root, executable)?;
-    server.initialize().await?;
-    let (thread, model) = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
-        server
-            .resume_thread(workspace_root, thread_id, policy)
-            .await?
-    } else {
-        server.start_thread(workspace_root, policy).await?
-    };
-    let input = compose_input(message, context, history);
-    let turn_id = server
-        .start_turn(&thread, &input, workspace_root, policy)
-        .await?;
-    on_event(CodexEvent::Started {
-        model: model.clone(),
-        thread_id: thread.clone(),
-        turn_id: turn_id.clone(),
-        input,
-    });
-
-    let mut output = String::new();
-    let mut usage = None;
-    let mut tools = ToolLifecycle::default();
-    loop {
-        if cancellation
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow())
+    let result = async {
+        server.initialize().await?;
+        let (thread, model) = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty())
         {
-            let result = server.interrupt_turn(&thread, &turn_id).await;
-            server.stop().await;
-            return match result {
-                Ok(()) => Err(CodexFailure::interrupted(output)),
-                Err(error) => Err(CodexFailure::interruption_failed(
-                    format!("Codex interruption did not complete cleanly: {error}"),
-                    output,
-                )),
-            };
-        }
-        let message = if cancellation.is_some() {
-            enum NextMessage {
-                Message(anyhow::Result<Value>),
-                Cancel,
-                CancellationClosed,
+            server
+                .resume_thread(workspace_root, thread_id, policy)
+                .await?
+        } else {
+            server.start_thread(workspace_root, policy).await?
+        };
+        let input = compose_input(message, context, history);
+        let turn_id = server
+            .start_turn(&thread, &input, workspace_root, policy)
+            .await?;
+        on_event(CodexEvent::Started {
+            model: model.clone(),
+            thread_id: thread.clone(),
+            turn_id: turn_id.clone(),
+            input,
+        });
+
+        let mut output = String::new();
+        let mut usage = None;
+        let mut tools = ToolLifecycle::default();
+        loop {
+            if cancellation
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow())
+            {
+                let result = server.interrupt_turn(&thread, &turn_id).await;
+                return match result {
+                    Ok(()) => Err(CodexFailure::interrupted(output)),
+                    Err(error) => Err(CodexFailure::interruption_failed(
+                        format!("Codex interruption did not complete cleanly: {error}"),
+                        output,
+                    )),
+                };
             }
-            let next = {
-                let receiver = cancellation.as_mut().expect("checked above");
-                tokio::select! {
-                    message = server.read_message() => NextMessage::Message(message),
-                    changed = receiver.changed() => {
-                        if changed.is_ok() && *receiver.borrow() {
-                            NextMessage::Cancel
-                        } else {
-                            NextMessage::CancellationClosed
+            let message = if cancellation.is_some() {
+                enum NextMessage {
+                    Message(anyhow::Result<Value>),
+                    Cancel,
+                    CancellationClosed,
+                }
+                let next = {
+                    let receiver = cancellation.as_mut().expect("checked above");
+                    tokio::select! {
+                        message = server.read_message() => NextMessage::Message(message),
+                        changed = receiver.changed() => {
+                            if changed.is_ok() && *receiver.borrow() {
+                                NextMessage::Cancel
+                            } else {
+                                NextMessage::CancellationClosed
+                            }
                         }
                     }
+                };
+                match next {
+                    NextMessage::Message(message) => message
+                        .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?,
+                    NextMessage::Cancel => {
+                        let result = server.interrupt_turn(&thread, &turn_id).await;
+                        return match result {
+                            Ok(()) => Err(CodexFailure::interrupted(output)),
+                            Err(error) => Err(CodexFailure::interruption_failed(
+                                format!("Codex interruption did not complete cleanly: {error}"),
+                                output,
+                            )),
+                        };
+                    }
+                    NextMessage::CancellationClosed => {
+                        cancellation = None;
+                        continue;
+                    }
                 }
+            } else {
+                server
+                    .read_message()
+                    .await
+                    .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
             };
-            match next {
-                NextMessage::Message(message) => {
-                    message.map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
-                }
-                NextMessage::Cancel => {
-                    let result = server.interrupt_turn(&thread, &turn_id).await;
-                    server.stop().await;
-                    return match result {
-                        Ok(()) => Err(CodexFailure::interrupted(output)),
-                        Err(error) => Err(CodexFailure::interruption_failed(
-                            format!("Codex interruption did not complete cleanly: {error}"),
-                            output,
-                        )),
-                    };
-                }
-                NextMessage::CancellationClosed => {
-                    cancellation = None;
-                    continue;
-                }
+            reject_server_request(&message)
+                .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?;
+            if apply_stream_event(
+                parse_stream_event(&message),
+                &mut output,
+                &mut usage,
+                &mut tools,
+                &mut on_event,
+            )? {
+                break;
             }
-        } else {
-            server
-                .read_message()
-                .await
-                .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?
-        };
-        reject_server_request(&message)
-            .map_err(|error| CodexFailure::new(error.to_string(), output.clone()))?;
-        if apply_stream_event(
-            parse_stream_event(&message),
-            &mut output,
-            &mut usage,
-            &mut tools,
-            &mut on_event,
-        )? {
-            break;
         }
-    }
-    server.stop().await;
-    if output.trim().is_empty() {
-        return Err(CodexFailure::new(
-            "Codex returned an empty response",
+        if output.trim().is_empty() {
+            return Err(CodexFailure::new(
+                "Codex returned an empty response",
+                output,
+            ));
+        }
+        Ok(CodexResult {
             output,
-        ));
+            model,
+            thread_id: thread,
+            turn_id,
+            usage,
+        })
     }
-    Ok(CodexResult {
-        output,
-        model,
-        thread_id: thread,
-        turn_id,
-        usage,
-    })
+    .await;
+    server.stop().await;
+    result
 }
 
 fn apply_stream_event<F>(
@@ -892,8 +894,10 @@ fn file_change_effect(change: &Value) -> Option<RunToolEffect> {
             path: PathBuf::from(path),
             content_change: RunContentChange::Modified,
         }),
-        // The current schema cannot encode delete or rename as FileWrite.
-        // Preserve the native report as explicit incomplete attribution.
+        "delete" | "remove" => Some(RunToolEffect::FileDelete {
+            path: PathBuf::from(path),
+        }),
+        // Preserve rename and unknown native kinds as incomplete attribution.
         _ => Some(RunToolEffect::Unattributed {
             category: RunEffectCategory::FileSystem,
             reason: format!(
@@ -1255,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn file_changes_preserve_unrepresentable_deletes_and_renames_as_unattributed() {
+    fn file_changes_preserve_deletes_and_unrepresentable_renames() {
         let changes = json!([
             {"path":"new.rs","kind":{"type":"add"}},
             {"path":"old.rs","kind":{"type":"delete"}},
@@ -1287,9 +1291,8 @@ mod tests {
                     path: PathBuf::from("new.rs"),
                     content_change: RunContentChange::Created
                 },
-                RunToolEffect::Unattributed {
-                    category: RunEffectCategory::FileSystem,
-                    reason: "Codex reported file change kind delete for old.rs; this effect is not representable as a file write".into(),
+                RunToolEffect::FileDelete {
+                    path: PathBuf::from("old.rs"),
                 },
                 RunToolEffect::Unattributed {
                     category: RunEffectCategory::FileSystem,
@@ -1395,6 +1398,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn server_stop_kills_and_reaps_the_process_group_leader() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut server = CodexServer {
+            child,
+            stdin,
+            stdout,
+        };
+
+        server.stop().await;
+
+        assert!(server.child.try_wait().unwrap().is_some());
     }
 
     #[test]
