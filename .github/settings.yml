@@ -2,7 +2,7 @@
 # https://github.com/repository-settings/app
 
 repository:
-  description: "Agentic coding harness with tool execution and TUI"
+  description: "Experimental local coding agent with terminal and browser workspaces"
   private: false
   has_issues: true
   has_wiki: false
