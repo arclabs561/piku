@@ -552,6 +552,28 @@ mod list_dir_tool {
     }
 
     #[test]
+    fn concurrent_fixtures_have_independent_contents() {
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for round in 0..16 {
+                        let dir = tempdir();
+                        let name = format!("worker-{worker}-{round}.txt");
+                        std::fs::write(dir.join(&name), "").unwrap();
+                        let result = list_dir::execute(serde_json::json!({ "path": dir }));
+                        assert!(!result.is_error, "{}", result.output);
+                        assert_eq!(result.output, name, "fixture: {}", dir.display());
+                        std::fs::remove_dir_all(&dir).unwrap();
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn missing_dir_is_error() {
         let result = list_dir::execute(serde_json::json!({ "path": "/no/such/dir" }));
         assert!(result.is_error);
@@ -565,18 +587,26 @@ mod list_dir_tool {
 }
 
 // ---------------------------------------------------------------------------
-// Shared test helper — creates a temp dir that auto-deletes
+// Shared test helper — creates a unique temp dir; callers own cleanup.
 // ---------------------------------------------------------------------------
 
 fn tempdir() -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "piku_test_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos())
-    ));
-    std::fs::create_dir_all(&base).unwrap();
-    base
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let base = std::env::temp_dir().join(format!(
+            "piku_test_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        match std::fs::create_dir(&base) {
+            Ok(()) => return base,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create test directory {}: {error}", base.display()),
+        }
+    }
 }
 
 /// Limited write-path guard for `write_file` / `edit_file`.
