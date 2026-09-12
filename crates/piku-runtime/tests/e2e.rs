@@ -59,6 +59,7 @@ impl Provider for ScriptedProvider {
 struct SequenceProvider {
     sequences: Arc<Mutex<Vec<Vec<Event>>>>,
     call_index: Arc<Mutex<usize>>,
+    requests: Arc<Mutex<Vec<MessageRequest>>>,
 }
 
 impl SequenceProvider {
@@ -66,6 +67,7 @@ impl SequenceProvider {
         Self {
             sequences: Arc::new(Mutex::new(sequences)),
             call_index: Arc::new(Mutex::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -77,8 +79,9 @@ impl Provider for SequenceProvider {
 
     fn stream_message(
         &self,
-        _request: MessageRequest,
+        request: MessageRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
+        self.requests.lock().unwrap().push(request);
         let seqs = self.sequences.lock().unwrap();
         let mut idx = self.call_index.lock().unwrap();
         let events = seqs[(*idx).min(seqs.len() - 1)].clone();
@@ -2219,6 +2222,67 @@ async fn auto_compact_prefers_masking_over_summarization() {
     }
 }
 
+#[tokio::test]
+async fn masking_only_compaction_reaches_next_provider_request() {
+    use piku_api::RequestContent;
+    use piku_runtime::session::{ContentBlock, ConversationMessage};
+
+    let mut session = Session::new("mask-runtime-request".to_string());
+    session.push(ConversationMessage::user("inspect the old command output"));
+    session.push(ConversationMessage::assistant(
+        vec![ContentBlock::ToolUse {
+            id: "old-tool".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "large-command"}),
+        }],
+        None,
+    ));
+    let original = "[masked: legitimate tool output]".repeat(30_000);
+    session.push(ConversationMessage::tool_result(
+        "old-tool".to_string(),
+        original.clone(),
+        false,
+    ));
+    for index in 0..12 {
+        session.push(ConversationMessage::user(format!("recent tail {index}")));
+    }
+
+    let provider = SequenceProvider::new(vec![text_stop("continued")]);
+    let mut sink = CollectSink::default();
+    run_turn(
+        "continue",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "auto compaction must not call a summary provider"
+    );
+    let content = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .collect::<Vec<_>>();
+    assert!(content
+        .iter()
+        .any(|block| matches!(block, RequestContent::ToolUse { id, .. } if id == "old-tool")));
+    assert!(content.iter().any(|block| matches!(block, RequestContent::ToolResult { tool_use_id, content, .. } if tool_use_id == "old-tool" && content.starts_with("[masked:"))));
+    assert!(!content.iter().any(
+        |block| matches!(block, RequestContent::ToolResult { content, .. } if content == &original)
+    ));
+}
+
 /// Verify `TaskRegistry.fail()` marks task and fires notification.
 #[tokio::test]
 async fn task_failure_notification_fires() {
@@ -2646,7 +2710,7 @@ async fn dedup_allows_reread_after_edit() {
 }
 
 #[tokio::test]
-async fn dedup_still_blocks_immediate_duplicate_read() {
+async fn repeated_read_executes_against_current_filesystem_state() {
     let dir = tempdir();
     let file = dir.join("v.txt");
     std::fs::write(&file, "hello").unwrap();
@@ -2674,11 +2738,117 @@ async fn dedup_still_blocks_immediate_duplicate_read() {
     )
     .await;
 
-    // Second identical read with no intervening write should be deduped.
+    // Argument equality cannot prove a filesystem observation is unchanged.
     assert_eq!(sink.tool_starts.len(), 2);
+    assert!(!sink.tool_ends[1].3, "second read should execute");
+    assert!(sink.tool_ends[1].2.contains("hello"));
+}
+
+#[tokio::test]
+async fn reread_observes_write_from_failed_shell_command() {
+    let dir = tempdir();
+    let file = dir.join("state.txt");
+    std::fs::write(&file, "before").unwrap();
+    let read_input = serde_json::json!({"path": file}).to_string();
+    let shell_input = serde_json::json!({
+        "command": format!("printf after > {}; exit 1", file.display())
+    })
+    .to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("r1", "read_file", &read_input),
+        tool_call_events("b1", "bash", &shell_input),
+        tool_call_events("r2", "read_file", &read_input),
+        text_stop("observed after"),
+    ]);
+    let mut session = Session::new("reread-failed-shell".to_string());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "read, make a failing change, then reread",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(sink.tool_starts.len(), 3);
+    assert!(sink.tool_ends[1].3, "shell command should report failure");
+    assert!(!sink.tool_ends[2].3, "reread should execute");
+    assert!(sink.tool_ends[2].2.contains("after"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manage_memory_does_not_acknowledge_when_persistence_fails() {
+    let dir = tempdir();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("manage_memory_persistence_failure_in_isolated_process")
+        .arg("--nocapture")
+        .current_dir(&dir)
+        .env("PIKU_RUN_MEMORY_PERSISTENCE_FAILURE_HELPER", "1")
+        .status()
+        .unwrap();
     assert!(
-        sink.tool_ends[1].2.contains("already called") || sink.tool_ends[1].3,
-        "duplicate read should be deduped"
+        status.success(),
+        "isolated runtime regression failed: {status}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manage_memory_persistence_failure_in_isolated_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::env::var_os("PIKU_RUN_MEMORY_PERSISTENCE_FAILURE_HELPER").is_none() {
+        return;
+    }
+
+    let dir = std::env::current_dir().unwrap();
+    let store_path = piku_runtime::embed_memory::default_store_path(&dir);
+    let mut store = piku_runtime::MemoryStore::default();
+    store.insert("fact".to_string(), vec![], vec![1.0], 6);
+    store.save(&store_path).unwrap();
+    let store_dir = store_path.parent().unwrap();
+    std::fs::set_permissions(store_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let input = serde_json::json!({"action": "invalidate", "id": 0}).to_string();
+    let provider = SequenceProvider::new(vec![
+        tool_call_events("m1", "manage_memory", &input),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("memory-persistence-failure".to_string());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "invalidate the stored fact",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+
+    std::fs::set_permissions(store_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        sink.tool_ends[0].3,
+        "persistence failure must be a tool error"
+    );
+    assert!(sink.tool_ends[0].2.contains("persistence failed"));
+    let loaded = piku_runtime::MemoryStore::try_load(&store_path).unwrap();
+    assert!(
+        loaded.entries[0].is_valid,
+        "failed mutation must not be acknowledged or persisted"
     );
 }
 
@@ -2878,15 +3048,13 @@ async fn retry_ceiling_dedups_or_lsr_blocks_third_interaction() {
         None,
     )
     .await;
-    // At most 2 real executions (first + deduped), then model sees dedup message and stops
+    // The iteration ceiling bounds repeated observations without asserting
+    // that matching arguments imply unchanged filesystem state.
     assert!(
         result.iterations <= 5,
         "retry ceiling must prevent endless same-arg calls: iterations={}",
         result.iterations
     );
-    // Second call is deduped, third also deduped or short-circuits
-    assert!(sink
-        .tool_ends
-        .iter()
-        .any(|(_, _, out, _)| out.contains("already called")));
+    assert_eq!(sink.tool_starts.len(), 3, "each read must execute");
+    assert!(sink.tool_ends.iter().all(|(_, _, _, is_error)| !is_error));
 }

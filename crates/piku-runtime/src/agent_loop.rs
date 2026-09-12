@@ -214,9 +214,6 @@ async fn run_turn_inner(
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
 
-    // Dedup detection: canonical string key (tool_name + args JSON) for exact match.
-    // Uses String keys instead of hashing to avoid collision risk on safety-critical dedup.
-    let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
     let advertised_tool_names: HashSet<String> = tool_defs.iter().map(|t| t.name.clone()).collect();
 
     // Track where we last extracted memories (message index).
@@ -285,20 +282,35 @@ async fn run_turn_inner(
                 } else {
                     "structural"
                 };
-                if result.removed_message_count > 0 {
-                    let masked_tool_results = result
-                        .compacted_session
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.blocks)
-                        .filter(|block| {
-                            matches!(
-                                block,
-                                ContentBlock::ToolResult { output, .. }
-                                    if output.starts_with("[masked:")
-                            )
-                        })
-                        .count();
+                let masked_tool_results = result
+                    .compacted_session
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.blocks)
+                    .filter(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolResult { output, .. }
+                                if output.starts_with("[masked:")
+                        )
+                    })
+                    .count();
+                let newly_masked_tool_results = session
+                    .messages
+                    .iter()
+                    .zip(&result.compacted_session.messages)
+                    .flat_map(|(before, after)| before.blocks.iter().zip(&after.blocks))
+                    .filter(|(before, after)| {
+                        matches!(
+                            (before, after),
+                            (
+                                ContentBlock::ToolResult { output: before, .. },
+                                ContentBlock::ToolResult { output: after, .. },
+                            ) if before != after && after.starts_with("[masked:")
+                        )
+                    })
+                    .count();
+                if result.removed_message_count > 0 || newly_masked_tool_results > 0 {
                     sink.on_run_event(&crate::run_record::RunEvent::CompactionApplied {
                         before_messages,
                         after_messages: result.compacted_session.messages.len(),
@@ -325,7 +337,15 @@ async fn run_turn_inner(
                             let flag = extraction_in_flight.clone();
                             flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             tokio::spawn(async move {
-                                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                                let mut store =
+                                    match crate::embed_memory::MemoryStore::try_load(&store_path) {
+                                        Ok(store) => store,
+                                        Err(error) => {
+                                            eprintln!("[piku] memory extraction skipped: {error}");
+                                            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            return;
+                                        }
+                                    };
                                 let n = crate::embed_memory::extract_and_store(
                                     &transcript,
                                     provider_clone.as_ref(),
@@ -335,7 +355,11 @@ async fn run_turn_inner(
                                 )
                                 .await;
                                 if n > 0 {
-                                    let _ = store.save(&store_path);
+                                    if let Err(error) = store.save(&store_path) {
+                                        eprintln!(
+                                            "[piku] memory extraction persistence failed: {error}"
+                                        );
+                                    }
                                 }
                                 flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             });
@@ -515,38 +539,6 @@ async fn run_turn_inner(
                 }
             }
 
-            // Dedup detection: skip if we've seen this exact (tool, args) before.
-            // Read-only tools (read_file, glob, grep, list_dir) are checked;
-            // write tools and agent tools are exempt (side effects may differ).
-            let is_dedup_eligible = matches!(
-                tool_name.as_str(),
-                "read_file" | "glob" | "grep" | "list_dir"
-            );
-            if is_dedup_eligible {
-                let call_key = format!("{tool_name}:{params}");
-                if !seen_tool_calls.insert(call_key) {
-                    let dedup_msg = format!(
-                        "You already called {tool_name} with the same arguments. \
-                         The result hasn't changed — try a different approach."
-                    );
-                    sink.on_tool_start(tool_name, tool_use_id, params);
-                    sink.on_tool_end(tool_name, tool_use_id, &dedup_msg, true);
-                    session.push(ConversationMessage::tool_result(
-                        tool_use_id.clone(),
-                        dedup_msg.clone(),
-                        true,
-                    ));
-                    sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
-                        tool_call_id: tool_use_id.clone(),
-                        result: crate::run_record::ContentRef::Inline { text: dedup_msg },
-                        is_error: true,
-                        effects: Vec::new(),
-                        verification: None,
-                    });
-                    continue;
-                }
-            }
-
             sink.on_tool_start(tool_name, tool_use_id, params);
 
             // Route special tools through the runtime; everything else through execute_tool.
@@ -556,8 +548,17 @@ async fn run_turn_inner(
                 // Semantic search over embedding store -- needs embedding the query
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
-                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
-                if store.valid_count() == 0 {
+                let (mut store, load_error) =
+                    match crate::embed_memory::MemoryStore::try_load(&store_path) {
+                        Ok(store) => (store, None),
+                        Err(error) => (crate::embed_memory::MemoryStore::default(), Some(error)),
+                    };
+                if let Some(error) = load_error {
+                    (
+                        format!("search_memory: could not load memory store: {error}"),
+                        true,
+                    )
+                } else if store.valid_count() == 0 {
                     (
                         "No memories stored yet. Use write_memory to save facts.".to_string(),
                         false,
@@ -583,8 +584,9 @@ async fn run_turn_inner(
                         match embed_result {
                             Ok(Ok(query_vec)) => {
                                 let retrieved = store.hybrid_retrieve(&query_vec, query, max_k);
-                                let _ = store.save(&store_path);
-                                if retrieved.is_empty() {
+                                if let Err(error) = store.save(&store_path) {
+                                    (format!("search_memory: persistence failed: {error}"), true)
+                                } else if retrieved.is_empty() {
                                     (
                                         "No relevant memories found for that query.".to_string(),
                                         false,
@@ -607,23 +609,41 @@ async fn run_turn_inner(
                 // Memory management -- direct store access, no embedding needed
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
-                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
                 let is_mutating =
                     params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
-                let result = piku_tools::embed_memory_tool::execute_manage_memory(
-                    params.clone(),
-                    &mut store,
-                );
-                // Only save on mutating actions
-                if is_mutating {
-                    let _ = store.save(&store_path);
+                match crate::embed_memory::MemoryStore::try_load(&store_path) {
+                    Ok(mut store) => {
+                        let result = piku_tools::embed_memory_tool::execute_manage_memory(
+                            params.clone(),
+                            &mut store,
+                        );
+                        if is_mutating && !result.is_error {
+                            match store.save(&store_path) {
+                                Ok(()) => {
+                                    unpack_tool_result(result, &mut tool_effects, &mut verification)
+                                }
+                                Err(error) => {
+                                    (format!("manage_memory: persistence failed: {error}"), true)
+                                }
+                            }
+                        } else {
+                            unpack_tool_result(result, &mut tool_effects, &mut verification)
+                        }
+                    }
+                    Err(error) => (
+                        format!("manage_memory: could not load memory store: {error}"),
+                        true,
+                    ),
                 }
-                unpack_tool_result(result, &mut tool_effects, &mut verification)
             } else if tool_name == "record_attempt" {
                 // Record an attempt in the embedding store -- needs embedding
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
-                let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+                let (mut store, load_error) =
+                    match crate::embed_memory::MemoryStore::try_load(&store_path) {
+                        Ok(store) => (store, None),
+                        Err(error) => (crate::embed_memory::MemoryStore::default(), Some(error)),
+                    };
 
                 let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("");
                 let approach = params
@@ -632,7 +652,12 @@ async fn run_turn_inner(
                     .unwrap_or("");
                 let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
 
-                if let Some(existing_id) = attempt_id {
+                if let Some(error) = load_error {
+                    (
+                        format!("record_attempt: could not load memory store: {error}"),
+                        true,
+                    )
+                } else if let Some(existing_id) = attempt_id {
                     // Update path: goal/approach not required — just outcome + detail.
                     let outcome = params
                         .get("outcome")
@@ -655,8 +680,12 @@ async fn run_turn_inner(
                             true,
                         )
                     } else if store.record_outcome(existing_id, outcome_enum, detail) {
-                        let _ = store.save(&store_path);
-                        (format!("attempt {existing_id} updated: {outcome}"), false)
+                        match store.save(&store_path) {
+                            Ok(()) => (format!("attempt {existing_id} updated: {outcome}"), false),
+                            Err(error) => {
+                                (format!("record_attempt: persistence failed: {error}"), true)
+                            }
+                        }
                     } else {
                         (format!("attempt {existing_id} not found"), true)
                     }
@@ -704,15 +733,19 @@ async fn run_turn_inner(
                                 };
                                 store.record_outcome(id, outcome_enum, detail);
                             }
-                            let _ = store.save(&store_path);
                             let status = params
                                 .get("outcome")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("pending");
-                            (
-                                format!("attempt recorded (id={id}, status={status})"),
-                                false,
-                            )
+                            match store.save(&store_path) {
+                                Ok(()) => (
+                                    format!("attempt recorded (id={id}, status={status})"),
+                                    false,
+                                ),
+                                Err(error) => {
+                                    (format!("record_attempt: persistence failed: {error}"), true)
+                                }
+                            }
                         }
                         _ => (
                             "record_attempt: embedding service unavailable".to_string(),
@@ -826,10 +859,6 @@ async fn run_turn_inner(
             };
 
             let action = sink.on_tool_end(tool_name, tool_use_id, &output, is_error);
-            if !is_error && matches!(tool_name.as_str(), "write_file" | "edit_file" | "bash") {
-                seen_tool_calls.clear();
-            }
-
             // PostToolUse hooks -- params is still available since we borrow tool_calls.
             if let Some(hooks) = hook_registry {
                 hooks.run_post_tool_use(

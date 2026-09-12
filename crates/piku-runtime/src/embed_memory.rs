@@ -10,12 +10,15 @@
 /// - Atomic notes: one fact per entry, not paragraphs (A-MEM pattern)
 /// - Mark invalid rather than delete (preserves audit trail)
 use std::fmt::Write;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 mod backend;
 pub use backend::{embed_text, embed_text_with_config, EmbedBackend, EmbedConfig};
+
+static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -196,37 +199,95 @@ fn normalize(v: &mut [f32]) {
 // ---------------------------------------------------------------------------
 
 impl MemoryStore {
+    /// Load a store while distinguishing a missing file from an unreadable or
+    /// corrupt one. Mutating callers must use this result before acknowledging
+    /// their change.
+    pub fn try_load(path: &Path) -> Result<Self, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read memories at {} failed: {error}",
+                    path.display()
+                ));
+            }
+        };
+        serde_json::from_str(&content).map_err(|error| {
+            let backup = path.with_extension("json.bak");
+            match std::fs::copy(path, &backup) {
+                Ok(_) => format!(
+                    "memories at {} are corrupt; backup created at {}: {error}",
+                    path.display(),
+                    backup.display()
+                ),
+                Err(backup_error) => format!(
+                    "memories at {} are corrupt and backup to {} failed: {backup_error}; parse error: {error}",
+                    path.display(),
+                    backup.display()
+                ),
+            }
+        })
+    }
+
     /// Load from a JSON file. Returns empty store if file doesn't exist.
     /// If the file exists but is corrupt, backs it up before returning empty.
     #[must_use]
     pub fn load(path: &Path) -> Self {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return Self::default(); // File doesn't exist
-        };
-        match serde_json::from_str(&content) {
-            Ok(store) => store,
-            Err(e) => {
-                // Corrupt file — back up before returning empty to avoid data loss
-                let backup = path.with_extension("json.bak");
-                let _ = std::fs::copy(path, &backup);
-                eprintln!(
-                    "[piku] warning: corrupt memories at {}, backed up to {}: {e}",
-                    path.display(),
-                    backup.display()
-                );
-                Self::default()
-            }
-        }
+        Self::try_load(path).unwrap_or_else(|error| {
+            eprintln!("[piku] warning: {error}");
+            Self::default()
+        })
     }
 
-    /// Save to a JSON file.
+    /// Save by atomic same-directory replacement. This guarantees atomic
+    /// visibility to readers, not crash durability because neither file nor
+    /// directory metadata is synced.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize failed: {e}"))?;
-        std::fs::write(path, json).map_err(|e| format!("write failed: {e}"))
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("memories.json");
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create temporary memory file failed: {error}"))?;
+        if let Err(error) = file.write_all(json.as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("write temporary memory file failed: {error}"));
+        }
+        if let Ok(existing) = std::fs::metadata(path) {
+            if let Err(error) = std::fs::set_permissions(&temporary, existing.permissions()) {
+                drop(file);
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("preserve memory file permissions failed: {error}"));
+            }
+        }
+        drop(file);
+        std::fs::rename(&temporary, path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("replace memory file failed: {error}")
+        })
     }
 
     /// Record which model produced this store's vectors.
@@ -1547,6 +1608,73 @@ pub mod tests {
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].content, "test fact");
         assert_eq!(loaded.next_id, 1);
+    }
+
+    #[test]
+    fn try_load_distinguishes_missing_from_unreadable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(MemoryStore::try_load(&dir.path().join("missing.json")).is_ok());
+        assert!(
+            MemoryStore::try_load(dir.path()).is_err(),
+            "a directory is not a missing memory file"
+        );
+    }
+
+    #[test]
+    fn corrupt_store_reports_backup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memories.json");
+        std::fs::write(&path, "not json").unwrap();
+        std::fs::create_dir(path.with_extension("json.bak")).unwrap();
+
+        let error = MemoryStore::try_load(&path).unwrap_err();
+        assert!(error.contains("corrupt"));
+        assert!(error.contains("backup"));
+        assert!(error.contains("failed"));
+    }
+
+    #[test]
+    fn failed_atomic_replacement_leaves_previous_store_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Common Unix and macOS filesystems accept a 255-byte final component.
+        // The production temporary name adds a dot, process ID, sequence, and
+        // suffix, so its creation fails before the destination can be renamed.
+        let path = dir.path().join("m".repeat(255));
+        let mut original = MemoryStore::default();
+        original.insert("old".to_string(), vec![], make_embedding(1.0), 6);
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        let mut replacement = MemoryStore::default();
+        replacement.insert("new".to_string(), vec![], make_embedding(2.0), 6);
+        let failed = replacement.save(&path);
+
+        assert!(
+            failed.is_err(),
+            "temporary-file creation must fail before rename"
+        );
+        let loaded = MemoryStore::try_load(&path).unwrap();
+        assert_eq!(loaded.entries[0].content, "old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_existing_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memories.json");
+        let mut store = MemoryStore::default();
+        store.insert("old".to_string(), vec![], make_embedding(1.0), 6);
+        store.save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        store.insert("new".to_string(), vec![], make_embedding(2.0), 6);
+        store.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
