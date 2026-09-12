@@ -47,7 +47,9 @@ impl LeaseNonce {
             return Err(LeaseError::InvalidNonceSyntax);
         }
         let mut bytes = [0; NONCE_BYTES];
-        for (output, pair) in bytes.iter_mut().zip(token.as_bytes().chunks_exact(2)) {
+        let (pairs, remainder) = token.as_bytes().as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for (output, pair) in bytes.iter_mut().zip(pairs) {
             *output = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
         }
         Ok(Self(bytes))
