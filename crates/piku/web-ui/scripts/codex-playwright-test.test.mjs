@@ -55,6 +55,9 @@ test("agent QA contract evaluates the product thesis, not only UI mechanics", as
     assert.ok(parsedSchema.properties.journey.items.required.includes(field));
   assert.match(prompt, /expectation-gap probe/i);
   assert.match(prompt, /bounded observational self-talk/i);
+  assert.match(prompt, /interleaved-agent room/i);
+  assert.match(prompt, /private actor history is not represented as ambient shared context/i);
+  assert.match(prompt, /durable handoff\/reference rather than an unsolicited\s+assistant reply/i);
   assert.equal(parsedSchema.properties.findings.items.properties.id.pattern, "^f[1-9][0-9]*$");
   for (const field of ["id", "finding_ids", "evidence_ids", "retest_of"])
     assert.ok(parsedSchema.properties.followups.items.required.includes(field));

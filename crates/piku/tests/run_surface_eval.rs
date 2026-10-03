@@ -4,14 +4,21 @@
 //! measure comprehension, preference, or usability, and they are deliberately
 //! not collapsed into a single score.
 
+#[path = "agentic/surface_contract.rs"]
+mod surface_contract;
+
+use piku::cell_view::{cells, raw_output, render_text as render_cells_text, select};
 use piku::run_view::{
     build_search_index_with_artifacts, render_html_with_artifacts, render_text, RunSearchEntry,
 };
 use piku_runtime::{
-    read_run_record, ContextManifest, RunContentRef, RunDisposition, RunEvent,
-    RunPermissionDecision, RunRecorder, UsageRecord, RUN_INLINE_CONTENT_LIMIT_BYTES,
+    handoff_bubbles_to_ancestor, read_run_record, ContextManifest, HandoffDelivery, RunContentRef,
+    RunDisposition, RunEvent, RunPermissionDecision, RunRecorder, Session, UsageRecord,
+    RUN_INLINE_CONTENT_LIMIT_BYTES,
 };
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use surface_contract::{Surface, SurfacePacket};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RetrievalMetric {
@@ -315,4 +322,212 @@ fn projection_metrics_compare_capabilities_without_declaring_a_winner() {
     assert_status_retrieval(&compact, &html);
     assert_metadata_retrieval(&compact, &search_index);
     assert_artifact_retrieval(&compact, &search_index);
+}
+
+#[test]
+fn native_shell_output_is_addressable_without_faking_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shell-eval.jsonl");
+    let mut recorder = RunRecorder::open(&path, "shell-eval").unwrap();
+    recorder
+        .append_run(RunEvent::ShellCommand {
+            command: "printf shell-marker-4821".to_string(),
+            cwd: PathBuf::from("/workspace/example"),
+            exit_code: Some(0),
+            output: RunContentRef::Unavailable {
+                reason: "native terminal passthrough; output was not captured".to_string(),
+            },
+        })
+        .unwrap();
+
+    let events = read_run_record(&path).unwrap();
+    let projected = cells(&events);
+    let cell_text = render_cells_text(&events, Some("@@1"));
+    let record_text = render_text(&events);
+    let metric = RetrievalMetric {
+        target_found: cell_text.contains("shell-marker-4821"),
+        candidate_events: projected.len(),
+        false_positives: projected.len().saturating_sub(1),
+        target_rank: Some(1),
+        chars_exposed_after_query: cell_text.chars().count(),
+        navigation_actions_to_full_content: Some(0),
+        provenance: ProvenanceMetric {
+            present: [ProvenanceField::Sequence, ProvenanceField::EventKind]
+                .into_iter()
+                .collect(),
+        },
+    };
+
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].id.short, "@@1");
+    assert!(record_text.contains("cwd /workspace/example"));
+    assert!(cell_text.contains("output was not captured"));
+    assert!(metric.target_found);
+    assert_eq!(metric.candidate_events, 1);
+    assert_eq!(metric.false_positives, 0);
+    assert_eq!(metric.target_rank, Some(1));
+    assert_eq!(metric.navigation_actions_to_full_content, Some(0));
+}
+
+#[test]
+fn captured_shell_output_is_retrievable_without_regeneration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("captured-shell-eval.jsonl");
+    let retained = format!(
+        "captured-marker-2048\n{}",
+        "line of captured evidence\n".repeat(RUN_INLINE_CONTENT_LIMIT_BYTES / 8)
+    );
+    let mut recorder = RunRecorder::open(&path, "captured-shell-eval").unwrap();
+    recorder
+        .append_run(RunEvent::ShellCommand {
+            command: "generate-report".to_string(),
+            cwd: PathBuf::from("/workspace/example"),
+            exit_code: Some(0),
+            output: inline(&retained),
+        })
+        .unwrap();
+
+    let events = read_run_record(&path).unwrap();
+    let projected = cells(&events);
+    let reopened = raw_output(&events, &path, "@@1").unwrap();
+
+    assert_eq!(reopened, retained);
+    assert!(matches!(
+        projected[0].items[0].content,
+        Some(RunContentRef::Artifact(_))
+    ));
+}
+
+#[test]
+fn reference_language_keeps_local_shortcuts_and_durable_objects_distinct() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reference-language-eval.jsonl");
+    let mut recorder = RunRecorder::open(&path, "reference-language-eval").unwrap();
+    for command in ["first-observation", "second-observation"] {
+        recorder
+            .append_run(RunEvent::ShellCommand {
+                command: command.to_string(),
+                cwd: PathBuf::from("/workspace/example"),
+                exit_code: Some(0),
+                output: inline(command),
+            })
+            .unwrap();
+    }
+
+    let events = read_run_record(&path).unwrap();
+    let projected = cells(&events);
+    let canonical = projected[1].id.canonical.clone();
+
+    assert_eq!(projected[0].id.short, "@@1");
+    assert_eq!(projected[1].id.short, "@@2");
+    assert!(canonical.starts_with("ref:run:"));
+    assert_eq!(select(projected.clone(), Some("@@2")).unwrap().len(), 1);
+    assert_eq!(select(projected.clone(), Some("@c2")).unwrap().len(), 1);
+    assert_eq!(select(projected, Some(&canonical)).unwrap().len(), 1);
+    assert!(select(cells(&events), Some("@file:notes.md#L1-L2")).is_none());
+    assert!(select(cells(&events), Some("@someone")).is_none());
+    assert!(select(cells(&events), Some("%selection")).is_none());
+}
+
+#[test]
+fn interleaved_agent_turns_remain_distinguishable_without_nested_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("interleaved-agents-eval.jsonl");
+    let mut recorder = RunRecorder::open(&path, "interleaved-agents-eval").unwrap();
+    for (turn_id, provider, model, prompt) in [
+        ("research-1", "anthropic", "claude", "map the evidence"),
+        ("critic-1", "openrouter", "qwen", "challenge the evidence"),
+        ("research-2", "anthropic", "claude", "answer the challenge"),
+    ] {
+        let (id, label) = if turn_id.starts_with("critic") {
+            ("critic", "Critic")
+        } else {
+            ("researcher", "Researcher")
+        };
+        recorder
+            .append_run(RunEvent::ActorTurn {
+                target_turn_id: turn_id.to_string(),
+                actor: piku_runtime::ActorRef {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                },
+            })
+            .unwrap();
+        recorder
+            .append(
+                turn_id,
+                RunEvent::TurnStarted {
+                    provider: Some(provider.to_string()),
+                    model: model.to_string(),
+                    input: inline(prompt),
+                },
+            )
+            .unwrap();
+        recorder
+            .append(
+                turn_id,
+                RunEvent::TurnCompleted {
+                    usage: None,
+                    stop_reason: Some("end_turn".to_string()),
+                },
+            )
+            .unwrap();
+    }
+
+    let events = read_run_record(&path).unwrap();
+    let projected = cells(&events);
+    let text = render_cells_text(&events, None);
+
+    assert_eq!(projected.len(), 3);
+    assert_eq!(projected[0].actor.id, "researcher");
+    assert_eq!(projected[1].actor.id, "critic");
+    assert_eq!(projected[2].actor.id, "researcher");
+    assert_eq!(
+        projected
+            .iter()
+            .map(|cell| &cell.turn_id)
+            .collect::<Vec<_>>(),
+        vec!["research-1", "critic-1", "research-2"]
+    );
+    assert!(text.contains("@@1 · Researcher"));
+    assert!(text.contains("@@2 · Critic"));
+
+    let packet = SurfacePacket::output_recovery_room(Surface::Tui);
+    assert!(
+        packet.validate().is_ok(),
+        "the TUI scenario must retain its evidence contract"
+    );
+}
+
+#[test]
+fn room_simulation_preserves_actor_privacy_and_bounds_recursive_handoffs() {
+    let mut room = Session::new("room-simulation".to_string());
+    room.push(piku_runtime::ConversationMessage::user(
+        "researcher-only scratch",
+    ));
+    room.select_actor("critic");
+    assert!(
+        room.messages.is_empty(),
+        "actors must not share private history"
+    );
+    room.push(piku_runtime::ConversationMessage::user(
+        "critic-only scratch",
+    ));
+    room.select_actor("primary");
+    assert_eq!(room.messages.len(), 1);
+    room.select_actor("critic");
+    assert_eq!(room.messages.len(), 1);
+
+    assert!(handoff_bubbles_to_ancestor(&[
+        HandoffDelivery::Bubble,
+        HandoffDelivery::Bubble,
+    ]));
+    assert!(!handoff_bubbles_to_ancestor(&[
+        HandoffDelivery::Bubble,
+        HandoffDelivery::Notice,
+    ]));
+    assert!(!handoff_bubbles_to_ancestor(&[HandoffDelivery::Join]));
+    assert!(!handoff_bubbles_to_ancestor(&[]));
 }

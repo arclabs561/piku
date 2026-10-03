@@ -11,6 +11,7 @@ import { codexExecArgs, codexJudgeEnvironment, resolvedCodexModel } from "./code
 import { cleanupStaleAutomationSurfaces, deleteSurface } from "./automation-surfaces.mjs";
 import { PLAYWRIGHT_TOOLS, withPlaywrightAuthority } from "./playwright-authority.mjs";
 import { runDeterministicFrontPorch } from "./deterministic-front-porch.mjs";
+import { evaluationReviewRoot, webReviewDirectory } from "./evaluation-review.mjs";
 import {
   canonicalEvaluationFocus,
   evaluationStageToFocusProposals,
@@ -68,9 +69,27 @@ export function explorerHardCallLimit(environment = process.env) {
   return Number(environment.PIKU_EXPLORER_HARD_MAX_CALLS || 80);
 }
 
-export function explorerReportOutcome(report) {
+export function browserToolRetryLimit(environment = process.env) {
+  const configured = Number(environment.PIKU_BROWSER_TOOL_RETRIES ?? 1);
+  if (!Number.isInteger(configured) || configured < 0 || configured > 1)
+    throw new Error("PIKU_BROWSER_TOOL_RETRIES must be 0 or 1");
+  return configured;
+}
+
+export function explorerAttemptDirectory(runDir, role, attempt = 1) {
+  if (!roles.includes(role)) throw new Error(`unknown explorer role: ${role}`);
+  if (!Number.isInteger(attempt) || attempt < 1 || attempt > 2)
+    throw new Error("explorer attempt must be 1 or 2");
+  const roleDir = path.join(runDir, role);
+  return attempt === 1 ? roleDir : path.join(roleDir, `retry-${String(attempt).padStart(3, "0")}`);
+}
+
+export function explorerReportOutcome(report, { browserCalls = null } = {}) {
   return report.status === "blocked"
-    ? { runStatus: "inconclusive", failureClass: "explorer_blocked" }
+    ? {
+      runStatus: "inconclusive",
+      failureClass: browserCalls === 0 ? "browser_tool_unavailable" : "explorer_blocked",
+    }
     : { runStatus: "completed", failureClass: "none" };
 }
 
@@ -390,6 +409,16 @@ export async function buildPromptManifest({
         target_calls: config.target_calls,
         max_snapshots: config.max_snapshots,
         evaluation_focus: role === "coding_trace" ? evaluationFocus?.attestation ?? null : null,
+        browser_tool_retry: config.retry ? {
+          attempt: config.retry.attempt,
+          condition: "blocked report with zero browser calls",
+          surface: config.retry.identity.surface,
+          request_id: config.retry.identity.requestId,
+          playwright_output_dir: path.join(
+            explorerAttemptDirectory(runDir, role, config.retry.attempt),
+            "playwright-output",
+          ),
+        } : null,
       }),
       tools: attestedValue({
         executable: "codex",
@@ -510,12 +539,20 @@ export async function loadValidatedExplorerRun(runDir, runId) {
   for (const role of roles) {
     if (manifest.explorers?.[role]?.status !== "completed")
       throw new Error(`resume requires completed explorer: ${role}`);
-    const roleDir = path.join(runDir, role);
-    const reportPath = path.join(roleDir, "evidence.json");
-    const eventsPath = path.join(roleDir, "events.jsonl");
-    if (manifest.explorers[role].evidence !== `${role}/evidence.json`
-      || manifest.explorers[role].events !== `${role}/events.jsonl`)
+    const evidence = manifest.explorers[role].evidence;
+    const events = manifest.explorers[role].events;
+    const attemptDirectory = new RegExp(`^${role}(?:/retry-002)?$`);
+    if (typeof evidence !== "string" || typeof events !== "string"
+      || !evidence.endsWith("/evidence.json") || !events.endsWith("/events.jsonl")
+      || !attemptDirectory.test(path.posix.dirname(evidence))
+      || path.posix.dirname(evidence) !== path.posix.dirname(events))
       throw new Error(`resume manifest has noncanonical explorer paths: ${role}`);
+    const roleDir = path.resolve(runDir, path.posix.dirname(evidence));
+    const reportPath = path.resolve(runDir, evidence);
+    const eventsPath = path.resolve(runDir, events);
+    const roleRelative = path.relative(runDir, roleDir);
+    if (roleRelative.startsWith("..") || path.isAbsolute(roleRelative))
+      throw new Error(`resume manifest explorer path escapes run directory: ${role}`);
     const [reportText, eventTrace] = await Promise.all([readFile(reportPath, "utf8"), readFile(eventsPath, "utf8")]);
     const violation = traceAuthorityViolation(eventTrace);
     if (violation) throw new Error(`resume explorer trace is invalid for ${role}: ${violation}`);
@@ -564,9 +601,12 @@ export function renderBoundedSynthesisPrompt(template, validated) {
   );
 }
 
-export async function resumeSynthesis(runId, { ledgerPath = path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl") } = {}) {
+export async function resumeSynthesis(runId, {
+  ledgerPath = path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl"),
+  environment = process.env,
+} = {}) {
   if (!runId || safeRunId(runId) !== runId) throw new Error("resume run ID is invalid");
-  const runDir = path.join(repoRoot, ".artifacts", "playwright-agent", "parallel", runId);
+  const runDir = webReviewDirectory(evaluationReviewRoot(environment), runId);
   await runDeterministicFrontPorch({
     baseUrl,
     webUiDir,
@@ -857,14 +897,18 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
   if (!promptManifest) throw new Error("run manifest requires an immutable prompt manifest reference");
   const roles = {};
   for (const explorer of explorers) {
-    const roleDir = path.join(runDir, explorer.role);
+    const reportPath = explorer.reportPath || path.join(runDir, explorer.role, "evidence.json");
+    const eventsPath = explorer.eventsPath || path.join(path.dirname(reportPath), "events.jsonl");
+    const roleDir = path.dirname(reportPath);
+    const relativeReport = path.relative(runDir, reportPath);
+    const relativeEvents = path.relative(runDir, eventsPath);
     let files = [];
     try { files = (await readdir(roleDir)).sort(); } catch { /* A failed launch may create no directory. */ }
     let viewport = null;
     let screenshots = [];
     if (files.includes("evidence.json")) {
       try {
-        const report = JSON.parse(await readFile(path.join(roleDir, "evidence.json"), "utf8"));
+        const report = JSON.parse(await readFile(reportPath, "utf8"));
         viewport = report.viewport || null;
         screenshots = (report.evidence || [])
           .filter((item) => item.kind === "screenshot" && typeof item.artifact === "string")
@@ -880,10 +924,11 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
     }
     roles[explorer.role] = {
       status: explorer.runStatus,
-      evidence: files.includes("evidence.json") ? `${explorer.role}/evidence.json` : null,
-      events: files.includes("events.jsonl") ? `${explorer.role}/events.jsonl` : null,
+      evidence: files.includes("evidence.json") ? relativeReport : null,
+      events: files.includes("events.jsonl") ? relativeEvents : null,
       screenshots,
       viewport,
+      attempt: explorer.attempt ?? 1,
     };
   }
   const manifest = {
@@ -900,9 +945,9 @@ export async function writeRunManifest(runDir, runId, explorers, synthesis = nul
   return manifest;
 }
 
-async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCalls, hardMaxCalls, maxSnapshots, timeoutMs, runtime, identity, model, promptManifest, evaluationFocus = null }) {
+async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCalls, hardMaxCalls, maxSnapshots, timeoutMs, runtime, identity, model, promptManifest, evaluationFocus = null, attempt = 1 }) {
   const started = Date.now();
-  const roleDir = path.join(runDir, role);
+  const roleDir = explorerAttemptDirectory(runDir, role, attempt);
   const reportPath = path.join(roleDir, "evidence.json");
   const eventsPath = path.join(roleDir, "events.jsonl");
   const playwrightOutputDir = path.join(roleDir, "playwright-output");
@@ -921,7 +966,7 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
   let failureClass = "codex_exit";
   try {
     outcome = await runCodex({
-      label: role,
+      label: attempt === 1 ? role : `${role}-retry-${attempt}`,
       prompt,
       schemaPath: path.join(webUiDir, "e2e", "explorer-report.schema.json"),
       reportPath, eventsPath, timeoutMs, maxCalls: hardMaxCalls, maxSnapshots, playwright: true, playwrightOutputDir,
@@ -951,7 +996,7 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
       await attestEvidenceArtifacts(report, roleDir, playwrightOutputDir, await readFile(eventsPath, "utf8"));
       validateExplorerReport(report);
       await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-      ({ runStatus, failureClass } = explorerReportOutcome(report));
+      ({ runStatus, failureClass } = explorerReportOutcome(report, { browserCalls: outcome.calls }));
     }
   } catch (error) {
     failureClass = "invalid_report";
@@ -971,7 +1016,7 @@ async function runExplorer({ role, runId, runDir, baseUrl, ledgerPath, targetCal
   };
   record.evidence_ids = report?.evidence.map((item) => item.id) ?? [];
   await appendEvaluationRecord(ledgerPath, record);
-  return { role, report, reportPath, runStatus };
+  return { role, report, reportPath, eventsPath, runStatus, failureClass, attempt };
 }
 
 export async function runEvaluation({
@@ -984,6 +1029,7 @@ export async function runEvaluation({
   if (resumeRunId) {
     await resumeSynthesis(resumeRunId, {
       ledgerPath: environment.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl"),
+      environment,
     });
     return { runId: resumeRunId, runStatus: "completed", resumed: true };
   }
@@ -996,9 +1042,10 @@ export async function runEvaluation({
   if (removed.length)
     console.error(`[piku eval] removed ${removed.length} stale automation surfaces`);
   const runId = safeRunId(environment.PIKU_EVAL_RUN_ID);
-  const runDir = path.join(repoRoot, ".artifacts", "playwright-agent", "parallel", runId);
+  const runDir = webReviewDirectory(evaluationReviewRoot(environment), runId);
   const ledgerPath = environment.PIKU_LIVE_LEDGER || path.join(repoRoot, "target", "live-ledger", "web-agent.jsonl");
   const maxSnapshots = Number(environment.PIKU_EXPLORER_MAX_SNAPSHOTS || 6);
+  const browserRetries = browserToolRetryLimit(environment);
   const timeoutMs = Number(environment.PIKU_EXPLORER_TIMEOUT_MS || 600_000);
   const explorerModel = resolvedCodexModel(environment);
   const synthesisConfig = {
@@ -1007,6 +1054,7 @@ export async function runEvaluation({
   };
   const explorerConfigs = Object.fromEntries(roles.map((role) => [role, {
     identity: explorerIdentity(runId, role),
+    retry: browserRetries === 1 ? { attempt: 2, identity: explorerIdentity(runId, role) } : null,
     model: explorerModel,
     target_calls: explorerCallBudget(role, environment),
     hard_max_calls: explorerHardCallLimit(environment),
@@ -1023,6 +1071,7 @@ export async function runEvaluation({
     explorer_hard_max_calls: explorerHardCallLimit(environment),
     explorer_max_snapshots: maxSnapshots,
     explorer_timeout_ms: timeoutMs,
+    browser_tool_retries: browserRetries,
   };
   const evaluationFocus = await prepareEvaluationFocus({ environment, runtime, runDir });
   const promptManifestDocument = await buildPromptManifest({
@@ -1045,6 +1094,30 @@ export async function runEvaluation({
     promptManifest,
     evaluationFocus,
   })));
+  for (let attempt = 2; attempt <= browserRetries + 1; attempt += 1) {
+    const retryRoles = results.filter((result) => result.failureClass === "browser_tool_unavailable")
+      .map((result) => result.role);
+    if (!retryRoles.length) break;
+    console.error(`[piku eval] retrying ${retryRoles.join(", ")} after zero browser calls`);
+    const retries = await Promise.all(retryRoles.map((role) => runExplorer({
+      role,
+      runId,
+      runDir,
+      baseUrl,
+      ledgerPath,
+      targetCalls: explorerConfigs[role].target_calls,
+      hardMaxCalls: explorerConfigs[role].hard_max_calls,
+      maxSnapshots,
+      timeoutMs,
+      runtime,
+      identity: explorerConfigs[role].retry.identity,
+      model: explorerConfigs[role].model,
+      promptManifest,
+      evaluationFocus,
+      attempt,
+    })));
+    for (const retry of retries) results[results.findIndex((result) => result.role === retry.role)] = retry;
+  }
   await writeRunManifest(runDir, runId, results, null, runtime, promptManifest);
   if (results.some((result) => result.runStatus !== "completed")) {
     console.error("At least one explorer failed; synthesis was not run.");

@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { runEvaluation, safeRunId } from "./parallel-agent-eval.mjs";
+import { evaluationReviewRoot, webFocusPairReviewDirectory } from "./evaluation-review.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptsDir, "../../../..");
@@ -140,7 +141,7 @@ export async function runFocusPair({
   environment = process.env,
   evaluate = runEvaluation,
   pairId = safeRunId(),
-  outputRoot = path.join(repoRoot, ".artifacts", "playwright-agent", "focus-pairs"),
+  outputRoot = path.join(evaluationReviewRoot(environment), "web-focus-pairs"),
 } = {}) {
   const order = focusPairOrder(pairOrdinal);
   validatePairId(pairId);
@@ -156,7 +157,9 @@ export async function runFocusPair({
     .filter((event) => event.event_kind === "proposal" && promotedProposalIds.has(event.proposal_id))
     .map((event) => event.question);
   await mkdir(outputRoot, { recursive: true });
-  const pairDir = path.join(outputRoot, pairId);
+  const pairDir = outputRoot === path.join(evaluationReviewRoot(environment), "web-focus-pairs")
+    ? webFocusPairReviewDirectory(evaluationReviewRoot(environment), pairId)
+    : path.join(outputRoot, pairId);
   await mkdir(pairDir, { recursive: false });
   const focusSnapshotFile = "focus-events.jsonl";
   const focusSnapshotPath = path.join(pairDir, focusSnapshotFile);

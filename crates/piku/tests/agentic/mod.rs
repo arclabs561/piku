@@ -10,6 +10,7 @@
 pub mod checks;
 pub mod memory;
 pub mod pty;
+pub mod recording;
 pub mod terminal;
 pub mod types;
 pub mod workspace;
@@ -17,6 +18,7 @@ pub mod workspace;
 pub use checks::deterministic_checks;
 pub use memory::{ConversationMemory, TurnSummary};
 pub use pty::PtyHandle;
+pub use recording::{RecordingPaths, TuiRecording};
 pub use terminal::TerminalObserver;
 pub use types::*;
 pub use workspace::{WorkspaceDiff, WorkspaceObserver};

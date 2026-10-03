@@ -8,6 +8,7 @@ import {
   assertEvaluationEnvelope,
   EVALUATION_SCHEMA_VERSION,
 } from "../../../../scripts/evaluation-envelope.mjs";
+import { surfaceJudgeAdapter } from "../../../../scripts/evaluation-surfaces.mjs";
 
 export { assertEvaluationEnvelope, EVALUATION_SCHEMA_VERSION };
 
@@ -36,6 +37,7 @@ export function evaluationRuntimeMetadata(repoRoot, runCommand = commandOutput) 
 export function evaluationRecord({
   runId,
   surface = null,
+  judgeSurface = "web",
   stageId = surface ?? "synthesis",
   scenarioId = "web-codex-replacement-thesis",
   perspective = "integrated_explorer",
@@ -47,6 +49,8 @@ export function evaluationRecord({
   artifactRefs = [],
   runtime = {},
 }) {
+  const evaluatedSurface = judgeSurface;
+  surfaceJudgeAdapter(evaluatedSurface);
   const identity = projectReportIdentity(report, runId, stageId);
   return {
     schema_version: EVALUATION_SCHEMA_VERSION,
@@ -54,7 +58,7 @@ export function evaluationRecord({
     record_kind: "stage",
     stage_id: stageId,
     scenario_id: scenarioId,
-    surface: "web",
+    surface: evaluatedSurface,
     subject_surface: surface,
     perspective,
     subject_model: null,

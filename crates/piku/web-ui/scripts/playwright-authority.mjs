@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const PLAYWRIGHT_TOOLS = Object.freeze([
   "browser_click", "browser_close", "browser_console_messages", "browser_drag",
@@ -10,16 +11,34 @@ export const PLAYWRIGHT_TOOLS = Object.freeze([
 
 export function withPlaywrightAuthority(args, outputDir) {
   const result = [...args];
-  const settingIndex = result.findIndex(
+  let commandIndex = result.findIndex(
+    (arg) => typeof arg === "string" && arg.startsWith("mcp_servers.playwright.command="),
+  );
+  let settingIndex = result.findIndex(
     (arg) => typeof arg === "string" && arg.startsWith("mcp_servers.playwright.args="),
   );
   if (settingIndex < 0)
     throw new Error("Codex arguments lack Playwright MCP configuration");
-  const configured = JSON.parse(
+  if (commandIndex < 0) {
+    result.splice(settingIndex, 0, "--config", `mcp_servers.playwright.command=${JSON.stringify(process.execPath)}`);
+    commandIndex = settingIndex + 1;
+    settingIndex += 2;
+  }
+  const underlyingCommand = JSON.parse(
+    result[commandIndex].slice(result[commandIndex].indexOf("=") + 1),
+  );
+  if (typeof underlyingCommand !== "string" || underlyingCommand.length === 0)
+    throw new Error("Playwright MCP command must be a non-empty string");
+  const underlying = JSON.parse(
     result[settingIndex].slice(result[settingIndex].indexOf("=") + 1),
   );
-  configured.push("--output-dir", path.resolve(outputDir));
-  result[settingIndex] = `mcp_servers.playwright.args=${JSON.stringify(configured)}`;
+  const root = path.resolve(outputDir);
+  underlying.push("--caps=devtools", "--output-dir", root);
+  const proxy = fileURLToPath(new URL("./browser-recorder-proxy.mjs", import.meta.url));
+  result[commandIndex] = `mcp_servers.playwright.command=${JSON.stringify(process.execPath)}`;
+  result[settingIndex] = `mcp_servers.playwright.args=${JSON.stringify([
+    proxy, "--recording-dir", root, "--", underlyingCommand, ...underlying,
+  ])}`;
   result.splice(
     -1,
     0,

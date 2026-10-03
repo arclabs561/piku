@@ -6,13 +6,19 @@ import { test } from "node:test";
 import path from "node:path";
 import {
   evaluationArtifactPaths,
+  managedEvaluationTimeoutMs,
   managedTerminalEnabled,
   managedPageBroker,
   managedJudgeEnvironment,
   managedArtifactDir,
+  evaluationReviewRoot,
+  webFocusPairReviewDirectory,
+  webReviewDirectory,
+  webRoleReviewDirectory,
   resolveManagedEvaluationEnvironment,
   validateRunId,
   writeBindingWithoutMaskingChildFailure,
+  writeReviewWithoutMaskingChildFailure,
   writeManagedLifecycleBinding,
 } from "./run-managed-eval.mjs";
 
@@ -83,6 +89,12 @@ test("deterministic e2e remains credential-free", async () => {
   }), { PATH: "/bin" });
 });
 
+test("managed evaluation timeout is bounded and explicit", () => {
+  assert.equal(managedEvaluationTimeoutMs({}), 300_000);
+  assert.equal(managedEvaluationTimeoutMs({ PIKU_MANAGED_EVAL_TIMEOUT_MS: "1500" }), 1500);
+  assert.throws(() => managedEvaluationTimeoutMs({ PIKU_MANAGED_EVAL_TIMEOUT_MS: "999" }), /1000 to 3600000/);
+});
+
 test("managed run IDs accept only bounded filename components", () => {
   assert.equal(validateRunId("2026-08-10T12-00-00-000Z"), "2026-08-10T12-00-00-000Z");
   for (const runId of ["", ".", "..", "../escape", "/tmp/escape", "run/escape", "run\\escape", "run--escape", `${"a".repeat(129)}`])
@@ -94,6 +106,34 @@ test("managed artifact directories are confined below the managed root", () => {
   const artifactDir = managedArtifactDir(root, "run-one");
   assert.equal(artifactDir, path.join(root, ".artifacts", "playwright-agent", "managed", "run-one"));
   assert.throws(() => managedArtifactDir(root, "../escape"), /PIKU_EVAL_RUN_ID/);
+});
+
+test("web review directories are confined below the human review root", () => {
+  const root = path.resolve("/tmp/piku-managed-root");
+  assert.equal(
+    webReviewDirectory(path.join(root, "reviews"), "run-one"),
+    path.join(root, "reviews", "web-run-one"),
+  );
+  assert.throws(() => webReviewDirectory(path.join(root, "reviews"), "../escape"), /PIKU_EVAL_RUN_ID/);
+  assert.equal(
+    webRoleReviewDirectory(path.join(root, "reviews"), "run-one", "recovery"),
+    path.join(root, "reviews", "web-run-one", "roles", "recovery"),
+  );
+  assert.equal(
+    webFocusPairReviewDirectory(path.join(root, "reviews"), "pair-one"),
+    path.join(root, "reviews", "web-focus-pairs", "pair-one"),
+  );
+});
+
+test("review artifacts default outside CloudDocs and permit an explicit override", () => {
+  assert.equal(
+    evaluationReviewRoot({}, "/Users/example"),
+    "/Users/example/Library/Caches/piku/eval-review",
+  );
+  assert.equal(
+    evaluationReviewRoot({ PIKU_EVAL_REVIEW_DIR: "/Volumes/evals" }, "/Users/example"),
+    "/Volumes/evals",
+  );
 });
 
 test("managed lifecycle binding attests final server and parallel manifests without rewriting them", async (t) => {
@@ -117,7 +157,7 @@ test("managed lifecycle binding attests final server and parallel manifests with
 
   const before = await readFile(promptManifestPath, "utf8");
   const { bindingPath, binding } = await writeManagedLifecycleBinding({
-    root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
+    root, reviewRoot: root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
   });
   assert.equal(await readFile(promptManifestPath, "utf8"), before);
   assert.equal(binding.server.lifecycle.sha256,
@@ -130,7 +170,7 @@ test("managed lifecycle binding attests final server and parallel manifests with
   assert.deepEqual(binding.expected_but_missing, []);
   assert.deepEqual(JSON.parse(await readFile(bindingPath, "utf8")), binding);
   await assert.rejects(writeManagedLifecycleBinding({
-    root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
+    root, reviewRoot: root, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
   }), /EEXIST/);
 });
 
@@ -153,13 +193,40 @@ test("failed managed runs attest partial artifacts and name expected missing out
   ]);
 
   const { binding } = await writeManagedLifecycleBinding({
-    root, artifactDir, mode: "parallel", runId, outcome: { code: 1, signal: null },
+    root, reviewRoot: root, artifactDir, mode: "parallel", runId, outcome: { code: 1, signal: null },
   });
   assert.deepEqual(binding.child, { exit_code: 1, exit_signal: null });
   assert.deepEqual(binding.evaluation_artifacts.map((item) => item.path), [
     path.relative(root, promptManifestPath),
   ]);
   assert.deepEqual(binding.expected_but_missing, [path.relative(root, manifestPath)]);
+});
+
+test("managed lifecycle bindings attest review artifacts outside the repository", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "piku-managed-repo-"));
+  const reviewRoot = await mkdtemp(path.join(os.tmpdir(), "piku-managed-review-"));
+  t.after(() => Promise.all([
+    rm(root, { recursive: true, force: true }), rm(reviewRoot, { recursive: true, force: true }),
+  ]));
+  const runId = "external-review";
+  const artifactDir = managedArtifactDir(root, runId);
+  const serverDir = path.join(artifactDir, "server");
+  const [manifestPath, promptManifestPath] = evaluationArtifactPaths(reviewRoot, "parallel", runId);
+  await Promise.all([
+    mkdir(serverDir, { recursive: true }), mkdir(path.dirname(manifestPath), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(serverDir, "lifecycle.json"), `${JSON.stringify({ ownership: "managed", status: "stopped" })}\n`),
+    writeFile(path.join(serverDir, "server.log"), "finished\n"),
+    writeFile(manifestPath, "parallel manifest\n"), writeFile(promptManifestPath, "prompt manifest\n"),
+  ]);
+  const { binding } = await writeManagedLifecycleBinding({
+    root, reviewRoot, artifactDir, mode: "parallel", runId, outcome: { code: 0, signal: null },
+  });
+  assert.equal(binding.evaluation_artifacts_location, "local-review-cache");
+  assert.deepEqual(binding.evaluation_artifacts.map((item) => item.path), [
+    path.relative(reviewRoot, manifestPath), path.relative(reviewRoot, promptManifestPath),
+  ]);
 });
 
 test("managed bindings preserve signal termination", async (t) => {
@@ -175,7 +242,7 @@ test("managed bindings preserve signal termination", async (t) => {
     writeFile(path.join(serverDir, "server.log"), "signal log\n"),
   ]);
   const { binding } = await writeManagedLifecycleBinding({
-    root, artifactDir, mode: "e2e", runId, outcome: { code: null, signal: "SIGTERM" },
+    root, reviewRoot: root, artifactDir, mode: "e2e", runId, outcome: { code: null, signal: "SIGTERM" },
   });
   assert.deepEqual(binding.child, { exit_code: null, exit_signal: "SIGTERM" });
 });
@@ -196,15 +263,31 @@ test("binding errors cannot replace a failed child outcome", async () => {
   }), /disk full/);
 });
 
-test("focus-pair bindings cover the pair dossier and both immutable arm manifests", () => {
+test("asset-review errors cannot replace a failed child outcome", async () => {
+  const messages = [];
+  const result = await writeReviewWithoutMaskingChildFailure({
+    outcome: { code: 1, signal: null },
+    writeReview: async () => { throw new Error("review disk full"); },
+    reportError: (message) => messages.push(message),
+  });
+  assert.equal(result, null);
+  assert.match(messages[0], /review disk full/);
+  await assert.rejects(writeReviewWithoutMaskingChildFailure({
+    outcome: { code: 0, signal: null },
+    writeReview: async () => { throw new Error("review disk full"); },
+    reportError: () => {},
+  }), /review disk full/);
+});
+
+test("focus-pair bindings cover the local pair dossier and both immutable arm manifests", () => {
   const paths = evaluationArtifactPaths("/repo", "focus-pair", "pair-one")
     .map((item) => path.relative("/repo", item));
   assert.deepEqual(paths, [
-    ".artifacts/playwright-agent/focus-pairs/pair-one/manifest.json",
-    ".artifacts/playwright-agent/focus-pairs/pair-one/report.json",
-    ".artifacts/playwright-agent/parallel/pair-one-blind/manifest.json",
-    ".artifacts/playwright-agent/parallel/pair-one-blind/prompt-manifest.json",
-    ".artifacts/playwright-agent/parallel/pair-one-focused/manifest.json",
-    ".artifacts/playwright-agent/parallel/pair-one-focused/prompt-manifest.json",
+    "web-focus-pairs/pair-one/manifest.json",
+    "web-focus-pairs/pair-one/report.json",
+    "web-pair-one-blind/manifest.json",
+    "web-pair-one-blind/prompt-manifest.json",
+    "web-pair-one-focused/manifest.json",
+    "web-pair-one-focused/prompt-manifest.json",
   ]);
 });

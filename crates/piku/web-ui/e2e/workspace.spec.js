@@ -1825,7 +1825,10 @@ test("execution traces stay visibly transient and outside workspace persistence"
     runUrl: "/run/durable-trace-run",
     requestId: "trace-contract",
     serverTurnId: "web-chat-trace-contract",
-    status: "running",
+    // `route.fulfill` supplies this fixture as one completed SSE body. The
+    // durable metadata is the invariant here; a fast local consumer may have
+    // already processed the terminal event by the time this read occurs.
+    status: "done",
   });
 
   await expect(chat.locator(".chat-response")).toContainText("trace complete");
@@ -1898,7 +1901,13 @@ test("workspace state crosses browser contexts while viewport state does not", a
     });
   });
 
-  await addObject(page, "terminal", { x: 120, y: 110 });
+  // Managed model-judge servers deliberately disable terminal authority. This
+  // test covers cross-context workspace persistence, so use a neutral note in
+  // that mode rather than requiring a capability the evaluator forbids.
+  const persistedKind = process.env.PIKU_REQUIRE_EVALUATION_FIXTURES === "1"
+    ? "note"
+    : "terminal";
+  await addObject(page, persistedKind, { x: 120, y: 110 });
   await addObject(page, "chat", { x: 900, y: 540 });
   const chat = page.locator('[data-kind="chat"]');
   await selectManagedFixture(chat);
@@ -1918,15 +1927,17 @@ test("workspace state crosses browser contexts while viewport state does not", a
   const freshPage = await freshContext.newPage();
   try {
     await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
-    await expect(freshPage.locator('[data-kind="terminal"]')).toHaveCount(1);
-    await expect(freshPage.locator('[data-kind="terminal"]')).toContainText("unrestricted host shell");
-    await expect(freshPage.locator('[data-kind="terminal"] .xterm')).toHaveCount(0);
-    await expect(
-      freshPage.locator('[data-kind="terminal"]').getByRole("button", {
-        name: "start shell",
-        exact: true,
-      }),
-    ).toBeVisible();
+    await expect(freshPage.locator(`[data-kind="${persistedKind}"]`)).toHaveCount(1);
+    if (persistedKind === "terminal") {
+      await expect(freshPage.locator('[data-kind="terminal"]')).toContainText("unrestricted host shell");
+      await expect(freshPage.locator('[data-kind="terminal"] .xterm')).toHaveCount(0);
+      await expect(
+        freshPage.locator('[data-kind="terminal"]').getByRole("button", {
+          name: "start shell",
+          exact: true,
+        }),
+      ).toBeVisible();
+    }
     await expect(freshPage.locator('[data-kind="chat"] .chat-response')).toContainText("durable cross-context answer");
     await expect(freshPage.locator('[data-kind="chat"] .chat-turn-status')).toContainText("done · attempt 1");
     await expect(freshPage.locator(".workspace-object.selected")).toHaveCount(0);
@@ -2222,6 +2233,98 @@ test("page change history persists an inspectable narrow diff and rerun control"
   await expect(page.locator(".activity-card").last()).toContainText("Done");
   await expect(page.locator(".activity-card").last()).toContainText("Host verification");
   await expect(page.locator(".activity-card").last()).toContainText("saved source remained unchanged");
+});
+
+test("applying a page proposal keeps its original target after selection changes", async ({
+  page,
+  request,
+  surfaceName,
+}) => {
+  const saved = await request.put(
+    `/api/surfaces/${encodeURIComponent(surfaceName)}/workspace`,
+    {
+      data: {
+        objects: [
+          {
+            id: "proposed-page",
+            kind: "page_preview",
+            title: "page preview",
+            x: 680,
+            y: 70,
+            width: 480,
+            height: 320,
+            z: 1,
+            content: "",
+          },
+          {
+            id: "newly-selected-note",
+            kind: "note",
+            title: "note",
+            x: 680,
+            y: 430,
+            width: 480,
+            height: 320,
+            z: 2,
+            content: "",
+          },
+          {
+            id: "page-change",
+            kind: "workspace_task",
+            title: "change",
+            x: 70,
+            y: 70,
+            width: 480,
+            height: 320,
+            z: 3,
+            content: "",
+          },
+        ],
+      },
+    },
+  );
+  expect(saved.ok()).toBeTruthy();
+  await page.reload();
+
+  const requestedTargetIds = [];
+  await page.route("**/api/chat", async (route) => {
+    const body = route.request().postDataJSON();
+    requestedTargetIds.push(body.target_id);
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        { kind: "request_accepted", surface: surfaceName, request_kind: "page" },
+        {
+          kind: "page_snapshot",
+          target_id: body.target_id,
+          html: "<!doctype html><html><body><h1>bound target</h1></body></html>",
+        },
+        {
+          kind: "completed",
+          surface: surfaceName,
+          message: "Page source updated",
+          canvas_changed: true,
+          request_kind: "page",
+        },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  const change = page.locator('[data-object-id="page-change"]');
+  await change.getByLabel("Change target").selectOption("page");
+  await change.getByLabel("Change instruction").fill("bind this proposal");
+  await change.getByLabel("Change instruction").press("Enter");
+  await expect(change.locator(".change-proposal")).toContainText("proposed-page");
+
+  // A source-backed workspace has one page preview by contract. Selecting a
+  // different workspace object must not retarget an already-proposed page
+  // change.
+  await page.locator('[data-object-id="newly-selected-note"] .object-handle').click();
+  await expect(page.locator('[data-object-id="newly-selected-note"]')).toHaveClass(/selected/);
+  await change.getByRole("button", { name: "apply proposed change" }).click();
+
+  await expect.poll(() => requestedTargetIds).toEqual(["proposed-page"]);
+  await expect(change.locator(".change-history")).toContainText("target: page · proposed-page");
 });
 
 test("chat output renders safe Markdown, KaTeX, and Mermaid by default", async ({

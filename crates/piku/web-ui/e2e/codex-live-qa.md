@@ -102,6 +102,17 @@ the most useful usability evidence.
    `05-final-desktop.png`. Verify narrow scroll state does not displace the
    desktop canvas.
 
+When the surface exposes an interleaved-agent room, also perform this bounded
+room probe without treating it as a background-task test: select two visible
+actors, send one short turn to each, and inspect the returned timeline. Verify
+that the two turns remain chronological and visibly attributable, and that a
+private actor history is not represented as ambient shared context. If the
+surface does not expose actors, record that as an absent capability rather than
+inventing a hidden interaction. If a delegated task completion is visible,
+inspect whether it is a durable handoff/reference rather than an unsolicited
+assistant reply; only claim recursive bubbling when the UI shows its routing
+policy and ancestry.
+
 8. REFLECT — Compare the empty, working, reloaded, and narrow states. Evaluate
    the eight thesis dimensions below using only observed evidence. A dimension
    is `absent` when the workflow requires guessing, transcript memory, or
@@ -123,6 +134,11 @@ Required thesis dimensions, in this exact order:
    powers are distinct before activation.
 8. `spatial_utility` — the canvas improves task understanding over a linear
    transcript rather than merely arranging windows.
+
+For `context_control`, `state_visibility`, and `recovery`, explicitly account
+for the room probe: named actor identity, private-versus-shared context, and
+the distinction between an interleaved foreground turn and a delegated-job
+handoff. Do not award credit merely because a provider/model string appears.
 
 For each dimension return a 1–5 score, `demonstrated`, `partial`, `absent`, or
 `blocked`, and concrete evidence. Use `supported` only if all eight dimensions

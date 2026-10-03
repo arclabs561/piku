@@ -24,7 +24,7 @@
   },
   "devDependencies": {
     "@playwright/mcp": "0.0.78",
-    "@playwright/test": "1.58.1",
+    "@playwright/test": "1.62.1",
     "esbuild": "0.28.1"
   }
 }

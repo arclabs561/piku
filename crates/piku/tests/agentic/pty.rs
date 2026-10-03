@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::terminal::TerminalObserver;
 use super::types::*;
+use super::{RecordingPaths, TuiRecording};
 
 pub struct PtyHandle {
     /// Kept for Drop — rexpect sends SIGTERM then SIGKILL after kill_timeout.
@@ -16,10 +17,16 @@ pub struct PtyHandle {
     pub raw_capture: Vec<u8>,
     /// Set when the PTY reader returns EOF or EIO (process dead).
     eof: bool,
+    recording: Option<TuiRecording>,
 }
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            recording
+                .finish()
+                .expect("managed-PTY recording must finish successfully");
+        }
         // Send Ctrl-D (EOF) to trigger piku's clean shutdown before the PTY
         // process is killed. Without this, SIGTERM arrives mid-render and can
         // leave zombie child processes (e.g. in-flight ollama requests).
@@ -80,10 +87,50 @@ impl PtyHandle {
             reader,
             raw_capture: Vec::new(),
             eof: false,
+            recording: None,
+        }
+    }
+
+    /// Starts a replayable evidence bundle. Input contents stay out of both
+    /// artifacts unless raw input events are explicitly requested by the test.
+    /// PTY output can still contain terminal echo, so recordings are not safe
+    /// to share merely because raw input events are omitted.
+    pub fn start_recording(
+        &mut self,
+        directory: &Path,
+        title: &str,
+        record_raw_input_events: bool,
+    ) -> std::io::Result<RecordingPaths> {
+        let (recording, paths) =
+            TuiRecording::create(directory, 40, 120, title, record_raw_input_events)?;
+        self.recording = Some(recording);
+        Ok(paths)
+    }
+
+    /// Finalizes the evidence bundle. Callers that judge the run must invoke
+    /// this before consuming artifacts, so a missing footer is ineligible.
+    pub fn finish_recording(&mut self) -> std::io::Result<()> {
+        match self.recording.take() {
+            Some(recording) => recording.finish(),
+            None => Ok(()),
+        }
+    }
+
+    /// Adds a structured evaluator annotation at the current replay time.
+    pub fn annotate(&mut self, label: &str, value: serde_json::Value) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .annotation(label, &value)
+                .expect("managed-PTY recording annotation must be written");
         }
     }
 
     pub fn send_bytes(&mut self, bytes: &[u8]) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .input(bytes)
+                .expect("managed-PTY recording input must be written");
+        }
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
@@ -98,12 +145,18 @@ impl PtyHandle {
     }
 
     pub fn execute_action(&mut self, action: &Action, observer: &mut TerminalObserver) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .action(action)
+                .expect("managed-PTY recording action must be written");
+        }
         match action {
             Action::Type(c) => {
                 let mut buf = [0u8; 4];
                 let bytes = c.encode_utf8(&mut buf);
                 self.send_bytes(bytes.as_bytes());
                 self.settle(observer, Duration::from_millis(30));
+                self.record_observation("after_type", observer);
             }
             Action::Key(key) => {
                 self.send_bytes(key.as_bytes());
@@ -113,13 +166,16 @@ impl PtyHandle {
                     _ => Duration::from_millis(30),
                 };
                 self.settle(observer, settle);
+                self.record_observation("after_key", observer);
             }
             Action::Observe => {
                 self.drain(observer);
+                self.record_observation("explicit", observer);
             }
             Action::Wait(d) => {
                 std::thread::sleep(*d);
                 self.drain(observer);
+                self.record_observation("after_wait", observer);
             }
             Action::TypeString { text, delay_ms } => {
                 for c in text.chars() {
@@ -128,11 +184,13 @@ impl PtyHandle {
                     self.send_bytes(bytes.as_bytes());
                     std::thread::sleep(Duration::from_millis(*delay_ms));
                     self.drain(observer);
+                    self.record_observation("during_type_text", observer);
                 }
             }
             Action::Submit(s) => {
                 self.send_line(s);
                 self.settle(observer, Duration::from_millis(50));
+                self.record_observation("after_submit", observer);
             }
         }
     }
@@ -148,6 +206,11 @@ impl PtyHandle {
                     break;
                 }
                 Ok(n) => {
+                    if let Some(recording) = &mut self.recording {
+                        recording
+                            .output(&buf[..n])
+                            .expect("managed-PTY recording output must be written");
+                    }
                     observer.process(&buf[..n]);
                     self.raw_capture.extend_from_slice(&buf[..n]);
                     total += n;
@@ -190,6 +253,14 @@ impl PtyHandle {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn record_observation(&mut self, reason: &str, observer: &TerminalObserver) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .observation(reason, &observer.snapshot())
+                .expect("managed-PTY recording observation must be written");
         }
     }
 

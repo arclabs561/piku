@@ -72,7 +72,8 @@ eval-summary ledger="target/live-ledger":
 
 # Fast contract tests for the shared evaluation ledger and web judge harness.
 eval-harness-test:
-    node --test scripts/evaluation-summary.test.mjs scripts/evaluation-focus.test.mjs scripts/evaluation-focus-cli.test.mjs scripts/codex-app-server-probe.test.mjs
+    node --test scripts/evaluation-summary.test.mjs scripts/evaluation-focus.test.mjs scripts/evaluation-focus-cli.test.mjs scripts/evaluation-surfaces.test.mjs scripts/codex-app-server-probe.test.mjs
+    cargo test -p piku --test surface_evaluation_schema
     cd crates/piku/web-ui && npm run test:harness
 
 # Run local live LLM smoke tests and write a ledger under target/live-ledger.

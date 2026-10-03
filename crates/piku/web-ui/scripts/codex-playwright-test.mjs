@@ -16,16 +16,16 @@ import {
   withPlaywrightAuthority,
 } from "./playwright-authority.mjs";
 import { runDeterministicFrontPorch } from "./deterministic-front-porch.mjs";
+import { evaluationReviewRoot, webRoleReviewDirectory } from "./evaluation-review.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const webUiDir = path.resolve(scriptDir, "..");
 const repoRoot = path.resolve(webUiDir, "../../..");
-const artifactsDir = path.join(repoRoot, ".artifacts", "playwright-agent");
 const promptPath = path.join(webUiDir, "e2e", "codex-live-qa.md");
 const schemaPath = path.join(webUiDir, "e2e", "agent-report.schema.json");
 const runId = process.env.PIKU_EVAL_RUN_ID || new Date().toISOString().replaceAll(/[:.]/g, "-");
 const surfaceName = `qa-${Date.now()}-journey`;
-const runDir = path.join(artifactsDir, "runs", runId);
+const runDir = webRoleReviewDirectory(evaluationReviewRoot(), runId, "single");
 const playwrightOutputDir = path.join(runDir, "playwright-output");
 const reportPath = path.join(runDir, "report.json");
 const eventsPath = path.join(runDir, "events.jsonl");

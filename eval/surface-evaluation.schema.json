@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://piku.local/schemas/surface-evaluation.schema.json",
+  "title": "Piku cross-surface evaluation packet",
+  "description": "A portable observation packet for one shared evaluation scenario. This schema admits evidence shape only; it does not assign a product verdict or score.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Schema revision for this packet, independent of the append-only evaluation envelope revision."
+    },
+    "scenario_id": {
+      "const": "output-recovery-room",
+      "description": "The shared output recovery and interleaved-actor scenario."
+    },
+    "surface": {
+      "type": "string",
+      "enum": ["cli", "tui", "web"],
+      "description": "The product surface observed by this packet."
+    },
+    "observation": {
+      "type": "string",
+      "enum": ["bounded_subprocess", "managed_pty", "bounded_playwright"],
+      "description": "The authority used to observe the subject; it is not a claim about product behavior."
+    },
+    "evidence_kinds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "argv", "exit_status", "stdout_or_artifact", "run_record",
+          "pty_transcript", "key_events", "resize_events",
+          "browser_events", "screenshots", "dom_predicates"
+        ]
+      },
+      "description": "Kinds of attested evidence retained with the packet. Artifact references themselves stay in the evaluation envelope."
+    },
+    "recording": {
+      "$ref": "#/$defs/recording_metadata",
+      "description": "Optional compatibility metadata for the replay that backs this packet. A judge must reject an absent, incomplete, or uninspectable recording; schema admission remains backward compatible for existing v1 packets."
+    },
+    "claims": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "output_visible", "reference_addressable", "interruption_preserved", "recovery_without_regeneration",
+          "actors_attributed", "actor_context_isolated", "handoff_is_notice_not_reply"
+        ]
+      },
+      "description": "Scenario claims tested by retained evidence. Valid shape does not establish that any claim is true."
+    }
+  },
+  "required": ["schema_version", "scenario_id", "surface", "observation", "evidence_kinds", "claims"],
+  "$defs": {
+    "recording_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": ["complete", "incomplete"],
+          "description": "Whether recording reached a complete terminal state."
+        },
+        "inspectability": {
+          "enum": ["inspectable", "uninspectable"],
+          "description": "Whether a judge can inspect the retained source artifacts."
+        },
+        "source_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "ref": { "type": "string", "minLength": 1 },
+              "retention": {
+                "enum": ["durable", "local_private", "remote_redacted", "ephemeral"],
+                "description": "Retention boundary for this inspectable artifact reference."
+              }
+            },
+            "required": ["ref", "retention"]
+          }
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the recording is incomplete or cannot be inspected."
+        }
+      },
+      "required": ["status", "inspectability", "source_artifacts"],
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "incomplete" } }, "required": ["status"] },
+          "then": { "required": ["reason"] }
+        },
+        {
+          "if": { "properties": { "inspectability": { "const": "uninspectable" } }, "required": ["inspectability"] },
+          "then": { "required": ["reason"] }
+        }
+      ]
+    },
+    "cli_requirements": {
+      "properties": {
+        "observation": { "const": "bounded_subprocess" },
+        "evidence_kinds": {
+          "allOf": [
+            { "contains": { "const": "argv" } },
+            { "contains": { "const": "exit_status" } },
+            { "contains": { "const": "stdout_or_artifact" } },
+            { "contains": { "const": "run_record" } }
+          ]
+        }
+      }
+    },
+    "tui_requirements": {
+      "properties": {
+        "observation": { "const": "managed_pty" },
+        "evidence_kinds": {
+          "allOf": [
+            { "contains": { "const": "pty_transcript" } },
+            { "contains": { "const": "key_events" } },
+            { "contains": { "const": "resize_events" } },
+            { "contains": { "const": "run_record" } }
+          ]
+        }
+      }
+    },
+    "web_requirements": {
+      "properties": {
+        "observation": { "const": "bounded_playwright" },
+        "evidence_kinds": {
+          "allOf": [
+            { "contains": { "const": "browser_events" } },
+            { "contains": { "const": "screenshots" } },
+            { "contains": { "const": "dom_predicates" } },
+            { "contains": { "const": "run_record" } }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "surface": { "const": "cli" } }, "required": ["surface"] },
+      "then": { "$ref": "#/$defs/cli_requirements" }
+    },
+    {
+      "if": { "properties": { "surface": { "const": "tui" } }, "required": ["surface"] },
+      "then": { "$ref": "#/$defs/tui_requirements" }
+    },
+    {
+      "if": { "properties": { "surface": { "const": "web" } }, "required": ["surface"] },
+      "then": { "$ref": "#/$defs/web_requirements" }
+    },
+    {
+      "properties": {
+        "claims": {
+          "allOf": [
+            { "contains": { "const": "output_visible" } },
+            { "contains": { "const": "reference_addressable" } },
+            { "contains": { "const": "interruption_preserved" } },
+            { "contains": { "const": "recovery_without_regeneration" } },
+            { "contains": { "const": "actors_attributed" } },
+            { "contains": { "const": "actor_context_isolated" } },
+            { "contains": { "const": "handoff_is_notice_not_reply" } }
+          ]
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "schema_version": 1,
+      "scenario_id": "output-recovery-room",
+      "surface": "tui",
+      "observation": "managed_pty",
+      "evidence_kinds": ["pty_transcript", "key_events", "resize_events", "run_record"],
+      "recording": {
+        "status": "complete",
+        "inspectability": "inspectable",
+        "source_artifacts": [{ "ref": "cast:output-recovery", "retention": "local_private" }]
+      },
+      "claims": ["output_visible", "reference_addressable", "interruption_preserved", "recovery_without_regeneration", "actors_attributed", "actor_context_isolated", "handoff_is_notice_not_reply"]
+    }
+  ]
+}

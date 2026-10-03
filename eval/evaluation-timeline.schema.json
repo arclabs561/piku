@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://piku.local/schemas/evaluation-timeline.schema.json",
+  "title": "Piku replayable evaluation timeline",
+  "description": "Append-only annotations over surface-native replay artifacts. The timeline never replaces the raw artifacts it cites.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "surface": { "enum": ["cli", "tui", "web"] },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["process", "asciicast", "playwright"] },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "recording": {
+          "$ref": "#/$defs/recording_metadata",
+          "description": "Compatibility metadata that determines whether this replay may support a judge claim."
+        }
+      },
+      "required": ["kind", "artifacts"]
+    },
+    "annotations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "t_ms": { "type": "integer", "minimum": 0 },
+          "kind": { "enum": ["action", "observation", "finding", "judge", "handoff"] },
+          "ref": { "type": ["string", "null"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "evidence_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        },
+        "required": ["t_ms", "kind", "ref", "summary", "evidence_ids"]
+      }
+    }
+  },
+  "required": ["schema_version", "surface", "replay", "annotations"],
+  "$defs": {
+    "recording_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["complete", "incomplete"] },
+        "inspectability": { "enum": ["inspectable", "uninspectable"] },
+        "source_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "ref": { "type": "string", "minLength": 1 },
+              "retention": { "enum": ["durable", "local_private", "remote_redacted", "ephemeral"] }
+            },
+            "required": ["ref", "retention"]
+          }
+        },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "required": ["status", "inspectability", "source_artifacts"],
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "incomplete" } }, "required": ["status"] },
+          "then": { "required": ["reason"] }
+        },
+        {
+          "if": { "properties": { "inspectability": { "const": "uninspectable" } }, "required": ["inspectability"] },
+          "then": { "required": ["reason"] }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "surface": { "const": "cli" } }, "required": ["surface"] },
+      "then": { "properties": { "replay": { "properties": { "kind": { "const": "process" } } } } }
+    },
+    {
+      "if": { "properties": { "surface": { "const": "tui" } }, "required": ["surface"] },
+      "then": { "properties": { "replay": { "properties": { "kind": { "const": "asciicast" } } } } }
+    },
+    {
+      "if": { "properties": { "surface": { "const": "web" } }, "required": ["surface"] },
+      "then": { "properties": { "replay": { "properties": { "kind": { "const": "playwright" } } } } }
+    }
+  ]
+}

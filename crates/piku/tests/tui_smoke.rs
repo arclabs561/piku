@@ -464,10 +464,18 @@ fn help_slash_command_renders() {
 
     let out = pty.captured();
     assert!(!out.contains("panicked at"), "panic on /help:\n{out}");
-    // Help output should mention at least one known command.
+    // Help output should preserve both basic and actor-navigation commands.
     assert!(
         out.contains("/help") || out.contains("Commands") || out.contains("/permissions"),
         "/help did not render recognizable output:\n{out}"
+    );
+    assert!(
+        out.contains("/actors") && out.contains("/actor [name]"),
+        "/help did not expose actor navigation:\n{out}"
+    );
+    assert!(
+        out.contains("/cells") && out.contains("/cell @@N"),
+        "/help did not expose durable output navigation:\n{out}"
     );
 }
 

@@ -19,6 +19,10 @@ test("judge Codex runs naked with an explicit model and task prompt", () => {
   assert.ok(args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'));
   const mcpArgs = args.find((arg) => arg.startsWith("mcp_servers.playwright.args="));
   const configured = JSON.parse(mcpArgs.slice(mcpArgs.indexOf("=") + 1));
+  const command = args.find((arg) => arg.startsWith("mcp_servers.playwright.command="));
+  assert.equal(JSON.parse(command.slice(command.indexOf("=") + 1)), process.execPath);
+  assert.match(configured[0], /node_modules\/@playwright\/mcp\/cli\.js$/);
+  assert.equal(configured.includes("npx"), false);
   assert.equal(configured.includes("--block-service-workers"), false);
   assert.equal(args.at(-1), "Act as the evaluator.");
   assert.ok(!args.includes("--profile"));

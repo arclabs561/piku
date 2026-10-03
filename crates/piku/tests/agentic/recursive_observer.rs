@@ -424,7 +424,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(retained[0].disposition, "INCONCLUSIVE");
-        assert!(retained[0].evidence_turns.is_empty());
+        assert_eq!(retained[0].evidence_turns, [] as [u64; 0]);
     }
 
     #[test]

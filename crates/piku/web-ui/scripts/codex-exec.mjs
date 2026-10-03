@@ -1,4 +1,9 @@
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
 export const DEFAULT_JUDGE_MODEL = "gpt-5.6-sol";
+const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
+const playwrightMcpEntrypoint = path.join(scriptsDir, "..", "node_modules", "@playwright", "mcp", "cli.js");
 
 export function resolvedCodexModel(source = process.env) {
   return source.PIKU_CODEX_MODEL || DEFAULT_JUDGE_MODEL;
@@ -43,10 +48,10 @@ export function codexExecArgs({
       || !parsedOrigin.port)
       throw new Error("playwrightOrigin must be a loopback HTTP origin with an explicit port");
     args.push(
-      "--config", 'mcp_servers.playwright.command="npx"',
+      "--config", `mcp_servers.playwright.command=${JSON.stringify(process.execPath)}`,
       "--config", `mcp_servers.playwright.cwd=${JSON.stringify(playwrightCwd)}`,
       "--config", 'mcp_servers.playwright.default_tools_approval_mode="approve"',
-      "--config", `mcp_servers.playwright.args=${JSON.stringify(["--no-install", "playwright-mcp", "--headless", "--isolated", "--browser", "chromium", "--allowed-hosts", "localhost,127.0.0.1", "--allowed-origins", origin])}`,
+      "--config", `mcp_servers.playwright.args=${JSON.stringify([playwrightMcpEntrypoint, "--headless", "--isolated", "--browser", "chromium", "--allowed-hosts", "localhost,127.0.0.1", "--allowed-origins", origin])}`,
     );
   }
   args.push(prompt);

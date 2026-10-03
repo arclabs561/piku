@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::time::Duration;
 
 // ===========================================================================
@@ -155,6 +156,7 @@ impl From<vt100::Color> for Color {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // Terminal attributes are independent, not states.
 pub struct StyledCell {
     pub ch: String,
     pub bold: bool,
@@ -189,7 +191,7 @@ impl ScreenSnapshot {
         if r < self.rows.len() {
             &self.rows[r]
         } else {
-            self.rows.last().map(|s| s.as_str()).unwrap_or("")
+            self.rows.last().map_or("", String::as_str)
         }
     }
 
@@ -228,14 +230,14 @@ impl ScreenSnapshot {
         let visible: Vec<&str> = self
             .rows
             .iter()
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .filter(|l| !l.trim().is_empty())
             .collect();
 
         let mut out = String::new();
         for (i, line) in visible.iter().enumerate() {
             if i >= max_lines {
-                out.push_str(&format!("  ... ({} more lines)\n", visible.len() - i));
+                let _ = writeln!(out, "  ... ({} more lines)", visible.len() - i);
                 break;
             }
             let truncated = safe_truncate(line, 120);

@@ -34,6 +34,20 @@ the observed outcome, its consequence, and the smallest useful next probe.
 This is bounded observational self-talk, not hidden chain-of-thought. Preserve
 surprises and disconfirmed expectations, and bind every probe to evidence.
 
+Work as an explicit **observe → act → verify** loop. At the start of each
+meaningful phase, take a fresh, minimal observation of the relevant card or
+control and state the predicate that would make the next action worthwhile.
+Choose the smallest permitted interaction that tests it, then make a separate
+fresh observation of the resulting state before continuing. A click, edit,
+submit, reload, rerun, drag, resize, or cancel is an action; a snapshot,
+targeted DOM predicate, screenshot, console query, or network query is an
+observation. Do not treat a successful action call as verification. Keep every
+user-visible mutation semantically atomic: never combine submit, reload,
+rerun, or cancellation with its verification in one browser-code call. When
+the expected state is not present, record that gap and either run the smallest
+discriminating probe or mark the claim not tested; do not search for a more
+favorable interpretation.
+
 Before reload, select a named card and record a semantic selected-state predicate
 as `true`; a border color or screenshot alone is insufficient. Treat focus and
 selection as transient interaction state unless the product explicitly documents

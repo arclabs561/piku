@@ -53,6 +53,8 @@ use std::time::{Duration, Instant, SystemTime};
 mod playground;
 #[path = "agentic/playground_ledger.rs"]
 mod playground_ledger;
+#[path = "agentic/recording.rs"]
+mod recording;
 #[path = "agentic/recursive_observer.rs"]
 mod recursive_observer;
 #[path = "agentic/scenario.rs"]
@@ -68,6 +70,7 @@ use playground_ledger::{
     ReviewClaimRecord, ReviewRecord, RunEvidenceRecord, ScenarioContractRecord, SpendRecord,
     TurnRecord, EVALUATION_CONTRACT, EVALUATION_STAGE_ID, EVALUATOR_VERSION,
 };
+use recording::TuiRecording;
 use recursive_observer::RecursiveReview;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +92,21 @@ fn is_enabled() -> bool {
 
 fn piku_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_piku"))
+}
+
+fn evaluation_review_root() -> PathBuf {
+    if let Some(configured) = std::env::var_os("PIKU_EVAL_REVIEW_DIR") {
+        return PathBuf::from(configured);
+    }
+    if let Some(cache_root) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(cache_root).join("piku/eval-review");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Caches/piku/eval-review");
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target/eval-review")
 }
 
 fn has_key(var: &str) -> bool {
@@ -987,6 +1005,7 @@ struct PtyHandle {
     permission_response: PermissionResponse,
     permission_events: Vec<String>,
     spend: Arc<RunSpend>,
+    recording: Option<TuiRecording>,
 }
 
 /// The explicit response used when the observed terminal asks for permission.
@@ -1098,6 +1117,30 @@ impl PtyHandle {
             permission_response: PermissionResponse::from_env(),
             permission_events: Vec::new(),
             spend,
+            recording: None,
+        }
+    }
+
+    fn start_recording(&mut self, directory: &Path, title: &str) -> std::io::Result<()> {
+        let (recording, paths) = TuiRecording::create(directory, 40, 120, title, false)?;
+        eprintln!("[agentic_user] replay: {}", paths.cast.display());
+        eprintln!("[agentic_user] annotations: {}", paths.trace.display());
+        self.recording = Some(recording);
+        Ok(())
+    }
+
+    fn finish_recording(&mut self) -> std::io::Result<()> {
+        match self.recording.take() {
+            Some(recording) => recording.finish(),
+            None => Ok(()),
+        }
+    }
+
+    fn annotate(&mut self, label: &str, value: &serde_json::Value) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .annotation(label, value)
+                .expect("agentic-user recording annotation must be written");
         }
     }
 
@@ -1108,6 +1151,11 @@ impl PtyHandle {
 
     /// Send raw bytes to the PTY
     fn send_bytes(&mut self, bytes: &[u8]) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .input(bytes)
+                .expect("agentic-user recording input must be written");
+        }
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
@@ -1126,12 +1174,18 @@ impl PtyHandle {
     /// Execute an action, feeding output to the terminal observer.
     /// Returns after a short settle time.
     fn execute_action(&mut self, action: &Action, observer: &mut TerminalObserver) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .action(action)
+                .expect("agentic-user recording action must be written");
+        }
         match action {
             Action::Type(c) => {
                 let mut buf = [0u8; 4];
                 let bytes = c.encode_utf8(&mut buf);
                 self.send_bytes(bytes.as_bytes());
                 self.settle(observer, Duration::from_millis(30));
+                self.record_observation("after_type", observer);
             }
             Action::Key(key) => {
                 self.send_bytes(key.as_bytes());
@@ -1142,13 +1196,16 @@ impl PtyHandle {
                     _ => Duration::from_millis(30),
                 };
                 self.settle(observer, settle);
+                self.record_observation("after_key", observer);
             }
             Action::Observe => {
                 self.drain(observer);
+                self.record_observation("explicit", observer);
             }
             Action::Wait(d) => {
                 std::thread::sleep(*d);
                 self.drain(observer);
+                self.record_observation("after_wait", observer);
             }
             Action::TypeString { text, delay_ms } => {
                 for c in text.chars() {
@@ -1157,11 +1214,13 @@ impl PtyHandle {
                     self.send_bytes(bytes.as_bytes());
                     std::thread::sleep(Duration::from_millis(*delay_ms));
                     self.drain(observer);
+                    self.record_observation("during_type_text", observer);
                 }
             }
             Action::Submit(s) => {
                 self.send_line(s);
                 self.settle(observer, Duration::from_millis(50));
+                self.record_observation("after_submit", observer);
             }
         }
     }
@@ -1177,6 +1236,11 @@ impl PtyHandle {
                     break;
                 }
                 Ok(n) => {
+                    if let Some(recording) = &mut self.recording {
+                        recording
+                            .output(&buf[..n])
+                            .expect("agentic-user recording output must be written");
+                    }
                     observer.process(&buf[..n]);
                     self.raw_capture.extend_from_slice(&buf[..n]);
                     total += n;
@@ -1229,6 +1293,14 @@ impl PtyHandle {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn record_observation(&mut self, reason: &str, observer: &TerminalObserver) {
+        if let Some(recording) = &mut self.recording {
+            recording
+                .observation(reason, &observer.snapshot())
+                .expect("agentic-user recording observation must be written");
         }
     }
 
@@ -2166,46 +2238,42 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
             description: "Developer testing the input/readline layer.",
             phases: vec![
                 Phase {
-                    name: "slash_help",
+                    name: "slash_completion",
                     scripted: vec![
-                        // Type '/' char-by-char and observe completion menu
                         Action::Type('/'),
-                        Action::Wait(Duration::from_millis(200)),
-                        Action::Observe,
-                        // Type 'h', 'e', 'l' to narrow completions
                         Action::TypeString {
                             text: "hel".into(),
                             delay_ms: 80,
                         },
-                        Action::Wait(Duration::from_millis(150)),
-                        Action::Observe,
-                        // Tab to complete
                         Action::Key(SpecialKey::Tab),
-                        Action::Wait(Duration::from_millis(150)),
                         Action::Observe,
-                        // Enter to execute
-                        Action::Key(SpecialKey::Enter),
                     ],
-                    focus: "Did typing '/' show anything (completion hint, menu)? \
-                            Did typing 'hel' narrow it? Did Tab fill in '/help'? \
-                            Did Enter show the help output?",
+                    focus: "Inspect the input row immediately after Tab, before Enter. Did '/hel' become '/help'? Do not infer completion from later help output.",
                     freeform_turns: 0,
                 },
                 Phase {
-                    name: "tab_completion",
+                    name: "slash_help_submit",
+                    scripted: vec![
+                        Action::Key(SpecialKey::Enter),
+                    ],
+                    focus: "After submitting the already-completed /help command, is the input buffer cleared and is help output visible?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "ambiguous_completion",
                     scripted: vec![
                         Action::Type('/'),
-                        Action::Type('s'),
-                        Action::Type('t'),
-                        Action::Wait(Duration::from_millis(100)),
+                        Action::Type('c'),
                         Action::Key(SpecialKey::Tab),
-                        Action::Wait(Duration::from_millis(200)),
                         Action::Observe,
-                        // Clear with Ctrl-U if we want to try something else
-                        Action::Key(SpecialKey::CtrlU),
                     ],
-                    focus: "Did '/st' + Tab complete to '/status'? Check the input row \
-                            contents after Tab.",
+                    focus: "Inspect '/c' immediately after Tab. It has multiple slash-command candidates, so the trace must show an explicit ambiguity/candidate state or preserve '/c'; it must not silently execute a command.",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "completion_cleanup",
+                    scripted: vec![Action::Key(SpecialKey::Escape), Action::Observe],
+                    focus: "After Esc, confirm the ambiguous completion/input buffer is cleared without executing a command.",
                     freeform_turns: 0,
                 },
                 Phase {
@@ -2220,6 +2288,49 @@ fn fixture_personas() -> HashMap<&'static str, Persona> {
                     focus: "Is the echoed user message visually distinct from the prompt? \
                             Check that the echo row has dim styling. Is the response helpful?",
                     freeform_turns: 1,
+                },
+            ],
+        },
+    );
+
+    // Keeps the inspectable-output workflow in the same keyboard-level harness
+    // as ordinary TUI usage. The first turn makes an addressable agent cell;
+    // the next two phases verify discovery and reopening without regenerating.
+    m.insert(
+        "cell_inspector",
+        Persona {
+            name: "cell_inspector",
+            description: "Developer revisiting durable output in the terminal.",
+            phases: vec![
+                Phase {
+                    name: "produce_cell",
+                    scripted: vec![Action::Submit("What is 2 + 2?".into())],
+                    focus: "Did piku produce a visible completed response and return to a ready prompt?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "list_cells",
+                    scripted: vec![Action::Submit("/cells".into())],
+                    focus: "Does /cells show a durable @@ reference for the completed earlier turn, with actor, status, and a readable output preview? It must not regenerate the answer.",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "reopen_cell",
+                    scripted: vec![Action::Submit("/cell @@1".into())],
+                    focus: "Does /cell @@1 reopen the first completed turn with its original prompt and output preview, while preserving a usable input prompt? It must not ask the model again.",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "list_activity",
+                    scripted: vec![Action::Submit("/activity".into())],
+                    focus: "Does /activity show durable ## references for the earlier local /cells and /cell commands, distinct from the agent turn's @@ output cell and without regenerating anything?",
+                    freeform_turns: 0,
+                },
+                Phase {
+                    name: "reopen_receipt",
+                    scripted: vec![Action::Submit("/receipt ##1".into())],
+                    focus: "Does /receipt ##1 reopen the /cells interaction with its command, action, and full retained result while preserving a usable input prompt?",
+                    freeform_turns: 0,
                 },
             ],
         },
@@ -2712,6 +2823,12 @@ can decide:
   rendering fault. Say that, rather than reporting it as piku doing nothing.
 - Layout, wrapping, spacing, colour, and cursor position are screen questions.
   The transcript cannot decide them.
+- A cell line shaped `@eN assistant_message · text` is the rendered preview
+  of that assistant output. Do not report missing cell output when that line
+  contains the text in question.
+- Raw PTY capture can contain both terminal input echo and Piku's semantic
+  scrollback echo. Treat duplicate text as a visual defect only when the
+  VT100-rendered screen itself shows it twice.
 
 When only the screen is available, say so in the observation rather than
 inferring what piku did from what was drawn.
@@ -3770,6 +3887,15 @@ fn run_agentic_session(persona: &Persona) {
         &[],
         Arc::clone(&spend),
     );
+    let recording_dir = PathBuf::from("target/agentic-recordings").join(format!(
+        "{}-{}",
+        persona.name,
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
+    ));
+    pty.start_recording(&recording_dir, &format!("Piku TUI: {}", persona.name))
+        .expect("agentic evaluation requires a writable recording bundle");
     let mut ws_observer = WorkspaceObserver::new(workspace.clone());
     let mut memory = ConversationMemory::new();
     let ua_llm = LlmClient::new(ua_spec, Arc::clone(&spend));
@@ -3993,19 +4119,23 @@ fn run_agentic_session(persona: &Persona) {
         let mut response_timed_out = false;
         for action in &phase.scripted {
             eprintln!("[agentic_user] scripted: {action}");
+            let is_submission =
+                matches!(action, Action::Submit(_) | Action::Key(SpecialKey::Enter));
+            let pre_contents = is_submission.then(|| observer.snapshot().contents.clone());
+            // A local slash command may render and return to ready during the
+            // short settle inside `execute_action`. Open its capture window
+            // before sending Enter so the evidence includes that immediate
+            // output, not just slower model turns.
+            if is_submission {
+                pty.clear_capture();
+            }
             pty.execute_action(action, &mut observer);
 
             // After Submit: wait for screen to change (thinking/response starts),
             // then wait for ready to come back (response complete).
-            if matches!(action, Action::Submit(_) | Action::Key(SpecialKey::Enter)) {
-                // Open the capture window at the turn boundary, before waiting
-                // for anything. Clearing after the first screen change also
-                // discarded whatever else arrived in that drain.
-                pty.clear_capture();
-
+            if let Some(pre_contents) = pre_contents {
                 // Phase 1: wait until screen changes from the pre-submit state
                 let change_started = Instant::now();
-                let pre_contents = observer.snapshot().contents.clone();
                 let change_deadline = change_started + Duration::from_secs(15);
                 loop {
                     pty.drain(&mut observer);
@@ -4157,11 +4287,30 @@ fn run_agentic_session(persona: &Persona) {
             format!(
                 "FULL OUTPUT:\n{}\n\nVISIBLE SCREEN:\n{}",
                 evidence_excerpt(&captured, 8_000),
-                snap_after.summary(10)
+                // The latest local-command output lives immediately above the
+                // pinned prompt, while help can occupy the top of the screen.
+                // A ten-row prefix therefore fabricates a disagreement between
+                // terminal capture and viewport. The PTY is only 40 rows, so
+                // include the whole visible grid for a faithful judgement.
+                snap_after.summary(40)
             )
         } else {
             snap_after.summary(30)
         };
+        // The transcript and condensed viewport can place footer text beside
+        // the prompt in a way a human terminal would not. Give the judge the
+        // emulator's cursor-addressed rows explicitly: this is the source of
+        // truth for whether typed input remains after a submitted command.
+        screen_for_llm.push_str(&format!(
+            "\nAUTHORITATIVE INPUT STATE (from the VT100 cursor row):\n\
+             INPUT ROW: {:?}\n\
+             FOOTER ROW: {:?}\n\
+             The literal placeholder `Send a message or /help` means the input is empty; \
+             it is not retained `/help` text. Do not infer input persistence from a footer \
+             hint or a flattened transcript.\n",
+            snap_after.input_row(),
+            snap_after.footer_row(),
+        ));
         if permission_events.is_empty() {
             screen_for_llm
                 .push_str("\nPERMISSION EVENTS: none detected by the terminal observer.\n");
@@ -4231,6 +4380,15 @@ fn run_agentic_session(persona: &Persona) {
             next_action: NextAction::Quit, // scripted phase, no next
         });
         if let Some(entry) = entries.last() {
+            pty.annotate(
+                "judge_phase",
+                &serde_json::json!({
+                    "phase": entry.phase,
+                    "action_recorded": true,
+                    "finding_count": entry.deterministic_findings.len(),
+                    "observation_count": entry.observations.len(),
+                }),
+            );
             append_playground_turn(
                 ledger.as_ref(),
                 persona,
@@ -4395,6 +4553,15 @@ fn run_agentic_session(persona: &Persona) {
                         next_action: NextAction::Quit,
                     });
                     if let Some(entry) = entries.last() {
+                        pty.annotate(
+                            "judge_freeform",
+                            &serde_json::json!({
+                                "phase": entry.phase,
+                                "action_recorded": true,
+                                "finding_count": entry.deterministic_findings.len(),
+                                "observation_count": entry.observations.len(),
+                            }),
+                        );
                         append_playground_turn(
                             ledger.as_ref(),
                             persona,
@@ -4423,6 +4590,13 @@ fn run_agentic_session(persona: &Persona) {
     // never make the evaluator's evidence and review depend on that reap.
     eprintln!("[agentic_user] sending /exit to piku...");
     pty.clear_capture();
+    // A scripted probe may intentionally leave text in the editor (for
+    // example, to inspect ambiguous tab completion). Clear that pending input
+    // before typing the harness teardown command; otherwise the trace records
+    // a fabricated command such as `/c/exit` and judges reason about cleanup
+    // noise instead of the interaction under evaluation.
+    pty.send_bytes(b"\x1b");
+    pty.settle(&mut observer, Duration::from_millis(100));
     pty.send_line("/exit");
     std::thread::sleep(Duration::from_millis(500));
     // piku names its session file on the way out. That file is the only
@@ -4434,6 +4608,57 @@ fn run_agentic_session(persona: &Persona) {
     let piku_session_source = piku_session_path
         .clone()
         .or_else(|| parse_session_path(&pty.captured_text()));
+    pty.finish_recording()
+        .expect("agentic evaluation requires a complete recording bundle");
+    // Keep a stable, human-reviewable bundle before the test harness cleans
+    // its transient recording directory. The standard `.cast` is replayable
+    // in asciinema, while the copied JSONL files expose the semantic evidence
+    // and judge context beside it.
+    let review_dir = evaluation_review_root().join(
+        recording_dir
+            .file_name()
+            .expect("recording directory has a name"),
+    );
+    std::fs::create_dir_all(&review_dir).expect("evaluation review directory is writable");
+    for file in ["session.cast", "trace.jsonl"] {
+        std::fs::copy(recording_dir.join(file), review_dir.join(file))
+            .expect("completed recording artifact is copied for review");
+    }
+    if let Some(source) = piku_session_source.as_deref() {
+        let source = Path::new(source);
+        if source.is_file() {
+            std::fs::copy(source, review_dir.join("session.json"))
+                .expect("piku session is copied for review");
+        }
+        if let Some(run_source) = run_record_path_for_session(source) {
+            if run_source.is_file() {
+                std::fs::copy(&run_source, review_dir.join("run.jsonl"))
+                    .expect("run record is copied for review");
+            }
+        }
+    }
+    std::fs::write(
+        review_dir.join("README.txt"),
+        "Piku evaluator review bundle\n\n\
+session.cast: replay with `asciinema play session.cast` or an asciinema-compatible viewer.\n\
+trace.jsonl: evaluator actions, screen observations, and judge annotations.\n\
+run.jsonl: durable Piku run record, when the evaluated session produced one.\n\
+session.json: saved conversation, when available.\n",
+    )
+    .expect("evaluation review readme is written");
+    let asset_reviewer =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("web-ui/scripts/evaluation-asset-review.mjs");
+    let review_status = Command::new("node")
+        .arg(asset_reviewer)
+        .arg("tui")
+        .arg(&review_dir)
+        .status()
+        .expect("evaluation review requires the local Node asset reviewer");
+    assert!(
+        review_status.success(),
+        "evaluation asset review packet was not written"
+    );
+    eprintln!("[agentic_user] review bundle: {}", review_dir.display());
     eprintln!("[agentic_user] dropping PTY handle (detached)...");
     std::thread::spawn(move || drop(pty));
     eprintln!("[agentic_user] generating report...");
@@ -4446,34 +4671,44 @@ fn run_agentic_session(persona: &Persona) {
     let mut compact_projection_lines = 0;
     let mut raw_record_bytes = 0;
     if let (Some(source), Some(ledger)) = (&piku_session_source, &ledger) {
-        match ledger.copy_piku_session(Path::new(source)) {
-            Ok(path) => {
-                eprintln!("[playground] piku session: {}", path.display());
-                piku_session_copy = path.display().to_string();
+        if Path::new(source).is_file() {
+            match ledger.copy_piku_session(Path::new(source)) {
+                Ok(path) => {
+                    eprintln!("[playground] piku session: {}", path.display());
+                    piku_session_copy = path.display().to_string();
+                }
+                Err(error) => eprintln!("[playground] could not copy piku session: {error}"),
             }
-            Err(error) => eprintln!("[playground] could not copy piku session: {error}"),
-        }
-        // The trace sits beside the session under the same id, and carries the
-        // timing the session does not: how long each provider stream took.
-        // Without it a slow turn and a hung turn look identical.
-        let trace_source = Path::new(source)
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| {
-                root.join("traces")
-                    .join(Path::new(source).file_stem().map_or_else(
-                        || "unknown".into(),
-                        |stem| format!("{}.jsonl", stem.to_string_lossy()),
-                    ))
-            });
-        if let Some(trace_source) = trace_source {
-            match ledger.copy_piku_trace(&trace_source) {
-                Ok(path) => eprintln!("[playground] piku trace: {}", path.display()),
-                Err(error) => eprintln!(
-                    "[playground] could not copy piku trace from {}: {error}",
-                    trace_source.display()
-                ),
+            // The trace sits beside the session under the same id, and carries the
+            // timing the session does not: how long each provider stream took.
+            // Without it a slow turn and a hung turn look identical.
+            let trace_source = Path::new(source)
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(|root| {
+                    root.join("traces")
+                        .join(Path::new(source).file_stem().map_or_else(
+                            || "unknown".into(),
+                            |stem| format!("{}.jsonl", stem.to_string_lossy()),
+                        ))
+                });
+            if let Some(trace_source) = trace_source {
+                if trace_source.is_file() {
+                    match ledger.copy_piku_trace(&trace_source) {
+                        Ok(path) => eprintln!("[playground] piku trace: {}", path.display()),
+                        Err(error) => eprintln!(
+                            "[playground] could not copy piku trace from {}: {error}",
+                            trace_source.display()
+                        ),
+                    }
+                } else {
+                    eprintln!("[playground] piku trace not produced for this command-only session");
+                }
             }
+        } else {
+            eprintln!(
+                "[playground] piku session and trace not produced for this command-only session"
+            );
         }
     } else {
         eprintln!("[playground] piku did not report a session file on exit");
@@ -4481,20 +4716,21 @@ fn run_agentic_session(persona: &Persona) {
 
     if let Some(source) = piku_session_source.as_deref() {
         if let Some(run_source) = run_record_path_for_session(Path::new(source)) {
-            match piku_runtime::read_run_record(&run_source) {
-                Ok(events) if events.is_empty() => run_evidence_findings.push(format!(
-                    "[harness:MAJOR] piku's durable run record is empty: {}",
-                    run_source.display()
-                )),
-                Ok(events) => {
-                    let audit = piku_runtime::audit_run_record(&events);
-                    let compact_projection = piku::run_view::render_text(&events);
-                    compact_projection_chars = compact_projection.chars().count();
-                    compact_projection_lines = compact_projection.lines().count();
-                    raw_record_bytes = std::fs::metadata(&run_source)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    eprintln!(
+            if run_source.is_file() {
+                match piku_runtime::read_run_record(&run_source) {
+                    Ok(events) if events.is_empty() => run_evidence_findings.push(format!(
+                        "[harness:MAJOR] piku's durable run record is empty: {}",
+                        run_source.display()
+                    )),
+                    Ok(events) => {
+                        let audit = piku_runtime::audit_run_record(&events);
+                        let compact_projection = piku::run_view::render_text(&events);
+                        compact_projection_chars = compact_projection.chars().count();
+                        compact_projection_lines = compact_projection.lines().count();
+                        raw_record_bytes = std::fs::metadata(&run_source)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        eprintln!(
                         "[run-evidence] turns {}/{}, tools {}/{}, permissions {}, context {} selected/{} excluded, findings {}",
                         audit.completed_turn_count,
                         audit.turn_count,
@@ -4505,22 +4741,22 @@ fn run_agentic_session(persona: &Persona) {
                         audit.context.messages_excluded,
                         audit.findings.len(),
                     );
-                    run_evidence_findings.extend(
-                        audit
-                            .findings
-                            .iter()
-                            .filter(|finding| {
-                                finding.severity == piku_runtime::AuditSeverity::Error
-                            })
-                            .map(|finding| {
-                                format!(
-                                    "[run-evidence:MAJOR] {} — {} (sequences {:?})",
-                                    finding.code, finding.message, finding.sequences
-                                )
-                            }),
-                    );
-                    if let Some(ledger) = &ledger {
-                        match ledger.copy_piku_run(&run_source) {
+                        run_evidence_findings.extend(
+                            audit
+                                .findings
+                                .iter()
+                                .filter(|finding| {
+                                    finding.severity == piku_runtime::AuditSeverity::Error
+                                })
+                                .map(|finding| {
+                                    format!(
+                                        "[run-evidence:MAJOR] {} — {} (sequences {:?})",
+                                        finding.code, finding.message, finding.sequences
+                                    )
+                                }),
+                        );
+                        if let Some(ledger) = &ledger {
+                            match ledger.copy_piku_run(&run_source) {
                             Ok(path) => {
                                 piku_run_record_copy = path.display().to_string();
                                 eprintln!(
@@ -4547,13 +4783,16 @@ fn run_agentic_session(persona: &Persona) {
                                 run_source.display()
                             )),
                         }
+                        }
+                        run_evidence_audit = Some(audit);
                     }
-                    run_evidence_audit = Some(audit);
+                    Err(error) => run_evidence_findings.push(format!(
+                        "[harness:MAJOR] could not read piku's durable run record at {}: {error}",
+                        run_source.display()
+                    )),
                 }
-                Err(error) => run_evidence_findings.push(format!(
-                    "[harness:MAJOR] could not read piku's durable run record at {}: {error}",
-                    run_source.display()
-                )),
+            } else {
+                eprintln!("[run-evidence] no durable run record was produced for this command-only session");
             }
         } else {
             run_evidence_findings.push(
@@ -5875,6 +6114,19 @@ fn agentic_user_input_explorer() {
     );
     let ps = personas();
     run_agentic_session(ps.get("input_explorer").unwrap());
+}
+
+#[test]
+#[serial(agentic)]
+#[ignore = "live agentic-user harness; run with `cargo test --test agentic_user -- --ignored` and a provider"]
+fn agentic_user_cell_inspector() {
+    assert!(
+        is_enabled(),
+        "agentic_user is opt-in (run with --ignored) and needs a provider: \
+         run Ollama locally, or set OPENROUTER_API_KEY / ANTHROPIC_API_KEY"
+    );
+    let ps = personas();
+    run_agentic_session(ps.get("cell_inspector").unwrap());
 }
 
 #[test]

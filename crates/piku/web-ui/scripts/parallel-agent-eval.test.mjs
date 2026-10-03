@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, buildPromptManifest, codexExitFailureClass, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest, writeSynthesisFocusProposals } from "./parallel-agent-eval.mjs";
+import { PLAYWRIGHT_TOOLS, attestEvidenceArtifacts, browserToolRetryLimit, buildPromptManifest, codexExitFailureClass, explorerAttemptDirectory, explorerCallBudget, explorerHardCallLimit, explorerIdentity, explorerReportOutcome, loadValidatedExplorerRun, nextSynthesisAttemptDir, playwrightAuthorityViolation, prepareEvaluationFocus, renderBoundedSynthesisPrompt, renderExplorerPrompt, renderRolePrompt, restrictSynthesisPrompt, safeRunId, screenshotProducerIndex, subjectStateHash, traceAuthorityViolation, validateExplorerReport, validateSynthesis, withPlaywrightAuthority, writeRunManifest, writeSynthesisFocusProposals } from "./parallel-agent-eval.mjs";
 import { attestedFiles, attestedValue, writePromptManifest } from "./evaluation-prompt-manifest.mjs";
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +73,15 @@ test("explorers get working budgets inside a separate hard runaway limit", () =>
   assert.equal(explorerHardCallLimit({ PIKU_EXPLORER_HARD_MAX_CALLS: "72" }), 72);
 });
 
+test("browser-tool recovery has one bounded retained retry directory", () => {
+  assert.equal(browserToolRetryLimit({}), 1);
+  assert.equal(browserToolRetryLimit({ PIKU_BROWSER_TOOL_RETRIES: "0" }), 0);
+  assert.throws(() => browserToolRetryLimit({ PIKU_BROWSER_TOOL_RETRIES: "2" }), /0 or 1/);
+  assert.equal(explorerAttemptDirectory("/tmp/run", "recovery"), "/tmp/run/recovery");
+  assert.equal(explorerAttemptDirectory("/tmp/run", "recovery", 2), "/tmp/run/recovery/retry-002");
+  assert.throws(() => explorerAttemptDirectory("/tmp/run", "recovery", 3), /1 or 2/);
+});
+
 test("Codex usage exhaustion is classified as evaluator quota", () => {
   const trace = `${JSON.stringify({ type: "error", message: "You've hit your usage limit. Purchase more credits." })}\n`;
   assert.equal(codexExitFailureClass(trace), "evaluator_quota");
@@ -87,6 +96,10 @@ test("a blocked explorer cannot authorize product synthesis", () => {
   assert.deepEqual(explorerReportOutcome({ status: "completed" }), {
     runStatus: "completed",
     failureClass: "none",
+  });
+  assert.deepEqual(explorerReportOutcome({ status: "blocked" }, { browserCalls: 0 }), {
+    runStatus: "inconclusive",
+    failureClass: "browser_tool_unavailable",
   });
 });
 
@@ -183,13 +196,21 @@ test("screenshot producer index normalizes relative event filenames", () => {
 });
 
 test("Playwright authority config omits unsafe code and pins an output directory", () => {
-  const args = ["exec", "--config", 'mcp_servers.playwright.args=["playwright-mcp"]', "prompt"];
+  const args = [
+    "exec", "--config", 'mcp_servers.playwright.command="npx"', "--config",
+    'mcp_servers.playwright.args=["--no-install","playwright-mcp"]', "prompt",
+  ];
   const hardened = withPlaywrightAuthority(args, "/tmp/piku-role-output");
   const encoded = hardened.join("\n");
   assert.match(encoded, /--output-dir/);
   assert.match(encoded, /enabled_tools=/);
   assert.equal(PLAYWRIGHT_TOOLS.includes("browser_run_code_unsafe"), false);
   assert.equal(encoded.includes("browser_run_code_unsafe"), false);
+  const setting = hardened.find((arg) => arg.startsWith("mcp_servers.playwright.args="));
+  const configured = JSON.parse(setting.slice(setting.indexOf("=") + 1));
+  const separator = configured.indexOf("--");
+  assert.equal(configured[separator + 1], "npx");
+  assert.deepEqual(configured.slice(separator + 2, separator + 4), ["--no-install", "playwright-mcp"]);
 });
 
 test("explorer prompt and Playwright MCP use the exact same output directory", () => {
@@ -535,7 +556,7 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   assert.match(codexRuntime, /--ephemeral/);
   assert.match(codexRuntime, /--ignore-user-config/);
   assert.match(codexRuntime, /--ignore-rules/);
-  assert.match(codexRuntime, /playwright-mcp/);
+  assert.match(codexRuntime, /@playwright.*mcp.*cli\.js/);
   for (const file of ["explorer-coding-trace.md", "explorer-recovery.md", "synthesis.md", "explorer-report.schema.json", "synthesis-report.schema.json"])
     await readFile(path.join(webUiDir, "e2e", file), "utf8");
   const synthesisPrompt = await readFile(path.join(webUiDir, "e2e", "synthesis.md"), "utf8");
@@ -609,6 +630,25 @@ test("run manifest safely indexes an absolute screenshot below the run", async (
   }));
   const manifest = await writeRunManifest(root, "run-absolute", [{ role: "recovery", runStatus: "harness_failure" }], null, null, promptManifestReference);
   assert.deepEqual(manifest.explorers.recovery.screenshots, ["recovery/playwright-output/after.png"]);
+});
+
+test("run manifest points at an effective retry without erasing the first attempt", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-eval-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = path.join(root, "recovery");
+  const retry = path.join(first, "retry-002");
+  await mkdir(retry, { recursive: true });
+  await writeFile(path.join(first, "evidence.json"), "original attempt");
+  await writeFile(path.join(retry, "evidence.json"), JSON.stringify({ evidence: [] }));
+  await writeFile(path.join(retry, "events.jsonl"), "");
+  const manifest = await writeRunManifest(root, "retry-run", [{
+    role: "recovery", runStatus: "completed", attempt: 2,
+    reportPath: path.join(retry, "evidence.json"), eventsPath: path.join(retry, "events.jsonl"),
+  }], null, null, promptManifestReference);
+  assert.equal(manifest.explorers.recovery.evidence, "recovery/retry-002/evidence.json");
+  assert.equal(manifest.explorers.recovery.events, "recovery/retry-002/events.jsonl");
+  assert.equal(manifest.explorers.recovery.attempt, 2);
+  assert.equal(await readFile(path.join(first, "evidence.json"), "utf8"), "original attempt");
 });
 
 async function writeResumeFixture(root, runId, statuses = { coding_trace: "completed", recovery: "completed" }) {
@@ -687,6 +727,26 @@ test("resume loader accepts only canonical completed explorer packets", async (t
   await assert.rejects(loadValidatedExplorerRun(root, "run-1"), /requires completed explorer: recovery/);
 });
 
+test("resume loader accepts only the retained canonical retry path", async (t) => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-resume-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeResumeFixture(root, "run-retry");
+  const retry = path.join(root, "recovery", "retry-002");
+  await mkdir(path.join(retry, "playwright-output"), { recursive: true });
+  await writeFile(path.join(retry, "evidence.json"), await readFile(path.join(root, "recovery", "evidence.json")));
+  await writeFile(path.join(retry, "events.jsonl"), await readFile(path.join(root, "recovery", "events.jsonl")));
+  const manifestPath = path.join(root, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.explorers.recovery.evidence = "recovery/retry-002/evidence.json";
+  manifest.explorers.recovery.events = "recovery/retry-002/events.jsonl";
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const loaded = await loadValidatedExplorerRun(root, "run-retry");
+  assert.equal(loaded.packetPaths[1], path.join(retry, "evidence.json"));
+  manifest.explorers.recovery.evidence = "recovery/retry-003/evidence.json";
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  await assert.rejects(loadValidatedExplorerRun(root, "run-retry"), /noncanonical explorer paths: recovery/);
+});
+
 test("resume attempts are numbered and never clobber prior synthesis output", async (t) => {
   const root = await mkdtemp(path.join(process.env.TMPDIR || "/tmp", "piku-attempt-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -755,4 +815,9 @@ test("evaluator prompts treat product strings as untrusted and keep cancellation
   assert.match(recovery, /selection as transient interaction state/);
   assert.match(recovery, /minimal dedicated predicate proving that turn is running and its stop/);
   assert.match(recovery, /In separate observations/);
+  for (const prompt of [coding, recovery]) {
+    assert.match(prompt, /observe → act → verify/);
+    assert.match(prompt, /Do not treat a successful action call as verification/);
+    assert.match(prompt, /semantically atomic/);
+  }
 });
