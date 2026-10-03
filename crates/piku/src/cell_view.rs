@@ -50,10 +50,14 @@ pub fn raw_output(
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "unknown cell reference")
         })?;
+    // An agent turn's output is its final answer; a shell cell has one item.
     let content = cell
         .items
         .iter()
-        .find_map(|item| item.content.as_ref())
+        .rev()
+        .find(|item| item.kind == "assistant_message")
+        .and_then(|item| item.content.as_ref())
+        .or_else(|| cell.items.iter().find_map(|item| item.content.as_ref()))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cell has no output"))?;
     match content {
         ContentRef::Inline { text } => Ok(text.clone()),
@@ -167,6 +171,52 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    fn turn_event(sequence: u64, event: RunEvent) -> RunEventEnvelope {
+        RunEventEnvelope {
+            schema_version: RUN_RECORD_SCHEMA_VERSION,
+            sequence,
+            recorded_at_ms: 0,
+            session_id: "session-1".to_string(),
+            scope: piku_runtime::RunEventScope::Turn {
+                turn_id: "turn-1".to_string(),
+            },
+            event,
+        }
+    }
+
+    #[test]
+    fn raw_output_of_agent_turn_is_final_assistant_message() {
+        let inline = |text: &str| RunContentRef::Inline {
+            text: text.to_string(),
+        };
+        let events = [
+            turn_event(
+                0,
+                RunEvent::TurnStarted {
+                    provider: None,
+                    model: "model".to_string(),
+                    input: inline("prompt"),
+                },
+            ),
+            turn_event(
+                1,
+                RunEvent::AssistantMessage {
+                    content: inline("working on it"),
+                },
+            ),
+            turn_event(
+                2,
+                RunEvent::AssistantMessage {
+                    content: inline("final answer"),
+                },
+            ),
+        ];
+        assert_eq!(
+            raw_output(&events, Path::new("run.jsonl"), "@@1").unwrap(),
+            "final answer"
         );
     }
 

@@ -622,3 +622,168 @@ fn print_headless_writes_trace_with_paired_ids() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Headless run against a canned OpenAI-compatible server
+// ---------------------------------------------------------------------------
+
+/// Serve canned streaming completions on a local port and record each request
+/// body. The server thread lives until the test process exits.
+fn fake_completions_server(
+    answer_chunks: &'static [&'static str],
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&bodies);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (header_end, content_length) = loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break (request.len(), 0);
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            recorded
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request[header_end..]).into_owned());
+            let mut response = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for data in answer_chunks {
+                response.push_str("data: ");
+                response.push_str(data);
+                response.push_str("\n\n");
+            }
+            response.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base_url, bodies)
+}
+
+/// One headless turn against the canned server, returning its output and the
+/// session id parsed from the "session saved" line.
+fn run_headless_turn(config: &std::path::Path, base_url: &str) -> (Output, String) {
+    let out = piku_clean_env()
+        .args(["-p", "say hello"])
+        .env("XDG_CONFIG_HOME", config)
+        .env("PIKU_BASE_URL", base_url)
+        .env("PIKU_API_KEY", "test-key")
+        .env("PIKU_MODEL", "canned-model")
+        .current_dir(config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    let session_id = err
+        .lines()
+        .find_map(|line| line.split("sessions/").nth(1))
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .unwrap_or_else(|| panic!("no session id in stderr: {err}"))
+        .to_string();
+    (out, session_id)
+}
+
+const CANNED_ANSWER: &[&str] = &[
+    r#"{"choices":[{"delta":{"content":"hello **there**"},"finish_reason":null}]}"#,
+    r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
+];
+
+#[test]
+fn headless_output_to_a_pipe_has_no_escape_sequences_and_reports_usage() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let (out, _) = run_headless_turn(config.path(), &base_url);
+
+    let text = stdout(&out);
+    assert!(
+        !text.contains('\x1b'),
+        "stdout is not a terminal but contains escapes: {text:?}"
+    );
+    assert!(text.contains("hello"), "answer missing: {text:?}");
+    assert!(text.contains("7↑ 3↓ tokens"), "usage missing: {text:?}");
+    assert!(
+        stderr(&out).contains("tool calls run without prompting"),
+        "headless approval policy not announced: {}",
+        stderr(&out)
+    );
+    let bodies = bodies.lock().unwrap();
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(request["stream_options"]["include_usage"], true);
+}
+
+#[test]
+fn inspect_selectors_imply_their_listing_and_raw_is_the_final_answer() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, _) = fake_completions_server(CANNED_ANSWER);
+    let (_, session_id) = run_headless_turn(config.path(), &base_url);
+    let inspect = |args: &[&str]| {
+        piku_clean_env()
+            .arg("inspect")
+            .arg(&session_id)
+            .args(args)
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+
+    let cell = inspect(&["--cell", "@@1"]);
+    assert!(cell.status.success(), "stderr: {}", stderr(&cell));
+    assert!(stdout(&cell).starts_with("@@1 ·"), "{}", stdout(&cell));
+
+    let raw = inspect(&["--raw", "@@1"]);
+    assert!(raw.status.success(), "stderr: {}", stderr(&raw));
+    assert_eq!(stdout(&raw), "hello **there**");
+
+    let activity = inspect(&["--activity"]);
+    assert!(activity.status.success());
+    assert_eq!(stdout(&activity), "");
+    assert!(
+        stderr(&activity).contains("no interaction receipts"),
+        "empty listing is silent: {}",
+        stderr(&activity)
+    );
+}
+
+#[test]
+fn subcommand_help_omits_top_level_only_flags() {
+    for subcommand in ["inspect", "conclude", "web", "providers"] {
+        let out = piku_clean_env()
+            .args([subcommand, "--help"])
+            .output()
+            .unwrap();
+        let help = stdout(&out);
+        for flag in ["--read-only", "--print", "--resume"] {
+            assert!(
+                !help.contains(flag),
+                "`piku {subcommand} --help` lists {flag}:\n{help}"
+            );
+        }
+    }
+}

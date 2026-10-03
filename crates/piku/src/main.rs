@@ -7,7 +7,7 @@ use piku::trace::TraceWriter;
 use piku::tui_repl;
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use piku_runtime::{
     build_system_prompt, run_turn, OutputSink, PermissionOutcome, PermissionPrompter,
@@ -156,12 +156,9 @@ fn inspect_run(
     if events.is_empty() {
         anyhow::bail!("no durable run record found at {}", path.display());
     }
-    if selected_cell.is_some() && !cells {
-        anyhow::bail!("--cell requires --cells");
-    }
-    if selected_receipt.is_some() && !activity {
-        anyhow::bail!("--receipt requires --activity");
-    }
+    // Selecting one item implies the listing it belongs to.
+    let cells = cells || selected_cell.is_some();
+    let activity = activity || selected_receipt.is_some();
     if cells && activity {
         anyhow::bail!("--cells and --activity cannot be combined");
     }
@@ -230,6 +227,9 @@ fn inspect_run(
             println!("{}", serde_json::to_string_pretty(&selected_cells)?);
         }
         InspectFormat::Text if activity => {
+            if selected_receipts.is_empty() {
+                eprintln!("no interaction receipts recorded for {session_id}");
+            }
             print!(
                 "{}",
                 piku::receipt_view::render_receipts_text(&selected_receipts)
@@ -407,6 +407,10 @@ async fn run_single_shot(
         eprintln!("[piku] read-only mode: file-inspection tools only");
         piku_tools::read_only_tool_definitions()
     } else {
+        eprintln!(
+            "[piku] tool calls run without prompting; {} deny rule(s) from settings.toml apply",
+            config.deny.len()
+        );
         all_tool_definitions()
     };
     let prompter = ConfiguredAllowAll::new(&config.deny);
@@ -506,15 +510,32 @@ struct StdoutSink {
     stdout: io::Stdout,
     trace: TraceWriter,
     md: piku::markdown::StreamingMarkdown,
+    color: bool,
 }
 
 impl StdoutSink {
     fn new(trace: TraceWriter) -> Self {
+        let stdout = io::stdout();
+        let color = stdout.is_terminal() && env::var_os("NO_COLOR").is_none();
         Self {
-            stdout: io::stdout(),
+            stdout,
             trace,
             md: piku::markdown::StreamingMarkdown::new_stdout(),
+            color,
         }
+    }
+
+    /// Write rendered output, dropping escape sequences when stdout is a file,
+    /// a pipe, or `NO_COLOR` is set.
+    fn emit(&mut self, text: &str) {
+        if self.color {
+            let _ = self.stdout.write_all(text.as_bytes());
+        } else {
+            let _ = self
+                .stdout
+                .write_all(piku::markdown::strip_ansi(text).as_bytes());
+        }
+        let _ = self.stdout.flush();
     }
 }
 
@@ -522,8 +543,7 @@ impl OutputSink for StdoutSink {
     fn on_text(&mut self, text: &str) {
         let rendered = self.md.push(text);
         if !rendered.is_empty() {
-            let _ = self.stdout.write_all(rendered.as_bytes());
-            let _ = self.stdout.flush();
+            self.emit(&rendered);
         }
         self.trace.text_chunk(text);
     }
@@ -531,7 +551,7 @@ impl OutputSink for StdoutSink {
     fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value) {
         let flushed = self.md.flush();
         if !flushed.is_empty() {
-            let _ = self.stdout.write_all(flushed.as_bytes());
+            self.emit(&flushed);
         }
         let args = piku::format_tool_input(tool_name, input);
         let line = if args.is_empty() {
@@ -539,8 +559,7 @@ impl OutputSink for StdoutSink {
         } else {
             format!("\n\x1b[2m[{tool_name} {args} …]\x1b[0m")
         };
-        let _ = writeln!(self.stdout, "{line}");
-        let _ = self.stdout.flush();
+        self.emit(&format!("{line}\n"));
 
         self.trace.tool_start(tool_name, tool_id, input);
     }
@@ -562,11 +581,9 @@ impl OutputSink for StdoutSink {
         } else {
             result.to_string()
         };
-        let _ = writeln!(
-            self.stdout,
-            "\x1b[2m[{tool_name} → {tag}]\x1b[0m\n{preview}\n"
-        );
-        let _ = self.stdout.flush();
+        self.emit(&format!(
+            "\x1b[2m[{tool_name} → {tag}]\x1b[0m\n{preview}\n\n"
+        ));
 
         self.trace.tool_end(tool_name, tool_id, result, !is_error);
 
@@ -581,25 +598,21 @@ impl OutputSink for StdoutSink {
     }
 
     fn on_permission_denied(&mut self, tool_name: &str, reason: &str) {
-        let _ = writeln!(
-            self.stdout,
-            "\x1b[33m[permission denied: {tool_name}]\x1b[0m {reason}"
-        );
-        let _ = self.stdout.flush();
+        self.emit(&format!(
+            "\x1b[33m[permission denied: {tool_name}]\x1b[0m {reason}\n"
+        ));
         self.trace.permission_denied(tool_name, reason);
     }
 
     fn on_turn_complete(&mut self, usage: &TokenUsage, iterations: u32) {
         let flushed = self.md.flush();
         if !flushed.is_empty() {
-            let _ = self.stdout.write_all(flushed.as_bytes());
+            self.emit(&flushed);
         }
-        let _ = writeln!(
-            self.stdout,
-            "\n\x1b[2m[{iterations} iter · {}↑ {}↓ tokens]\x1b[0m",
+        self.emit(&format!(
+            "\n\x1b[2m[{iterations} iter · {}↑ {}↓ tokens]\x1b[0m\n",
             usage.input_tokens, usage.output_tokens
-        );
-        let _ = self.stdout.flush();
+        ));
         self.trace
             .turn_end(iterations, usage.input_tokens, usage.output_tokens);
     }

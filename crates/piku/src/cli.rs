@@ -27,26 +27,17 @@ pub struct Cli {
     )]
     pub provider: Option<String>,
 
-    #[arg(
-        long,
-        global = true,
-        help = "Run with file-inspection tools only, then exit"
-    )]
+    #[arg(long, help = "Run with file-inspection tools only, then exit")]
     pub read_only: bool,
 
     #[arg(
         short = 'p',
         long = "print",
-        global = true,
-        help = "Headless: run the prompt, print the result, and exit"
+        help = "Headless: run the prompt, print the result, and exit. Tool calls run without prompting except those matching deny rules in settings.toml"
     )]
     pub print: bool,
 
-    #[arg(
-        long,
-        global = true,
-        help = "Resume a previous session by ID (partial match ok)"
-    )]
+    #[arg(long, help = "Resume a previous session by ID (partial match ok)")]
     pub resume: Option<String>,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]

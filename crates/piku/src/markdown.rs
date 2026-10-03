@@ -474,29 +474,32 @@ fn try_strip_ordered_item(line: &str) -> Option<(usize, &str, &str)> {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+/// Remove CSI escape sequences (colour, cursor) so output piped to a file or
+/// another program is plain text.
+#[must_use]
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-            } else {
-                out.push(ch);
-            }
-        }
-        out
-    }
 
     #[test]
     fn heading_rendered() {
