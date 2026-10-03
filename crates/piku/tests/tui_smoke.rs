@@ -102,8 +102,12 @@ impl Pty {
         S: AsRef<std::ffi::OsStr>,
     {
         let mut cmd = Command::new(piku_binary());
-        cmd.args(args)
-            .current_dir(cwd)
+        cmd.args(args);
+        Self::spawn_command(cmd, cwd)
+    }
+
+    fn spawn_command(mut cmd: Command, cwd: &std::path::Path) -> Self {
+        cmd.current_dir(cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -391,6 +395,45 @@ fn read_only_flag_starts_read_only_tui() {
         !blocked_path.exists(),
         "read-only shell escape created {}",
         blocked_path.display()
+    );
+    pty.exit_cleanly();
+}
+
+/// Output already on screen when `piku` starts (a shell session, earlier
+/// command output) must scroll away, not stay behind to be drawn over without
+/// being erased. `setup_layout` used to park the cursor on row 1 before its
+/// scroll-away newlines, so a full screen of prior output scrolled one line
+/// and the rest leaked into the new frame.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn launch_scrolls_prior_screen_output_away() {
+    let tmp = smoke_tempdir();
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        &format!(
+            "i=0; while [ $i -lt {TEST_ROWS} ]; do echo STALE-LINE-$i; i=$((i+1)); done; exec \"$0\""
+        ),
+    ])
+    .arg(piku_binary());
+    let mut pty = Pty::spawn_command(cmd, tmp.path());
+    assert!(
+        pty.wait_for("❯", Duration::from_secs(5)),
+        "TUI prompt not reached:\n{}",
+        pty.captured()
+    );
+    pty.wait(Duration::from_millis(300));
+    let screen = pty.screen();
+    let leaked: Vec<String> = screen
+        .rows
+        .iter()
+        .filter(|row| row.contains("STALE-LINE"))
+        .cloned()
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "prior output stayed on screen under the TUI frame: {leaked:?}"
     );
     pty.exit_cleanly();
 }

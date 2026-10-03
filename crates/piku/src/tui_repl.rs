@@ -976,7 +976,10 @@ fn setup_layout(rows: u16, cols: u16, model: &str, provider: &str, session_id: &
 
     // Reset scroll region first so the layout below isn't clipped by a
     // region left over from a previous setup_layout (self-update re-entry).
-    leave_scroll_region(1);
+    // Park on the bottom row: the newlines below scroll the whole screen only
+    // when they start there. From row 1 they scroll one line and leave earlier
+    // output on screen to be drawn over without being erased.
+    leave_scroll_region(rows);
     // Scroll the shell's existing output up into scrollback rather than
     // erasing it. `\x1b[2J` — and an equivalent per-row `\x1b[2K` sweep —
     // destroys whatever the user had on screen when they typed `piku`.
