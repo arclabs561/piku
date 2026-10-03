@@ -182,6 +182,9 @@ pub fn build_openai_body(request: &MessageRequest) -> serde_json::Value {
         "messages": messages,
         "max_tokens": request.max_tokens,
         "stream": true,
+        // Without this, OpenAI-compatible servers (ollama included) omit the
+        // final usage chunk and token counts read as zero.
+        "stream_options": { "include_usage": true },
     });
 
     if let Some(tools) = &request.tools {

@@ -249,6 +249,12 @@ mod openai_body_builder {
     }
 
     #[test]
+    fn streamed_body_requests_usage_chunk() {
+        let body = build_openai_body(&simple_request("hello"));
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn tools_emitted_correctly() {
         let mut req = simple_request("use a tool");
         req.tools = Some(vec![ToolDefinition {
