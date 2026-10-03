@@ -46,7 +46,7 @@ use test_helpers::strip_ansi;
 #[test]
 fn tool_input_bash_empty() {
     let input = serde_json::json!({});
-    assert!(piku::format_tool_input("bash", &input).is_empty());
+    assert_eq!(piku::format_tool_input("bash", &input), "");
 }
 
 #[test]

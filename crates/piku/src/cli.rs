@@ -61,6 +61,31 @@ pub enum Commands {
     Inspect {
         #[arg(help = "Session ID")]
         session_id: String,
+        #[arg(long, help = "Render addressable cells instead of the event stream")]
+        cells: bool,
+        #[arg(
+            long,
+            help = "Render addressable interaction receipts instead of the event stream"
+        )]
+        activity: bool,
+        #[arg(
+            long,
+            value_name = "REFERENCE",
+            help = "Show one cell (@@N or canonical cell reference; @cN remains accepted)"
+        )]
+        cell: Option<String>,
+        #[arg(
+            long,
+            value_name = "REFERENCE",
+            help = "Show one receipt (##N or canonical receipt reference)"
+        )]
+        receipt: Option<String>,
+        #[arg(
+            long,
+            value_name = "REFERENCE",
+            help = "Print one cell's retained text output"
+        )]
+        raw: Option<String>,
         #[arg(long, help = "JSON output")]
         json: bool,
         #[arg(long, help = "HTML output")]
@@ -149,10 +174,20 @@ mod tests {
         match cli.command {
             Some(Commands::Inspect {
                 session_id,
+                cells,
+                activity,
+                cell,
+                receipt,
+                raw,
                 html,
                 json,
             }) => {
                 assert_eq!(session_id, "session-1");
+                assert!(!cells);
+                assert!(!activity);
+                assert!(cell.is_none());
+                assert!(receipt.is_none());
+                assert!(raw.is_none());
                 assert!(html);
                 assert!(!json);
             }
@@ -164,12 +199,66 @@ mod tests {
     fn inspect_defaults_to_text() {
         let cli = Cli::try_parse_from(["piku", "inspect", "session-1"]).unwrap();
         match cli.command {
-            Some(Commands::Inspect { html, json, .. }) => {
+            Some(Commands::Inspect {
+                html,
+                json,
+                cells,
+                activity,
+                cell,
+                receipt,
+                raw,
+                ..
+            }) => {
                 assert!(!html);
                 assert!(!json);
+                assert!(!cells);
+                assert!(!activity);
+                assert!(cell.is_none());
+                assert!(receipt.is_none());
+                assert!(raw.is_none());
             }
             _ => panic!("expected Inspect"),
         }
+    }
+
+    #[test]
+    fn inspect_raw_accepts_a_cell_reference() {
+        let cli = Cli::try_parse_from(["piku", "inspect", "session-1", "--raw", "@@2"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inspect { raw: Some(reference), .. }) if reference == "@@2"
+        ));
+    }
+
+    #[test]
+    fn inspect_cells_accepts_a_short_reference() {
+        let cli = Cli::try_parse_from(["piku", "inspect", "session-1", "--cells", "--cell", "@@2"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inspect { cells: true, cell: Some(reference), .. }) if reference == "@@2"
+        ));
+    }
+
+    #[test]
+    fn inspect_activity_accepts_a_receipt_reference() {
+        let cli = Cli::try_parse_from([
+            "piku",
+            "inspect",
+            "session-1",
+            "--activity",
+            "--receipt",
+            "##2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inspect {
+                activity: true,
+                receipt: Some(reference),
+                ..
+            }) if reference == "##2"
+        ));
     }
 
     #[test]

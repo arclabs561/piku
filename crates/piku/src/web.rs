@@ -602,6 +602,8 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         .route("/api/chat/write-lease", post(write_lease_handler))
         .route("/api/executors", get(executor_catalog))
         .route("/api/terminal/read", post(terminal_read_handler))
+        .route("/api/runs/{session_id}/cells", get(run_cells))
+        .route("/api/runs/{session_id}/receipts", get(run_receipts))
         .route("/run/{session_id}", get(view_run));
     if state.terminal_enabled {
         app = app.route("/api/terminal/pty", get(pty::terminal_pty_handler));
@@ -4012,6 +4014,17 @@ impl OutputSink for WebSink {
 
     fn on_run_event(&mut self, event: &RunEvent) {
         let activity = match event {
+            RunEvent::ActorTurn {
+                target_turn_id,
+                actor,
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("actor:{target_turn_id}"),
+                "phase": "room",
+                "state": "verified",
+                "label": format!("Actor selected · {}", actor.label),
+                "detail": format!("{} · {}/{}", actor.id, actor.provider, actor.model),
+            }),
             RunEvent::TurnStarted {
                 provider, model, ..
             } => serde_json::json!({
@@ -4179,6 +4192,36 @@ impl OutputSink for WebSink {
                 "label": "Turn cancelled",
                 "detail": reason,
             }),
+            RunEvent::ShellCommand {
+                command,
+                cwd,
+                exit_code,
+                ..
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("shell:{}", self.request_id),
+                "phase": "shell",
+                "state": if exit_code == &Some(0) { "complete" } else { "error" },
+                "label": command,
+                "detail": format!("cwd={} exit={exit_code:?}; output remained in the terminal", cwd.display()),
+            }),
+            RunEvent::OperatorCommand {
+                command,
+                action_id,
+                result,
+                is_error,
+            } => serde_json::json!({
+                "kind": "activity_event",
+                "event_id": format!("operator:{}", self.request_id),
+                "phase": "operator",
+                "state": if *is_error { "error" } else { "complete" },
+                "label": command,
+                "detail": format!(
+                    "{} · {}",
+                    action_id.as_deref().unwrap_or("local command"),
+                    if result.is_some() { "result retained" } else { "result not retained" },
+                ),
+            }),
             RunEvent::Warning { message } => serde_json::json!({
                 "kind": "activity_event",
                 "event_id": format!("warning:{}", self.request_id),
@@ -4196,6 +4239,72 @@ impl OutputSink for WebSink {
 // ---------------------------------------------------------------------------
 // Run view (read-only, from CLI inspect)
 // ---------------------------------------------------------------------------
+
+async fn run_cells(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<piku_runtime::CellView>>, (StatusCode, String)> {
+    validate_run_id(&session_id)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
+    let path = state.config.runs_dir().join(format!("{session_id}.jsonl"));
+    let events = piku_runtime::read_run_record(&path).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("run {session_id} not found: {error}"),
+        )
+    })?;
+    if events.is_empty() {
+        return Err((StatusCode::NOT_FOUND, format!("run {session_id} is empty")));
+    }
+    let cells = crate::actions::execute(
+        &crate::actions::Action::InspectCells {
+            open_in_pager: false,
+        },
+        &events,
+        &path,
+    )
+    .and_then(crate::actions::ActionReport::require_cells)
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not project run {session_id} cells: {error}"),
+        )
+    })?;
+    Ok(Json(cells))
+}
+
+async fn run_receipts(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<crate::receipt_view::ReceiptView>>, (StatusCode, String)> {
+    validate_run_id(&session_id)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
+    let path = state.config.runs_dir().join(format!("{session_id}.jsonl"));
+    let events = piku_runtime::read_run_record(&path).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("run {session_id} not found: {error}"),
+        )
+    })?;
+    if events.is_empty() {
+        return Err((StatusCode::NOT_FOUND, format!("run {session_id} is empty")));
+    }
+    let receipts = crate::actions::execute(
+        &crate::actions::Action::InspectReceipts {
+            open_in_pager: false,
+        },
+        &events,
+        &path,
+    )
+    .and_then(crate::actions::ActionReport::require_receipts)
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not project run {session_id} receipts: {error}"),
+        )
+    })?;
+    Ok(Json(receipts))
+}
 
 async fn view_run(
     State(state): State<Arc<AppState>>,

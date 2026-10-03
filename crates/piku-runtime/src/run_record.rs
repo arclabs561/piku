@@ -23,8 +23,11 @@ use piku_api::TokenUsage;
 /// that an executor cannot attribute to a concrete target. The reader remains
 /// compatible with earlier records. Version 6 records the exact Piku-resolved
 /// request context and the digest of the composed model input. Version 7 adds
-/// a typed file deletion effect.
-pub const RUN_RECORD_SCHEMA_VERSION: u32 = 7;
+/// a typed file deletion effect. Version 8 adds explicit, terminal-owned shell
+/// commands so an interactive command is inspectable without falsely claiming
+/// its inherited terminal output was captured. Version 9 adds named actor
+/// assignment for interleaved foreground room turns.
+pub const RUN_RECORD_SCHEMA_VERSION: u32 = 9;
 
 /// Content larger than this is stored beside the JSONL record as an artifact.
 /// The event stream stays cheap to scan while retaining the complete value.
@@ -149,6 +152,11 @@ impl<'de> Deserialize<'de> for RunEventEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RunEvent {
+    /// Assign one named room actor to a turn before that turn starts.
+    ActorTurn {
+        target_turn_id: String,
+        actor: ActorRef,
+    },
     TurnStarted {
         provider: Option<String>,
         model: String,
@@ -226,6 +234,27 @@ pub enum RunEvent {
     TurnCancelled {
         reason: String,
     },
+    /// A foreground shell command whose stdin/stdout/stderr remained attached
+    /// to the operator's terminal. `output` is unavailable by design unless a
+    /// later explicit capture mode recorded it as an artifact.
+    ShellCommand {
+        command: String,
+        cwd: PathBuf,
+        exit_code: Option<i32>,
+        output: ContentRef,
+    },
+    /// A local Piku command invoked by the operator. This is an interaction
+    /// receipt, not an output cell: it groups the typed command with its
+    /// semantic action and any deliberately retained result.
+    OperatorCommand {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ContentRef>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
     Warning {
         message: String,
     },
@@ -249,10 +278,22 @@ pub enum RunEvent {
     },
 }
 
+/// A configured foreground participant, distinct from a background subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorRef {
+    pub id: String,
+    pub label: String,
+    pub provider: String,
+    pub model: String,
+}
+
 impl RunEvent {
     fn scope_kind(&self) -> EventScopeKind {
         match self {
-            Self::UserDisposition { .. } => EventScopeKind::Run,
+            Self::UserDisposition { .. }
+            | Self::ShellCommand { .. }
+            | Self::OperatorCommand { .. }
+            | Self::ActorTurn { .. } => EventScopeKind::Run,
             Self::ChildRunRef { .. }
             | Self::TurnStarted { .. }
             | Self::ContextBuilt { .. }
@@ -702,7 +743,14 @@ impl RunRecorder {
             RunEvent::AssistantMessage { content } => Some(("assistant", content)),
             RunEvent::ToolCompleted { result, .. } => Some(("tool-result", result)),
             RunEvent::UserDisposition { note, .. } => Some(("disposition", note)),
-            RunEvent::ContextBuilt { .. }
+            RunEvent::ShellCommand { output, .. } => Some(("shell-output", output)),
+            RunEvent::OperatorCommand {
+                result: Some(result),
+                ..
+            } => Some(("operator-result", result)),
+            RunEvent::ActorTurn { .. }
+            | RunEvent::OperatorCommand { result: None, .. }
+            | RunEvent::ContextBuilt { .. }
             | RunEvent::ContextSourcesResolved { .. }
             | RunEvent::ContextUnavailable { .. }
             | RunEvent::ToolStarted { .. }
@@ -1084,6 +1132,39 @@ mod tests {
     }
 
     #[test]
+    fn materializes_large_operator_receipt_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session-1.jsonl");
+        let large = "cell output\n".repeat(RUN_INLINE_CONTENT_LIMIT_BYTES / 12 + 1);
+        let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
+        recorder
+            .append_run(RunEvent::OperatorCommand {
+                command: "/cells --pager".to_string(),
+                action_id: Some("inspect.cells".to_string()),
+                result: Some(ContentRef::Inline {
+                    text: large.clone(),
+                }),
+                is_error: false,
+            })
+            .unwrap();
+        drop(recorder);
+
+        let events = read_run_record(&path).unwrap();
+        let RunEvent::OperatorCommand {
+            result: Some(ContentRef::Artifact(artifact)),
+            ..
+        } = &events[0].event
+        else {
+            panic!("large operator receipt result was not materialized");
+        };
+        assert_eq!(artifact.bytes, u64::try_from(large.len()).unwrap());
+        assert_eq!(
+            fs::read_to_string(path.parent().unwrap().join(&artifact.relative_path)).unwrap(),
+            large
+        );
+    }
+
+    #[test]
     fn leaves_small_content_inline() {
         let path = test_path("inline");
         let mut recorder = RunRecorder::open(&path, "session-1").unwrap();
@@ -1278,6 +1359,14 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        recorder
+            .append_run(RunEvent::OperatorCommand {
+                command: "/cells".to_string(),
+                action_id: None,
+                result: None,
+                is_error: false,
+            })
+            .unwrap();
         fs::remove_file(path).unwrap();
     }
 

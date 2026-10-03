@@ -9,10 +9,13 @@
     clippy::match_same_arms
 )]
 
+pub mod actions;
+pub mod cell_view;
 pub mod cli;
 pub mod config;
 pub mod input_helper;
 pub mod markdown;
+pub mod receipt_view;
 pub mod run_view;
 /// Public library surface — used by integration tests and main.rs.
 pub mod self_update;

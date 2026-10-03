@@ -26,9 +26,9 @@ use crate::self_update;
 use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use piku_runtime::{
-    build_system_prompt, run_turn_with_registry, InterjectionRx, InterjectionTx, OutputSink,
-    PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, ResolvedProvider,
-    Session, TaskRegistry, TaskStatus, TokenUsage, TurnResult,
+    build_system_prompt, run_turn_with_registry, OutputSink, PermissionOutcome, PermissionPrompter,
+    PermissionRequest, PostToolAction, ResolvedProvider, Session, TaskRegistry, TaskStatus,
+    TokenUsage, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 
@@ -287,9 +287,181 @@ fn leave_scroll_region(park: u16) {
     let _ = io::stdout().flush();
 }
 
+/// Open durable content through the operator's normal pager while Piku has
+/// handed the foreground terminal to the child process. The content travels on
+/// stdin rather than becoming shell source; `$PAGER` itself is the operator's
+/// trusted terminal configuration and may include flags such as `less -R`.
+fn run_pager(content: &str) -> io::Result<std::process::ExitStatus> {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exec ${PAGER:-less -R}")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(content.as_bytes())?;
+    }
+    child.wait()
+}
+
+/// A temporary, keyboard-native view of retained output cells. It owns the
+/// alternate screen, so browsing never destroys the operator's live shell
+/// transcript. `j`/`k` select cells; inside a cell they scroll its exact
+/// retained output. Escape first returns to the list, then to the REPL.
+fn inspect_cells_interactively(record_path: &std::path::Path) -> io::Result<()> {
+    let events = piku_runtime::read_run_record(record_path)?;
+    let cells = crate::cell_view::cells(&events);
+    let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        terminal::enable_raw_mode()?;
+    }
+    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
+    let mut selected = 0usize;
+    let mut detail: Option<(String, usize)> = None;
+    loop {
+        let (cols, rows) = term_size();
+        let visible_rows = usize::from(rows.saturating_sub(2)).max(1);
+        print!("\x1b[H\x1b[2J\x1b[1mPiku output cells\x1b[0m  j/k move · Enter open · p pager · Esc back\r\n\r\n");
+        if let Some((content, offset)) = &detail {
+            let lines: Vec<&str> = content.lines().collect();
+            for line in lines.iter().skip(*offset).take(visible_rows) {
+                println!(
+                    "{}\r",
+                    crate::truncate_on_char_boundary(line, usize::from(cols))
+                );
+            }
+            if lines.is_empty() {
+                println!("\x1b[2m(no retained text)\x1b[0m\r");
+            }
+        } else if cells.is_empty() {
+            println!("\x1b[2mNo durable output cells yet.\x1b[0m\r");
+        } else {
+            for (index, cell) in cells.iter().enumerate().take(visible_rows) {
+                let marker = if index == selected { "\x1b[7m>" } else { " " };
+                let prompt = cell.input.as_ref().map_or("", |input| match input {
+                    piku_runtime::RunContentRef::Inline { text } => {
+                        text.lines().next().unwrap_or("")
+                    }
+                    _ => "retained input",
+                });
+                println!(
+                    "{marker} {} · {:?} · {}\x1b[0m\r",
+                    cell.id.short,
+                    cell.status,
+                    crate::truncate_on_char_boundary(prompt, usize::from(cols).saturating_sub(28))
+                );
+            }
+        }
+        print!(
+            "\x1b[{};1H\x1b[2m{}\x1b[0m",
+            rows,
+            if detail.is_some() {
+                "j/k scroll · Esc list"
+            } else {
+                "Ctrl+O opens this view from an empty prompt"
+            }
+        );
+        let _ = io::stdout().flush();
+        let Event::Key(KeyEvent { code, .. }) = cxevent::read()? else {
+            continue;
+        };
+        match code {
+            KeyCode::Esc => {
+                if detail.take().is_none() {
+                    break;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some((content, offset)) = &mut detail {
+                    *offset = (*offset + 1).min(content.lines().count().saturating_sub(1));
+                } else if !cells.is_empty() {
+                    selected = (selected + 1).min(cells.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some((_, offset)) = &mut detail {
+                    *offset = offset.saturating_sub(1);
+                } else {
+                    selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter if detail.is_none() && !cells.is_empty() => {
+                detail = Some((
+                    crate::cell_view::raw_output(&events, record_path, &cells[selected].id.short)
+                        .unwrap_or_else(|error| format!("[output unavailable: {error}]")),
+                    0,
+                ));
+            }
+            KeyCode::Char('p') if detail.is_some() => {
+                let (content, _) = detail.as_ref().expect("detail checked");
+                print!("\x1b[?1049l\x1b[?25h");
+                let _ = terminal::disable_raw_mode();
+                let _ = run_pager(content);
+                if !was_raw {
+                    terminal::enable_raw_mode()?;
+                }
+                print!("\x1b[?1049h\x1b[?25l");
+            }
+            _ => {}
+        }
+    }
+    print!("\x1b[?1049l\x1b[?25h");
+    let _ = io::stdout().flush();
+    if !was_raw {
+        terminal::disable_raw_mode()?;
+    }
+    Ok(())
+}
+
+fn parse_cell_command(argument: &str) -> Result<(Option<String>, bool), &'static str> {
+    let input = format!("/cell {argument}");
+    match crate::actions::parse_tui_slash(&input)? {
+        Some(crate::actions::Action::InspectCell {
+            reference,
+            open_in_pager,
+        }) => Ok((reference, open_in_pager)),
+        Some(
+            crate::actions::Action::InspectCells { .. }
+            | crate::actions::Action::InspectReceipts { .. }
+            | crate::actions::Action::InspectReceipt { .. },
+        )
+        | None => {
+            unreachable!("a /cell input must parse as inspect.cell")
+        }
+    }
+}
+
 /// Move cursor to (row, col) — 1-indexed.
 fn goto(row: u16, col: u16) {
     print!("\x1b[{row};{col}H");
+}
+
+/// Move a local command result into the scrolling transcript, leaving the
+/// fixed footer and input row intact. Custom slash commands must use this just
+/// like [`handle_slash_cmd`] does; printing at the input row makes output
+/// disappear as the bottom frame is restored.
+fn begin_slash_output() {
+    let (_, rows) = term_size();
+    let scroll_bot = rows.saturating_sub(2);
+    goto(scroll_bot, 1);
+    print!("\r\n");
+}
+
+fn record_operator_receipt(
+    run: &mut piku_runtime::RunHandle,
+    command: &str,
+    action_id: &str,
+    result: &str,
+    is_error: bool,
+) -> io::Result<()> {
+    run.record_run(piku_runtime::RunEvent::OperatorCommand {
+        command: command.to_string(),
+        action_id: Some(action_id.to_string()),
+        result: Some(piku_runtime::RunContentRef::Inline {
+            text: result.to_string(),
+        }),
+        is_error,
+    })
+    .map(|_| ())
 }
 
 fn term_size() -> (u16, u16) {
@@ -384,6 +556,7 @@ fn install_terminal_restoring_signal_handlers() {}
 pub(crate) struct FooterState<'a> {
     pub(crate) provider: &'a str,
     pub(crate) model: &'a str,
+    pub(crate) actor: &'a str,
     pub(crate) session_id: &'a str,
     pub(crate) input_tokens: u32,
     pub(crate) output_tokens: u32,
@@ -414,7 +587,7 @@ pub(crate) fn render_footer(cols: u16, s: &FooterState) -> String {
 fn render_footer_inner(cols: u16, s: &FooterState) -> String {
     // ── Segments ──────────────────────────────────────────────────────────────
     // Left anchor: provider · model (normal weight, always shown)
-    let model_seg = format!(" {} · {} ", s.provider, s.model);
+    let model_seg = format!(" {} · {} · @{} ", s.provider, s.model, s.actor);
 
     // Token usage (dim, omitted when zero)
     let tok_seg = if s.input_tokens > 0 || s.output_tokens > 0 {
@@ -474,7 +647,7 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 
     let sep_vis = vis(sep); // │ is 1 display column but 3 UTF-8 bytes
 
-    // Required: model_seg + separator + hint_seg
+    // Required identity: provider, model, active actor, and the help hint.
     let base_width = vis(&model_seg) + sep_vis + vis(hint_seg);
     let mut budget = cols.saturating_sub(base_width);
 
@@ -819,6 +992,7 @@ fn setup_layout(rows: u16, cols: u16, model: &str, provider: &str, session_id: &
         &FooterState {
             provider,
             model,
+            actor: "primary",
             session_id,
             input_tokens: 0,
             output_tokens: 0,
@@ -1123,12 +1297,13 @@ async fn run_tui_repl_core(
     post_restart: bool,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
+    let mut resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let mut model = config
         .model
         .as_deref()
         .unwrap_or(&resolved.default_model)
         .to_string();
+    let mut active_actor = "primary".to_string();
 
     let cwd = std::env::current_dir()?;
     let date = crate::current_date();
@@ -1175,11 +1350,6 @@ async fn run_tui_repl_core(
         config.agent_links_dir(),
         Some(run_path.clone()),
     );
-    // Wire a notification channel so background agent completions inject
-    // a user-role message into the parent's interjection stream.
-    let (notif_tx, notif_rx): (InterjectionTx, InterjectionRx) = tokio::sync::mpsc::channel(32);
-    task_registry.set_notification_channel(notif_tx);
-    let mut notif_rx = notif_rx;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
     // Announce the session at the start, not only on the way out. It is
     // rewritten after every turn, so a name known up front can be tailed live
@@ -1385,9 +1555,75 @@ async fn run_tui_repl_core(
                     break;
                 }
 
-                // ! prefix: direct bash command (bypass AI)
-                // TODO: route through runtime's bash tool so the command appears in
-                // session history, respects permissions, and shows in session replay.
+                // !! explicitly captures a noninteractive command as durable
+                // evidence. Use ! for a real foreground terminal program.
+                if let Some(cmd) = full_input.strip_prefix("!!") {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() {
+                        let (_, rows) = term_size();
+                        let scroll_bot = rows.saturating_sub(2);
+                        goto(rows, 1);
+                        print!("\x1b[2K");
+                        goto(scroll_bot, 1);
+                        if read_only {
+                            println!(
+                                "\r\n\x1b[33m[read-only]\x1b[0m shell commands are disabled\r"
+                            );
+                            continue;
+                        }
+                        println!("\r\n\x1b[2;35m!!\x1b[0m \x1b[2m{cmd}\x1b[0m\r");
+                        let captured = std::process::Command::new("sh").arg("-c").arg(cmd).output();
+                        let (exit_code, output) = match captured {
+                            Ok(captured) => {
+                                let stdout = String::from_utf8_lossy(&captured.stdout);
+                                let stderr = String::from_utf8_lossy(&captured.stderr);
+                                print!("{stdout}");
+                                if !stderr.is_empty() {
+                                    eprint!("{stderr}");
+                                }
+                                (captured.status.code(), format!("{stdout}{stderr}"))
+                            }
+                            Err(error) => {
+                                let message = format!("shell capture failed: {error}");
+                                println!("\x1b[31m{message}\x1b[0m\r");
+                                (None, message)
+                            }
+                        };
+                        let shell_record = piku_runtime::RunEvent::ShellCommand {
+                            command: cmd.to_string(),
+                            cwd: std::env::current_dir().unwrap_or_default(),
+                            exit_code,
+                            output: piku_runtime::RunContentRef::Inline { text: output },
+                        };
+                        if let Err(error) = run.record_run(shell_record) {
+                            println!(
+                                "\r\n  \x1b[31m[shell capture could not be recorded: {error}]\x1b[0m\r"
+                            );
+                        }
+                        let (cols, rows) = term_size();
+                        draw_footer(
+                            rows.saturating_sub(1),
+                            cols,
+                            &FooterState {
+                                provider: resolved.name(),
+                                model: &model,
+                                actor: &active_actor,
+                                session_id: &session_id,
+                                input_tokens: total_usage.input_tokens,
+                                output_tokens: total_usage.output_tokens,
+                                turns: 0,
+                                running_agents: 0,
+                                context_pct: context_pct_for(total_usage.input_tokens, &model),
+                            },
+                        );
+                        let _ = io::stdout().flush();
+                    }
+                    continue;
+                }
+
+                // ! prefix: direct foreground shell command (bypass AI).
+                // It deliberately inherits this terminal: pagers, colour, editors,
+                // and commands with stdin must remain ordinary shell programs.
                 if let Some(cmd) = full_input.strip_prefix('!') {
                     let cmd = cmd.trim();
                     if !cmd.is_empty() {
@@ -1407,6 +1643,7 @@ async fn run_tui_repl_core(
                                 &FooterState {
                                     provider: resolved.name(),
                                     model: &model,
+                                    actor: &active_actor,
                                     session_id: &session_id,
                                     input_tokens: total_usage.input_tokens,
                                     output_tokens: total_usage.output_tokens,
@@ -1427,32 +1664,40 @@ async fn run_tui_repl_core(
                         // while it runs, then restore the frame around its
                         // output.
                         leave_scroll_region(rows);
-                        let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
+                        let status = std::process::Command::new("sh").arg("-c").arg(cmd).status();
                         let (_, rows) = term_size();
                         let scroll_bot = rows.saturating_sub(2);
                         enter_scroll_region(rows, scroll_bot);
-                        match output {
-                            Ok(out) => {
-                                let stdout_str = String::from_utf8_lossy(&out.stdout);
-                                let stderr_str = String::from_utf8_lossy(&out.stderr);
-                                for line in stdout_str.lines().take(20) {
-                                    println!("  {line}\r");
-                                }
-                                if stdout_str.lines().count() > 20 {
-                                    println!(
-                                        "  \x1b[2m… +{} lines\x1b[0m\r",
-                                        stdout_str.lines().count() - 20
-                                    );
-                                }
-                                if !stderr_str.is_empty() {
-                                    for line in stderr_str.lines().take(5) {
-                                        println!("  \x1b[31m{line}\x1b[0m\r");
-                                    }
-                                }
-                            }
+                        let exit_code = status
+                            .as_ref()
+                            .ok()
+                            .and_then(std::process::ExitStatus::code);
+                        match &status {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => println!(
+                                "\r\n  \x1b[33m[shell exited {}]\x1b[0m\r",
+                                status.code().map_or_else(
+                                    || "by signal".to_string(),
+                                    |code| code.to_string()
+                                )
+                            ),
                             Err(e) => {
-                                println!("  \x1b[31m{e}\x1b[0m\r");
+                                println!("\r\n  \x1b[31m[shell failed: {e}]\x1b[0m\r");
                             }
+                        }
+                        let shell_record = piku_runtime::RunEvent::ShellCommand {
+                            command: cmd.to_string(),
+                            cwd: std::env::current_dir().unwrap_or_default(),
+                            exit_code,
+                            output: piku_runtime::RunContentRef::Unavailable {
+                                reason: "native terminal passthrough; output was not captured"
+                                    .to_string(),
+                            },
+                        };
+                        if let Err(error) = run.record_run(shell_record) {
+                            println!(
+                                "\r\n  \x1b[31m[shell provenance could not be recorded: {error}]\x1b[0m\r"
+                            );
                         }
                         let (cols, rows) = term_size();
                         draw_footer(
@@ -1461,6 +1706,7 @@ async fn run_tui_repl_core(
                             &FooterState {
                                 provider: resolved.name(),
                                 model: &model,
+                                actor: &active_actor,
                                 session_id: &session_id,
                                 input_tokens: total_usage.input_tokens,
                                 output_tokens: total_usage.output_tokens,
@@ -1480,8 +1726,478 @@ async fn run_tui_repl_core(
                     goto(rows, 1);
                     print!("\x1b[2K");
                     let _ = io::stdout().flush();
+                    let actor_input = full_input.trim();
+                    let actor_command = (actor_input == "/actor"
+                        || actor_input.starts_with("/actor "))
+                    .then(|| {
+                        actor_input
+                            .strip_prefix("/actor")
+                            .expect("actor command has the expected prefix")
+                    });
+                    if let Some(argument) = actor_command {
+                        begin_slash_output();
+                        let name = argument.trim();
+                        let (rendered, is_error) = if name.is_empty() {
+                            (format!("active actor: {active_actor}\r"), false)
+                        } else if name == "primary" || config.actor(name).is_some() {
+                            let profile = config.actor(name);
+                            let provider_name = profile
+                                .and_then(|profile| profile.provider.as_deref())
+                                .or(config.provider.as_deref());
+                            match ResolvedProvider::resolve(provider_name) {
+                                Ok(next_provider) => {
+                                    let next_model = profile
+                                        .and_then(|profile| profile.model.as_deref())
+                                        .or(config.model.as_deref())
+                                        .unwrap_or(&next_provider.default_model)
+                                        .to_string();
+                                    run.session_mut().select_actor(name);
+                                    active_actor = name.to_string();
+                                    resolved = next_provider;
+                                    model = next_model;
+                                    let (cols, rows) = term_size();
+                                    draw_footer(
+                                        rows.saturating_sub(1),
+                                        cols,
+                                        &FooterState {
+                                            provider: resolved.name(),
+                                            model: &model,
+                                            actor: &active_actor,
+                                            session_id: &session_id,
+                                            input_tokens: total_usage.input_tokens,
+                                            output_tokens: total_usage.output_tokens,
+                                            turns: 0,
+                                            running_agents: task_registry.running().len(),
+                                            context_pct: context_pct_for(
+                                                total_usage.input_tokens,
+                                                &model,
+                                            ),
+                                        },
+                                    );
+                                    (
+                                        format!(
+                                            "\x1b[2m[actor → {active_actor} · {}/{model}]\x1b[0m\r",
+                                            resolved.name()
+                                        ),
+                                        false,
+                                    )
+                                }
+                                Err(error) => (format!("\x1b[31m[actor]\x1b[0m {error}\r"), true),
+                            }
+                        } else {
+                            (
+                                format!("\x1b[31m[actor]\x1b[0m unknown actor: {name}\r"),
+                                true,
+                            )
+                        };
+                        println!("{rendered}");
+                        if let Err(error) = record_operator_receipt(
+                            &mut run,
+                            &full_input,
+                            "tui.actor",
+                            &rendered,
+                            is_error,
+                        ) {
+                            println!("\x1b[31m[actor]\x1b[0m receipt was not recorded: {error}\r");
+                        }
+                        continue;
+                    }
+                    if actor_input == "/actors" {
+                        begin_slash_output();
+                        let mut rendered =
+                            "\x1b[1mActors:\x1b[0m\r\n  primary  default provider/model\r\n"
+                                .to_string();
+                        for (name, profile) in &config.actors {
+                            rendered.push_str(&format!(
+                                "  {name:<8} {}\r\n",
+                                profile.label.as_deref().unwrap_or(name)
+                            ));
+                        }
+                        print!("{rendered}");
+                        if let Err(error) = record_operator_receipt(
+                            &mut run,
+                            &full_input,
+                            "tui.actors",
+                            &rendered,
+                            false,
+                        ) {
+                            println!("\x1b[31m[actors]\x1b[0m receipt was not recorded: {error}\r");
+                        }
+                        continue;
+                    }
+                    let receipt_input = full_input.trim();
+                    if receipt_input == "/activity"
+                        || receipt_input.starts_with("/activity ")
+                        || receipt_input == "/receipt"
+                        || receipt_input.starts_with("/receipt ")
+                    {
+                        let action = match crate::actions::parse_tui_slash(receipt_input) {
+                            Ok(Some(
+                                action @ (crate::actions::Action::InspectReceipts { .. }
+                                | crate::actions::Action::InspectReceipt { .. }),
+                            )) => action,
+                            Err(error) => {
+                                begin_slash_output();
+                                println!("\x1b[33m[activity]\x1b[0m {error}\r");
+                                continue;
+                            }
+                            _ => unreachable!("the receipt action was matched above"),
+                        };
+                        let pager_requested = matches!(
+                            &action,
+                            crate::actions::Action::InspectReceipts {
+                                open_in_pager: true
+                            } | crate::actions::Action::InspectReceipt {
+                                open_in_pager: true,
+                                ..
+                            }
+                        );
+                        if !pager_requested {
+                            begin_slash_output();
+                        }
+                        let rendered =
+                            piku_runtime::read_run_record(run.record_path()).and_then(|events| {
+                                let report =
+                                    crate::actions::execute(&action, &events, run.record_path())?;
+                                match &action {
+                                    crate::actions::Action::InspectReceipt {
+                                        open_in_pager: true,
+                                        ..
+                                    } => report.require_exact_output(),
+                                    crate::actions::Action::InspectReceipt { .. } => {
+                                        report.require_receipts().map(|mut receipts| {
+                                            receipts.pop().map_or_else(String::new, |receipt| {
+                                                crate::receipt_view::render_receipt_text(&receipt)
+                                            })
+                                        })
+                                    }
+                                    _ => report.require_receipts().map(|receipts| {
+                                        crate::receipt_view::render_receipts_text(&receipts)
+                                    }),
+                                }
+                            });
+                        match rendered {
+                            Ok(rendered) if rendered.is_empty() => {
+                                let message = "unknown receipt";
+                                if let Err(error) = record_operator_receipt(
+                                    &mut run,
+                                    &full_input,
+                                    action.id(),
+                                    message,
+                                    true,
+                                ) {
+                                    println!("\x1b[31m[activity]\x1b[0m receipt was not recorded: {error}\r");
+                                }
+                                println!("\x1b[33m[activity]\x1b[0m {message}\r");
+                            }
+                            Ok(rendered) if pager_requested => {
+                                let receipt = record_operator_receipt(
+                                    &mut run,
+                                    &full_input,
+                                    action.id(),
+                                    &rendered,
+                                    false,
+                                );
+                                let (_, rows) = term_size();
+                                goto(rows, 1);
+                                print!("\x1b[2K");
+                                let _ = io::stdout().flush();
+                                leave_scroll_region(rows);
+                                let pager = run_pager(&rendered);
+                                let (_, rows) = term_size();
+                                enter_scroll_region(rows, rows.saturating_sub(2));
+                                if let Err(error) = pager {
+                                    println!(
+                                        "\x1b[31m[activity]\x1b[0m could not open pager: {error}\r"
+                                    );
+                                }
+                                if let Err(error) = receipt {
+                                    println!("\x1b[31m[activity]\x1b[0m receipt was not recorded: {error}\r");
+                                }
+                            }
+                            Ok(rendered) => {
+                                if let Err(error) = record_operator_receipt(
+                                    &mut run,
+                                    &full_input,
+                                    action.id(),
+                                    &rendered,
+                                    false,
+                                ) {
+                                    println!("\x1b[31m[activity]\x1b[0m receipt was not recorded: {error}\r");
+                                }
+                                print!("{rendered}\r");
+                            }
+                            Err(error) => {
+                                let message = format!("could not inspect activity: {error}");
+                                if let Err(record_error) = record_operator_receipt(
+                                    &mut run,
+                                    &full_input,
+                                    action.id(),
+                                    &message,
+                                    true,
+                                ) {
+                                    println!("\x1b[31m[activity]\x1b[0m receipt was not recorded: {record_error}\r");
+                                }
+                                println!("\x1b[31m[activity]\x1b[0m {message}\r");
+                            }
+                        }
+                        continue;
+                    }
+                    let cell_index_input = full_input.trim();
+                    if cell_index_input == "/cells" || cell_index_input.starts_with("/cells ") {
+                        let action = match crate::actions::parse_tui_slash(cell_index_input) {
+                            Ok(Some(action @ crate::actions::Action::InspectCells { .. })) => {
+                                action
+                            }
+                            Err(error) => {
+                                begin_slash_output();
+                                println!("\x1b[33m[cells]\x1b[0m {error}\r");
+                                continue;
+                            }
+                            _ => unreachable!("the inspection action was matched above"),
+                        };
+                        let pager_requested = matches!(
+                            &action,
+                            crate::actions::Action::InspectCells {
+                                open_in_pager: true
+                            }
+                        );
+                        if !pager_requested {
+                            begin_slash_output();
+                        }
+                        match piku_runtime::read_run_record(run.record_path()) {
+                            Ok(events) => {
+                                match crate::actions::execute(&action, &events, run.record_path())
+                                    .and_then(crate::actions::ActionReport::require_cells)
+                                    .map(|cells| crate::cell_view::render_cells_text(&cells))
+                                {
+                                    Ok(rendered) if pager_requested => {
+                                        let receipt = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            action.id(),
+                                            &rendered,
+                                            false,
+                                        );
+                                        let (_, rows) = term_size();
+                                        goto(rows, 1);
+                                        print!("\x1b[2K");
+                                        let _ = io::stdout().flush();
+                                        leave_scroll_region(rows);
+                                        let pager = run_pager(&rendered);
+                                        let (_, rows) = term_size();
+                                        let scroll_bot = rows.saturating_sub(2);
+                                        enter_scroll_region(rows, scroll_bot);
+                                        if let Err(error) = pager {
+                                            println!("\x1b[31m[cells]\x1b[0m could not open pager: {error}\r");
+                                        }
+                                        let (cols, rows) = term_size();
+                                        draw_footer(
+                                            rows.saturating_sub(1),
+                                            cols,
+                                            &FooterState {
+                                                provider: resolved.name(),
+                                                model: &model,
+                                                actor: &active_actor,
+                                                session_id: &session_id,
+                                                input_tokens: total_usage.input_tokens,
+                                                output_tokens: total_usage.output_tokens,
+                                                turns: 0,
+                                                running_agents: task_registry.running().len(),
+                                                context_pct: context_pct_for(
+                                                    total_usage.input_tokens,
+                                                    &model,
+                                                ),
+                                            },
+                                        );
+                                        if let Err(error) = receipt {
+                                            println!("\x1b[31m[cells]\x1b[0m receipt was not recorded: {error}\r");
+                                        }
+                                        let _ = io::stdout().flush();
+                                    }
+                                    Ok(rendered) => {
+                                        if let Err(error) = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            action.id(),
+                                            &rendered,
+                                            false,
+                                        ) {
+                                            println!("\x1b[31m[cells]\x1b[0m receipt was not recorded: {error}\r");
+                                        }
+                                        print!("{rendered}\r");
+                                    }
+                                    Err(error) => {
+                                        let message = format!("could not render cells: {error}");
+                                        if let Err(record_error) = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            action.id(),
+                                            &message,
+                                            true,
+                                        ) {
+                                            println!("\x1b[31m[cells]\x1b[0m receipt was not recorded: {record_error}\r");
+                                        }
+                                        println!("\x1b[31m[cells]\x1b[0m {message}\r");
+                                    }
+                                }
+                            }
+                            Err(error) => println!(
+                                "\x1b[31m[cells]\x1b[0m could not read run record: {error}\r"
+                            ),
+                        }
+                        continue;
+                    }
+                    let slash_input = full_input.trim();
+                    if slash_input == "/cell" || slash_input.starts_with("/cell ") {
+                        begin_slash_output();
+                        let reference = slash_input
+                            .strip_prefix("/cell")
+                            .expect("cell command has the expected prefix");
+                        let (selected, pager_requested) = match parse_cell_command(reference) {
+                            Ok(command) => command,
+                            Err(error) => {
+                                println!("\x1b[33m[cell]\x1b[0m {error}\r");
+                                continue;
+                            }
+                        };
+                        if pager_requested && selected.is_none() {
+                            println!("\x1b[33m[cell]\x1b[0m usage: /cell @@N --pager\r");
+                            continue;
+                        }
+                        match piku_runtime::read_run_record(run.record_path()) {
+                            Ok(events) => {
+                                if pager_requested {
+                                    let reference = selected
+                                        .as_deref()
+                                        .expect("pager requires a cell reference");
+                                    match crate::actions::execute(
+                                        &crate::actions::Action::InspectCell {
+                                            reference: Some(reference.to_string()),
+                                            open_in_pager: true,
+                                        },
+                                        &events,
+                                        run.record_path(),
+                                    )
+                                    .and_then(crate::actions::ActionReport::require_exact_output)
+                                    {
+                                        Ok(content) => {
+                                            let receipt = record_operator_receipt(
+                                                &mut run,
+                                                &full_input,
+                                                "inspect.cell",
+                                                &content,
+                                                false,
+                                            );
+                                            let (_, rows) = term_size();
+                                            goto(rows, 1);
+                                            print!("\x1b[2K");
+                                            let _ = io::stdout().flush();
+                                            leave_scroll_region(rows);
+                                            let pager = run_pager(&content);
+                                            let (_, rows) = term_size();
+                                            let scroll_bot = rows.saturating_sub(2);
+                                            enter_scroll_region(rows, scroll_bot);
+                                            if let Err(error) = pager {
+                                                println!("\x1b[31m[cell]\x1b[0m could not open pager: {error}\r");
+                                            }
+                                            let (cols, rows) = term_size();
+                                            draw_footer(
+                                                rows.saturating_sub(1),
+                                                cols,
+                                                &FooterState {
+                                                    provider: resolved.name(),
+                                                    model: &model,
+                                                    actor: &active_actor,
+                                                    session_id: &session_id,
+                                                    input_tokens: total_usage.input_tokens,
+                                                    output_tokens: total_usage.output_tokens,
+                                                    turns: 0,
+                                                    running_agents: task_registry.running().len(),
+                                                    context_pct: context_pct_for(
+                                                        total_usage.input_tokens,
+                                                        &model,
+                                                    ),
+                                                },
+                                            );
+                                            if let Err(error) = receipt {
+                                                println!("\x1b[31m[cell]\x1b[0m receipt was not recorded: {error}\r");
+                                            }
+                                            let _ = io::stdout().flush();
+                                        }
+                                        Err(error) => {
+                                            let message =
+                                                format!("could not open cell output: {error}");
+                                            if let Err(record_error) = record_operator_receipt(
+                                                &mut run,
+                                                &full_input,
+                                                "inspect.cell",
+                                                &message,
+                                                true,
+                                            ) {
+                                                println!("\x1b[31m[cell]\x1b[0m receipt was not recorded: {record_error}\r");
+                                            }
+                                            println!("\x1b[31m[cell]\x1b[0m {message}\r");
+                                        }
+                                    }
+                                } else {
+                                    let rendered = crate::actions::execute(
+                                        &crate::actions::Action::InspectCell {
+                                            reference: selected.clone(),
+                                            open_in_pager: false,
+                                        },
+                                        &events,
+                                        run.record_path(),
+                                    )
+                                    .and_then(crate::actions::ActionReport::require_cells)
+                                    .map(|cells| crate::cell_view::render_cells_text(&cells));
+                                    if rendered.as_ref().is_ok_and(String::is_empty) {
+                                        let reference = selected.as_deref().unwrap_or("");
+                                        let message = format!("unknown cell: {reference}");
+                                        if let Err(error) = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            "inspect.cell",
+                                            &message,
+                                            true,
+                                        ) {
+                                            println!("\x1b[31m[cell]\x1b[0m receipt was not recorded: {error}\r");
+                                        }
+                                        println!("\x1b[33m[cell]\x1b[0m {message}\r");
+                                    } else if let Ok(rendered) = rendered {
+                                        if let Err(error) = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            "inspect.cell",
+                                            &rendered,
+                                            false,
+                                        ) {
+                                            println!("\x1b[31m[cell]\x1b[0m receipt was not recorded: {error}\r");
+                                        }
+                                        print!("{rendered}\r");
+                                    } else if let Err(error) = rendered {
+                                        let message = format!("could not render cell: {error}");
+                                        if let Err(record_error) = record_operator_receipt(
+                                            &mut run,
+                                            &full_input,
+                                            "inspect.cell",
+                                            &message,
+                                            true,
+                                        ) {
+                                            println!("\x1b[31m[cell]\x1b[0m receipt was not recorded: {record_error}\r");
+                                        }
+                                        println!("\x1b[31m[cell]\x1b[0m {message}\r");
+                                    }
+                                }
+                            }
+                            Err(error) => println!(
+                                "\x1b[31m[cell]\x1b[0m could not read run record: {error}\r"
+                            ),
+                        }
+                        continue;
+                    }
                     let current_model_name = model.clone();
-                    let should_exit = handle_slash_cmd(
+                    let slash_result = handle_slash_cmd(
                         &full_input,
                         run.session_mut(),
                         &total_usage,
@@ -1489,12 +2205,24 @@ async fn run_tui_repl_core(
                         resolved.name(),
                         &session_id,
                         &mut model,
+                        &active_actor,
                         &task_registry,
                         config,
                         &hook_registry,
                         read_only,
                     );
-                    if should_exit {
+                    if let Err(error) = record_operator_receipt(
+                        &mut run,
+                        &full_input,
+                        &slash_result.action_id,
+                        &slash_result.rendered,
+                        slash_result.is_error,
+                    ) {
+                        println!(
+                            "\r\n  \x1b[31m[command receipt could not be recorded: {error}]\x1b[0m\r"
+                        );
+                    }
+                    if slash_result.should_exit {
                         break;
                     }
                     continue;
@@ -1528,6 +2256,12 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 let mut system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                if let Some(instructions) = config
+                    .actor(&active_actor)
+                    .and_then(|profile| profile.instructions.as_deref())
+                {
+                    system_sections.push(format!("# Actor Instructions\n\n{instructions}"));
+                }
                 if read_only {
                     system_sections.push(crate::read_only_system_prompt_section());
                 }
@@ -1551,6 +2285,19 @@ async fn run_tui_repl_core(
                 sink.trace
                     .session_config(resolved.name(), &model, read_only);
                 let turn_id = format!("turn-{}", run.session().messages.len());
+                let actor_label = config
+                    .actor(&active_actor)
+                    .and_then(|profile| profile.label.clone())
+                    .unwrap_or_else(|| active_actor.clone());
+                run.record_run(piku_runtime::RunEvent::ActorTurn {
+                    target_turn_id: turn_id.clone(),
+                    actor: piku_runtime::ActorRef {
+                        id: active_actor.clone(),
+                        label: actor_label,
+                        provider: resolved.name().to_string(),
+                        model: model.clone(),
+                    },
+                })?;
 
                 // Show a ticking thinking indicator on the input row.
                 // A background task updates it every second with elapsed time.
@@ -1663,7 +2410,7 @@ async fn run_tui_repl_core(
                         &prompter,
                         recording_sink,
                         config.max_turns,
-                        Some(&mut notif_rx),
+                        None,
                         &task_registry,
                         0,
                         &custom_agents,
@@ -1710,6 +2457,7 @@ async fn run_tui_repl_core(
                     &FooterState {
                         provider: resolved.name(),
                         model: &model,
+                        actor: &active_actor,
                         session_id: &session_id,
                         input_tokens: total_usage.input_tokens,
                         output_tokens: total_usage.output_tokens,
@@ -1753,6 +2501,31 @@ async fn run_tui_repl_core(
                 }
             }
 
+            Ok(ReadOutcome::Inspect) => {
+                if let Err(error) = inspect_cells_interactively(run.record_path()) {
+                    let (_, rows) = term_size();
+                    goto(rows.saturating_sub(2), 1);
+                    println!("\x1b[31m[cells]\x1b[0m could not open inspector: {error}\r");
+                }
+                let (cols, rows) = term_size();
+                enter_scroll_region(rows, rows.saturating_sub(2));
+                draw_footer(
+                    rows.saturating_sub(1),
+                    cols,
+                    &FooterState {
+                        provider: resolved.name(),
+                        model: &model,
+                        actor: &active_actor,
+                        session_id: &session_id,
+                        input_tokens: total_usage.input_tokens,
+                        output_tokens: total_usage.output_tokens,
+                        turns: 0,
+                        running_agents: task_registry.running().len(),
+                        context_pct: context_pct_for(total_usage.input_tokens, &model),
+                    },
+                );
+            }
+
             Ok(ReadOutcome::Cancel) => {
                 // Ctrl-C / Esc: cancel current input
                 let (_, rows) = term_size();
@@ -1766,6 +2539,7 @@ async fn run_tui_repl_core(
                     &FooterState {
                         provider: resolved.name(),
                         model: &model,
+                        actor: &active_actor,
                         session_id: &session_id,
                         input_tokens: total_usage.input_tokens,
                         output_tokens: total_usage.output_tokens,
@@ -1938,7 +2712,18 @@ fn first_n_lines(s: &str, n: usize) -> String {
 
 // ── Slash commands ─────────────────────────────────────────────────────────────
 
-/// Returns true if the REPL should exit.
+/// The rendered command output and its semantic receipt metadata.
+struct SlashCommandResult {
+    should_exit: bool,
+    action_id: String,
+    rendered: String,
+    is_error: bool,
+}
+
+/// Run a local slash command and retain the exact text sent to the scrollback.
+///
+/// The caller records the returned text as one interaction receipt after this
+/// function has released its mutable session borrow.
 fn handle_slash_cmd(
     input: &str,
     session: &mut Session,
@@ -1947,14 +2732,33 @@ fn handle_slash_cmd(
     provider_name: &str,
     session_id: &str,
     model: &mut String,
+    active_actor: &str,
     task_registry: &TaskRegistry,
     config: &crate::config::PikuConfig,
     hook_registry: &piku_runtime::HookRegistry,
     read_only: bool,
-) -> bool {
+) -> SlashCommandResult {
     let mut parts = input.trim()[1..].splitn(2, ' ');
     let cmd = parts.next().unwrap_or("").to_lowercase();
     let arg = parts.next().map(|s| s.trim().to_string());
+    let action_id = format!("tui.{cmd}");
+    let mut rendered = String::new();
+    let mut is_error = false;
+
+    macro_rules! slash_line {
+        ($($arg:tt)*) => {{
+            let line = format!($($arg)*);
+            rendered.push_str(&line);
+            rendered.push_str("\r\n");
+            println!("{line}\r");
+        }};
+    }
+    macro_rules! slash_error {
+        ($($arg:tt)*) => {{
+            is_error = true;
+            slash_line!($($arg)*);
+        }};
+    }
 
     // Print into scroll zone
     let (_, rows) = term_size();
@@ -1976,7 +2780,7 @@ fn handle_slash_cmd(
             } else {
                 ""
             };
-            println!(
+            slash_line!(
                 "\x1b[1mCommands:\x1b[0m\r
   /help          This message\r
 {shell_help}
@@ -1985,6 +2789,14 @@ fn handle_slash_cmd(
   /model [name]  Show or switch model\r
   /provider [n]  Show provider or switch hint\r
   /providers     Show provider status\r
+  /actors        List available conversation actors\r
+  /actor [name]  Show or switch the active actor\r
+  /cells [--pager]  List durable output cells, optionally in $PAGER\r
+  /cell @@N      Reopen one output cell\r
+  /cell @@N --pager  Open one cell's exact output in $PAGER\r
+  /activity [--pager]  List durable interaction receipts\r
+  /receipt ##N   Reopen one interaction receipt\r
+  /receipt ##N --pager  Open its exact retained result in $PAGER\r
   /tasks         List background agents\r
   /sessions      List saved sessions\r
   /clear         Clear session context\r
@@ -2003,16 +2815,16 @@ fn handle_slash_cmd(
             );
         }
         "status" => {
-            println!(
+            slash_line!(
                 "\x1b[1mStatus:\x1b[0m  provider={provider_name}  model={current_model}  msgs={}\r",
                 session.messages.len(),
             );
         }
         "version" | "v" => {
-            println!("\x1b[1mpiku\x1b[0m {}\r", crate::VERSION);
+            slash_line!("\x1b[1mpiku\x1b[0m {}\r", crate::VERSION);
         }
         "cost" => {
-            println!(
+            slash_line!(
                 "\x1b[1mTokens:\x1b[0m  in={}  out={}  total={}\r",
                 total_usage.input_tokens,
                 total_usage.output_tokens,
@@ -2020,13 +2832,13 @@ fn handle_slash_cmd(
             );
         }
         "model" => match arg {
-            None => println!("model: {current_model}\r"),
+            None => slash_line!("model: {current_model}\r"),
             Some(_) if read_only => {
-                println!("\x1b[33m[read-only]\x1b[0m model changes are disabled\r");
+                slash_line!("\x1b[33m[read-only]\x1b[0m model changes are disabled\r");
             }
             Some(m) => {
                 m.clone_into(model);
-                println!("\x1b[2m[model → {m}]\x1b[0m\r");
+                slash_line!("\x1b[2m[model → {m}]\x1b[0m\r");
                 let (cols, rows) = term_size();
                 draw_footer(
                     rows.saturating_sub(1),
@@ -2034,6 +2846,7 @@ fn handle_slash_cmd(
                     &FooterState {
                         provider: provider_name,
                         model: &m,
+                        actor: active_actor,
                         session_id,
                         input_tokens: total_usage.input_tokens,
                         output_tokens: total_usage.output_tokens,
@@ -2045,15 +2858,15 @@ fn handle_slash_cmd(
             }
         },
         "provider" => match arg {
-            None => println!("provider: {provider_name}\r"),
+            None => slash_line!("provider: {provider_name}\r"),
             Some(name) => {
-                println!(
+                slash_line!(
                     "\x1b[33m[provider]\x1b[0m restart with `piku --provider {name}` to switch\r"
                 );
             }
         },
         "providers" => {
-            println!("\x1b[1mProviders:\x1b[0m\r");
+            slash_line!("\x1b[1mProviders:\x1b[0m\r");
             for provider in piku_runtime::provider_availability() {
                 let marker = if provider.name == provider_name {
                     "current"
@@ -2069,21 +2882,24 @@ fn handle_slash_cmd(
                 } else {
                     "\x1b[2m"
                 };
-                println!(
+                slash_line!(
                     "  {color}{:<10}\x1b[0m {:<9} \x1b[2mdefault={} ({})\x1b[0m\r",
-                    provider.name, marker, provider.default_model, provider.note
+                    provider.name,
+                    marker,
+                    provider.default_model,
+                    provider.note
                 );
             }
         }
         "sessions" => match crate::sessions_dir() {
             Err(e) => {
-                println!("\x1b[31m/sessions:\x1b[0m could not resolve sessions dir: {e}\r");
+                slash_error!("\x1b[31m/sessions:\x1b[0m could not resolve sessions dir: {e}\r");
             }
             Ok(dir) => {
-                println!("\x1b[1mSessions:\x1b[0m  {}\r", dir.display());
+                slash_line!("\x1b[1mSessions:\x1b[0m  {}\r", dir.display());
                 match std::fs::read_dir(&dir) {
                     Err(e) => {
-                        println!(
+                        slash_error!(
                             "\x1b[31m/sessions:\x1b[0m read_dir failed: {e}. \
                              Directory may have been removed or is unreadable.\r"
                         );
@@ -2100,7 +2916,7 @@ fn handle_slash_cmd(
                         });
                         files.reverse();
                         if files.is_empty() {
-                            println!("\x1b[2m  (no sessions yet)\x1b[0m\r");
+                            slash_line!("\x1b[2m  (no sessions yet)\x1b[0m\r");
                         } else {
                             for f in files.iter().take(15) {
                                 let raw_name = f.file_name();
@@ -2117,7 +2933,7 @@ fn handle_slash_cmd(
                                     );
                                 let first = first_user_message_preview(&f.path());
                                 let preview = first.as_deref().unwrap_or("(empty)");
-                                println!(
+                                slash_line!(
                                     "  \x1b[2m{mtime:>5}\x1b[0m  {name}  \x1b[2m{preview}\x1b[0m\r"
                                 );
                             }
@@ -2129,9 +2945,9 @@ fn handle_slash_cmd(
         "tasks" | "agents" => {
             let tasks = task_registry.all();
             if tasks.is_empty() {
-                println!("\x1b[2mno background agents\x1b[0m\r");
+                slash_line!("\x1b[2mno background agents\x1b[0m\r");
             } else {
-                println!("\x1b[1mBackground agents:\x1b[0m\r");
+                slash_line!("\x1b[1mBackground agents:\x1b[0m\r");
                 for t in &tasks {
                     let status_color = match t.status {
                         TaskStatus::Running => "\x1b[33m",
@@ -2139,63 +2955,71 @@ fn handle_slash_cmd(
                         TaskStatus::Failed => "\x1b[31m",
                     };
                     let elapsed = t.elapsed().as_secs();
-                    println!(
+                    slash_line!(
                         "  {status_color}{}\x1b[0m  \x1b[2m{}\x1b[0m  {}s  depth={}\r",
-                        t.name, t.id, elapsed, t.depth
+                        t.name,
+                        t.id,
+                        elapsed,
+                        t.depth
                     );
                     if let Some(ref out) = t.output {
                         let preview: String = out.chars().take(80).collect();
-                        println!("    \x1b[2m{preview}\x1b[0m\r");
+                        slash_line!("    \x1b[2m{preview}\x1b[0m\r");
                     }
                 }
             }
         }
         "clear" => {
             if read_only {
-                println!("\x1b[33m[read-only]\x1b[0m /clear is disabled\r");
+                slash_line!("\x1b[33m[read-only]\x1b[0m /clear is disabled\r");
             } else {
                 session.messages.clear();
-                println!("\x1b[2m[session cleared]\x1b[0m\r");
+                slash_line!("\x1b[2m[session cleared]\x1b[0m\r");
             }
         }
         "permissions" | "perms" => {
             if config.allow.is_empty() && config.deny.is_empty() {
-                println!("\x1b[2m[no permission rules configured]\x1b[0m\r");
-                println!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.toml or .piku/settings.toml\x1b[0m\r");
+                slash_line!("\x1b[2m[no permission rules configured]\x1b[0m\r");
+                slash_line!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.toml or .piku/settings.toml\x1b[0m\r");
             } else {
                 if !config.allow.is_empty() {
-                    println!("\x1b[32mAllow:\x1b[0m\r");
+                    slash_line!("\x1b[32mAllow:\x1b[0m\r");
                     for rule in &config.allow {
-                        println!("  {rule}\r");
+                        slash_line!("  {rule}\r");
                     }
                 }
                 if !config.deny.is_empty() {
-                    println!("\x1b[31mDeny:\x1b[0m\r");
+                    slash_line!("\x1b[31mDeny:\x1b[0m\r");
                     for rule in &config.deny {
-                        println!("  {rule}\r");
+                        slash_line!("  {rule}\r");
                     }
                 }
             }
         }
         "hooks" => {
             if hook_registry.has_hooks() {
-                println!("\x1b[1mActive hooks:\x1b[0m\r");
+                slash_line!("\x1b[1mActive hooks:\x1b[0m\r");
                 let summary = hook_registry.summary();
                 for line in summary.lines() {
-                    println!("  {line}\r");
+                    slash_line!("  {line}\r");
                 }
             } else {
-                println!("\x1b[2m[no hooks configured]\x1b[0m\r");
-                println!(
+                slash_line!("\x1b[2m[no hooks configured]\x1b[0m\r");
+                slash_line!(
                     "\x1b[2mAdd hooks to the XDG-aware Piku hooks.json or .piku/hooks.json\x1b[0m\r"
                 );
             }
         }
         "exit" | "quit" | "q" => {
-            return true;
+            return SlashCommandResult {
+                should_exit: true,
+                action_id,
+                rendered,
+                is_error,
+            };
         }
         other => {
-            println!("\x1b[33m[unknown]\x1b[0m /{other} — try /help\r");
+            slash_error!("\x1b[33m[unknown]\x1b[0m /{other} — try /help\r");
         }
     }
 
@@ -2206,6 +3030,7 @@ fn handle_slash_cmd(
         &FooterState {
             provider: provider_name,
             model,
+            actor: active_actor,
             session_id,
             input_tokens: total_usage.input_tokens,
             output_tokens: total_usage.output_tokens,
@@ -2215,7 +3040,12 @@ fn handle_slash_cmd(
         },
     );
     let _ = io::stdout().flush();
-    false
+    SlashCommandResult {
+        should_exit: false,
+        action_id,
+        rendered,
+        is_error,
+    }
 }
 
 // ── Tool formatting ────────────────────────────────────────────────────────────
@@ -2382,6 +3212,21 @@ mod tests {
     }
 
     #[test]
+    fn cell_command_keeps_pager_explicit() {
+        assert_eq!(parse_cell_command(""), Ok((None, false)));
+        assert_eq!(
+            parse_cell_command("@@12"),
+            Ok((Some("@@12".to_string()), false))
+        );
+        assert_eq!(
+            parse_cell_command("@@12 --pager"),
+            Ok((Some("@@12".to_string()), true))
+        );
+        assert!(parse_cell_command("@@12 --pager extra").is_err());
+        assert!(parse_cell_command("--pager").is_err());
+    }
+
+    #[test]
     fn permission_description_truncation_keeps_unicode_boundaries() {
         // At 80 columns the 54-byte prefix budget falls inside `日`.
         let description = format!("{}日 then continue", "a".repeat(53));
@@ -2454,6 +3299,7 @@ mod tests {
         FooterState {
             provider: "openrouter",
             model: "claude-sonnet",
+            actor: "researcher",
             session_id: "session-123456789-42",
             input_tokens: 5000,
             output_tokens: 200,
@@ -2472,6 +3318,7 @@ mod tests {
         let plain = strip_ansi(&line);
         assert!(plain.contains("openrouter"), "provider: {plain}");
         assert!(plain.contains("claude-sonnet"), "model: {plain}");
+        assert!(plain.contains("@researcher"), "actor: {plain}");
     }
 
     #[test]
@@ -2808,6 +3655,7 @@ mod tests {
             &FooterState {
                 provider: "openrouter",
                 model: "anthropic/claude-sonnet-4-6",
+                actor: "primary",
                 session_id: "sess-abc",
                 input_tokens: 1_000_000, // $3
                 output_tokens: 0,
@@ -2826,6 +3674,7 @@ mod tests {
             &FooterState {
                 provider: "openrouter",
                 model: "rando/unknown",
+                actor: "primary",
                 session_id: "sess-abc",
                 input_tokens: 1_000_000,
                 output_tokens: 1_000_000,

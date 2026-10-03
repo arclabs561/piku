@@ -183,6 +183,24 @@ impl crate::agent_loop::OutputSink for DevNullSink {
 /// Default max turns for a spawned subagent.
 pub const DEFAULT_SUBAGENT_MAX_TURNS: u32 = 20;
 
+/// Delivery policy at one parent-child delegation edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffDelivery {
+    Join,
+    Notice,
+    Bubble,
+}
+
+/// A descendant reaches an attended ancestor only when every intervening edge
+/// opted into bubbling. UI and evaluators use this same recursion rule.
+#[must_use]
+pub fn handoff_bubbles_to_ancestor(path: &[HandoffDelivery]) -> bool {
+    !path.is_empty()
+        && path
+            .iter()
+            .all(|delivery| *delivery == HandoffDelivery::Bubble)
+}
+
 // ---------------------------------------------------------------------------
 // IDs
 // ---------------------------------------------------------------------------

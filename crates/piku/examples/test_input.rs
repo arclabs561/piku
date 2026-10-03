@@ -23,6 +23,9 @@ fn main() {
             Ok(ReadOutcome::Cancel) => {
                 println!("\x1b[33mCancelled\x1b[0m\n");
             }
+            Ok(ReadOutcome::Inspect) => {
+                println!("\x1b[2mInspect requested\x1b[0m\n");
+            }
             Ok(ReadOutcome::Exit) => {
                 println!("\x1b[2mExit\x1b[0m");
                 break;

@@ -192,6 +192,19 @@ impl<'a> Auditor<'a> {
                 audit_content(&mut self.audit.content, note);
                 return;
             }
+            (EventScope::Run, RunEvent::ShellCommand { output, .. }) => {
+                audit_content(&mut self.audit.content, output);
+                return;
+            }
+            (EventScope::Run, RunEvent::OperatorCommand { result, .. }) => {
+                if let Some(result) = result {
+                    audit_content(&mut self.audit.content, result);
+                }
+                return;
+            }
+            (EventScope::Run, RunEvent::ActorTurn { .. }) => {
+                return;
+            }
             (EventScope::Run, _) => {
                 self.add_finding(
                     AuditSeverity::Error,
@@ -289,7 +302,12 @@ impl<'a> Auditor<'a> {
             RunEvent::ContextSourcesResolved { .. }
             | RunEvent::Warning { .. }
             | RunEvent::ChildRunRef { .. } => {}
-            RunEvent::UserDisposition { .. } => unreachable!("scope checked above"),
+            RunEvent::UserDisposition { .. }
+            | RunEvent::ShellCommand { .. }
+            | RunEvent::OperatorCommand { .. }
+            | RunEvent::ActorTurn { .. } => {
+                unreachable!("scope checked above")
+            }
         }
     }
 
@@ -855,6 +873,7 @@ fn finding(
 
 fn event_name(event: &RunEvent) -> &'static str {
     match event {
+        RunEvent::ActorTurn { .. } => "actor_turn",
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
         RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
@@ -869,6 +888,8 @@ fn event_name(event: &RunEvent) -> &'static str {
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::TurnFailed { .. } => "turn_failed",
         RunEvent::TurnCancelled { .. } => "turn_cancelled",
+        RunEvent::ShellCommand { .. } => "shell_command",
+        RunEvent::OperatorCommand { .. } => "operator_command",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
         RunEvent::ChildRunRef { .. } => "child_run_ref",

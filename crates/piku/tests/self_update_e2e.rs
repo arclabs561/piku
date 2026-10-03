@@ -51,7 +51,7 @@ mod cli_parsing {
     fn empty_args_returns_repl() {
         let cli = Cli::try_parse_from(["piku"]).unwrap();
         assert!(cli.command.is_none());
-        assert!(cli.prompt.is_empty());
+        assert_eq!(cli.prompt, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -158,7 +158,7 @@ mod cli_parsing {
     fn resume_flag_equals_form() {
         let cli = Cli::try_parse_from(["piku", "--resume=session-abc"]).unwrap();
         assert_eq!(cli.resume.as_deref(), Some("session-abc"));
-        assert!(cli.prompt.is_empty());
+        assert_eq!(cli.prompt, [] as [std::string::String; 0]);
     }
 
     #[test]

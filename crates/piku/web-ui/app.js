@@ -619,21 +619,23 @@ async function submitMessage(
             observedEffects = summarizeEffects(event.observed_effects);
             observedEffectsReported = Array.isArray(event.observed_effects);
             const changed = event.canvas_changed !== false;
+            const elapsed = Number(event.elapsed_seconds);
+            const elapsedLabel = Number.isFinite(elapsed) ? `${elapsed.toFixed(1)}s` : "—";
+            const iterations = Number(event.iterations);
             terminalWrite(
               "complete  [" +
                 event.surface +
                 "] canvas=" +
                 (changed ? "updated" : "unchanged") +
                 " iterations=" +
-                event.iterations +
+                (Number.isFinite(iterations) ? iterations : "—") +
                 " elapsed=" +
-                event.elapsed_seconds.toFixed(1) +
-                "s",
+                elapsedLabel,
             );
             finishActivity(
               activity,
               "complete",
-              event.message + " · " + event.elapsed_seconds.toFixed(1) + "s",
+              event.message + " · " + elapsedLabel,
             );
             setActivityEvent(
               activity,
@@ -1001,7 +1003,12 @@ function openCreationMenu(event) {
   menu.className = "create-menu";
   menu.innerHTML =
     '<strong>add to workspace</strong><button data-kind="chat">chat</button><button data-kind="workspace_task">change workspace or page</button><button data-kind="terminal">terminal</button><button data-kind="file">file</button><button data-kind="note">note</button><button data-kind="page_preview">page preview</button>';
-  if (!terminalEnabled) menu.querySelector('[data-kind="terminal"]').remove();
+  if (!terminalEnabled) {
+    const terminal = menu.querySelector('[data-kind="terminal"]');
+    terminal.disabled = true;
+    terminal.title = "Terminal access is unavailable in this capability profile";
+    terminal.textContent = "terminal · unavailable in this profile";
+  }
   if (overlay.querySelector('[data-kind="page_preview"]'))
     menu.querySelector('[data-kind="page_preview"]').remove();
   overlay.append(menu);
@@ -1010,6 +1017,7 @@ function openCreationMenu(event) {
   menu.querySelectorAll("button").forEach((button) =>
     button.addEventListener("click", (click) => {
       click.stopPropagation();
+      if (button.disabled) return;
       const kind = button.dataset.kind;
       closeCreationMenu();
       createWorkspaceObject(kind, anchor);
@@ -1111,7 +1119,7 @@ function enableResize(object) {
         bottom = top + height,
         styles = getComputedStyle(object),
         minWidth = parseFloat(styles.minWidth) || 288,
-        minHeight = parseFloat(styles.minHeight) || 128;
+        minHeight = parseFloat(styles.minHeight) || 192;
       const move = (next) => {
         const dx = next.clientX - startX,
           dy = next.clientY - startY;
@@ -1177,7 +1185,7 @@ function enableResize(object) {
       const step = event.shiftKey ? 64 : 16;
       const styles = getComputedStyle(object);
       const minWidth = parseFloat(styles.minWidth) || 288;
-      const minHeight = parseFloat(styles.minHeight) || 128;
+      const minHeight = parseFloat(styles.minHeight) || 192;
       const left = parseFloat(object.style.left) || 8;
       const top = parseFloat(object.style.top) || 8;
       const maxHeight = Math.max(
@@ -1274,6 +1282,12 @@ function parseChangeCard(content) {
         status: ["idle", "running", "done", "error"].includes(value.status) ? value.status : "idle",
         summary: typeof value.summary === "string" ? value.summary : "",
         diff: typeof value.diff === "string" ? value.diff : "",
+        proposal: value.proposal && typeof value.proposal === "object" ? {
+          target: value.proposal.target === "page" ? "page" : "workspace",
+          targetId: typeof value.proposal.targetId === "string" ? value.proposal.targetId : "",
+          instruction: typeof value.proposal.instruction === "string" ? value.proposal.instruction : "",
+          sourceFingerprint: typeof value.proposal.sourceFingerprint === "string" ? value.proposal.sourceFingerprint : "",
+        } : null,
         runs: Array.isArray(value.runs)
           ? value.runs.slice(-8).map((run, index) => ({
               ordinal: Number.isInteger(run?.ordinal) && run.ordinal > 0
@@ -1319,7 +1333,7 @@ function parseChangeCard(content) {
           : [],
       };
   } catch { /* Older change cards had no durable execution state. */ }
-  return { version: 5, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+  return { version: 5, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", proposal: null, runs: [] };
 }
 function nextChangeRunOrdinal(runs) {
   return runs.reduce(
@@ -1537,6 +1551,16 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       if (existingDiff) diffExpanded = existingDiff.open;
       output.replaceChildren();
       output.dataset.status = state.status;
+      if (state.proposal) {
+        const proposal = document.createElement("section"), apply = document.createElement("button");
+        proposal.className = "change-proposal";
+        proposal.textContent = `proposed · ${state.proposal.target} · ${state.proposal.targetId || "target unresolved"} · review before apply`;
+        apply.type = "button";
+        apply.textContent = "apply proposed change";
+        apply.addEventListener("click", () => runChange(state.proposal.instruction, state.proposal));
+        proposal.append(apply);
+        output.append(proposal);
+      }
       if (!state.summary && !state.diff) return;
       const summary = document.createElement("div");
       summary.className = "change-summary";
@@ -1611,11 +1635,11 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         output.append(rerun);
       }
     };
-    const runChange = async (message) => {
+    const runChange = async (message, proposal = null) => {
       message = message.trim();
       if (!message || state.status === "running") return;
       await executorCatalogReady;
-      const requestKind = scope.value === "page" ? "page" : "workspace",
+      const requestKind = proposal?.target || (scope.value === "page" ? "page" : "workspace"),
         executor = availableExecutorFor(requestKind);
       if (!executor) {
         state.target = scope.value;
@@ -1628,7 +1652,14 @@ function createWorkspaceObject(kind, anchor, restore = null) {
         return;
       }
       state.instruction = message;
-      state.target = scope.value;
+      state.target = requestKind;
+      if (proposal && proposal.sourceFingerprint !== currentPageHtml) {
+        state.status = "error";
+        state.summary = "Proposed page change is stale; review it again against the current source.";
+        state.proposal = null;
+        persistChange(); renderResult(); return;
+      }
+      state.proposal = null;
       state.status = "running";
       state.summary = "running…";
       if (state.target !== "page") state.diff = "";
@@ -1639,7 +1670,9 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       const changesPage = state.target === "page",
         before = currentPageHtml,
         targetId = changesPage
-          ? selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null
+          ? proposal
+            ? proposal.targetId || null
+            : selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null
           : null,
         result = await submitMessage(
           message,
@@ -1689,7 +1722,14 @@ function createWorkspaceObject(kind, anchor, restore = null) {
       event.preventDefault();
       const message = field.value.trim();
       if (!message) return;
-      runChange(message);
+      if (scope.value !== "page") return runChange(message);
+      const targetId = selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || "";
+      state.instruction = message;
+      state.target = "page";
+      state.status = "idle";
+      state.summary = "Review the proposed target, then apply explicitly.";
+      state.proposal = { target: "page", targetId, instruction: message, sourceFingerprint: currentPageHtml };
+      persistChange(); renderResult();
     });
     field.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {

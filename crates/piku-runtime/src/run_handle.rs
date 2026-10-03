@@ -3,7 +3,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::{OutputSink, RecordingSink, RunRecorder, Session};
+use crate::{OutputSink, RecordingSink, RunEvent, RunRecorder, Session};
 
 /// The runtime state that every interactive surface needs for a durable run.
 ///
@@ -45,6 +45,11 @@ impl RunHandle {
 
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    /// Append a run-scoped event that is not part of an agent turn.
+    pub fn record_run(&mut self, event: RunEvent) -> io::Result<u64> {
+        self.recorder.append_run(event)
     }
 
     /// Borrow the session and wrap a surface sink for one recorded turn.

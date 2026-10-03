@@ -97,6 +97,13 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
             let _ = writeln!(output, "\n{current_scope}");
         }
         match &envelope.event {
+            RunEvent::ActorTurn { actor, .. } => {
+                let _ = writeln!(
+                    output,
+                    "  ◇ actor [{} / {}] {}",
+                    actor.provider, actor.model, actor.label
+                );
+            }
             RunEvent::TurnStarted {
                 provider,
                 model,
@@ -268,6 +275,36 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
             RunEvent::TurnCancelled { reason } => {
                 let _ = writeln!(output, "  ◼ cancelled · {reason}");
             }
+            RunEvent::ShellCommand {
+                command,
+                cwd,
+                exit_code,
+                output: shell_output,
+            } => {
+                let _ = writeln!(
+                    output,
+                    "  $ `{command}` · cwd {} · exit={exit_code:?} · {}",
+                    cwd.display(),
+                    content_preview(shell_output, 120)
+                );
+            }
+            RunEvent::OperatorCommand {
+                command,
+                action_id,
+                result,
+                is_error,
+            } => {
+                let action = action_id.as_deref().unwrap_or("local command");
+                let result = result.as_ref().map_or_else(
+                    || "result not retained".to_string(),
+                    |result| content_preview(result, 120),
+                );
+                let _ = writeln!(
+                    output,
+                    "  > `{command}` · {action} · {} · {result}",
+                    if *is_error { "failed" } else { "completed" }
+                );
+            }
             RunEvent::Warning { message } => {
                 let _ = writeln!(output, "  ! {message}");
             }
@@ -425,6 +462,7 @@ fn build_search_index(
 
 fn event_kind(event: &RunEvent) -> &'static str {
     match event {
+        RunEvent::ActorTurn { .. } => "actor_turn",
         RunEvent::TurnStarted { .. } => "turn_started",
         RunEvent::ContextBuilt { .. } => "context_built",
         RunEvent::ContextSourcesResolved { .. } => "context_sources_resolved",
@@ -439,6 +477,8 @@ fn event_kind(event: &RunEvent) -> &'static str {
         RunEvent::TurnCompleted { .. } => "turn_completed",
         RunEvent::TurnFailed { .. } => "turn_failed",
         RunEvent::TurnCancelled { .. } => "turn_cancelled",
+        RunEvent::ShellCommand { .. } => "shell_command",
+        RunEvent::OperatorCommand { .. } => "operator_command",
         RunEvent::Warning { .. } => "warning",
         RunEvent::UserDisposition { .. } => "user_disposition",
         RunEvent::ChildRunRef { .. } => "child_run_ref",
@@ -491,10 +531,13 @@ fn load_artifacts(
 
 fn event_content(envelope: &RunEventEnvelope) -> Option<&ContentRef> {
     match &envelope.event {
+        RunEvent::ActorTurn { .. } => None,
         RunEvent::TurnStarted { input, .. } => Some(input),
         RunEvent::CompactionApplied { summary, .. } => Some(summary),
         RunEvent::AssistantMessage { content } => Some(content),
         RunEvent::ToolCompleted { result, .. } => Some(result),
+        RunEvent::ShellCommand { output, .. } => Some(output),
+        RunEvent::OperatorCommand { result, .. } => result.as_ref(),
         RunEvent::ContextBuilt { .. }
         | RunEvent::ContextSourcesResolved { .. }
         | RunEvent::ContextUnavailable { .. }

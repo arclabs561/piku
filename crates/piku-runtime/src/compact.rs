@@ -220,6 +220,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
                 provider: session.provider.clone(),
                 model: session.model.clone(),
                 messages: all,
+                actor_histories: session.actor_histories.clone(),
+                active_actor: session.active_actor.clone(),
             },
             removed_message_count: 0,
         };
@@ -242,6 +244,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             provider: session.provider.clone(),
             model: session.model.clone(),
             messages: compacted_messages,
+            actor_histories: session.actor_histories.clone(),
+            active_actor: session.active_actor.clone(),
         },
         removed_message_count: masked.len(),
     }
@@ -276,6 +280,8 @@ pub fn apply_compact_summary(
             provider: session.provider.clone(),
             model: session.model.clone(),
             messages: compacted_messages,
+            actor_histories: session.actor_histories.clone(),
+            active_actor: session.active_actor.clone(),
         },
         removed_message_count: removed_count,
     }

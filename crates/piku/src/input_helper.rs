@@ -28,6 +28,8 @@ pub const SLASH_CMDS: &[&str] = &[
     "/model",
     "/tasks",
     "/agents",
+    "/actors",
+    "/actor",
     "/sessions",
     "/permissions",
     "/hooks",
@@ -471,6 +473,7 @@ impl InputBuffer {
 pub enum ReadOutcome {
     Submit(String),
     Cancel,
+    Inspect,
     Exit,
 }
 
@@ -645,6 +648,9 @@ impl LineEditor {
                     Action::Cancel => {
                         break ReadOutcome::Cancel;
                     }
+                    Action::Inspect => {
+                        break ReadOutcome::Inspect;
+                    }
                     Action::Exit => {
                         break ReadOutcome::Exit;
                     }
@@ -722,6 +728,11 @@ impl LineEditor {
         }
         match key {
             // ── Ctrl combos ─────────────────────────────────────────────
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() => Action::Inspect,
             KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers,
@@ -1348,6 +1359,7 @@ pub enum Action {
     Continue,
     Submit,
     Cancel,
+    Inspect,
     Exit,
 }
 
@@ -1666,6 +1678,18 @@ mod tests {
         let action = editor.handle_key(ctrl('j'), &mut input);
         assert_eq!(action, Action::Continue);
         assert_eq!(input.as_str(), "a\n");
+    }
+
+    #[test]
+    fn ctrl_o_opens_cell_inspection_only_from_an_empty_prompt() {
+        let mut editor = LineEditor::new("> ");
+        let mut empty = InputBuffer::new();
+        assert_eq!(editor.handle_key(ctrl('o'), &mut empty), Action::Inspect);
+
+        let mut filled = InputBuffer::new();
+        filled.insert('o');
+        assert_eq!(editor.handle_key(ctrl('o'), &mut filled), Action::Continue);
+        assert_eq!(filled.as_str(), "o");
     }
 
     #[test]

@@ -7,6 +7,7 @@
 /// Config file: `$XDG_CONFIG_HOME/piku/settings.toml`, falling back to
 /// `~/.config/piku/settings.toml` (user-global).
 /// Project-local overrides: `.piku/settings.toml` (merged on top).
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const PROVIDER_ENV_KEYS: &[&str] = &[
@@ -39,6 +40,15 @@ pub struct ProviderConfig {
     pub host: Option<String>,
 }
 
+/// A named foreground participant in an interleaved room.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ActorConfig {
+    pub label: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub instructions: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Settings file schema
 // ---------------------------------------------------------------------------
@@ -60,6 +70,9 @@ pub struct SettingsFile {
     /// Tool names to always deny.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Named actor profiles, configured as `[actors.researcher]`.
+    #[serde(default)]
+    pub actors: BTreeMap<String, ActorConfig>,
     /// Provider-specific config blocks.
     #[serde(default)]
     pub openrouter: Option<ProviderConfig>,
@@ -90,6 +103,7 @@ pub struct PikuConfig {
     pub allow: Vec<String>,
     /// Tool names to always deny (global + project merged).
     pub deny: Vec<String>,
+    pub actors: BTreeMap<String, ActorConfig>,
     /// Per-provider config blocks (global + project merged).
     pub provider_configs: ProviderConfigMap,
     /// Resolved user-global config dir (`XDG_CONFIG_HOME` or `~/.config` fallback).
@@ -141,6 +155,7 @@ impl PikuConfig {
             max_turns: settings.max_turns,
             allow: settings.allow,
             deny: settings.deny,
+            actors: settings.actors,
             provider_configs: ProviderConfigMap {
                 openrouter: settings.openrouter,
                 anthropic: settings.anthropic,
@@ -156,6 +171,11 @@ impl PikuConfig {
     #[must_use]
     pub fn sessions_dir(&self) -> PathBuf {
         self.config_dir.join("sessions")
+    }
+
+    #[must_use]
+    pub fn actor(&self, name: &str) -> Option<&ActorConfig> {
+        self.actors.get(name)
     }
 
     /// Traces directory.
@@ -323,6 +343,7 @@ fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
     // Allow/deny: append (project rules extend global rules).
     base.allow.extend(overlay.allow.iter().cloned());
     base.deny.extend(overlay.deny.iter().cloned());
+    base.actors.extend(overlay.actors.clone());
 
     // Provider config blocks: overlay wins when set.
     if overlay.openrouter.is_some() {

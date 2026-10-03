@@ -6,6 +6,7 @@
 
 pub mod agent_loop;
 pub mod agents;
+pub mod cell_view;
 pub mod compact;
 pub mod context;
 pub mod embed_memory;
@@ -29,6 +30,7 @@ pub use agent_loop::{
 pub use agents::{
     agent_listing_prompt_with_custom, find_agent, find_built_in, load_custom_agents, AgentDef,
 };
+pub use cell_view::{project_cells, CellActor, CellId, CellItem, CellStatus, CellView};
 pub use compact::{
     apply_compact_summary, compact_session, should_compact, CompactionConfig, CompactionResult,
 };
@@ -62,16 +64,17 @@ pub use run_audit::{
 };
 pub use run_handle::{RunHandle, RunTurn};
 pub use run_record::{
-    read_run_record, ArtifactRef, AuthorityLeaseOutcome, ContentChange as RunContentChange,
-    ContentRef as RunContentRef, ContextManifest, ContextMessage, ContextSection,
-    ContextSourceSummary, ContextTool, EffectCategory as RunEffectCategory,
-    EventScope as RunEventScope, PermissionDecision as RunPermissionDecision, RecordingSink,
-    RunDisposition, RunEvent, RunEventEnvelope, RunRecorder, ToolEffect as RunToolEffect,
-    TurnAuthority, UsageRecord, VerificationIndeterminate, VerificationRecord, VerificationStatus,
+    read_run_record, ActorRef, ArtifactRef, AuthorityLeaseOutcome,
+    ContentChange as RunContentChange, ContentRef as RunContentRef, ContextManifest,
+    ContextMessage, ContextSection, ContextSourceSummary, ContextTool,
+    EffectCategory as RunEffectCategory, EventScope as RunEventScope,
+    PermissionDecision as RunPermissionDecision, RecordingSink, RunDisposition, RunEvent,
+    RunEventEnvelope, RunRecorder, ToolEffect as RunToolEffect, TurnAuthority, UsageRecord,
+    VerificationIndeterminate, VerificationRecord, VerificationStatus,
     RUN_INLINE_CONTENT_LIMIT_BYTES, RUN_RECORD_SCHEMA_VERSION,
 };
 pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 pub use task::{
-    AgentTaskId, SubagentEvidence, TaskEntry, TaskRegistry, TaskStatus, DEFAULT_SUBAGENT_MAX_TURNS,
-    MAX_SPAWN_DEPTH,
+    handoff_bubbles_to_ancestor, AgentTaskId, HandoffDelivery, SubagentEvidence, TaskEntry,
+    TaskRegistry, TaskStatus, DEFAULT_SUBAGENT_MAX_TURNS, MAX_SPAWN_DEPTH,
 };

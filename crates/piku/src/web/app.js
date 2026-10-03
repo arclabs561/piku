@@ -210372,13 +210372,16 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
               observedEffects = summarizeEffects(event3.observed_effects);
               observedEffectsReported = Array.isArray(event3.observed_effects);
               const changed = event3.canvas_changed !== false;
+              const elapsed = Number(event3.elapsed_seconds);
+              const elapsedLabel = Number.isFinite(elapsed) ? `${elapsed.toFixed(1)}s` : "\u2014";
+              const iterations = Number(event3.iterations);
               terminalWrite(
-                "complete  [" + event3.surface + "] canvas=" + (changed ? "updated" : "unchanged") + " iterations=" + event3.iterations + " elapsed=" + event3.elapsed_seconds.toFixed(1) + "s"
+                "complete  [" + event3.surface + "] canvas=" + (changed ? "updated" : "unchanged") + " iterations=" + (Number.isFinite(iterations) ? iterations : "\u2014") + " elapsed=" + elapsedLabel
               );
               finishActivity(
                 activity,
                 "complete",
-                event3.message + " \xB7 " + event3.elapsed_seconds.toFixed(1) + "s"
+                event3.message + " \xB7 " + elapsedLabel
               );
               setActivityEvent(
                 activity,
@@ -210693,7 +210696,12 @@ ${checks.join("\n")}`;
     const anchor2 = canvasPoint(event3), menu = document.createElement("div");
     menu.className = "create-menu";
     menu.innerHTML = '<strong>add to workspace</strong><button data-kind="chat">chat</button><button data-kind="workspace_task">change workspace or page</button><button data-kind="terminal">terminal</button><button data-kind="file">file</button><button data-kind="note">note</button><button data-kind="page_preview">page preview</button>';
-    if (!terminalEnabled) menu.querySelector('[data-kind="terminal"]').remove();
+    if (!terminalEnabled) {
+      const terminal = menu.querySelector('[data-kind="terminal"]');
+      terminal.disabled = true;
+      terminal.title = "Terminal access is unavailable in this capability profile";
+      terminal.textContent = "terminal \xB7 unavailable in this profile";
+    }
     if (overlay.querySelector('[data-kind="page_preview"]'))
       menu.querySelector('[data-kind="page_preview"]').remove();
     overlay.append(menu);
@@ -210702,6 +210710,7 @@ ${checks.join("\n")}`;
     menu.querySelectorAll("button").forEach(
       (button) => button.addEventListener("click", (click) => {
         click.stopPropagation();
+        if (button.disabled) return;
         const kind = button.dataset.kind;
         closeCreationMenu();
         createWorkspaceObject(kind, anchor2);
@@ -210781,7 +210790,7 @@ ${checks.join("\n")}`;
         selectWorkspaceObject(object3);
         handle.setPointerCapture(event3.pointerId);
         const corner = handle.dataset.resizeCorner;
-        const startX2 = event3.clientX, startY2 = event3.clientY, left3 = parseFloat(object3.style.left) || 8, top2 = parseFloat(object3.style.top) || 8, width3 = object3.offsetWidth, height2 = object3.offsetHeight, right3 = left3 + width3, bottom2 = top2 + height2, styles8 = getComputedStyle(object3), minWidth = parseFloat(styles8.minWidth) || 288, minHeight = parseFloat(styles8.minHeight) || 128;
+        const startX2 = event3.clientX, startY2 = event3.clientY, left3 = parseFloat(object3.style.left) || 8, top2 = parseFloat(object3.style.top) || 8, width3 = object3.offsetWidth, height2 = object3.offsetHeight, right3 = left3 + width3, bottom2 = top2 + height2, styles8 = getComputedStyle(object3), minWidth = parseFloat(styles8.minWidth) || 288, minHeight = parseFloat(styles8.minHeight) || 192;
         const move = (next3) => {
           const dx = next3.clientX - startX2, dy = next3.clientY - startY2;
           let nextLeft = left3, nextTop = top2, nextWidth = width3, nextHeight = height2;
@@ -210843,7 +210852,7 @@ ${checks.join("\n")}`;
         const step3 = event3.shiftKey ? 64 : 16;
         const styles8 = getComputedStyle(object3);
         const minWidth = parseFloat(styles8.minWidth) || 288;
-        const minHeight = parseFloat(styles8.minHeight) || 128;
+        const minHeight = parseFloat(styles8.minHeight) || 192;
         const left3 = parseFloat(object3.style.left) || 8;
         const top2 = parseFloat(object3.style.top) || 8;
         const maxHeight = Math.max(
@@ -210936,6 +210945,12 @@ ${checks.join("\n")}`;
           status: ["idle", "running", "done", "error"].includes(value2.status) ? value2.status : "idle",
           summary: typeof value2.summary === "string" ? value2.summary : "",
           diff: typeof value2.diff === "string" ? value2.diff : "",
+          proposal: value2.proposal && typeof value2.proposal === "object" ? {
+            target: value2.proposal.target === "page" ? "page" : "workspace",
+            targetId: typeof value2.proposal.targetId === "string" ? value2.proposal.targetId : "",
+            instruction: typeof value2.proposal.instruction === "string" ? value2.proposal.instruction : "",
+            sourceFingerprint: typeof value2.proposal.sourceFingerprint === "string" ? value2.proposal.sourceFingerprint : ""
+          } : null,
           runs: Array.isArray(value2.runs) ? value2.runs.slice(-8).map((run5, index) => ({
             ordinal: Number.isInteger(run5?.ordinal) && run5.ordinal > 0 ? run5.ordinal : index + 1,
             target: run5?.target === "page" ? "page" : "workspace",
@@ -210960,7 +210975,7 @@ ${checks.join("\n")}`;
         };
     } catch {
     }
-    return { version: 5, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", runs: [] };
+    return { version: 5, instruction: "", target: "workspace", status: "idle", summary: "", diff: "", proposal: null, runs: [] };
   }
   function nextChangeRunOrdinal(runs) {
     return runs.reduce(
@@ -211151,6 +211166,16 @@ ${checks.join("\n")}`;
         if (existingDiff) diffExpanded = existingDiff.open;
         output2.replaceChildren();
         output2.dataset.status = state4.status;
+        if (state4.proposal) {
+          const proposal = document.createElement("section"), apply5 = document.createElement("button");
+          proposal.className = "change-proposal";
+          proposal.textContent = `proposed \xB7 ${state4.proposal.target} \xB7 ${state4.proposal.targetId || "target unresolved"} \xB7 review before apply`;
+          apply5.type = "button";
+          apply5.textContent = "apply proposed change";
+          apply5.addEventListener("click", () => runChange(state4.proposal.instruction, state4.proposal));
+          proposal.append(apply5);
+          output2.append(proposal);
+        }
         if (!state4.summary && !state4.diff) return;
         const summary = document.createElement("div");
         summary.className = "change-summary";
@@ -211214,11 +211239,11 @@ ${checks.join("\n")}`;
           output2.append(rerun);
         }
       };
-      const runChange = async (message) => {
+      const runChange = async (message, proposal = null) => {
         message = message.trim();
         if (!message || state4.status === "running") return;
         await executorCatalogReady;
-        const requestKind = scope.value === "page" ? "page" : "workspace", executor = availableExecutorFor(requestKind);
+        const requestKind = proposal?.target || (scope.value === "page" ? "page" : "workspace"), executor = availableExecutorFor(requestKind);
         if (!executor) {
           state4.target = scope.value;
           state4.status = "error";
@@ -211230,14 +211255,23 @@ ${checks.join("\n")}`;
           return;
         }
         state4.instruction = message;
-        state4.target = scope.value;
+        state4.target = requestKind;
+        if (proposal && proposal.sourceFingerprint !== currentPageHtml) {
+          state4.status = "error";
+          state4.summary = "Proposed page change is stale; review it again against the current source.";
+          state4.proposal = null;
+          persistChange();
+          renderResult();
+          return;
+        }
+        state4.proposal = null;
         state4.status = "running";
         state4.summary = "running\u2026";
         if (state4.target !== "page") state4.diff = "";
         persistChange();
         renderResult();
         const ordinal2 = nextChangeRunOrdinal(state4.runs), startedAt = (/* @__PURE__ */ new Date()).toISOString();
-        const changesPage = state4.target === "page", before = currentPageHtml, targetId = changesPage ? selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null : null, result = await submitMessage(
+        const changesPage = state4.target === "page", before = currentPageHtml, targetId = changesPage ? proposal ? proposal.targetId || null : selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || null : null, result = await submitMessage(
           message,
           { x: parseFloat(object3.style.left), y: parseFloat(object3.style.top) + object3.offsetHeight + 8 },
           changesPage ? "page" : "workspace",
@@ -211283,7 +211317,15 @@ ${checks.join("\n")}`;
         event3.preventDefault();
         const message = field.value.trim();
         if (!message) return;
-        runChange(message);
+        if (scope.value !== "page") return runChange(message);
+        const targetId = selectedPageId || overlay.querySelector('[data-kind="page_preview"]')?.dataset.objectId || "";
+        state4.instruction = message;
+        state4.target = "page";
+        state4.status = "idle";
+        state4.summary = "Review the proposed target, then apply explicitly.";
+        state4.proposal = { target: "page", targetId, instruction: message, sourceFingerprint: currentPageHtml };
+        persistChange();
+        renderResult();
       });
       field.addEventListener("keydown", (event3) => {
         if (event3.key === "Enter" && !event3.shiftKey) {

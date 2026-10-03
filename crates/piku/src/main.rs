@@ -16,6 +16,7 @@ use piku_runtime::{
 use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
 use piku_tools::all_tool_definitions;
 
+#[allow(clippy::too_many_lines)] // Command dispatch stays beside its subcommand wiring.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     piku::telemetry::init();
@@ -40,6 +41,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Inspect {
             session_id,
+            cells,
+            activity,
+            cell,
+            receipt,
+            raw,
             json,
             html,
         }) => {
@@ -51,7 +57,18 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 InspectFormat::Text
             };
-            inspect_run(&config, session_id, format)?;
+            inspect_run(
+                &config,
+                session_id,
+                &InspectOptions {
+                    format,
+                    cells: *cells,
+                    activity: *activity,
+                    selected_cell: cell.as_deref(),
+                    selected_receipt: receipt.as_deref(),
+                    raw_cell: raw.as_deref(),
+                },
+            )?;
             return Ok(());
         }
         Some(Commands::Conclude {
@@ -111,13 +128,116 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inspect_run(config: &PikuConfig, session_id: &str, format: InspectFormat) -> anyhow::Result<()> {
+struct InspectOptions<'a> {
+    format: InspectFormat,
+    cells: bool,
+    activity: bool,
+    selected_cell: Option<&'a str>,
+    selected_receipt: Option<&'a str>,
+    raw_cell: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_lines)] // Validation and format rendering form one CLI contract.
+fn inspect_run(
+    config: &PikuConfig,
+    session_id: &str,
+    options: &InspectOptions<'_>,
+) -> anyhow::Result<()> {
+    let InspectOptions {
+        format,
+        cells,
+        activity,
+        selected_cell,
+        selected_receipt,
+        raw_cell,
+    } = *options;
     let path = config.runs_dir().join(format!("{session_id}.jsonl"));
     let events = piku_runtime::read_run_record(&path)?;
     if events.is_empty() {
         anyhow::bail!("no durable run record found at {}", path.display());
     }
+    if selected_cell.is_some() && !cells {
+        anyhow::bail!("--cell requires --cells");
+    }
+    if selected_receipt.is_some() && !activity {
+        anyhow::bail!("--receipt requires --activity");
+    }
+    if cells && activity {
+        anyhow::bail!("--cells and --activity cannot be combined");
+    }
+    if let Some(reference) = raw_cell {
+        if !matches!(format, InspectFormat::Text)
+            || cells
+            || activity
+            || selected_cell.is_some()
+            || selected_receipt.is_some()
+        {
+            anyhow::bail!("--raw cannot be combined with --json, --html, --cells, --activity, --cell, or --receipt");
+        }
+        let output = piku::actions::execute(
+            &piku::actions::Action::InspectCell {
+                reference: Some(reference.to_string()),
+                open_in_pager: true,
+            },
+            &events,
+            &path,
+        )?
+        .require_exact_output()?;
+        print!("{output}");
+        return Ok(());
+    }
+    let selected_cells = if cells {
+        let action = selected_cell.map_or(
+            piku::actions::Action::InspectCells {
+                open_in_pager: false,
+            },
+            |reference| piku::actions::Action::InspectCell {
+                reference: Some(reference.to_string()),
+                open_in_pager: false,
+            },
+        );
+        let cells = piku::actions::execute(&action, &events, &path)?.require_cells()?;
+        if selected_cell.is_some() && cells.is_empty() {
+            anyhow::bail!("unknown cell reference; use piku inspect {session_id} --cells");
+        }
+        cells
+    } else {
+        Vec::new()
+    };
+    let selected_receipts = if activity {
+        let action = selected_receipt.map_or(
+            piku::actions::Action::InspectReceipts {
+                open_in_pager: false,
+            },
+            |reference| piku::actions::Action::InspectReceipt {
+                reference: Some(reference.to_string()),
+                open_in_pager: false,
+            },
+        );
+        let receipts = piku::actions::execute(&action, &events, &path)?.require_receipts()?;
+        if selected_receipt.is_some() && receipts.is_empty() {
+            anyhow::bail!("unknown receipt reference; use piku inspect {session_id} --activity");
+        }
+        receipts
+    } else {
+        Vec::new()
+    };
     match format {
+        InspectFormat::Text if cells => {
+            print!("{}", piku::cell_view::render_cells_text(&selected_cells));
+        }
+        InspectFormat::Json if cells => {
+            println!("{}", serde_json::to_string_pretty(&selected_cells)?);
+        }
+        InspectFormat::Text if activity => {
+            print!(
+                "{}",
+                piku::receipt_view::render_receipts_text(&selected_receipts)
+            );
+        }
+        InspectFormat::Json if activity => {
+            println!("{}", serde_json::to_string_pretty(&selected_receipts)?);
+        }
         InspectFormat::Text => print!("{}", piku::run_view::render_text(&events)),
         InspectFormat::Json => println!("{}", piku::run_view::render_json(&events)?),
         InspectFormat::Html => {

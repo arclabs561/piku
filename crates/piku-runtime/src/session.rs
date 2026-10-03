@@ -5,6 +5,7 @@
 )]
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use piku_api::TokenUsage;
 
@@ -28,6 +29,12 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Private histories keyed by configured foreground actor. The active
+    /// actor's history remains in `messages` for compatibility with the loop.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actor_histories: BTreeMap<String, Vec<ConversationMessage>>,
+    #[serde(default = "default_actor_id")]
+    pub active_actor: String,
 }
 
 impl Session {
@@ -38,6 +45,8 @@ impl Session {
             provider: None,
             model: None,
             messages: Vec::new(),
+            actor_histories: BTreeMap::new(),
+            active_actor: default_actor_id(),
         }
     }
 
@@ -61,6 +70,19 @@ impl Session {
 
     pub fn push(&mut self, msg: ConversationMessage) {
         self.messages.push(msg);
+    }
+
+    /// Change foreground actor without merging private model histories.
+    pub fn select_actor(&mut self, actor: impl Into<String>) {
+        let actor = actor.into();
+        if actor == self.active_actor {
+            return;
+        }
+        let previous = std::mem::take(&mut self.messages);
+        self.actor_histories
+            .insert(self.active_actor.clone(), previous);
+        self.messages = self.actor_histories.remove(&actor).unwrap_or_default();
+        self.active_actor = actor;
     }
 
     /// Approximate token count (4 chars/token heuristic).
@@ -143,6 +165,32 @@ impl Session {
 
             msg.importance = Some((keyword_score * 0.6 + recency).min(1.0));
         }
+    }
+}
+
+fn default_actor_id() -> String {
+    "primary".to_string()
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn actor_switches_keep_private_histories_separate() {
+        let mut session = Session::new("room-1".to_string());
+        session.push(ConversationMessage::user("private researcher note"));
+        session.select_actor("critic");
+        assert!(session.messages.is_empty());
+        session.push(ConversationMessage::user("private critic note"));
+        session.select_actor("primary");
+        assert_eq!(session.messages.len(), 1);
+        session.select_actor("critic");
+        assert_eq!(session.messages.len(), 1);
+        assert!(matches!(
+            &session.messages[0].blocks[0],
+            ContentBlock::Text { text } if text == "private critic note"
+        ));
     }
 }
 
