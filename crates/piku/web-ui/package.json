@@ -2,7 +2,7 @@
   "name": "piku-web-ui",
   "private": true,
   "scripts": {
-    "build": "esbuild app.js --bundle --format=iife --platform=browser --target=safari17 --outfile=../src/web/app.js --loader:.css=css",
+    "build": "esbuild app.js --bundle --format=iife --platform=browser --target=safari17 --outfile=../src/web/app.js --loader:.css=css && node scripts/third-party-notices.mjs",
     "test:e2e": "node ./node_modules/@playwright/test/cli.js test",
     "test:e2e:managed": "node scripts/run-managed-eval.mjs e2e",
     "test:e2e:smoke": "node ./node_modules/@playwright/test/cli.js test e2e/operator-journey.spec.js e2e/workspace.spec.js --grep \"an operator can inspect, contextualize, rerun, and resume|a second blank-canvas click closes the creation menu|Escape dismisses the creation menu|notes drag and persist through the server|corner handles resize, reposition, and persist workspace cards|chat cards persist isolated notebook history and rerun from edited turns\"",
@@ -16,10 +16,10 @@
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",
     "@xterm/xterm": "6.0.0",
-    "dompurify": "^3.4.13",
-    "katex": "^0.17.0",
+    "dompurify": "^3.4.16",
+    "katex": "^0.18.10",
     "marked": "^18.0.9",
-    "marked-katex-extension": "^5.1.10",
+    "marked-katex-extension": "^5.1.13",
     "mermaid": "^11.16.1"
   },
   "devDependencies": {

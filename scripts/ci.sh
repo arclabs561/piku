@@ -98,11 +98,12 @@ web_bundle() (
     ./node_modules/.bin/esbuild app.js --bundle --format=iife \
       --platform=browser --target=safari17 --outfile="$scratch/app.js" \
       --loader:.css=css
+    node scripts/third-party-notices.mjs "$scratch/THIRD_PARTY_NOTICES.txt"
   )
 
   local drift=0
   local asset
-  for asset in app.js app.css; do
+  for asset in app.js app.css THIRD_PARTY_NOTICES.txt; do
     if ! cmp -s "$scratch/$asset" "$generated_root/$asset"; then
       printf 'web: crates/piku/src/web/%s is stale; run npm run build in crates/piku/web-ui\n' "$asset" >&2
       drift=1
