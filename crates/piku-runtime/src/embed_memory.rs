@@ -394,7 +394,7 @@ impl MemoryStore {
             .collect();
 
         // Sort by composite score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         scored
             .into_iter()
@@ -427,7 +427,7 @@ impl MemoryStore {
             .filter(|(sim, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         scored
             .into_iter()
@@ -493,7 +493,7 @@ impl MemoryStore {
             .filter(|(sim, _, _, _)| *sim >= MIN_SIMILARITY)
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         scored
             .into_iter()
@@ -656,7 +656,7 @@ impl MemoryStore {
             .filter(|(score, _)| *score > MIN_SIMILARITY)
             .collect();
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Collect unique root IDs from top-scoring attempts.
         let mut seen_roots = Vec::new();

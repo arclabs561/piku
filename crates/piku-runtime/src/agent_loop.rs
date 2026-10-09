@@ -1201,9 +1201,7 @@ fn curate_message_indices(
     head_ranked.sort_by(|&a, &b| {
         let ia = messages[a].importance.unwrap_or(0.0);
         let ib = messages[b].importance.unwrap_or(0.0);
-        ib.partial_cmp(&ia)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.cmp(&a))
+        ib.total_cmp(&ia).then_with(|| b.cmp(&a))
     });
 
     // Include messages greedily by importance until budget exhausted.
@@ -2491,6 +2489,26 @@ mod curation_tests {
                 "tail message {i} missing"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // test indices 0..64, exact f32 value irrelevant
+    fn curation_tolerates_nan_importance() {
+        // A NaN score must not make the ranking comparator inconsistent:
+        // since Rust 1.81 `sort_by` may panic on a non-total order.
+        let filler = "x".repeat(4_000);
+        let msgs: Vec<ConversationMessage> = (0..64)
+            .map(|i| {
+                let importance = if i % 3 == 0 {
+                    f32::NAN
+                } else {
+                    (i % 7) as f32 / 7.0
+                };
+                user_msg(&format!("{i}:{filler}"), Some(importance))
+            })
+            .collect();
+        let kept = curate_messages(&msgs, 30_000);
+        assert!(kept.len() >= 6 && kept.len() < msgs.len());
     }
 
     #[test]
