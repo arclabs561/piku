@@ -112,6 +112,7 @@ impl Default for HookResult {
 pub struct HookRegistry {
     config: HookConfig,
     project_dir: Option<PathBuf>,
+    untrusted_project_hooks: Option<PathBuf>,
     /// Handles of async hooks currently running. Shared across clones so
     /// `shutdown` sees every in-flight hook regardless of which clone
     /// spawned it.
@@ -167,21 +168,46 @@ impl HookRegistry {
     /// Load hooks from `$XDG_CONFIG_HOME/piku/hooks.json` (with the standard
     /// config fallback), merged with project-local `.piku/hooks.json`.
     /// Project hooks are appended and run after global hooks.
+    ///
+    /// Project hooks are shell commands from the repository, so a fresh clone
+    /// could run code on startup. They load only when the user has trusted
+    /// this exact file content for this directory. Starting with
+    /// `PIKU_TRUST_PROJECT_HOOKS=1` records that trust in the global
+    /// `trusted-hooks.json`; any later edit to the file needs trust again.
     #[must_use]
     pub fn load(project_dir: &Path) -> Self {
+        let trust_now = std::env::var("PIKU_TRUST_PROJECT_HOOKS").as_deref() == Ok("1");
+        Self::load_with_trust(project_dir, &global_config_dir(), trust_now)
+    }
+
+    fn load_with_trust(project_dir: &Path, global_dir: &Path, trust_now: bool) -> Self {
         // Layer 1: global hooks
-        let global_dir = global_config_dir();
         let mut config = load_hooks_file(&global_dir.join("hooks.json"));
 
-        // Layer 2: project-local hooks (appended)
-        let project_config = load_hooks_file(&project_dir.join(".piku").join("hooks.json"));
-        merge_hook_config(&mut config, project_config);
+        // Layer 2: project-local hooks (appended), only if trusted
+        let project_hooks = project_dir.join(".piku").join("hooks.json");
+        let mut untrusted_project_hooks = None;
+        if let Ok(bytes) = std::fs::read(&project_hooks) {
+            if project_hooks_trusted(project_dir, &bytes, global_dir, trust_now) {
+                merge_hook_config(&mut config, load_hooks_file(&project_hooks));
+            } else {
+                untrusted_project_hooks = Some(project_hooks);
+            }
+        }
 
         Self {
             config,
             project_dir: Some(project_dir.to_path_buf()),
+            untrusted_project_hooks,
             pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Project hooks file that was found but skipped because it is not
+    /// trusted, so callers can tell the user.
+    #[must_use]
+    pub fn untrusted_project_hooks(&self) -> Option<&Path> {
+        self.untrusted_project_hooks.as_deref()
     }
 
     /// Load hooks from a single project directory only (no global merge).
@@ -193,6 +219,7 @@ impl HookRegistry {
         Self {
             config,
             project_dir: Some(project_dir.to_path_buf()),
+            untrusted_project_hooks: None,
             pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -679,6 +706,46 @@ fn global_config_dir() -> PathBuf {
     base.join("piku")
 }
 
+/// Whether `bytes` (the project's `.piku/hooks.json`) matches the content
+/// trusted for `project_dir` in `<global_dir>/trusted-hooks.json`. With
+/// `trust_now`, record the current content as trusted first.
+fn project_hooks_trusted(
+    project_dir: &Path,
+    bytes: &[u8],
+    global_dir: &Path,
+    trust_now: bool,
+) -> bool {
+    let store_path = global_dir.join("trusted-hooks.json");
+    let key = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf())
+        .display()
+        .to_string();
+    let digest = crate::Sha256Digest::of_bytes(bytes).as_str().to_string();
+    let mut store: std::collections::BTreeMap<String, String> = std::fs::read(&store_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default();
+    if store.get(&key) == Some(&digest) {
+        return true;
+    }
+    if !trust_now {
+        return false;
+    }
+    store.insert(key, digest);
+    let written = std::fs::create_dir_all(global_dir).and_then(|()| {
+        let json = serde_json::to_vec_pretty(&store).map_err(std::io::Error::other)?;
+        std::fs::write(&store_path, json)
+    });
+    if let Err(e) = written {
+        eprintln!(
+            "[piku] warning: could not record hook trust in {}: {e}",
+            store_path.display()
+        );
+    }
+    true
+}
+
 fn load_hooks_file(path: &Path) -> HookConfig {
     match std::fs::read_to_string(path) {
         Ok(content) => match serde_json::from_str(&content) {
@@ -906,6 +973,38 @@ mod tests {
     fn parse_non_json_returns_none() {
         assert!(parse_pre_tool_decision("not json").is_none());
         assert!(parse_pre_tool_decision("").is_none());
+    }
+
+    /// A cloned repository's `.piku/hooks.json` is arbitrary shell; it must
+    /// not run until the user trusts that exact file content.
+    #[test]
+    fn project_hooks_require_explicit_trust() {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let hooks_dir = project.path().join(".piku");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hooks = r#"{"SessionStart":[{"hooks":[{"command":"echo cloned"}]}]}"#;
+        std::fs::write(hooks_dir.join("hooks.json"), hooks).unwrap();
+
+        let untrusted = HookRegistry::load_with_trust(project.path(), global.path(), false);
+        assert!(!untrusted.has_hooks(), "untrusted project hooks loaded");
+
+        let trusted = HookRegistry::load_with_trust(project.path(), global.path(), true);
+        assert!(trusted.has_hooks(), "explicit trust should load hooks");
+
+        let remembered = HookRegistry::load_with_trust(project.path(), global.path(), false);
+        assert!(
+            remembered.has_hooks(),
+            "trust should persist for same content"
+        );
+
+        let changed = r#"{"SessionStart":[{"hooks":[{"command":"echo changed"}]}]}"#;
+        std::fs::write(hooks_dir.join("hooks.json"), changed).unwrap();
+        let after_change = HookRegistry::load_with_trust(project.path(), global.path(), false);
+        assert!(
+            !after_change.has_hooks(),
+            "changed hooks.json must need trust again"
+        );
     }
 
     #[test]

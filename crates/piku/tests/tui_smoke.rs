@@ -574,11 +574,16 @@ fn hooks_config_loads_from_project_file() {
             }]
         }]
     });
-    std::fs::write(
-        tmp.path().join(".piku").join("hooks.json"),
-        serde_json::to_string_pretty(&hooks_json).unwrap(),
-    )
-    .unwrap();
+    let hooks_text = serde_json::to_string_pretty(&hooks_json).unwrap();
+    std::fs::write(tmp.path().join(".piku").join("hooks.json"), &hooks_text).unwrap();
+    // Project hooks load only after the user trusts this exact content.
+    let trust_dir = isolated_config_home().join("piku");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    let trust = serde_json::json!({
+        tmp.path().canonicalize().unwrap().display().to_string():
+            piku_runtime::Sha256Digest::of_bytes(hooks_text.as_bytes()).as_str(),
+    });
+    std::fs::write(trust_dir.join("trusted-hooks.json"), trust.to_string()).unwrap();
 
     let mut pty = Pty::spawn_in(tmp.path());
     let ready = pty.wait_for("❯", Duration::from_secs(5));

@@ -1319,6 +1319,12 @@ async fn run_tui_repl_core(
     if hook_registry.has_hooks() {
         eprintln!("\x1b[2m[hooks loaded from .piku/hooks.json]\x1b[0m");
     }
+    if let Some(path) = hook_registry.untrusted_project_hooks() {
+        eprintln!(
+            "\x1b[33m[skipped untrusted project hooks {}: review the file, then start once with PIKU_TRUST_PROJECT_HOOKS=1 to trust this content]\x1b[0m",
+            path.display()
+        );
+    }
 
     // Session-start maintenance: evict stale/weak memories from embedding store.
     if !read_only {
@@ -3092,7 +3098,10 @@ pub(crate) fn format_result_lines(result: &str, max_lines: usize, dim: bool) -> 
     for (i, line) in lines.iter().take(show_lines).enumerate() {
         // Truncate very long lines (minified JSON, binary-ish content)
         let display = if line.len() > MAX_LINE_WIDTH {
-            format!("{}…", &line[..MAX_LINE_WIDTH])
+            format!(
+                "{}…",
+                crate::truncate_on_char_boundary(line, MAX_LINE_WIDTH)
+            )
         } else {
             (*line).to_string()
         };
@@ -3212,6 +3221,15 @@ mod tests {
         assert_eq!(scroll_region_sequence(1, 0), None);
         assert_eq!(scroll_region_sequence(1, 1), None);
         assert_eq!(scroll_region_sequence(3, 2), None);
+    }
+
+    #[test]
+    fn long_multibyte_result_line_truncates_on_char_boundary() {
+        // 300 bytes of 3-byte chars: the 200-byte cap falls inside one.
+        let line = "€".repeat(100);
+        let out = format_result_lines(&line, 4, false);
+        assert!(out.contains('…'), "{out}");
+        assert!(out.contains(&"€".repeat(66)), "{out}");
     }
 
     #[test]

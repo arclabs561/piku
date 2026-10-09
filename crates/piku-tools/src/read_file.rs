@@ -39,7 +39,11 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     };
 
     // Size guard: prevent OOM on huge files or special files (/dev/zero).
+    // Devices and FIFOs report length 0 and may never reach EOF.
     match std::fs::metadata(&p.path) {
+        Ok(meta) if !meta.is_file() => {
+            return ToolResult::error(format!("read_file: {} is not a regular file", p.path));
+        }
         Ok(meta) if meta.len() > MAX_FILE_SIZE => {
             return ToolResult::error(format!(
                 "read_file: {} is too large ({} bytes, limit {})",
@@ -52,10 +56,21 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         _ => {}
     }
 
-    let content = match std::fs::read_to_string(&p.path) {
-        Ok(c) => c,
+    // Bound the read too: the file can grow between stat and read.
+    let mut content = String::new();
+    let read = std::fs::File::open(&p.path).and_then(|f| {
+        std::io::Read::read_to_string(&mut std::io::Read::take(f, MAX_FILE_SIZE + 1), &mut content)
+    });
+    match read {
+        Ok(n) if n as u64 > MAX_FILE_SIZE => {
+            return ToolResult::error(format!(
+                "read_file: {} is too large (over {MAX_FILE_SIZE} bytes)",
+                p.path
+            ));
+        }
+        Ok(_) => {}
         Err(e) => return ToolResult::error(format!("read_file: {}: {e}", p.path)),
-    };
+    }
 
     match (p.start_line, p.end_line) {
         (None, None) => ToolResult::ok(content),

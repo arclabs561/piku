@@ -165,18 +165,36 @@ pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), St
         let canonical_base = base
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize base {}: {e}", base.display()))?;
-        let abs = canonical_base.join(target_path);
-        let mut check = abs.clone();
-        let canonical_target = loop {
-            match check.canonicalize() {
-                Ok(c) => break c,
-                Err(_) => {
-                    if !check.pop() {
-                        return Err(format!("relative path escapes project root: {target}"));
+        // Resolve one component at a time: existing prefixes are canonicalized
+        // (following symlinks), and `..` pops the resolved path. Popping only
+        // the longest existing prefix would drop `..` after a missing
+        // directory, so `nope/../../x` would look like it stays inside.
+        let mut canonical_target = canonical_base.clone();
+        for component in target_path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    canonical_target.pop();
+                }
+                std::path::Component::Normal(part) => {
+                    canonical_target.push(part);
+                    if let Ok(resolved) = canonical_target.canonicalize() {
+                        canonical_target = resolved;
+                    } else if canonical_target
+                        .symlink_metadata()
+                        .is_ok_and(|m| m.file_type().is_symlink())
+                    {
+                        // A dangling symlink would be followed on write.
+                        return Err(format!(
+                            "relative path goes through unresolvable symlink: {target}"
+                        ));
                     }
                 }
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(format!("relative path escapes project root: {target}"));
+                }
             }
-        };
+        }
         if !canonical_target.starts_with(&canonical_base) {
             return Err(format!(
                 "relative path escapes project root: {} resolves to {} (outside {})",

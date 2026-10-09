@@ -81,6 +81,19 @@ mod read_file {
             result.output
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unbounded_device_file() {
+        // /dev/zero reports length 0 and never hits EOF.
+        let result = read_file::execute(serde_json::json!({ "path": "/dev/zero" }));
+        assert!(result.is_error, "device file should be rejected");
+        assert!(
+            result.output.contains("not a regular file"),
+            "{}",
+            result.output
+        );
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +306,50 @@ mod edit_file {
             std::fs::read_to_string(&path).unwrap(),
             "status: 🟢 passing"
         );
+    }
+
+    #[test]
+    fn not_found_message_truncates_multibyte_old_string() {
+        let dir = tempdir();
+        let path = dir.join("multibyte.txt");
+        std::fs::write(&path, "hello").unwrap();
+        // 300 bytes of 3-byte chars: byte 200 falls inside a character.
+        let old = "€".repeat(100);
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": old,
+            "new_string": "x",
+        }));
+        assert!(result.is_error);
+        assert!(result.output.contains("not found"), "{}", result.output);
+    }
+
+    #[test]
+    fn mixed_line_endings_are_preserved() {
+        let dir = tempdir();
+        let path = dir.join("mixed.txt");
+        std::fs::write(&path, "a\r\nb\nc\n").unwrap();
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": "b",
+            "new_string": "B",
+        }));
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\r\nB\nc\n");
+    }
+
+    #[test]
+    fn crlf_file_accepts_lf_old_string() {
+        let dir = tempdir();
+        let path = dir.join("crlf.txt");
+        std::fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        let result = edit_file::execute(serde_json::json!({
+            "path": path,
+            "old_string": "a\nb",
+            "new_string": "x\ny",
+        }));
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read(&path).unwrap(), b"x\r\ny\r\nc\r\n");
     }
 }
 
@@ -638,6 +695,61 @@ mod sandbox {
             "expected sandbox error, got: {}",
             r.output
         );
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_refuses_traversal_through_missing_dir() {
+        // `nope` does not exist, so canonicalizing the whole path fails and a
+        // prefix walk lands on the workspace itself; `..` must still count.
+        let parent = tempdir();
+        let td = parent.join("ws");
+        std::fs::create_dir(&td).unwrap();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "nope/../../escaped.txt",
+            "content": "boom",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(r.is_error, "traversal should be rejected: {}", r.output);
+        assert!(!parent.join("escaped.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(cwd)]
+    fn write_file_refuses_symlink_out_of_workspace() {
+        let parent = tempdir();
+        let td = parent.join("ws");
+        let outside = parent.join("outside");
+        std::fs::create_dir(&td).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, td.join("link")).unwrap();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "link/new/escaped.txt",
+            "content": "boom",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(
+            r.is_error,
+            "symlinked escape should be rejected: {}",
+            r.output
+        );
+        assert!(!outside.join("new").exists());
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn write_file_allows_dotdot_that_stays_inside() {
+        let td = tempdir();
+        cd(&td);
+        let params = serde_json::json!({
+            "path": "a/../b/ok.txt",
+            "content": "hi",
+        });
+        let r = crate::write_file::execute(params);
+        assert!(!r.is_error, "in-project write should succeed: {}", r.output);
     }
 
     #[test]

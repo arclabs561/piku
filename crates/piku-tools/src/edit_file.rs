@@ -83,15 +83,15 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     // Normalize CRLF → LF so that files with Windows line endings can be
     // edited with LF-only old_string (which is what LLMs always provide).
     // We preserve the original line ending style when writing back.
-    let has_crlf = raw.contains("\r\n");
+    let (has_crlf, mixed_endings) = line_endings(&raw);
     let content = if has_crlf {
         raw.replace("\r\n", "\n")
     } else {
         raw.clone()
     };
     // Also normalize old_string and new_string for comparison
-    let old_string_normalized = p.old_string.replace("\r\n", "\n");
-    let new_string_normalized = p.new_string.replace("\r\n", "\n");
+    let old_string_normalized = normalize_for_match(&p.old_string, mixed_endings);
+    let new_string_normalized = normalize_for_match(&p.new_string, mixed_endings);
 
     // Helper: restore original line endings if needed
     let restore = |s: String| -> String {
@@ -108,7 +108,7 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         if count == 0 {
             return ToolResult::error(format!(
                 "edit_file: old_string not found in {} — read {} with read_file first to see the exact content, then include more surrounding context in old_string. Your old_string was: {:?}",
-                p.path, p.path, &p.old_string[..p.old_string.len().min(200)]
+                p.path, p.path, &p.old_string[..p.old_string.floor_char_boundary(200)]
             ));
         }
         let final_content = restore(new_content);
@@ -134,7 +134,7 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     match count {
         0 => ToolResult::error(format!(
             "edit_file: old_string not found in {} — read {} with read_file first to get exact whitespace. Your old_string was: {:?}",
-            p.path, p.path, &p.old_string[..p.old_string.len().min(200)]
+            p.path, p.path, &p.old_string[..p.old_string.floor_char_boundary(200)]
         )),
         1 => {
             let new_content = content.replacen(&old_string_normalized, &new_string_normalized, 1);
@@ -158,5 +158,22 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
             "edit_file: ambiguous — old_string matched {n} times in {}. Use replace_all=true or provide more context.",
             p.path
         )),
+    }
+}
+
+/// Returns `(all_crlf, mixed)`. Only a file whose every LF is part of a CRLF
+/// round-trips through LF normalization; restoring a mixed file would turn
+/// its lone LFs into CRLFs, so a mixed file is edited verbatim.
+fn line_endings(raw: &str) -> (bool, bool) {
+    let crlf_count = raw.matches("\r\n").count();
+    let all_crlf = crlf_count > 0 && crlf_count == raw.matches('\n').count();
+    (all_crlf, crlf_count > 0 && !all_crlf)
+}
+
+fn normalize_for_match(s: &str, mixed_endings: bool) -> String {
+    if mixed_endings {
+        s.to_string()
+    } else {
+        s.replace("\r\n", "\n")
     }
 }
