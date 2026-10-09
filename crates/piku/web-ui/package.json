@@ -20,7 +20,7 @@
     "katex": "^0.18.10",
     "marked": "^18.0.9",
     "marked-katex-extension": "^5.1.13",
-    "mermaid": "^11.16.1"
+    "mermaid": "^12.1.0"
   },
   "devDependencies": {
     "@playwright/mcp": "0.0.78",
