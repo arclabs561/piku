@@ -210,7 +210,7 @@ fn bash_long_command_truncated() {
 #[test]
 fn read_file_with_line_range() {
     let input = serde_json::json!({
-        "path": "/Users/arc/Documents/dev/piku/crates/piku/src/tui_repl.rs",
+        "path": "/home/example/Documents/dev/piku/crates/piku/src/tui_repl.rs",
         "start_line": 100,
         "end_line": 200,
     });
@@ -231,7 +231,7 @@ fn read_file_short_path() {
 fn grep_with_path() {
     let input = serde_json::json!({
         "pattern": "fn main",
-        "path": "/Users/arc/Documents/dev/piku/crates/piku/src/"
+        "path": "/home/example/Documents/dev/piku/crates/piku/src/"
     });
     let result = piku::format_tool_input("grep", &input);
     assert!(result.contains("fn main"), "pattern present: {result}");

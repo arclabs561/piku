@@ -100,7 +100,7 @@ fn tool_input_read_file_with_lines() {
 #[test]
 fn tool_input_read_file_long_path_shortened() {
     let input = serde_json::json!({
-        "path": "/Users/arc/Documents/dev/piku/crates/piku/src/tui_repl.rs"
+        "path": "/home/example/Documents/dev/piku/crates/piku/src/tui_repl.rs"
     });
     let result = piku::format_tool_input("read_file", &input);
     assert!(
@@ -126,7 +126,7 @@ fn tool_input_grep_pattern_only() {
 fn tool_input_grep_with_long_path() {
     let input = serde_json::json!({
         "pattern": "TODO",
-        "path": "/Users/arc/Documents/dev/piku/crates/"
+        "path": "/home/example/Documents/dev/piku/crates/"
     });
     let result = piku::format_tool_input("grep", &input);
     assert!(result.contains("TODO"), "pattern: {result}");
