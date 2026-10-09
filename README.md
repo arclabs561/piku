@@ -3,6 +3,10 @@
 Piku runs a local coding agent in a terminal or browser workspace. It is
 experimental and currently built from source.
 
+For a mature terminal agent, use Claude Code, Codex CLI, aider, or opencode;
+piku pairs a provider-agnostic Rust agent with a browser canvas that holds
+chat, terminal, file, and preview cards side by side.
+
 ## Run
 
 Build the binary with stable Rust:
