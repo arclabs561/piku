@@ -494,6 +494,10 @@ impl ConfiguredAllowAll {
 }
 
 impl PermissionPrompter for ConfiguredAllowAll {
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        Some(std::sync::Arc::new(Self::new(&self.deny_rules)))
+    }
+
     fn decide(&self, _req: &PermissionRequest) -> PermissionOutcome {
         PermissionOutcome::Allow
     }

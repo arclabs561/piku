@@ -32,6 +32,12 @@ use piku_runtime::{
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 
+fn task_notifications(registry: &TaskRegistry) -> piku_runtime::agent_loop::InterjectionRx {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    registry.set_notification_channel(tx);
+    rx
+}
+
 // ── Permission prompter ───────────────────────────────────────────────────────
 
 /// Interactive permission prompter for the TUI.
@@ -72,7 +78,53 @@ impl TuiPrompter {
     }
 }
 
+struct DelegatedTuiPrompter {
+    allow_all: bool,
+    allow_rules: Vec<String>,
+    deny_rules: Vec<String>,
+}
+
+impl PermissionPrompter for DelegatedTuiPrompter {
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        Some(std::sync::Arc::new(Self {
+            allow_all: self.allow_all,
+            allow_rules: self.allow_rules.clone(),
+            deny_rules: self.deny_rules.clone(),
+        }))
+    }
+    fn denies(&self, name: &str, params: &serde_json::Value) -> Option<String> {
+        self.deny_rules
+            .iter()
+            .find(|rule| crate::config::matches_tool_pattern(rule, name, params))
+            .map(|rule| format!("denied by settings.toml rule: {rule}"))
+    }
+    fn decide(&self, req: &PermissionRequest) -> PermissionOutcome {
+        if self.allow_all
+            || self
+                .allow_rules
+                .iter()
+                .any(|rule| crate::config::matches_tool_pattern(rule, &req.tool_name, &req.params))
+        {
+            PermissionOutcome::Allow
+        } else {
+            PermissionOutcome::Deny {
+                reason: "child operation requires interactive approval".into(),
+            }
+        }
+    }
+}
+
 impl PermissionPrompter for TuiPrompter {
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        // Children cannot prompt the terminal; retain explicit allow rules and
+        // deny anything that would require a new interactive decision.
+        Some(std::sync::Arc::new(DelegatedTuiPrompter {
+            allow_all: self.allow_all.load(std::sync::atomic::Ordering::Relaxed),
+            allow_rules: self.allow_rules.clone(),
+            deny_rules: self.deny_rules.clone(),
+        }))
+    }
+
     fn denies(&self, tool_name: &str, params: &serde_json::Value) -> Option<String> {
         self.deny_rules
             .iter()
@@ -1329,15 +1381,12 @@ async fn run_tui_repl_core(
     // Session-start maintenance: evict stale/weak memories from embedding store.
     if !read_only {
         let store_path = piku_runtime::default_store_path(&cwd);
-        let mut store = piku_runtime::MemoryStore::load(&store_path);
-        if store.valid_count() > 0 {
-            let (stale, weak) = store.maintain();
-            if stale + weak > 0 {
-                let _ = store.save(&store_path);
-                eprintln!(
-                    "\x1b[2m[memory maintenance: {stale} stale + {weak} weak entries evicted]\x1b[0m"
-                );
-            }
+        match piku_runtime::MemoryStore::transaction(&store_path, |store| Ok(store.maintain())) {
+            Ok((stale, weak)) if stale + weak > 0 => eprintln!(
+                "\x1b[2m[memory maintenance: {stale} stale + {weak} weak entries evicted]\x1b[0m"
+            ),
+            Err(error) => eprintln!("[piku] memory maintenance failed: {error}"),
+            _ => {}
         }
     }
 
@@ -1359,6 +1408,7 @@ async fn run_tui_repl_core(
         config.agent_links_dir(),
         Some(run_path.clone()),
     );
+    let mut task_notification_rx = task_notifications(&task_registry);
     let session_path = sessions_dir.join(format!("{session_id}.json"));
     // Announce the session at the start, not only on the way out. It is
     // rewritten after every turn, so a name known up front can be tailed live
@@ -2419,7 +2469,7 @@ async fn run_tui_repl_core(
                         &prompter,
                         recording_sink,
                         config.max_turns,
-                        None,
+                        Some(&mut task_notification_rx),
                         &task_registry,
                         0,
                         &custom_agents,
@@ -2596,22 +2646,21 @@ async fn run_tui_repl_core(
         let transcript = piku_runtime::build_extraction_transcript(&run.session().messages);
         if !transcript.trim().is_empty() {
             let store_path = piku_runtime::default_store_path(&cwd);
-            let mut store = piku_runtime::MemoryStore::load(&store_path);
             let embed_config = piku_runtime::embed_memory::EmbedConfig::from_env();
             // Use a short timeout — don't make the user wait forever on exit
-            let extraction_future = piku_runtime::extract_and_store(
+            let extraction_future = piku_runtime::embed_memory::extract_and_persist(
                 &transcript,
                 resolved.as_provider(),
                 &model,
-                &mut store,
+                &store_path,
                 &embed_config,
             );
             match tokio::time::timeout(std::time::Duration::from_secs(15), extraction_future).await
             {
-                Ok(n) if n > 0 => {
-                    let _ = store.save(&store_path);
+                Ok(Ok(n)) if n > 0 => {
                     eprintln!("\x1b[2m[{n} memories extracted from session]\x1b[0m");
                 }
+                Ok(Err(error)) => eprintln!("[piku] memory extraction failed: {error}"),
                 _ => {} // timeout or no memories — exit silently
             }
         }
@@ -3212,6 +3261,87 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn task_completion_reaches_the_next_parent_request() {
+        struct InspectNotification;
+        impl piku_api::Provider for InspectNotification {
+            fn name(&self) -> &'static str {
+                "notification-test"
+            }
+            fn stream_message(
+                &self,
+                request: piku_api::MessageRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn futures_util::Stream<Item = Result<piku_api::Event, piku_api::ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let request = format!("{request:?}");
+                assert!(request.contains("completed in 1 turns"), "{request}");
+                assert!(request.contains("agent_join"), "{request}");
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(piku_api::Event::TextDelta {
+                        text: "acknowledged".into(),
+                    }),
+                    Ok(piku_api::Event::MessageStop {
+                        stop_reason: piku_api::StopReason::EndTurn,
+                    }),
+                ]))
+            }
+        }
+        let registry = TaskRegistry::new();
+        let mut rx = task_notifications(&registry);
+        let id = registry.register("child".into(), "check".into(), 1, None);
+        let output = "✓".repeat(4096);
+        registry.complete(&id, &output, 1);
+        let mut session = Session::new("notification-parent".into());
+        let result = run_turn_with_registry(
+            "continue",
+            &mut session,
+            &InspectNotification,
+            "scripted",
+            &[],
+            vec![],
+            &piku_runtime::AllowAll,
+            &mut piku_runtime::task::DevNullSink,
+            Some(1),
+            Some(&mut rx),
+            &registry,
+            0,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.iterations, 1);
+        assert!(session.messages.iter().any(|message| message.blocks.iter().any(|block| matches!(block, piku_runtime::session::ContentBlock::Text { text } if text.contains("agent_join") && text.chars().count() < 1200))));
+        assert_eq!(
+            registry.status(&id).unwrap().output.as_deref(),
+            Some(output.as_str())
+        );
+    }
+
+    #[test]
+    fn task_notification_overflow_preserves_queryable_results() {
+        let registry = TaskRegistry::new();
+        let rx = task_notifications(&registry);
+        let mut ids = Vec::new();
+        for _ in 0..33 {
+            let id = registry.register("child".into(), "check".into(), 1, None);
+            registry.complete(&id, "done", 1);
+            ids.push(id);
+        }
+        assert_eq!(rx.len(), 32);
+        assert_eq!(ids.len(), 33);
+        for id in ids {
+            let entry = registry.status(&id).unwrap();
+            assert_eq!(entry.status, TaskStatus::Done);
+            assert_eq!(entry.output.as_deref(), Some("done"));
+        }
+    }
+
     /// A scroll region needs bot above top; terminals ignore DECSTBM when it
     /// does not and the layout then draws against a region that was never
     /// set. Captures from a PTY with no winsize show `\x1b[1;0r`.
@@ -3245,6 +3375,36 @@ mod tests {
         );
         assert!(parse_cell_command("@@12 --pager extra").is_err());
         assert!(parse_cell_command("--pager").is_err());
+    }
+
+    #[test]
+    fn delegated_tui_policy_retains_denials_and_requires_prior_approval() {
+        let prompter = TuiPrompter::new(&[], &["write_file".into()]);
+        let req = PermissionRequest {
+            tool_name: "bash".into(),
+            params: serde_json::json!({"command":"echo safe"}),
+            destructiveness: Destructiveness::Likely,
+            description: "fixture".into(),
+        };
+        let child = prompter.delegated_policy().unwrap();
+        assert!(matches!(child.decide(&req), PermissionOutcome::Deny { .. }));
+        prompter
+            .allow_all
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let child = prompter.delegated_policy().unwrap();
+        assert!(matches!(child.decide(&req), PermissionOutcome::Allow));
+        assert!(matches!(
+            piku_runtime::permission::check_permission(
+                "write_file",
+                &serde_json::json!({"path":"new.txt","content":"x"}),
+                child.as_ref()
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+        let grandchild = child.delegated_policy().unwrap();
+        assert!(grandchild
+            .denies("write_file", &serde_json::json!({}))
+            .is_some());
     }
 
     #[test]
