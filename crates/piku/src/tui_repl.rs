@@ -666,11 +666,11 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
         String::new()
     };
 
-    // Context window % — amber >75%, red >90%
+    // Last request input estimate — amber >=75%, red >=90%
     let ctx_seg = match s.context_pct {
-        Some(pct) if pct >= 90 => format!(" \x1b[31m{pct}%\x1b[0m "),
-        Some(pct) if pct >= 75 => format!(" \x1b[33m{pct}%\x1b[0m "),
-        Some(pct) if pct >= 50 => format!(" {pct}% "),
+        Some(pct) if pct >= 90 => format!(" \x1b[31mlast req≈{pct}%\x1b[0m "),
+        Some(pct) if pct >= 75 => format!(" \x1b[33mlast req≈{pct}%\x1b[0m "),
+        Some(pct) if pct >= 50 => format!(" last req≈{pct}% "),
         _ => String::new(),
     };
 
@@ -940,63 +940,12 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Format a token count compactly: 1234 → "1.2k", 123456 → "123k", 12 → "12".
-/// Look up the context window size for a given model name.
-///
-/// Match strategy: case-insensitive substring check. Falls back to 200k
-/// (the Claude 4.x default and the most common choice) when the model
-/// is unfamiliar, so the percentage stays meaningful even for off-menu
-/// models. Override with `PIKU_CONTEXT_WINDOW=<tokens>` when the
-/// fallback is wrong.
-pub(crate) fn context_window_for(model: &str) -> u32 {
-    if let Ok(override_str) = std::env::var("PIKU_CONTEXT_WINDOW") {
-        if let Ok(n) = override_str.parse::<u32>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    let m = model.to_ascii_lowercase();
-    // Gemini 2.x / Gemini 3.x — 1M tokens
-    if m.contains("gemini-2") || m.contains("gemini-3") || m.contains("gemini-1.5") {
-        return 1_000_000;
-    }
-    // Claude 4.x and 3.x — 200k (1M with the 1m-context flag, not supported here)
-    if m.contains("claude") {
-        return 200_000;
-    }
-    // GPT-5 / o3 / o1 — 200k
-    if m.contains("gpt-5") || m.contains("o1") || m.contains("o3") {
-        return 200_000;
-    }
-    // GPT-4o / GPT-4.x / GPT-3.5 Turbo 16k — 128k is the modern default
-    if m.contains("gpt-4") || m.contains("gpt-3.5-turbo") {
-        return 128_000;
-    }
-    // Ollama local models: small defaults. Users with long-context
-    // builds can set PIKU_CONTEXT_WINDOW=131072 or similar.
-    if m.contains("llama") || m.contains("qwen") || m.contains("mistral") || m.contains("gemma") {
-        return 8_192;
-    }
-    // Unknown — assume a large window rather than an alarmingly-low one.
-    200_000
-}
-
-/// Estimate context window % from cumulative input tokens against a
-/// model-specific window. Returns None when tokens are zero.
-pub(crate) fn context_pct_for(input_tokens: u32, model: &str) -> Option<u8> {
-    if input_tokens == 0 {
-        return None;
-    }
-    let window = context_window_for(model);
-    let pct = ((input_tokens as f32 / window as f32) * 100.0).round() as u8;
-    Some(pct.min(100))
-}
-
-/// Backward-compatible shim. New call sites should use `context_pct_for`
-/// with the actual model name.
-pub(crate) fn context_pct(input_tokens: u32) -> Option<u8> {
-    context_pct_for(input_tokens, "claude")
+/// Last selected request input estimate, only for the model it described.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn request_context_pct(observed: Option<&(String, f32)>, model: &str) -> Option<u8> {
+    observed
+        .filter(|(observed_model, pressure)| observed_model == model && pressure.is_finite())
+        .map(|(_, pressure)| (pressure.clamp(0.0, 1.0) * 100.0).round() as u8)
 }
 
 pub(crate) fn fmt_tokens(n: u32) -> String {
@@ -1085,6 +1034,8 @@ fn teardown_layout(rows: u16) {
 
 pub struct TuiSink {
     stdout: io::Stdout,
+    request_model: Option<String>,
+    request_context: Option<(String, f32)>,
     /// Mtime of the running binary at startup — used to detect self-rebuilds
     /// even when `current_exe()` and the build output path resolve to the same file.
     binary_mtime_baseline: Option<std::time::SystemTime>,
@@ -1122,6 +1073,8 @@ impl TuiSink {
     ) -> Self {
         Self {
             stdout: io::stdout(),
+            request_model: None,
+            request_context: None,
             binary_mtime_baseline,
             build_candidate: self_update::default_build_output(),
             needs_indicator_clear: true,
@@ -1250,6 +1203,27 @@ impl OutputSink for TuiSink {
             "\x1b[33m[permission denied: {tool_name}]\x1b[0m {reason}"
         ));
         let _ = self.stdout.flush();
+    }
+
+    fn on_run_event(&mut self, event: &piku_runtime::run_record::RunEvent) {
+        use piku_runtime::run_record::RunEvent;
+        match event {
+            RunEvent::TurnStarted { .. } => {
+                self.request_model = None;
+                self.request_context = None;
+            }
+            RunEvent::ContextBuilt { manifest } => {
+                self.request_model = Some(manifest.model.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn on_context_pressure(&mut self, pressure: f32) {
+        self.request_context = self
+            .request_model
+            .as_ref()
+            .map(|model| (model.clone(), pressure));
     }
 
     fn on_provider_stream(&mut self, elapsed_ms: u64, blocks: usize, stop_reason: &str) {
@@ -1433,6 +1407,7 @@ async fn run_tui_repl_core(
     let mut run = piku_runtime::RunHandle::open(session, &run_path)?;
 
     let mut total_usage = initial_usage;
+    let mut request_context: Option<(String, f32)> = None;
 
     // Run SessionStart hooks -- captured context is appended to system prompt each turn.
     let hook_session_context = hook_registry.run_session_start(&session_id, &cwd);
@@ -1679,7 +1654,7 @@ async fn run_tui_repl_core(
                                 output_tokens: total_usage.output_tokens,
                                 turns: 0,
                                 running_agents: 0,
-                                context_pct: context_pct_for(total_usage.input_tokens, &model),
+                                context_pct: request_context_pct(request_context.as_ref(), &model),
                             },
                         );
                         let _ = io::stdout().flush();
@@ -1715,7 +1690,10 @@ async fn run_tui_repl_core(
                                     output_tokens: total_usage.output_tokens,
                                     turns: 0,
                                     running_agents: 0,
-                                    context_pct: context_pct_for(total_usage.input_tokens, &model),
+                                    context_pct: request_context_pct(
+                                        request_context.as_ref(),
+                                        &model,
+                                    ),
                                 },
                             );
                             let _ = io::stdout().flush();
@@ -1778,7 +1756,7 @@ async fn run_tui_repl_core(
                                 output_tokens: total_usage.output_tokens,
                                 turns: 0,
                                 running_agents: 0,
-                                context_pct: context_pct_for(total_usage.input_tokens, &model),
+                                context_pct: request_context_pct(request_context.as_ref(), &model),
                             },
                         );
                         let _ = io::stdout().flush();
@@ -1821,6 +1799,7 @@ async fn run_tui_repl_core(
                                     active_actor = name.to_string();
                                     resolved = next_provider;
                                     model = next_model;
+                                    request_context = None;
                                     let (cols, rows) = term_size();
                                     draw_footer(
                                         rows.saturating_sub(1),
@@ -1834,8 +1813,8 @@ async fn run_tui_repl_core(
                                             output_tokens: total_usage.output_tokens,
                                             turns: 0,
                                             running_agents: task_registry.running().len(),
-                                            context_pct: context_pct_for(
-                                                total_usage.input_tokens,
+                                            context_pct: request_context_pct(
+                                                request_context.as_ref(),
                                                 &model,
                                             ),
                                         },
@@ -2070,8 +2049,8 @@ async fn run_tui_repl_core(
                                                 output_tokens: total_usage.output_tokens,
                                                 turns: 0,
                                                 running_agents: task_registry.running().len(),
-                                                context_pct: context_pct_for(
-                                                    total_usage.input_tokens,
+                                                context_pct: request_context_pct(
+                                                    request_context.as_ref(),
                                                     &model,
                                                 ),
                                             },
@@ -2180,8 +2159,8 @@ async fn run_tui_repl_core(
                                                     output_tokens: total_usage.output_tokens,
                                                     turns: 0,
                                                     running_agents: task_registry.running().len(),
-                                                    context_pct: context_pct_for(
-                                                        total_usage.input_tokens,
+                                                    context_pct: request_context_pct(
+                                                        request_context.as_ref(),
                                                         &model,
                                                     ),
                                                 },
@@ -2277,6 +2256,9 @@ async fn run_tui_repl_core(
                         &hook_registry,
                         read_only,
                     );
+                    if model != current_model_name || run.session().messages.is_empty() {
+                        request_context = None;
+                    }
                     if let Err(error) = record_operator_receipt(
                         &mut run,
                         &full_input,
@@ -2509,6 +2491,7 @@ async fn run_tui_repl_core(
                 })?;
 
                 total_usage.accumulate(&result.usage);
+                request_context = sink.request_context.clone();
 
                 if let Some(err) = &result.stream_error {
                     // Print error into scroll zone
@@ -2532,7 +2515,7 @@ async fn run_tui_repl_core(
                         output_tokens: total_usage.output_tokens,
                         turns: result.iterations,
                         running_agents: task_registry.running().len(),
-                        context_pct: context_pct(total_usage.input_tokens),
+                        context_pct: request_context_pct(request_context.as_ref(), &model),
                     },
                 );
                 // Position input row, clear it, and restore cursor visibility.
@@ -2590,7 +2573,7 @@ async fn run_tui_repl_core(
                         output_tokens: total_usage.output_tokens,
                         turns: 0,
                         running_agents: task_registry.running().len(),
-                        context_pct: context_pct_for(total_usage.input_tokens, &model),
+                        context_pct: request_context_pct(request_context.as_ref(), &model),
                     },
                 );
             }
@@ -3685,27 +3668,100 @@ mod tests {
         assert_eq!(short_session_id("session-12345-678"), "…678");
     }
 
-    // ── context_pct ─────────────────────────────────────────────────
-
     #[test]
-    fn context_pct_zero_is_none() {
+    fn actual_tui_sink_uses_request_estimate_and_resets_unknown_turns() {
         with_clean_context_window_env(|| {
-            assert_eq!(context_pct(0), None);
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                struct Provider;
+                impl piku_api::Provider for Provider {
+                    fn name(&self) -> &'static str {
+                        "scripted-footer"
+                    }
+                    fn stream_message(
+                        &self,
+                        _: piku_api::MessageRequest,
+                    ) -> std::pin::Pin<
+                        Box<
+                            dyn futures_util::Stream<
+                                    Item = Result<piku_api::Event, piku_api::ApiError>,
+                                > + Send
+                                + '_,
+                        >,
+                    > {
+                        Box::pin(futures_util::stream::iter([
+                            Ok(piku_api::Event::TextDelta {
+                                text: "done".into(),
+                            }),
+                            Ok(piku_api::Event::UsageDelta {
+                                usage: TokenUsage {
+                                    input_tokens: 300_000,
+                                    ..TokenUsage::default()
+                                },
+                            }),
+                            Ok(piku_api::Event::MessageStop {
+                                stop_reason: piku_api::StopReason::EndTurn,
+                            }),
+                        ]))
+                    }
+                }
+                let mut sink =
+                    TuiSink::new("scripted", None, crate::trace::TraceWriter::disabled());
+                sink.needs_indicator_clear = false;
+                sink.on_context_pressure(0.0);
+                assert!(sink.request_context.is_none());
+                let mut session = Session::new("pressure-footer".into());
+                let result = piku_runtime::run_turn(
+                    "hello",
+                    &mut session,
+                    &Provider,
+                    "scripted",
+                    &["x".repeat(480_000)],
+                    vec![],
+                    &piku_runtime::permission::AllowAll,
+                    &mut sink,
+                    Some(1),
+                    None,
+                )
+                .await;
+                assert_eq!(result.usage.input_tokens, 300_000);
+                let mut footer = make_footer();
+                footer.model = "scripted";
+                footer.input_tokens = result.usage.input_tokens;
+                footer.context_pct = request_context_pct(sink.request_context.as_ref(), "scripted");
+                assert_eq!(footer.context_pct, Some(60));
+                let rendered = strip_ansi(&render_footer(160, &footer));
+                assert!(rendered.contains("req≈60%"), "{rendered}");
+                assert!(
+                    rendered.contains("300k"),
+                    "billing counter must stay intact: {rendered}"
+                );
+                assert_eq!(
+                    request_context_pct(sink.request_context.as_ref(), "changed-model"),
+                    None
+                );
+                sink.on_run_event(&piku_runtime::run_record::RunEvent::TurnStarted {
+                    provider: None,
+                    model: "scripted".into(),
+                    input: piku_runtime::run_record::ContentRef::Inline {
+                        text: "cancelled before request".into(),
+                    },
+                });
+                sink.on_context_pressure(0.0);
+                assert!(sink.request_context.is_none());
+            });
         });
     }
 
     #[test]
-    fn context_pct_half() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_pct(100_000), Some(50));
-        });
-    }
-
-    #[test]
-    fn context_pct_caps() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_pct(300_000), Some(100));
-        });
+    fn request_context_is_unknown_until_observed_and_model_scoped() {
+        assert_eq!(request_context_pct(None, "model"), None);
+        let observed = Some(("model".into(), 0.6));
+        assert_eq!(request_context_pct(observed.as_ref(), "model"), Some(60));
+        assert_eq!(request_context_pct(observed.as_ref(), "different"), None);
+        assert_eq!(
+            request_context_pct(Some(&("model".into(), 1.5)), "model"),
+            Some(100)
+        );
     }
 
     // ── format_result_lines ─────────────────────────────────────────
@@ -3768,60 +3824,6 @@ mod tests {
     #[test]
     fn tool_result_empty() {
         assert!(format_tool_result("bash", "", false).is_empty());
-    }
-
-    #[test]
-    fn context_window_claude_200k() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_window_for("anthropic/claude-sonnet-4-6"), 200_000);
-            assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
-            assert_eq!(context_window_for("anthropic/Claude-Opus-4-1"), 200_000);
-        });
-    }
-
-    #[test]
-    fn context_window_gpt4_128k() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_window_for("openai/gpt-4o"), 128_000);
-            assert_eq!(context_window_for("gpt-4-turbo"), 128_000);
-        });
-    }
-
-    #[test]
-    fn context_window_gemini_1m() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_window_for("google/gemini-2.5-pro"), 1_000_000);
-            assert_eq!(context_window_for("gemini-3-pro"), 1_000_000);
-        });
-    }
-
-    #[test]
-    fn context_window_ollama_8k_default() {
-        with_clean_context_window_env(|| {
-            assert_eq!(context_window_for("llama3.2:latest"), 8_192);
-            assert_eq!(context_window_for("qwen2.5-coder"), 8_192);
-        });
-    }
-
-    #[test]
-    fn context_window_env_override() {
-        with_clean_context_window_env(|| {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::env::set_var("PIKU_CONTEXT_WINDOW", "512000");
-            }
-            assert_eq!(context_window_for("claude-sonnet-4-6"), 512_000);
-        });
-    }
-
-    #[test]
-    fn context_pct_honors_model() {
-        with_clean_context_window_env(|| {
-            // 100k tokens, claude window 200k → 50%.
-            assert_eq!(context_pct_for(100_000, "claude-sonnet-4-6"), Some(50));
-            // Same 100k, gpt-4o window 128k → 78%.
-            assert_eq!(context_pct_for(100_000, "openai/gpt-4o"), Some(78));
-        });
     }
 
     #[test]
