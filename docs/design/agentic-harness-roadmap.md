@@ -377,3 +377,12 @@ workspace decisions from observed tests and consumers using free ADR identifiers
 Do not begin lazy tools, more concurrency, or a presentation redesign while the
 current surfaces and evaluator still misclassify their own capabilities and
 evidence.
+
+## Focused next designs
+
+- [Child task review](task-review-contract.md) compares the existing human
+  conclusion workflow with an enforced acceptance contract, keeping execution,
+  observed verification, and acceptance distinct.
+- [Collaboration and experience-memory experiment](agent-learning-collaboration-experiment.md)
+  defines single-agent/delegation and frozen held-out memory baselines. It is an
+  opt-in experiment proposal, not an implemented capability or measured gain.
