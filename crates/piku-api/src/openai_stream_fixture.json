@@ -1,0 +1,158 @@
+[
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": null,
+        "delta": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "synthetic-call",
+              "type": "function",
+              "function": {
+                "name": "inspect_file",
+                "arguments": ""
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": null,
+        "delta": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "function": {
+                "arguments": ""
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": null,
+        "delta": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "function": {
+                "arguments": "{\"path\": \"version.tx"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": null,
+        "delta": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "function": {
+                "arguments": "t"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": null,
+        "delta": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "index": 0,
+              "function": {
+                "arguments": "\"}"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "tool_calls",
+        "delta": {
+          "content": "",
+          "role": "assistant"
+        }
+      }
+    ],
+    "usage": null
+  },
+  {
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "tool_calls",
+        "delta": {
+          "content": "",
+          "role": "assistant"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 394,
+      "completion_tokens": 52,
+      "total_tokens": 446,
+      "cost": 6.54e-05,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 6.54e-05,
+        "upstream_inference_prompt_cost": 3.94e-05,
+        "upstream_inference_completions_cost": 2.6e-05
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    }
+  }
+]

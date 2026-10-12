@@ -119,6 +119,7 @@ impl Provider for OpenAiCompatProvider {
             let mut parser = SseParser::new();
             let mut decoder = crate::sse::Utf8Stream::new();
             let mut line_buf = String::new();
+            let mut state = OaiStreamState::default();
 
             while let Some(chunk) = stream.next().await {
                 let bytes = chunk?;
@@ -129,7 +130,7 @@ impl Provider for OpenAiCompatProvider {
                 for ch in text.chars() {
                     if ch == '\n' {
                         if let Some(sse) = parser.feed_line(&line_buf) {
-                            let events = parse_openai_sse(&sse.data)?;
+                            let events = state.parse(&sse.data)?;
                             for event in events {
                                 yield event;
                             }
@@ -144,7 +145,7 @@ impl Provider for OpenAiCompatProvider {
             // Flush remaining line (no terminating newline).
             if !line_buf.is_empty() {
                 if let Some(sse) = parser.feed_line(&line_buf) {
-                    let events = parse_openai_sse(&sse.data)?;
+                    let events = state.parse(&sse.data)?;
                     for event in events {
                         yield event;
                     }
@@ -154,7 +155,7 @@ impl Provider for OpenAiCompatProvider {
             // Otherwise a stream that closes without a trailing blank line
             // silently drops its final event (often `[DONE]`).
             if let Some(sse) = parser.finish() {
-                let events = parse_openai_sse(&sse.data)?;
+                let events = state.parse(&sse.data)?;
                 for event in events {
                     yield event;
                 }
@@ -380,6 +381,8 @@ fn tools_to_oai(tools: &[ToolDefinition]) -> serde_json::Value {
 
 #[derive(Debug, Deserialize)]
 struct OaiChunk {
+    #[serde(default)]
+    error: Option<serde_json::Value>,
     choices: Vec<OaiChoice>,
     #[serde(default)]
     usage: Option<OaiUsage>,
@@ -387,6 +390,8 @@ struct OaiChunk {
 
 #[derive(Debug, Deserialize)]
 struct OaiChoice {
+    #[serde(default)]
+    index: u32,
     delta: OaiDelta,
     finish_reason: Option<String>,
 }
@@ -397,6 +402,8 @@ struct OaiDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiToolCallDelta>>,
+    #[serde(flatten)]
+    other: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +433,10 @@ pub fn parse_openai_sse(data: &str) -> Result<Vec<Event>, ApiError> {
     let chunk: OaiChunk = serde_json::from_str(data)
         .map_err(|e| ApiError::SseParse(format!("bad JSON: {e}: {data}")))?;
 
+    Ok(openai_chunk_events(&chunk))
+}
+
+fn openai_chunk_events(chunk: &OaiChunk) -> Vec<Event> {
     let mut events = Vec::new();
 
     for choice in &chunk.choices {
@@ -488,5 +499,77 @@ pub fn parse_openai_sse(data: &str) -> Result<Vec<Event>, ApiError> {
         });
     }
 
-    Ok(events)
+    events
+}
+
+#[cfg(test)]
+#[path = "openai_stream_tests.rs"]
+mod stream_tests;
+
+/// A wire stream has one choice and one terminal decision. Some compatible
+/// servers repeat that decision in an otherwise empty usage chunk.
+#[derive(Default)]
+struct OaiStreamState {
+    terminal: Option<String>,
+    tool_ids: std::collections::BTreeMap<u32, String>,
+}
+
+impl OaiStreamState {
+    fn parse(&mut self, data: &str) -> Result<Vec<Event>, ApiError> {
+        if data == "[DONE]" {
+            return Ok(vec![]);
+        }
+        let mut chunk: OaiChunk = serde_json::from_str(data)
+            .map_err(|_| ApiError::SseParse("invalid Chat Completions chunk".into()))?;
+        if chunk.error.is_some() {
+            return Err(ApiError::SseParse("Chat Completions stream error".into()));
+        }
+        if chunk.choices.len() > 1 || chunk.choices.iter().any(|choice| choice.index != 0) {
+            return Err(ApiError::SseParse(
+                "multiple or nonzero Chat Completions choices".into(),
+            ));
+        }
+        for choice in &mut chunk.choices {
+            if let Some(terminal) = &self.terminal {
+                if delta_has_payload(&choice.delta) {
+                    return Err(ApiError::SseParse(
+                        "Chat Completions payload after terminal".into(),
+                    ));
+                }
+                if let Some(reason) = choice.finish_reason.take() {
+                    if &reason != terminal {
+                        return Err(ApiError::SseParse(
+                            "conflicting Chat Completions terminals".into(),
+                        ));
+                    }
+                }
+            } else if let Some(reason) = &choice.finish_reason {
+                self.terminal = Some(reason.clone());
+            }
+            for call in choice.delta.tool_calls.iter_mut().flatten() {
+                if let Some(id) = self.tool_ids.get(&call.index) {
+                    if call.id.as_ref().is_some_and(|wire_id| wire_id != id) {
+                        return Err(ApiError::SseParse(
+                            "Chat Completions tool index changed identity".into(),
+                        ));
+                    }
+                    call.id = Some(id.clone());
+                } else if let Some(id) = &call.id {
+                    self.tool_ids.insert(call.index, id.clone());
+                }
+            }
+        }
+        Ok(openai_chunk_events(&chunk))
+    }
+}
+
+fn delta_has_payload(delta: &OaiDelta) -> bool {
+    delta.content.as_ref().is_some_and(|text| !text.is_empty())
+        || delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        || delta.other.iter().any(|(key, value)| {
+            !(value.is_null() || key == "role" && value.as_str() == Some("assistant"))
+        })
 }
