@@ -463,6 +463,47 @@ fn conclude_appends_a_run_scoped_user_disposition() {
     assert_eq!(last["note"]["text"], "verify the browser projection");
 }
 
+#[test]
+fn conclude_can_append_while_live_recorder_remains_open() {
+    use piku_runtime::{read_run_record, RunEvent, RunRecorder};
+    let config = tempfile::tempdir().unwrap();
+    let path = config.path().join("piku/runs/live.jsonl");
+    let mut live = RunRecorder::open(&path, "live").unwrap();
+    live.append(
+        "turn",
+        RunEvent::Warning {
+            message: "before".into(),
+        },
+    )
+    .unwrap();
+    let output = piku_clean_env()
+        .args([
+            "conclude",
+            "live",
+            "--status",
+            "needs-work",
+            "--note",
+            "operator review",
+        ])
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        live.append(
+            "turn",
+            RunEvent::Warning {
+                message: "after".into()
+            }
+        )
+        .unwrap(),
+        2
+    );
+    let events = read_run_record(&path).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(matches!(events[1].event, RunEvent::UserDisposition { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // ArgError: bad flag usage exits non-zero with actionable message
 // ---------------------------------------------------------------------------
@@ -786,4 +827,46 @@ fn subcommand_help_omits_top_level_only_flags() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_html_resolves_cross_directory_record_alias_artifacts() {
+    use piku_runtime::{RunContentRef, RunEvent, RunRecorder};
+    let config = tempfile::tempdir().unwrap();
+    let runs = config.path().join("piku/runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let target = config.path().join("elsewhere/run.jsonl");
+    drop(RunRecorder::open(&target, "alias").unwrap());
+    let alias = runs.join("alias.jsonl");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let mut recorder = RunRecorder::open(&alias, "alias").unwrap();
+    let content = format!("{} unique-alias-artifact-needle", "payload ".repeat(4096));
+    recorder
+        .append(
+            "turn",
+            RunEvent::AssistantMessage {
+                content: RunContentRef::Inline {
+                    text: content.clone(),
+                },
+            },
+        )
+        .unwrap();
+    let output = piku_clean_env()
+        .args(["inspect", "alias", "--html"])
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let html = std::fs::read_to_string(runs.join("alias.html")).unwrap();
+    assert!(html.contains(&content));
+    let events = piku_runtime::read_run_record(&alias).unwrap();
+    let index = piku::run_view::build_search_index_with_artifacts(&events, &alias).unwrap();
+    assert!(index
+        .iter()
+        .any(|entry| entry.search_text.contains("unique-alias-artifact-needle")));
+    assert!(std::fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }

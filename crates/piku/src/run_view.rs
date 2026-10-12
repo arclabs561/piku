@@ -489,6 +489,24 @@ fn load_artifacts(
     events: &[RunEventEnvelope],
     record_path: &Path,
 ) -> std::io::Result<BTreeMap<String, String>> {
+    // Artifact references are relative to the actual record, as in RunRecorder.
+    // Preserve ordinary paths for projections built from in-memory events.
+    let resolved_path;
+    let record_path = match std::fs::symlink_metadata(record_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            resolved_path = record_path.canonicalize()?;
+            if !resolved_path.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "run record alias does not target a file",
+                ));
+            }
+            resolved_path.as_path()
+        }
+        Ok(_) => record_path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => record_path,
+        Err(error) => return Err(error),
+    };
     let base = record_path
         .parent()
         .ok_or_else(|| std::io::Error::other("run record path has no parent"))?;
@@ -862,6 +880,26 @@ mod tests {
 
         assert!(html.contains(artifact_text));
         assert!(html.contains("inspect full artifact"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_projection_rejects_invalid_record_alias_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let alias = directory.path().join("alias.jsonl");
+        std::os::unix::fs::symlink(directory.path().join("missing"), &alias).unwrap();
+        assert_eq!(
+            render_html_with_artifacts(&[], &alias).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let directory_alias = directory.path().join("directory.jsonl");
+        std::os::unix::fs::symlink(directory.path(), &directory_alias).unwrap();
+        assert_eq!(
+            render_html_with_artifacts(&[], &directory_alias)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
