@@ -10,6 +10,13 @@ pub enum PermissionOutcome {
 /// Callback for interactive permission prompts.
 /// Implement this to wire in the TUI confirmation UI.
 pub trait PermissionPrompter: Send + Sync {
+    /// An owned, noninteractive policy for a child that may outlive this turn.
+    /// Return `None` when the policy cannot be preserved; delegation then fails
+    /// closed. Snapshots must retain configured denials, including for Safe calls.
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        None
+    }
+
     fn decide(&self, req: &PermissionRequest) -> PermissionOutcome;
 
     /// Configured policy that outranks classification and session state.
@@ -39,6 +46,10 @@ pub struct PermissionRequest {
 pub struct AllowAll;
 
 impl PermissionPrompter for AllowAll {
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        Some(std::sync::Arc::new(Self))
+    }
+
     fn decide(&self, _req: &PermissionRequest) -> PermissionOutcome {
         PermissionOutcome::Allow
     }
@@ -49,6 +60,10 @@ impl PermissionPrompter for AllowAll {
 pub struct DenyAll;
 
 impl PermissionPrompter for DenyAll {
+    fn delegated_policy(&self) -> Option<std::sync::Arc<dyn PermissionPrompter>> {
+        Some(std::sync::Arc::new(Self))
+    }
+
     fn decide(&self, req: &PermissionRequest) -> PermissionOutcome {
         PermissionOutcome::Deny {
             reason: format!("DenyAll: {} is not permitted", req.tool_name),
@@ -58,10 +73,9 @@ impl PermissionPrompter for DenyAll {
 
 /// Evaluate whether a tool call requires permission.
 ///
-/// Static tool heuristics allow `Safe` calls directly, before configuration
-/// rules. Both `Likely` and `Definite` calls go to the configured prompter. In
-/// the TUI, a prior per-turn allow-all wins; otherwise deny rules precede allow
-/// rules and prompting. Writable launch turns use `AllowAll`.
+/// Configured denials are checked first, including for `Safe` calls and after
+/// per-turn approval. Otherwise `Safe` calls proceed directly; `Likely` and
+/// `Definite` calls go to the prompter.
 pub fn check_permission(
     tool_name: &str,
     params: &serde_json::Value,

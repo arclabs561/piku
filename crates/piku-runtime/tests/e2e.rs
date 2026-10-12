@@ -3058,3 +3058,169 @@ async fn retry_ceiling_dedups_or_lsr_blocks_third_interaction() {
     assert_eq!(sink.tool_starts.len(), 3, "each read must execute");
     assert!(sink.tool_ends.iter().all(|(_, _, _, is_error)| !is_error));
 }
+
+#[test]
+fn extraction_preserves_acknowledged_memory_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "memory_interleaving_in_isolated_process",
+            "--nocapture",
+        ])
+        .current_dir(dir.path())
+        .env("PIKU_MEMORY_INTERLEAVING_HELPER", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated memory regression failed: {status}"
+    );
+}
+
+struct DelayedExtraction {
+    entered: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+    first: std::sync::atomic::AtomicBool,
+}
+impl Provider for DelayedExtraction {
+    fn name(&self) -> &'static str {
+        "delayed-extraction"
+    }
+    fn stream_message(
+        &self,
+        req: MessageRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
+        let judge = req
+            .system
+            .as_ref()
+            .is_some_and(|blocks| format!("{blocks:?}").contains("conflict resolver"));
+        let first = judge && self.first.swap(false, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            if first { self.entered.notify_one(); self.resume.notified().await; }
+            yield Ok(Event::TextDelta { text: if judge { "ADD" } else { "- [importance:7] extracted C {tags: fixture}" }.into() });
+        })
+    }
+}
+
+async fn memory_embedding_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = header
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|v| v.parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = "{\"embeddings\":[[0.0,1.0]]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    (url, server)
+}
+
+#[tokio::test]
+async fn memory_interleaving_in_isolated_process() {
+    if std::env::var_os("PIKU_MEMORY_INTERLEAVING_HELPER").is_none() {
+        return;
+    }
+    let (url, server) = memory_embedding_server().await;
+    std::env::set_var("PIKU_EMBED_URL", &url);
+    std::env::set_var("PIKU_EMBED_BACKEND", "ollama");
+    let store_path = piku_runtime::default_store_path(&std::env::current_dir().unwrap());
+    let mut initial = piku_runtime::MemoryStore::default();
+    let id = initial.record_attempt("A".into(), "initial".into(), None, vec![0.0, 1.0], 6);
+    initial.save(&store_path).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let extractor = DelayedExtraction {
+        entered: entered.clone(),
+        resume: resume.clone(),
+        first: std::sync::atomic::AtomicBool::new(true),
+    };
+    let config = piku_runtime::EmbedConfig::from_env();
+    let extraction = piku_runtime::embed_memory::extract_and_persist(
+        "fixture",
+        &extractor,
+        "scripted",
+        &store_path,
+        &config,
+    );
+    let foreground = async {
+        entered.notified().await;
+        let provider = SequenceProvider::new(vec![
+            tool_call_events(
+                "add",
+                "record_attempt",
+                r#"{"goal":"B","approach":"foreground"}"#,
+            ),
+            tool_call_events(
+                "outcome",
+                "record_attempt",
+                &format!(
+                    r#"{{"attempt_id":{id},"outcome":"success","outcome_detail":"acknowledged"}}"#
+                ),
+            ),
+            text_stop("done"),
+        ]);
+        let mut session = Session::new("interleaving".into());
+        let mut sink = CollectSink::default();
+        run_turn(
+            "record B and finish A",
+            &mut session,
+            &provider,
+            "scripted",
+            &[],
+            all_tool_definitions(),
+            &AllowAll,
+            &mut sink,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(sink.tool_ends.len(), 2);
+        assert!(sink.tool_ends.iter().all(|t| !t.3), "{:#?}", sink.tool_ends);
+        resume.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(extraction, foreground)
+    })
+    .await
+    .expect("the memory interleaving must make progress");
+    assert_eq!(result.unwrap(), 1);
+    let stored = piku_runtime::MemoryStore::try_load(&store_path).unwrap();
+    assert_eq!(
+        stored.entries.len(),
+        3,
+        "extraction must preserve the acknowledged foreground addition"
+    );
+    assert_eq!(
+        stored.entries.iter().find(|e| e.id == id).unwrap().outcome,
+        Some(piku_runtime::Outcome::Success)
+    );
+    assert_eq!(stored.next_id, 3);
+    server.abort();
+}

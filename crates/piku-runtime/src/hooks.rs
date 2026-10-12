@@ -15,7 +15,6 @@
 ///
 /// Inspired by Claude Code's hooks system (code.claude.com/docs/en/hooks).
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -288,6 +287,7 @@ impl HookRegistry {
             "cwd": cwd.display().to_string(),
         });
 
+        let mut contexts = Vec::new();
         for entry in entries {
             if !matches_tool(entry.matcher.as_deref(), tool_name) {
                 continue;
@@ -307,6 +307,9 @@ impl HookRegistry {
                         if let Some(decision) = parse_pre_tool_decision(&stdout) {
                             if decision.decision != HookDecision::Allow {
                                 return decision;
+                            }
+                            if let Some(context) = decision.context {
+                                contexts.push(context);
                             }
                         }
                     }
@@ -328,7 +331,10 @@ impl HookRegistry {
             }
         }
 
-        HookResult::default()
+        HookResult {
+            decision: HookDecision::Allow,
+            context: (!contexts.is_empty()).then(|| contexts.join("\n")),
+        }
     }
 
     /// Run sync `PostToolUse` handlers inline and spawn handlers marked async.
@@ -635,62 +641,158 @@ fn run_hook_command_raw(
     timeout_secs: u64,
     project_dir: Option<&Path>,
 ) -> HookCommandResult {
-    use std::io::Write;
+    // Hook callers may already be inside a current-thread Tokio runtime.
+    // A separate thread keeps this synchronous API without nested block_on.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(e) => return HookCommandResult::Error(format!("hook runtime failed: {e}")),
+                };
+                runtime.block_on(run_hook_io(
+                    command,
+                    input_json,
+                    timeout_secs,
+                    deadline,
+                    project_dir,
+                ))
+            })
+            .join()
+            .unwrap_or_else(|_| HookCommandResult::Error("hook runner panicked".to_string()))
+    })
+}
+
+async fn run_hook_io(
+    command: &str,
+    input_json: &str,
+    timeout_secs: u64,
+    deadline: std::time::Instant,
+    project_dir: Option<&Path>,
+) -> HookCommandResult {
+    use std::fmt::Write as _;
     use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     if let Some(dir) = project_dir {
         cmd.env("PIKU_PROJECT_DIR", dir);
     }
-
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(child) => child,
         Err(e) => return HookCommandResult::Error(format!("spawn failed: {e}")),
     };
-
-    // Write JSON to stdin then close it so the child sees EOF.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input_json.as_bytes());
-    }
-
-    // Poll with timeout instead of blocking indefinitely.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap
-                    return HookCommandResult::Error(format!(
-                        "hook timed out after {timeout_secs}s: {command}"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+    #[cfg(unix)]
+    let process_group = child.id();
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let io = async {
+        let write = async {
+            // Hooks may intentionally ignore input and close stdin early.
+            match stdin.write_all(input_json.as_bytes()).await {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e),
+                _ => {}
             }
-            Err(e) => return HookCommandResult::Error(format!("wait failed: {e}")),
+            drop(stdin);
+            Ok(())
+        };
+        tokio::try_join!(
+            write,
+            read_hook_output(&mut stdout, "stdout", deadline),
+            read_hook_output(&mut stderr, "stderr", deadline),
+            child.wait(),
+        )
+    };
+    let result = Box::pin(tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        io,
+    ))
+    .await;
+    // Also clean group members after a successful shell exit. This does not
+    // confine descendants that deliberately create a new session or group.
+    #[cfg(unix)]
+    if let Some(group) = process_group.and_then(|id| i32::try_from(id).ok()) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    match result {
+        Ok(Ok(((), stdout, stderr, status))) => match status.code() {
+            Some(0) => HookCommandResult::Success(stdout),
+            Some(2) => HookCommandResult::Blocked(stderr),
+            Some(code) => HookCommandResult::Error(format!("exit code {code}: {stderr}")),
+            None => HookCommandResult::Error("killed by signal".to_string()),
+        },
+        failure => {
+            let _ = child.start_kill();
+            // SIGKILL normally reaps immediately. Never let cleanup defeat the
+            // deadline if the OS cannot finish a child promptly.
+            let reaped =
+                tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+            let mut message = match failure {
+                Err(_) => format!("hook timed out after {timeout_secs}s: {command}"),
+                Ok(Err(e)) => format!("hook I/O failed: {e}"),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            match reaped {
+                Err(_) => message.push_str("; child reap timed out"),
+                Ok(Err(e)) => {
+                    let _ = write!(message, "; child reap failed: {e}");
+                }
+                Ok(Ok(_)) => {}
+            }
+            HookCommandResult::Error(message)
         }
     }
+}
 
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return HookCommandResult::Error(format!("wait failed: {e}")),
-    };
+// Match the shell tool's per-stream output scale. Hooks carry JSON decisions,
+// so overflow is an error, never a silently truncated protocol message.
+const MAX_HOOK_OUTPUT_BYTES: usize = 256 * 1024;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+async fn read_hook_output(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    stream: &str,
+    deadline: std::time::Instant,
+) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
 
-    match output.status.code() {
-        Some(0) => HookCommandResult::Success(stdout),
-        Some(2) => HookCommandResult::Blocked(stderr),
-        Some(code) => HookCommandResult::Error(format!("exit code {code}: {stderr}")),
-        None => HookCommandResult::Error("killed by signal".to_string()),
+    let mut bytes = Vec::with_capacity(MAX_HOOK_OUTPUT_BYTES);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() + count > MAX_HOOK_OUTPUT_BYTES {
+            return Err(std::io::Error::other(format!(
+                "hook {stream} exceeded {MAX_HOOK_OUTPUT_BYTES}-byte limit"
+            )));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
     }
+    let output = String::from_utf8_lossy(&bytes).trim().to_string();
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("hook {stream} decoding exceeded deadline"),
+        ));
+    }
+    Ok(output)
 }
 
 fn global_config_dir() -> PathBuf {
@@ -1171,6 +1273,31 @@ mod tests {
     }
 
     #[test]
+    fn hook_deadline_includes_blocked_stdin() {
+        let start = std::time::Instant::now();
+        let result = run_hook_command_raw("sleep 4", &"x".repeat(1024 * 1024), 1, None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert!(matches!(result, HookCommandResult::Error(ref e) if e.contains("timed out")));
+    }
+
+    #[test]
+    fn hook_deadline_includes_inherited_output_pipes() {
+        let start = std::time::Instant::now();
+        let result = run_hook_command_raw("sleep 4 & exit 0", "{}", 1, None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert!(matches!(result, HookCommandResult::Error(ref e) if e.contains("timed out")));
+    }
+
+    #[test]
+    fn hook_drains_both_outputs_while_child_runs() {
+        let result = run_hook_command_raw(
+            "dd if=/dev/zero bs=65536 count=4 2>/dev/null; dd if=/dev/zero bs=65536 count=4 >&2 2>/dev/null",
+            "{}", 3, None,
+        );
+        assert!(matches!(result, HookCommandResult::Success(ref s) if s.len() == 262_144));
+    }
+
+    #[test]
     fn pre_tool_use_additional_context() {
         let stdout_json = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"remember to be careful"}}"#;
         let result = parse_pre_tool_decision(stdout_json).unwrap();
@@ -1304,3 +1431,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "hooks/tests.rs"]
+mod caller_tests;

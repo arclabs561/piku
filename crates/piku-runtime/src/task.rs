@@ -63,9 +63,9 @@ pub fn create_worktree(
     Ok((wt_path, branch))
 }
 
-/// Remove a git worktree and its branch.
-/// `changed` indicates whether the agent made any file changes.
-/// Returns the worktree path if changes were made (caller can report it).
+/// Retire a clean worktree whose HEAD and branch are integrated in the parent.
+/// `changed` is a conservative retention hint; false still checks actual Git state.
+/// Returns the path when work is retained or cleanup could not finish.
 #[must_use]
 pub fn cleanup_worktree(
     repo_root: &std::path::Path,
@@ -73,38 +73,93 @@ pub fn cleanup_worktree(
     branch: &str,
     changed: bool,
 ) -> Option<std::path::PathBuf> {
-    if changed {
-        // Leave the worktree intact — return path for the parent to report
+    if changed || !worktree_is_integrated(repo_root, wt_path, branch) {
         return Some(wt_path.to_path_buf());
     }
-    // No changes — clean up silently
-    remove_worktree_and_branch(repo_root, wt_path, branch);
-    None
+    if remove_worktree_and_branch(repo_root, wt_path, branch) {
+        None
+    } else {
+        Some(wt_path.to_path_buf())
+    }
+}
+
+// Unknown state is retained. Include ignored files: they may contain child work
+// too, and `worktree remove` alone does not protect them.
+fn worktree_is_integrated(
+    repo_root: &std::path::Path,
+    wt_path: &std::path::Path,
+    branch: &str,
+) -> bool {
+    let Ok(status) = std::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored",
+        ])
+        .current_dir(wt_path)
+        .output()
+    else {
+        return false;
+    };
+    if !status.status.success() || !status.stdout.is_empty() {
+        return false;
+    }
+    for revision in ["HEAD", branch] {
+        let Ok(tip) = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", revision])
+            .current_dir(wt_path)
+            .output()
+        else {
+            return false;
+        };
+        if !tip.status.success() {
+            return false;
+        }
+        let Ok(integrated) = std::process::Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                String::from_utf8_lossy(&tip.stdout).trim(),
+                "HEAD",
+            ])
+            .current_dir(repo_root)
+            .status()
+        else {
+            return false;
+        };
+        if !integrated.success() {
+            return false;
+        }
+    }
+    true
 }
 
 fn remove_worktree_and_branch(
     repo_root: &std::path::Path,
     wt_path: &std::path::Path,
     branch: &str,
-) {
-    let _ = std::process::Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            wt_path.to_str().unwrap_or("."),
-        ])
+) -> bool {
+    let removed = std::process::Command::new("git")
+        .args(["worktree", "remove"])
+        .arg(wt_path)
         .current_dir(repo_root)
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["branch", "-D", branch])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !removed {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["branch", "-d", branch])
         .current_dir(repo_root)
-        .output();
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Drop-based, best-effort cleanup for worktrees. If the owning future unwinds
 /// or is dropped before explicit cleanup, the Drop implementation attempts to
-/// remove the worktree and branch. It cannot run after process termination.
+/// retire a clean, integrated worktree and branch. Partial or unknown work is
+/// retained. It cannot run after process termination.
 ///
 /// The happy path calls [`WorktreeGuard::defuse`] to surrender ownership
 /// to the existing `cleanup_worktree` logic (which may keep the worktree
@@ -147,11 +202,7 @@ impl WorktreeGuard {
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         if self.armed {
-            // Early-drop path: unconditionally clean up. Any partial
-            // work inside the worktree is lost, but we avoid a permanent
-            // resource leak. Losing half-complete panicking-subagent work
-            // is a better outcome than accumulating zombie worktrees.
-            remove_worktree_and_branch(&self.repo_root, &self.wt_path, &self.branch);
+            let _ = cleanup_worktree(&self.repo_root, &self.wt_path, &self.branch, false);
         }
     }
 }
@@ -284,6 +335,22 @@ mod task_id_tests {
             decoded.child_session_id
         );
     }
+}
+
+// A notification is a bounded hint; agent_join retains the full result and
+// durable evidence even when the bounded channel cannot accept another hint.
+fn notification_preview(id: &AgentTaskId, message: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut preview: String = message.chars().take(1024).collect();
+    if message.chars().count() > 1024 {
+        preview.push('…');
+    }
+    let _ = write!(
+        preview,
+        "\nUse agent_join with task_id {id} for the full result and evidence."
+    );
+    preview
 }
 
 // ---------------------------------------------------------------------------
@@ -573,15 +640,20 @@ impl TaskRegistry {
         };
         Self::notify_waiters(&mut inner, id);
         if let (Some(msg), Some(tx)) = (notification, &inner.notification_tx) {
-            let _ = tx.try_send(msg);
+            let _ = tx.try_send(notification_preview(id, &msg));
         }
     }
 
     /// Mark a task as failed.
     pub fn fail(&self, id: &AgentTaskId, reason: &str) {
+        self.fail_after_turns(id, reason, 0);
+    }
+
+    pub(crate) fn fail_after_turns(&self, id: &AgentTaskId, reason: &str, turns_used: u32) {
         let mut inner = self.inner();
         let notification = if let Some(entry) = inner.tasks.get_mut(id) {
             entry.status = TaskStatus::Failed;
+            entry.turns_used = turns_used;
             entry.output = Some(reason.to_string());
             Some(format!(
                 "[agent \"{}\" ({}) failed: {}]",
@@ -592,7 +664,7 @@ impl TaskRegistry {
         };
         Self::notify_waiters(&mut inner, id);
         if let (Some(msg), Some(tx)) = (notification, &inner.notification_tx) {
-            let _ = tx.try_send(msg);
+            let _ = tx.try_send(notification_preview(id, &msg));
         }
     }
 
@@ -656,11 +728,14 @@ mod worktree_guard_tests {
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo_root = dir.path();
+        std::fs::write(repo_root.join("tracked.txt"), "initial").unwrap();
+        std::fs::write(repo_root.join(".gitignore"), "ignored.txt\n").unwrap();
         for args in [
             &["init", "-q", "-b", "main"][..],
             &["config", "user.email", "t@t.t"][..],
             &["config", "user.name", "t"][..],
-            &["commit", "--allow-empty", "-q", "-m", "init"][..],
+            &["add", "tracked.txt", ".gitignore"][..],
+            &["commit", "-q", "-m", "init"][..],
         ] {
             let status = std::process::Command::new("git")
                 .args(args)
@@ -670,6 +745,60 @@ mod worktree_guard_tests {
             assert!(status.success(), "git {args:?} failed");
         }
         dir
+    }
+
+    #[test]
+    fn cleanup_preserves_shell_edits_and_child_commits() {
+        for command in [
+            "printf work > untracked.txt",
+            "printf changed > tracked.txt",
+            "printf work > ignored.txt",
+            "printf work > committed.txt && git add committed.txt && git commit -qm child",
+        ] {
+            let repo = init_repo();
+            let (wt, branch) = create_worktree(repo.path(), &AgentTaskId::new()).unwrap();
+            assert!(std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(&wt)
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(
+                cleanup_worktree(repo.path(), &wt, &branch, false),
+                Some(wt.clone()),
+                "lost shell work: {command}"
+            );
+            assert!(wt.exists());
+            // Explicit disposal of this test's fixture after proving retention.
+            assert!(std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&wt)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+
+    #[test]
+    fn guard_preserves_partial_work_on_early_drop() {
+        let repo = init_repo();
+        let (wt, branch) = create_worktree(repo.path(), &AgentTaskId::new()).unwrap();
+        {
+            let _guard = WorktreeGuard::new(repo.path().to_path_buf(), wt.clone(), branch);
+            std::fs::write(wt.join("partial.txt"), "recover me").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(wt.join("partial.txt")).unwrap(),
+            "recover me"
+        );
+        assert!(std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
     }
 
     /// A guard that panics inside a scope should still remove the worktree.

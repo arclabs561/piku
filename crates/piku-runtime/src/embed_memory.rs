@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod backend;
+mod persistence;
 pub use backend::{embed_text, embed_text_with_config, EmbedBackend, EmbedConfig};
+pub use persistence::extract_and_persist;
 
 static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -245,6 +247,9 @@ impl MemoryStore {
     /// Save by atomic same-directory replacement. This guarantees atomic
     /// visibility to readers, not crash durability because neither file nor
     /// directory metadata is synced.
+    ///
+    /// This writes an owned snapshot. Shared runtime writers must use
+    /// [`Self::transaction`] instead of a separate load/mutate/save sequence.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
@@ -1053,8 +1058,18 @@ pub async fn extract_and_store(
         return 0;
     };
 
-    let facts = parse_extraction_response(&response);
-    let attempts = parse_attempt_lines(&response);
+    apply_extraction(&response, provider, model, store, embed_config).await
+}
+
+async fn apply_extraction(
+    response: &str,
+    provider: &dyn piku_api::Provider,
+    model: &str,
+    store: &mut MemoryStore,
+    embed_config: &EmbedConfig,
+) -> usize {
+    let facts = parse_extraction_response(response);
+    let attempts = parse_attempt_lines(response);
 
     if facts.is_empty() && attempts.is_empty() {
         return 0;

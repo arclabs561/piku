@@ -21,6 +21,9 @@ use crate::permission::{check_permission, PermissionOutcome, PermissionPrompter}
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session, UsageTracker};
 use crate::task::{TaskRegistry, MAX_SPAWN_DEPTH};
 
+#[cfg(test)]
+mod completion_tests;
+
 /// A channel the TUI can use to inject interjections mid-turn.
 /// Send a plain string; the agent wraps it in `<interjection>` tags so
 /// the model sees it as an in-band user message without breaking the
@@ -95,6 +98,43 @@ pub struct TurnResult {
     pub cancelled: bool,
 }
 
+// Internal so callers of the public turn helpers keep their existing API.
+struct TurnOutcome {
+    result: TurnResult,
+    exit: TurnExit,
+}
+
+enum TurnExit {
+    MaxTurns,
+    Cancelled,
+    Error,
+    Restart,
+    Provider(StopReason),
+}
+
+impl TurnExit {
+    fn reason(&self) -> &str {
+        match self {
+            Self::MaxTurns => "max_turns",
+            Self::Cancelled => "cancelled",
+            Self::Error => "error",
+            Self::Restart => "replace_and_exec",
+            Self::Provider(StopReason::EndTurn) => "end_turn",
+            Self::Provider(StopReason::ToolUse) => "tool_use",
+            Self::Provider(StopReason::MaxTokens) => "max_tokens",
+            Self::Provider(StopReason::StopSequence) => "stop_sequence",
+            Self::Provider(StopReason::Other(reason)) => reason,
+        }
+    }
+
+    fn completed(&self) -> bool {
+        matches!(
+            self,
+            Self::Provider(StopReason::EndTurn | StopReason::StopSequence)
+        )
+    }
+}
+
 /// Run a full agentic turn: stream, collect tool calls, execute, loop.
 ///
 /// Mutates `session` in place (appends messages).
@@ -136,6 +176,7 @@ pub async fn run_turn(
         None,
     )
     .await
+    .result
 }
 
 /// Like `run_turn` but with a `TaskRegistry` for background agent spawning
@@ -175,6 +216,7 @@ pub async fn run_turn_with_registry(
         cancel_flag,
     )
     .await
+    .result
 }
 
 async fn run_turn_inner(
@@ -193,7 +235,7 @@ async fn run_turn_inner(
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
     cancel_flag: Option<&CancelFlag>,
-) -> TurnResult {
+) -> TurnOutcome {
     let max = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let mut interjections = interjections;
     let mut cancelled = false;
@@ -232,9 +274,9 @@ async fn run_turn_inner(
     let compact_cfg =
         crate::compact::CompactionConfig::for_window(piku_context_window_for_model(model));
 
-    loop {
+    let exit = loop {
         if iterations >= max {
-            break;
+            break TurnExit::MaxTurns;
         }
         // Check cancellation flag before each iteration.
         if let Some(flag) = cancel_flag {
@@ -246,10 +288,21 @@ async fn run_turn_inner(
                         reason: "cancelled before provider request".to_string(),
                     });
                 }
-                break;
+                break TurnExit::Cancelled;
             }
         }
         iterations += 1;
+
+        // Deliver completions queued while the parent was idle before building
+        // its next provider request. The channel is also drained after tools.
+        if let Some(rx) = interjections.as_deref_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                sink.on_interjection(&msg);
+                session.push(ConversationMessage::user(&format!(
+                    "<interjection>\n{msg}\n</interjection>"
+                )));
+            }
+        }
 
         // Auto-compact: if the session is getting long, shed bulk.
         //
@@ -320,8 +373,8 @@ async fn run_turn_inner(
                         },
                     });
                     // Trigger memory extraction on the messages being compacted away.
-                    // Guarded: skip if a previous extraction is still in flight (prevents
-                    // race conditions on the store file).
+                    // Avoid duplicate extraction work within this turn. Persistence
+                    // separately serializes all writers, including other processes.
                     let new_messages = &session.messages[last_extraction_idx..];
                     if !new_messages.is_empty()
                         && !extraction_in_flight.load(std::sync::atomic::Ordering::Relaxed)
@@ -337,29 +390,18 @@ async fn run_turn_inner(
                             let flag = extraction_in_flight.clone();
                             flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             tokio::spawn(async move {
-                                let mut store =
-                                    match crate::embed_memory::MemoryStore::try_load(&store_path) {
-                                        Ok(store) => store,
-                                        Err(error) => {
-                                            eprintln!("[piku] memory extraction skipped: {error}");
-                                            flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                                            return;
-                                        }
-                                    };
-                                let n = crate::embed_memory::extract_and_store(
+                                if let Err(error) = crate::embed_memory::extract_and_persist(
                                     &transcript,
                                     provider_clone.as_ref(),
                                     &model_owned,
-                                    &mut store,
+                                    &store_path,
                                     &embed_config,
                                 )
-                                .await;
-                                if n > 0 {
-                                    if let Err(error) = store.save(&store_path) {
-                                        eprintln!(
-                                            "[piku] memory extraction persistence failed: {error}"
-                                        );
-                                    }
+                                .await
+                                {
+                                    eprintln!(
+                                        "[piku] memory extraction persistence failed: {error}"
+                                    );
                                 }
                                 flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             });
@@ -394,7 +436,7 @@ async fn run_turn_inner(
             stream_error = Some(err);
             // Don't push a partial assistant message on stream error — break cleanly
             tracker.record(usage);
-            break;
+            break TurnExit::Error;
         }
 
         tracker.record(usage.clone());
@@ -443,10 +485,6 @@ async fn run_turn_inner(
             assistant_blocks,
             Some(usage),
         ));
-
-        if tool_calls.is_empty() {
-            break;
-        }
 
         // execute each tool call sequentially (v0 — concurrent in a future phase)
         let cwd_for_hooks = std::env::current_dir().unwrap_or_default();
@@ -548,7 +586,7 @@ async fn run_turn_inner(
                 // Semantic search over embedding store -- needs embedding the query
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
-                let (mut store, load_error) =
+                let (store, load_error) =
                     match crate::embed_memory::MemoryStore::try_load(&store_path) {
                         Ok(store) => (store, None),
                         Err(error) => (crate::embed_memory::MemoryStore::default(), Some(error)),
@@ -583,19 +621,23 @@ async fn run_turn_inner(
                         .await;
                         match embed_result {
                             Ok(Ok(query_vec)) => {
-                                let retrieved = store.hybrid_retrieve(&query_vec, query, max_k);
-                                if let Err(error) = store.save(&store_path) {
-                                    (format!("search_memory: persistence failed: {error}"), true)
-                                } else if retrieved.is_empty() {
-                                    (
+                                let retrieved = crate::embed_memory::MemoryStore::transaction(
+                                    &store_path,
+                                    |fresh| Ok(fresh.hybrid_retrieve(&query_vec, query, max_k)),
+                                );
+                                match retrieved {
+                                    Err(error) => (
+                                        format!("search_memory: persistence failed: {error}"),
+                                        true,
+                                    ),
+                                    Ok(retrieved) if retrieved.is_empty() => (
                                         "No relevant memories found for that query.".to_string(),
                                         false,
-                                    )
-                                } else {
-                                    (
+                                    ),
+                                    Ok(retrieved) => (
                                         crate::embed_memory::format_retrieved_memories(&retrieved),
                                         false,
-                                    )
+                                    ),
                                 }
                             }
                             _ => (
@@ -611,35 +653,27 @@ async fn run_turn_inner(
                 let store_path = crate::embed_memory::default_store_path(&cwd);
                 let is_mutating =
                     params.get("action").and_then(|a| a.as_str()) == Some("invalidate");
-                match crate::embed_memory::MemoryStore::try_load(&store_path) {
-                    Ok(mut store) => {
-                        let result = piku_tools::embed_memory_tool::execute_manage_memory(
-                            params.clone(),
-                            &mut store,
-                        );
-                        if is_mutating && !result.is_error {
-                            match store.save(&store_path) {
-                                Ok(()) => {
-                                    unpack_tool_result(result, &mut tool_effects, &mut verification)
-                                }
-                                Err(error) => {
-                                    (format!("manage_memory: persistence failed: {error}"), true)
-                                }
-                            }
-                        } else {
-                            unpack_tool_result(result, &mut tool_effects, &mut verification)
-                        }
-                    }
-                    Err(error) => (
-                        format!("manage_memory: could not load memory store: {error}"),
-                        true,
-                    ),
+                let execute = |store: &mut crate::embed_memory::MemoryStore| {
+                    Ok(piku_tools::embed_memory_tool::execute_manage_memory(
+                        params.clone(),
+                        store,
+                    ))
+                };
+                let result = if is_mutating {
+                    crate::embed_memory::MemoryStore::transaction(&store_path, execute)
+                } else {
+                    crate::embed_memory::MemoryStore::try_load(&store_path)
+                        .and_then(|mut store| execute(&mut store))
+                };
+                match result {
+                    Ok(result) => unpack_tool_result(result, &mut tool_effects, &mut verification),
+                    Err(error) => (format!("manage_memory: persistence failed: {error}"), true),
                 }
             } else if tool_name == "record_attempt" {
                 // Record an attempt in the embedding store -- needs embedding
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
-                let (mut store, load_error) =
+                let (store, load_error) =
                     match crate::embed_memory::MemoryStore::try_load(&store_path) {
                         Ok(store) => (store, None),
                         Err(error) => (crate::embed_memory::MemoryStore::default(), Some(error)),
@@ -679,15 +713,19 @@ async fn run_turn_inner(
                             ),
                             true,
                         )
-                    } else if store.record_outcome(existing_id, outcome_enum, detail) {
-                        match store.save(&store_path) {
+                    } else {
+                        match crate::embed_memory::MemoryStore::transaction(&store_path, |fresh| {
+                            if fresh.record_outcome(existing_id, outcome_enum, detail) {
+                                Ok(())
+                            } else {
+                                Err(format!("attempt {existing_id} not found"))
+                            }
+                        }) {
                             Ok(()) => (format!("attempt {existing_id} updated: {outcome}"), false),
                             Err(error) => {
                                 (format!("record_attempt: persistence failed: {error}"), true)
                             }
                         }
-                    } else {
-                        (format!("attempt {existing_id} not found"), true)
                     }
                 } else if goal.trim().is_empty() || approach.trim().is_empty() {
                     (
@@ -712,33 +750,39 @@ async fn run_turn_inner(
                                 .get("importance")
                                 .and_then(serde_json::Value::as_u64)
                                 .unwrap_or(6) as u8;
-                            let id = store.record_attempt(
-                                goal.to_string(),
-                                approach.to_string(),
-                                parent_id,
-                                embedding,
-                                importance,
+                            let recorded = crate::embed_memory::MemoryStore::transaction(
+                                &store_path,
+                                |store| {
+                                    let id = store.record_attempt(
+                                        goal.to_string(),
+                                        approach.to_string(),
+                                        parent_id,
+                                        embedding,
+                                        importance,
+                                    );
+                                    // Apply immediate outcome if provided
+                                    let outcome = params.get("outcome").and_then(|v| v.as_str());
+                                    if let Some(outcome_str) = outcome {
+                                        let detail = params
+                                            .get("outcome_detail")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        let outcome_enum = match outcome_str {
+                                            "success" => crate::embed_memory::Outcome::Success,
+                                            "failure" => crate::embed_memory::Outcome::Failure,
+                                            _ => crate::embed_memory::Outcome::Pending,
+                                        };
+                                        store.record_outcome(id, outcome_enum, detail);
+                                    }
+                                    Ok(id)
+                                },
                             );
-                            // Apply immediate outcome if provided
-                            let outcome = params.get("outcome").and_then(|v| v.as_str());
-                            if let Some(outcome_str) = outcome {
-                                let detail = params
-                                    .get("outcome_detail")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                                let outcome_enum = match outcome_str {
-                                    "success" => crate::embed_memory::Outcome::Success,
-                                    "failure" => crate::embed_memory::Outcome::Failure,
-                                    _ => crate::embed_memory::Outcome::Pending,
-                                };
-                                store.record_outcome(id, outcome_enum, detail);
-                            }
                             let status = params
                                 .get("outcome")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("pending");
-                            match store.save(&store_path) {
-                                Ok(()) => (
+                            match recorded {
+                                Ok(id) => (
                                     format!("attempt recorded (id={id}, status={status})"),
                                     false,
                                 ),
@@ -822,6 +866,7 @@ async fn run_turn_inner(
                             model,
                             system_prompt,
                             &tool_defs,
+                            prompter,
                             depth,
                             &session.id,
                             &session.messages,
@@ -894,7 +939,7 @@ async fn run_turn_inner(
 
         // Self-update was requested — exit the loop cleanly
         if replace_and_exec.is_some() {
-            break;
+            break TurnExit::Restart;
         }
 
         // Drain any queued interjections and inject them as user messages.
@@ -917,9 +962,9 @@ async fn run_turn_inner(
 
         // only loop if stop_reason was tool_use
         if stop_reason != StopReason::ToolUse {
-            break;
+            break TurnExit::Provider(stop_reason);
         }
-    }
+    };
 
     // Score message relevance for context curation.
     session.score_messages();
@@ -927,17 +972,7 @@ async fn run_turn_inner(
     tracker.finish_turn();
     sink.on_turn_complete(&tracker.cumulative, iterations);
 
-    let completion_reason = if replace_and_exec.is_some() {
-        "replace_and_exec"
-    } else if cancelled {
-        "cancelled"
-    } else if stream_error.is_some() {
-        "error"
-    } else if iterations >= max {
-        "max_turns"
-    } else {
-        "end_turn"
-    };
+    let completion_reason = exit.reason();
     let terminal = if cancelled {
         crate::run_record::RunEvent::TurnCancelled {
             reason: "cancelled by user".to_string(),
@@ -982,12 +1017,15 @@ async fn run_turn_inner(
         );
     }
 
-    TurnResult {
-        iterations,
-        usage: tracker.cumulative.clone(),
-        stream_error,
-        replace_and_exec,
-        cancelled,
+    TurnOutcome {
+        result: TurnResult {
+            iterations,
+            usage: tracker.cumulative.clone(),
+            stream_error,
+            replace_and_exec,
+            cancelled,
+        },
+        exit,
     }
 }
 
@@ -1527,6 +1565,7 @@ fn execute_spawn_agent(
     model: &str,
     system_prompt: &[String],
     tool_defs: &[ToolDefinition],
+    prompter: &dyn PermissionPrompter,
     depth: u32,
     parent_session_id: &str,
     parent_session_messages: &[crate::session::ConversationMessage],
@@ -1545,6 +1584,32 @@ fn execute_spawn_agent(
         Ok(v) => v,
         Err(e) => return (format!("spawn_agent: {e}"), true, None),
     };
+
+    let Some(child_policy) = prompter.delegated_policy() else {
+        return (
+            "spawn_agent refused: parent permission policy cannot be delegated".into(),
+            true,
+            None,
+        );
+    };
+
+    // Attachments are reads on behalf of the child. Refuse the whole spawn
+    // before reading any bytes or allocating a worktree when required context
+    // is forbidden by either the parent or its delegated policy.
+    for path in &p.context_files {
+        let read_params = serde_json::json!({ "path": path });
+        for policy in [prompter, child_policy.as_ref()] {
+            if let PermissionOutcome::Deny { reason } =
+                check_permission("read_file", &read_params, policy)
+            {
+                return (
+                    format!("spawn_agent refused: context file {path}: {reason}"),
+                    true,
+                    None,
+                );
+            }
+        }
+    }
 
     // Worktree isolation: create a temp git worktree if requested
     let (worktree_path, worktree_branch, cwd_override) =
@@ -1700,7 +1765,7 @@ fn execute_spawn_agent(
     if depth == 0 {
         let cwd = std::env::current_dir().unwrap_or_default();
         let store_path = crate::embed_memory::default_store_path(&cwd);
-        let mut store = crate::embed_memory::MemoryStore::load(&store_path);
+        let store = crate::embed_memory::MemoryStore::load(&store_path);
         if store.valid_count() > 0 {
             let embed_config = crate::embed_memory::EmbedConfig::from_env();
             let query_text: String = p.task.chars().take(500).collect();
@@ -1732,16 +1797,25 @@ fn execute_spawn_agent(
                     .unwrap_or(Ok(Err("embed thread did not report".to_string())))
             };
             if let Ok(Ok(query_vec)) = query_result {
-                let retrieved = store.hybrid_retrieve(&query_vec, &query_text, 5);
-                if !retrieved.is_empty() {
-                    let mem_section = crate::embed_memory::format_retrieved_memories(&retrieved);
-                    prompt.push_str(&mem_section);
-                    let _ = store.save(&store_path);
-                }
-                // Also inject relevant attempt trees so subagents avoid repeating failures.
-                let attempt_trees = store.find_attempt_trees(&query_vec, &query_text, 3);
-                if !attempt_trees.is_empty() {
-                    prompt.push_str(&crate::embed_memory::format_attempt_trees(&attempt_trees));
+                let recalled =
+                    crate::embed_memory::MemoryStore::transaction(&store_path, |fresh| {
+                        Ok((
+                            fresh.hybrid_retrieve(&query_vec, &query_text, 5),
+                            fresh.find_attempt_trees(&query_vec, &query_text, 3),
+                        ))
+                    });
+                if let Ok((retrieved, attempt_trees)) = recalled {
+                    if !retrieved.is_empty() {
+                        let mem_section =
+                            crate::embed_memory::format_retrieved_memories(&retrieved);
+                        prompt.push_str(&mem_section);
+                    }
+                    // Also inject relevant attempt trees so subagents avoid repeating failures.
+                    if !attempt_trees.is_empty() {
+                        prompt.push_str(&crate::embed_memory::format_attempt_trees(&attempt_trees));
+                    }
+                } else if let Err(error) = recalled {
+                    eprintln!("[piku] memory recall persistence failed: {error}");
                 }
             }
         }
@@ -1831,6 +1905,7 @@ fn execute_spawn_agent(
         wt_branch,
         custom_agents_owned,
         hooks_owned,
+        child_policy,
     ));
 
     // Build a typed parent→child run pointer for the durable parent record.
@@ -1868,6 +1943,7 @@ async fn run_subagent_task(
     worktree_branch: Option<String>,
     custom_agents: Vec<crate::agents::AgentDef>,
     hook_registry: Option<crate::hooks::HookRegistry>,
+    child_policy: std::sync::Arc<dyn PermissionPrompter>,
 ) {
     let evidence = registry.evidence(&task_id);
     if evidence.is_some() {
@@ -1954,7 +2030,7 @@ async fn run_subagent_task(
             &model,
             &system_prompt,
             tool_defs,
-            &crate::permission::AllowAll,
+            child_policy.as_ref(),
             &mut recording_sink,
             Some(max_turns),
             None,
@@ -1975,7 +2051,7 @@ async fn run_subagent_task(
                 &model,
                 &system_prompt,
                 tool_defs,
-                &crate::permission::AllowAll,
+                child_policy.as_ref(),
                 &mut sink,
                 Some(max_turns),
                 None,
@@ -1990,6 +2066,7 @@ async fn run_subagent_task(
         )
     };
 
+    let TurnOutcome { result, exit } = result;
     let durability_error = record_error.map(|error| format!("run record failed: {error}"));
     let durability_error = match (durability_error, evidence.as_ref()) {
         (None, Some(item)) => session
@@ -1999,40 +2076,53 @@ async fn run_subagent_task(
         (error, _) => error,
     };
 
-    // Worktree cleanup. Happy path: defuse the guard so its Drop doesn't
-    // unconditionally remove the worktree; then delegate to the existing
-    // `changed`-aware cleanup (which keeps the worktree when the agent
-    // produced file changes).
-    let worktree_result = if let (Some(ref wt_path), Some(ref branch)) =
-        (&worktree_cwd, &worktree_branch)
-    {
-        if let Some(g) = worktree_guard.as_mut() {
-            g.defuse();
-        }
-        let changed = session.messages.iter().any(|m| {
-            m.blocks.iter().any(|b| matches!(b, crate::session::ContentBlock::ToolUse { name, .. } if matches!(name.as_str(), "write_file" | "edit_file")))
-        });
-        crate::task::cleanup_worktree(&repo_root, wt_path, branch, changed)
-    } else {
-        None
-    };
+    // Inspect actual Git state, including shell writes and child-only commits.
+    // The guard uses the same conservative disposition on early exit.
+    let worktree_result =
+        if let (Some(ref wt_path), Some(ref branch)) = (&worktree_cwd, &worktree_branch) {
+            if let Some(g) = worktree_guard.as_mut() {
+                g.defuse();
+            }
+            crate::task::cleanup_worktree(&repo_root, wt_path, branch, false)
+        } else {
+            None
+        };
     // Drop order: if we somehow skipped the defuse branch above, the guard
     // will still fire on function return.
     drop(worktree_guard);
 
+    let recovery_hint = worktree_result.as_ref().map_or_else(String::new, |path| {
+        format!(
+            "\n\n[Worktree retained or cleanup incomplete for task {task_id}: {}. Branch: {}. Review and accept the work or explicitly retire it.]",
+            path.display(),
+            worktree_branch.as_deref().unwrap_or("unknown"),
+        )
+    });
+
     let (status, iterations) = if let Some(error) = durability_error {
-        registry.fail(&task_id, &error);
+        registry.fail_after_turns(
+            &task_id,
+            &format!("{error}{recovery_hint}"),
+            result.iterations,
+        );
         ("failed", result.iterations)
     } else if let Some(err) = result.stream_error {
-        registry.fail(&task_id, &err);
+        registry.fail_after_turns(
+            &task_id,
+            &format!("{err}{recovery_hint}"),
+            result.iterations,
+        );
+        ("failed", result.iterations)
+    } else if !exit.completed() {
+        let reason = format!(
+            "incomplete child execution: {}{recovery_hint}",
+            exit.reason()
+        );
+        registry.fail_after_turns(&task_id, &reason, result.iterations);
         ("failed", result.iterations)
     } else {
         let mut output = extract_last_assistant_text(&session);
-        if let Some(wt_kept) = worktree_result {
-            output.push_str("\n\n[Changes saved in worktree: ");
-            output.push_str(&wt_kept.display().to_string());
-            output.push(']');
-        }
+        output.push_str(&recovery_hint);
         registry.complete(&task_id, &output, result.iterations);
         ("done", result.iterations)
     };
@@ -2054,10 +2144,18 @@ fn fail_subagent_setup(
     hook_registry: Option<&crate::hooks::HookRegistry>,
 ) {
     let repo_root = std::env::current_dir().unwrap_or_default();
-    if let (Some(worktree), Some(branch)) = (worktree_cwd, worktree_branch) {
-        let _ = crate::task::cleanup_worktree(&repo_root, worktree, branch, false);
-    }
-    registry.fail(task_id, reason);
+    let recovery_hint = if let (Some(worktree), Some(branch)) = (worktree_cwd, worktree_branch) {
+        crate::task::cleanup_worktree(&repo_root, worktree, branch, false).map_or_else(
+            String::new,
+            |path| format!(
+                "\n\n[Worktree retained or cleanup incomplete for task {task_id}: {}. Branch: {branch}. Review and accept the work or explicitly retire it.]",
+                path.display(),
+            ),
+        )
+    } else {
+        String::new()
+    };
+    registry.fail(task_id, &format!("{reason}{recovery_hint}"));
     if let Some(hooks) = hook_registry {
         hooks.run_subagent_stop(&task_id.to_string(), None, "failed", 0, &repo_root);
     }
