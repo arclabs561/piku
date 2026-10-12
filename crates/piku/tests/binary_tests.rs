@@ -67,6 +67,94 @@ fn providers_load_allowlisted_key_from_nearest_dotenv() {
     assert!(!stderr(&out).contains("test-only-key"));
 }
 
+#[test]
+fn web_honors_provider_and_model_overrides() {
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    for (configured_provider, args, expected_model) in [
+        (
+            "unavailable-provider",
+            vec!["--provider", "custom", "--model", "cli-model", "web"],
+            "cli-model",
+        ),
+        (
+            "unavailable-provider",
+            vec!["web", "--provider", "custom"],
+            "configured-model",
+        ),
+        ("custom", vec!["web", "--model", "cli-model"], "cli-model"),
+        ("custom", vec!["web"], "configured-model"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("piku");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(
+            config.join("settings.toml"),
+            format!("provider = \"{configured_provider}\"\nmodel = \"configured-model\"\n"),
+        )
+        .unwrap();
+        let ready = root.path().join("ready.json");
+        let mut server = Server(
+            Command::new(piku_binary())
+                .env_clear()
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path())
+                .env("PIKU_NO_DOTENV", "1")
+                .env("PIKU_WEB_DISABLE_TERMINAL", "1")
+                .env("PIKU_WEB_READY_FILE", &ready)
+                .env("PIKU_BASE_URL", "http://127.0.0.1:1/v1")
+                .current_dir(root.path())
+                .args(&args)
+                .args(["--port", "0"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "server exited: {args:?}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server not ready: {args:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ready: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
+        let catalog: serde_json::Value = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("{}/api/executors", ready["url"].as_str().unwrap()))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        let executors = catalog["executors"].as_array().unwrap();
+        let provider = executors
+            .iter()
+            .find(|item| item["id"] == "provider")
+            .unwrap();
+        assert_eq!(provider["available"], true, "args: {args:?}");
+        assert_eq!(provider["model"], expected_model, "args: {args:?}");
+        let codex = executors.iter().find(|item| item["id"] == "codex").unwrap();
+        assert_eq!(codex["model"], "account default");
+        assert_eq!(codex["available"], false);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // --version
 // ---------------------------------------------------------------------------

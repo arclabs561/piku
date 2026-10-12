@@ -81,7 +81,11 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Web { port }) => {
-            let config = PikuConfig::load(None, None, env::current_dir().ok().as_deref());
+            let config = PikuConfig::load(
+                cli.provider.as_deref(),
+                cli.model.as_deref(),
+                cwd.as_deref(),
+            );
             piku::web::serve(&config, *port).await?;
             return Ok(());
         }
@@ -420,7 +424,9 @@ async fn run_single_shot(
     let mut sink = StdoutSink::new(trace);
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
-    let turn_id = format!("turn-{}", session.messages.len());
+    let mut turn_nonce = [0; 16];
+    getrandom::fill(&mut turn_nonce).map_err(|error| anyhow::anyhow!("turn ID: {error}"))?;
+    let turn_id = format!("turn-{:032x}", u128::from_ne_bytes(turn_nonce));
     let mut run = RunHandle::open(session, &run_path)?;
     let result: TurnResult = {
         let mut turn = run.begin_turn(&mut sink, turn_id);

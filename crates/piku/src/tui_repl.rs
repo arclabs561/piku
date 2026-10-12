@@ -32,6 +32,13 @@ use piku_runtime::{
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 
+fn terminal_turn_id() -> io::Result<String> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::other(format!("turn identity allocation failed: {error}")))?;
+    Ok(format!("turn-{:032x}", u128::from_ne_bytes(bytes)))
+}
+
 fn task_notifications(registry: &TaskRegistry) -> piku_runtime::agent_loop::InterjectionRx {
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     registry.set_notification_channel(tx);
@@ -2343,7 +2350,7 @@ async fn run_tui_repl_core(
                 // next one.
                 sink.trace
                     .session_config(resolved.name(), &model, read_only);
-                let turn_id = format!("turn-{}", run.session().messages.len());
+                let turn_id = terminal_turn_id()?;
                 let actor_label = config
                     .actor(&active_actor)
                     .and_then(|profile| profile.label.clone())
@@ -3414,6 +3421,72 @@ mod tests {
         assert_eq!(
             truncate_permission_description(&description, 80),
             format!("{}…", "a".repeat(53))
+        );
+    }
+
+    #[test]
+    fn turn_identity_survives_actor_compaction_and_resume() {
+        use piku_runtime::{ConversationMessage, RunEvent, RunHandle};
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("run.jsonl");
+        let session_path = directory.path().join("session.json");
+        let mut run = RunHandle::open(Session::new("identity".into()), &record).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for phase in 0..4 {
+            match phase {
+                0 => run
+                    .session_mut()
+                    .push(ConversationMessage::user("primary private")),
+                1 => {
+                    run.session_mut().select_actor("critic");
+                    run.session_mut()
+                        .push(ConversationMessage::user("critic private"));
+                }
+                2 => {
+                    for _ in 0..8 {
+                        run.session_mut()
+                            .push(ConversationMessage::user("old context"));
+                    }
+                    let compacted = piku_runtime::apply_compact_summary(
+                        run.session(),
+                        "summary",
+                        piku_runtime::CompactionConfig {
+                            preserve_recent_messages: 0,
+                            max_estimated_tokens: 1,
+                        },
+                    );
+                    *run.session_mut() = compacted.compacted_session;
+                }
+                _ => {
+                    run.session().save(&session_path).unwrap();
+                    drop(run);
+                    run = RunHandle::open(Session::load(&session_path).unwrap(), &record).unwrap();
+                }
+            }
+            assert_eq!(run.session().messages.len(), 1);
+            let id = terminal_turn_id().unwrap();
+            assert!(
+                ids.insert(id.clone()),
+                "turn ID reused at phase {phase}: {id}"
+            );
+            // Exercise the real durable scope boundary without a provider or terminal.
+            let mut sink = piku_runtime::task::DevNullSink;
+            let mut turn = run.begin_turn(&mut sink, id);
+            turn.parts().1.on_run_event(&RunEvent::Warning {
+                message: format!("phase {phase}"),
+            });
+            turn.finish().unwrap();
+        }
+        let events = piku_runtime::read_run_record(record).unwrap();
+        assert_eq!(events.len(), 4);
+        let recorded: std::collections::HashSet<_> = events
+            .iter()
+            .map(|event| event.scope.turn_id().unwrap())
+            .collect();
+        assert_eq!(recorded.len(), 4);
+        run.session_mut().select_actor("primary");
+        assert!(
+            matches!(&run.session().messages[0].blocks[0], piku_runtime::ContentBlock::Text { text } if text == "primary private")
         );
     }
 
