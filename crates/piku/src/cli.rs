@@ -107,7 +107,7 @@ pub enum Commands {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
-    #[command(about = "Sign in manually; print the authorization URL and await callback")]
+    #[command(about = "Start bounded browser sign-in and print a local continuation link")]
     Login {
         #[arg(
             long,
@@ -118,6 +118,8 @@ pub enum AuthCommand {
         #[arg(long, help = "Request consent again during this login")]
         request_consent: bool,
     },
+    #[command(about = "Cancel the active browser sign-in attempt")]
+    CancelLogin,
     #[command(about = "List stored account metadata without contacting the provider")]
     Accounts,
     #[command(about = "Show selected account and funding status without a token probe")]

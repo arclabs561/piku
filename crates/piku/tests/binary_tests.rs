@@ -845,6 +845,64 @@ const CANNED_ANSWER: &[&str] = &[
 ];
 
 #[test]
+fn headless_stream_failure_exits_nonzero_after_retaining_partial_state() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, _) = fake_completions_server(&[
+        r#"{"choices":[{"delta":{"content":"retained partial answer"},"finish_reason":null}]}"#,
+    ]);
+    let out = piku_clean_env()
+        .args([
+            "--provider",
+            "custom",
+            "--print",
+            "test incomplete response",
+        ])
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("PIKU_BASE_URL", base_url)
+        .env("PIKU_API_KEY", "test-key")
+        .env("PIKU_MODEL", "canned-model")
+        .current_dir(config.path())
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(err.contains("stream error"), "{err}");
+    assert!(stdout(&out).contains("retained partial answer"));
+    let session_id = err
+        .lines()
+        .find_map(|line| line.split("sessions/").nth(1))
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .expect("session saved on failure");
+    let session = std::fs::read_to_string(
+        config
+            .path()
+            .join(format!("piku/sessions/{session_id}.json")),
+    )
+    .unwrap();
+    // Failed streams retain the user/session boundary; partial assistant text
+    // remains in the diagnostic trace rather than becoming replay history.
+    assert!(session.contains("test incomplete response"));
+    let run = std::fs::read_to_string(config.path().join(format!("piku/runs/{session_id}.jsonl")))
+        .unwrap();
+    let events: Vec<serde_json::Value> = run
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|row| row["event"] == "turn_failed"));
+    assert!(!events.iter().any(|row| row["event"] == "turn_completed"));
+    let trace = std::fs::read_to_string(
+        config
+            .path()
+            .join(format!("piku/traces/{session_id}.jsonl")),
+    )
+    .unwrap();
+    assert!(trace.contains("retained partial answer"));
+    assert!(
+        !out.status.success(),
+        "provider failure must reach the shell exit status: {err}"
+    );
+}
+
+#[test]
 fn headless_output_to_a_pipe_has_no_escape_sequences_and_reports_usage() {
     let config = tempfile::tempdir().unwrap();
     let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);

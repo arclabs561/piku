@@ -1,5 +1,5 @@
-//! Explicit operator commands; authorization URLs are presented only for login.
-use std::io::{self, IsTerminal, Write};
+//! Explicit operator commands; captured login exposes only a local bootstrap.
+mod login_helper;
 use std::sync::Arc;
 
 use piku::cli::AuthCommand;
@@ -7,34 +7,54 @@ use piku_runtime::chatgpt_auth::{default_directory, AccountInfo, AuthManager};
 
 const FUNDING: &str = "ChatGPT subscription funding; allowance and credits unknown; no hard output-token cap for foreground, children, or memory calls";
 
+pub fn helper_requested() -> bool {
+    login_helper::requested()
+}
+
+pub async fn run_helper() -> anyhow::Result<()> {
+    login_helper::run().await
+}
+
 pub async fn run(command: &AuthCommand) -> anyhow::Result<()> {
-    if matches!(command, AuthCommand::Login { .. })
-        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+    if let AuthCommand::Login {
+        registration,
+        request_consent,
+    } = command
     {
-        anyhow::bail!("ChatGPT login requires an attended terminal for stdin and stdout; run `piku auth chatgpt login` directly in your terminal without pipes or redirection");
+        let url = login_helper::launch(registration.clone(), *request_consent).await?;
+        println!("Open this local sign-in link, then choose Continue in your browser:");
+        println!("{url}");
+        println!("The attempt expires in 3 minutes. Check `piku auth chatgpt status` or stop it with `piku auth chatgpt cancel-login`.");
+        return Ok(());
     }
     let manager = AuthManager::open(default_directory()?)?;
     match command {
-        AuthCommand::Login {
-            registration,
-            request_consent,
-        } => {
-            let pending = manager
-                .begin_login(registration.as_deref(), *request_consent)
-                .await?;
-            eprintln!("Open this private authorization URL in your browser; do not share it:");
-            // May contain an identity hint. Never send this URL to tracing or
-            // account status; only the explicit interactive login presents it.
-            println!("{}", pending.authorization_url());
-            io::stdout().flush()?;
-            let account = manager.complete_login(pending).await?;
-            print_account(&account, false);
-            println!(
-                "Select explicitly with: piku auth chatgpt select {}",
-                account.registration_id
-            );
+        AuthCommand::Login { .. } => {
+            unreachable!("login was dispatched before opening the account store")
+        }
+        AuthCommand::CancelLogin => {
+            if manager.cancel_login()? {
+                println!("Login cancellation requested. Check `piku auth chatgpt status` for the terminal outcome.");
+            } else {
+                println!("No active login attempt.");
+            }
         }
         AuthCommand::Accounts | AuthCommand::Status => {
+            if matches!(command, AuthCommand::Status) {
+                if let Some(status) = manager.login_status()? {
+                    println!(
+                        "Login attempt: {} phase={} expires_at={}",
+                        status.attempt_id,
+                        serde_json::to_value(status.phase)?
+                            .as_str()
+                            .unwrap_or("unknown"),
+                        status.expires_at
+                    );
+                    if let Some(id) = status.registration_id {
+                        println!("Select explicitly with: piku auth chatgpt select {id}");
+                    }
+                }
+            }
             let selected = manager.selected_registration_id()?;
             let accounts = manager.list().await?;
             if accounts.is_empty() {

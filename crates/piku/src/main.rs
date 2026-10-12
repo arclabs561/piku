@@ -21,6 +21,9 @@ use piku_tools::all_tool_definitions;
 #[allow(clippy::too_many_lines)] // Command dispatch stays beside its subcommand wiring.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if auth_cli::helper_requested() {
+        return auth_cli::run_helper().await;
+    }
     piku::telemetry::init();
     let cwd = env::current_dir().ok();
     if env::var_os("PIKU_NO_DOTENV").is_none() {
@@ -467,10 +470,6 @@ async fn run_single_shot(
     };
     let session = run.into_session();
 
-    if let Some(err) = &result.stream_error {
-        eprintln!("[piku] stream error: {err}");
-    }
-
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
@@ -480,7 +479,10 @@ async fn run_single_shot(
         eprintln!("[piku] session saved → {}", session_path.display());
     }
 
-    if let Some(new_binary) = result.replace_and_exec {
+    report_launch_stream_error(result.stream_error.as_deref(), print || read_only)?;
+
+    let failed = result.stream_error.is_some();
+    if let Some(new_binary) = result.replace_and_exec.filter(|_| !failed) {
         eprintln!("[piku] rebuilt — restarting with new binary...");
         if let Err(e) = self_update::replace_and_exec(&new_binary) {
             eprintln!("[piku] self-update failed: {e}");
@@ -498,6 +500,16 @@ async fn run_single_shot(
 
     println!();
     tui_repl::run_tui_repl_with_session(config, Some(session), result.usage).await
+}
+
+fn report_launch_stream_error(error: Option<&str>, headless: bool) -> anyhow::Result<()> {
+    if let Some(error) = error {
+        if headless {
+            anyhow::bail!("stream error: {error}");
+        }
+        eprintln!("[piku] stream error: {error}");
+    }
+    Ok(())
 }
 
 struct ConfiguredAllowAll {

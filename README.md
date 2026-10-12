@@ -44,7 +44,8 @@ user configuration, and `.piku/settings.toml`. Run `piku providers` to see what
 the current launch can use.
 
 For eligible ChatGPT accounts, Sign in with ChatGPT keeps Piku's own agent loop
-and tools. Login requires an interactive terminal and explicit browser consent:
+and tools. Login works from captured command runners as well as terminals and
+returns a local browser link for explicit consent:
 
 ```bash
 piku auth chatgpt login
@@ -55,9 +56,11 @@ piku --provider chatgpt --model MODEL
 ```
 
 Select the account ID and model from the listed values. `auth chatgpt status`
-shows stored metadata; `auth chatgpt logout ACCOUNT_ID` removes local credentials
-and attempts remote revocation. Authorization URLs are private and may contain
-identity hints; keep them out of logs. Account credentials remain separate from
+shows login progress and stored metadata. Open the link and choose Continue
+within three minutes; `auth chatgpt cancel-login` stops a pending attempt.
+The printed link contains no OAuth credentials or identity hints.
+`auth chatgpt logout ACCOUNT_ID` removes local credentials and attempts remote
+revocation. Account credentials remain separate from
 project settings. Session replay is bound to the original account and model.
 
 This preview route requires plan-use permission and has no hard output-token
