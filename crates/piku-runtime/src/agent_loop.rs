@@ -22,7 +22,11 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session, Us
 use crate::task::{TaskRegistry, MAX_SPAWN_DEPTH};
 
 #[cfg(test)]
+mod cancellation_tests;
+#[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod context_tests;
 
 /// A channel the TUI can use to inject interjections mid-turn.
 /// Send a plain string; the agent wraps it in `<interjection>` tags so
@@ -423,14 +427,40 @@ async fn run_turn_inner(
 
         // stream the response
         let stream_started = std::time::Instant::now();
-        let (mut assistant_blocks, usage, mut stop_reason, maybe_err) =
-            stream_response(provider, request, sink).await;
+        let (mut assistant_blocks, usage, mut stop_reason, maybe_err, stream_cancelled) =
+            stream_response(provider, request, sink, cancel_flag).await;
         #[allow(clippy::cast_possible_truncation)]
         sink.on_provider_stream(
             stream_started.elapsed().as_millis() as u64,
             assistant_blocks.len(),
             &format!("{stop_reason:?}"),
         );
+
+        if stream_cancelled || cancellation_requested(cancel_flag) {
+            cancelled = true;
+            tracker.record(usage.clone());
+            // Keep observed text, but never dispatch unfinished tool arguments.
+            assistant_blocks.retain(|block| matches!(block, ContentBlock::Text { .. }));
+            if !assistant_blocks.is_empty() {
+                let text = assistant_blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                sink.on_run_event(&crate::run_record::RunEvent::AssistantMessage {
+                    content: crate::run_record::ContentRef::Inline { text },
+                });
+                session.push(ConversationMessage::assistant(
+                    assistant_blocks,
+                    Some(usage),
+                ));
+            }
+            sink.on_text("\n\x1b[2m[cancelled by user]\x1b[0m\n");
+            break TurnExit::Cancelled;
+        }
 
         if let Some(err) = maybe_err {
             stream_error = Some(err);
@@ -496,6 +526,23 @@ async fn run_turn_inner(
                 name: tool_name.clone(),
                 arguments: params.clone(),
             });
+            if cancellation_requested(cancel_flag) {
+                cancelled = true;
+                let output = "Cancelled before tool execution".to_string();
+                session.push(ConversationMessage::tool_result(
+                    tool_use_id.clone(),
+                    output.clone(),
+                    true,
+                ));
+                sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                    tool_call_id: tool_use_id.clone(),
+                    result: crate::run_record::ContentRef::Inline { text: output },
+                    is_error: true,
+                    effects: Vec::new(),
+                    verification: None,
+                });
+                continue;
+            }
             if !advertised_tool_names.contains(tool_name) {
                 let msg = format!("{tool_name} is not available in this mode");
                 sink.on_tool_start(tool_name, tool_use_id, params);
@@ -582,7 +629,11 @@ async fn run_turn_inner(
             // Route special tools through the runtime; everything else through execute_tool.
             let mut tool_effects = Vec::new();
             let mut verification = None;
-            let (output, is_error) = if tool_name == "search_memory" {
+            let (output, is_error) = if cancellation_requested(cancel_flag) {
+                // Hooks, permission prompts, and sink callbacks may set the flag.
+                cancelled = true;
+                ("Cancelled before tool execution".to_string(), true)
+            } else if tool_name == "search_memory" {
                 // Semantic search over embedding store -- needs embedding the query
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let store_path = crate::embed_memory::default_store_path(&cwd);
@@ -905,7 +956,7 @@ async fn run_turn_inner(
 
             let action = sink.on_tool_end(tool_name, tool_use_id, &output, is_error);
             // PostToolUse hooks -- params is still available since we borrow tool_calls.
-            if let Some(hooks) = hook_registry {
+            if let Some(hooks) = hook_registry.filter(|_| !cancellation_requested(cancel_flag)) {
                 hooks.run_post_tool_use(
                     tool_name,
                     params,
@@ -932,9 +983,19 @@ async fn run_turn_inner(
             // Self-update: sink detected a new binary — break cleanly after
             // persisting this tool result, then signal the caller.
             if let PostToolAction::ReplaceAndExec(path) = action {
-                replace_and_exec = Some(path);
-                break;
+                if !cancellation_requested(cancel_flag) {
+                    replace_and_exec = Some(path);
+                    break;
+                }
             }
+        }
+
+        // An already running tool settles normally so its observed effects are
+        // retained. Cancellation gates all subsequent dispatches, not rollback.
+        if cancelled || cancellation_requested(cancel_flag) {
+            cancelled = true;
+            sink.on_text("\n\x1b[2m[cancelled by user]\x1b[0m\n");
+            break TurnExit::Cancelled;
         }
 
         // Self-update was requested — exit the loop cleanly
@@ -1043,11 +1104,42 @@ fn unpack_tool_result(
 // Stream a single API call, collect events into blocks
 // ---------------------------------------------------------------------------
 
+fn cancellation_requested(flag: Option<&CancelFlag>) -> bool {
+    flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+async fn wait_for_cancellation(flag: Option<&CancelFlag>) {
+    let Some(flag) = flag else {
+        return std::future::pending().await;
+    };
+    // The public flag has no notification primitive. Poll only while awaiting
+    // provider output; a notify-bearing public API would break callers.
+    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn stream_response(
     provider: &dyn Provider,
     request: MessageRequest,
     sink: &mut dyn OutputSink,
-) -> (Vec<ContentBlock>, TokenUsage, StopReason, Option<String>) {
+    cancel_flag: Option<&CancelFlag>,
+) -> (
+    Vec<ContentBlock>,
+    TokenUsage,
+    StopReason,
+    Option<String>,
+    bool,
+) {
+    if cancellation_requested(cancel_flag) {
+        return (
+            Vec::new(),
+            TokenUsage::default(),
+            StopReason::EndTurn,
+            None,
+            true,
+        );
+    }
     let mut stream = provider.stream_message(request);
 
     let mut text_buf = String::new();
@@ -1063,7 +1155,22 @@ async fn stream_response(
     // The tool call whose content block is currently streaming.
     let mut open_tool_id: Option<String> = None;
 
-    while let Some(event) = stream.next().await {
+    let mut cancelled = false;
+    let cancellation = wait_for_cancellation(cancel_flag);
+    tokio::pin!(cancellation);
+    loop {
+        if cancellation_requested(cancel_flag) {
+            cancelled = true;
+            break;
+        }
+        let event = tokio::select! {
+            biased;
+            () = &mut cancellation => { cancelled = true; break; }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
             Err(e) => {
                 stream_err = Some(e.to_string());
@@ -1128,7 +1235,7 @@ async fn stream_response(
         blocks.push(ContentBlock::Text { text: text_buf });
     }
 
-    for id in tool_order {
+    for id in tool_order.into_iter().filter(|_| !cancelled) {
         if let Some((name, json_str)) = tool_calls.remove(&id) {
             let input: serde_json::Value = serde_json::from_str(&json_str)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
@@ -1136,7 +1243,7 @@ async fn stream_response(
         }
     }
 
-    (blocks, usage, stop_reason, stream_err)
+    (blocks, usage, stop_reason, stream_err, cancelled)
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,10 +1275,8 @@ fn piku_context_window_for_model(model: &str) -> usize {
     200_000
 }
 
-/// Budget-aware curation tail size: always keep the last N messages
-/// regardless of importance. Empirically 6 preserves the recent task
-/// context + any open tool_use/tool_result pair without being so large
-/// that it blows the budget on its own.
+/// Always keep the last N messages and every tool exchange intersecting them.
+/// Mandatory context may exceed the budget; the manifest reports that case.
 const CURATION_TAIL_SIZE: usize = 6;
 
 /// Fraction of the context window reserved for system prompt, tool
@@ -1186,12 +1291,9 @@ const CONTEXT_USAGE_CAP: f32 = 0.70;
 ///      Session::score_messages) and filled into the remaining budget.
 ///   3. Output is in chronological order.
 ///
-/// Pair invariant caveat: an assistant's tool_use and the next user's
-/// tool_result are distinct messages. If a tool_use is kept but its
-/// result is dropped (or vice versa), Anthropic / OpenAI will 400. The
-/// tail usually includes recent pairs together; for older pairs we keep
-/// them atomic by walking in chronological pairs when the earlier
-/// message of a pair is selected.
+/// Calls and all matching results form atomic chronological groups, including
+/// when the mandatory tail starts partway through an exchange. Curation
+/// preserves complete input exchanges; it does not repair malformed history.
 ///
 /// `model_window` is the provider's context window in tokens.
 #[cfg(test)]
@@ -1226,65 +1328,86 @@ fn curate_message_indices(
         return (0..messages.len()).collect();
     }
 
+    let groups = curation_groups(messages);
     let tail_start = messages.len() - CURATION_TAIL_SIZE;
-    let tail_tokens: usize = messages[tail_start..]
+    let mandatory_start = groups
+        .iter()
+        .find(|group| group.contains(&tail_start))
+        .map_or(tail_start, |group| group.start);
+    let tail_tokens: usize = messages[mandatory_start..]
         .iter()
         .map(crate::session::ConversationMessage::estimated_tokens)
         .sum();
     let mut remaining_budget = budget.saturating_sub(tail_tokens);
 
-    // Rank head messages by importance desc, with chronological index as
-    // tiebreaker (prefer more recent when importance ties).
-    let mut head_ranked: Vec<usize> = (0..tail_start).collect();
-    head_ranked.sort_by(|&a, &b| {
-        let ia = messages[a].importance.unwrap_or(0.0);
-        let ib = messages[b].importance.unwrap_or(0.0);
-        ib.total_cmp(&ia).then_with(|| b.cmp(&a))
+    // Any important member can retain its exchange, but cannot retain only
+    // its cheap result. Charge each disjoint group exactly once.
+    let importance = |group: &std::ops::Range<usize>| {
+        messages[group.clone()]
+            .iter()
+            .map(|message| message.importance.unwrap_or(0.0))
+            .max_by(f32::total_cmp)
+            .unwrap_or(0.0)
+    };
+    let mut head_ranked: Vec<_> = groups
+        .into_iter()
+        .filter(|group| group.end <= mandatory_start)
+        .collect();
+    head_ranked.sort_by(|a, b| {
+        importance(b)
+            .total_cmp(&importance(a))
+            .then_with(|| b.start.cmp(&a.start))
     });
 
-    // Include messages greedily by importance until budget exhausted.
-    // Pair invariant: if we include an Assistant message that has a
-    // ToolUse block, the following Tool message (its result) must also
-    // be included or the request is malformed.
-    let mut included: std::collections::BTreeSet<usize> = (tail_start..messages.len()).collect();
-    for idx in head_ranked {
-        if included.contains(&idx) {
-            continue;
-        }
-        // Compute pair: this message + its paired follower, if any.
-        let pair_end = pair_end_for(messages, idx);
-        let pair_cost: usize = (idx..=pair_end)
-            .map(|i| messages[i].estimated_tokens())
+    let mut included: Vec<usize> = (mandatory_start..messages.len()).collect();
+    for group in head_ranked {
+        let cost: usize = messages[group.clone()]
+            .iter()
+            .map(crate::session::ConversationMessage::estimated_tokens)
             .sum();
-        if pair_cost <= remaining_budget {
-            for i in idx..=pair_end {
-                included.insert(i);
-            }
-            remaining_budget -= pair_cost;
+        if cost <= remaining_budget {
+            included.extend(group);
+            remaining_budget -= cost;
         }
     }
-
-    included.into_iter().collect()
+    included.sort_unstable();
+    included
 }
 
-/// Find the last index of the pair that starts at `idx`. If the message
-/// at `idx` has a ToolUse block, the pair extends to include the
-/// following tool_result (role=Tool) message. Otherwise the pair is just
-/// `idx` itself.
-fn pair_end_for(messages: &[crate::session::ConversationMessage], idx: usize) -> usize {
-    let has_tool_use = messages[idx].role == crate::session::MessageRole::Assistant
-        && messages[idx]
-            .blocks
-            .iter()
-            .any(|b| matches!(b, crate::session::ContentBlock::ToolUse { .. }));
-    if has_tool_use
-        && idx + 1 < messages.len()
-        && messages[idx + 1].role == crate::session::MessageRole::Tool
-    {
-        idx + 1
-    } else {
-        idx
+/// Partition history into contiguous, non-overlapping selection units. Link
+/// results by ID rather than role or adjacency: one assistant can issue several
+/// calls, and persisted user messages can also contain tool results.
+fn curation_groups(messages: &[ConversationMessage]) -> Vec<std::ops::Range<usize>> {
+    let mut ends: Vec<usize> = (0..messages.len()).collect();
+    let mut calls = std::collections::HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { id, .. } if message.role == MessageRole::Assistant => {
+                    calls.insert(id.as_str(), index);
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    if let Some(start) = calls.remove(tool_use_id.as_str()) {
+                        ends[start] = index;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < messages.len() {
+        let mut end = ends[start];
+        let mut cursor = start;
+        while cursor <= end {
+            end = end.max(ends[cursor]);
+            cursor += 1;
+        }
+        groups.push(start..end + 1);
+        start = end + 1;
+    }
+    groups
 }
 
 fn build_request(
@@ -1356,16 +1479,30 @@ fn build_request(
         selected_indices.iter().copied().collect();
     let all_messages_selected = selected_indices.len() == session.messages.len();
     let tail_start = session.messages.len().saturating_sub(CURATION_TAIL_SIZE);
+    let mandatory_start = curation_groups(&session.messages)
+        .iter()
+        .find(|group| group.contains(&tail_start))
+        .map_or(tail_start, |group| group.start);
+    let selected_tokens: usize = selected_indices
+        .iter()
+        .map(|&index| session.messages[index].estimated_tokens())
+        .sum();
+    #[allow(clippy::cast_precision_loss)]
+    let over_budget = selected_tokens as f32 > window as f32 * CONTEXT_USAGE_CAP;
     let manifest_messages = session
         .messages
         .iter()
         .enumerate()
         .map(|(index, message)| {
             let selected = selected_set.contains(&index);
-            let reason = if all_messages_selected {
+            let reason = if selected && over_budget {
+                "mandatory_context_over_budget"
+            } else if all_messages_selected {
                 "within_context_budget"
             } else if selected && index >= tail_start {
                 "recent_tail"
+            } else if selected && index >= mandatory_start {
+                "recent_exchange"
             } else if selected {
                 "importance_budget"
             } else {

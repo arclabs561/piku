@@ -99,25 +99,43 @@ impl Session {
     /// atomic on the same filesystem — readers either see the old file or
     /// the new one, never a truncated partial.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Tmp file sibling to the destination so rename is same-filesystem.
-        // Include pid to avoid collisions between concurrent saves.
-        let tmp_path = match path.file_name() {
-            Some(name) => {
-                let tmp_name = format!("{}.tmp.{}", name.to_string_lossy(), std::process::id());
-                path.with_file_name(tmp_name)
+        // Exclusive creation protects concurrent saves and retained staging
+        // files from earlier processes that happened to use the same PID.
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session path has no filename",
+            )
+        })?;
+        let (tmp_path, mut staged) = loop {
+            let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let mut tmp_name = name.to_os_string();
+            tmp_name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+            let tmp_path = path.with_file_name(tmp_name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => break (tmp_path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
             }
-            None => path.with_extension("tmp"),
         };
-        std::fs::write(&tmp_path, &json)?;
-        // Rename is atomic. If this returns an error, the tmp file is left on
-        // disk; a later save from the same process may overwrite it. Piku does
-        // not currently scan and clean stale tmp files at startup.
+        staged.write_all(json.as_bytes())?;
+        drop(staged);
+        // Same-filesystem rename publishes one complete value. Failed writes
+        // or renames retain their staging file; there is no crash/fsync guarantee.
         std::fs::rename(&tmp_path, path)
     }
 
@@ -356,6 +374,44 @@ impl UsageTracker {
 #[cfg(test)]
 mod save_atomicity_tests {
     use super::*;
+
+    #[test]
+    fn same_process_writers_publish_only_complete_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        Session::new("initial".into()).save(&path).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ["a", "b"].into_iter().map(|id| {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut session = Session::new(id.into());
+                    session.push(ConversationMessage::user(id.repeat(256 * 1024)));
+                    let mut errors = Vec::new();
+                    for _ in 0..32 {
+                        barrier.wait();
+                        if let Err(error) = session.save(path) { errors.push(error.to_string()); }
+                        match Session::load(path) {
+                            Ok(value) => {
+                                let expected = value.id.repeat(256 * 1024);
+                                if !matches!(value.messages.first().and_then(|message| message.blocks.first()), Some(ContentBlock::Text { text }) if *text == expected) {
+                                    errors.push("mixed session payload".into());
+                                }
+                            }
+                            Err(error) => errors.push(error.to_string()),
+                        }
+                    }
+                    errors
+                })
+            }).collect();
+            let errors: Vec<_> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect();
+            assert!(errors.is_empty(), "concurrent saves failed: {errors:?}");
+        });
+    }
 
     #[test]
     fn save_does_not_leave_tmp_files_in_place_on_success() {

@@ -169,6 +169,44 @@ pub struct CompactionResult {
     pub removed_message_count: usize,
 }
 
+// Keep the cut outside ID-linked tool exchanges. Extending the mandatory tail
+// can leave us above the token target; dropping a call while retaining its
+// results would instead produce an invalid provider request.
+fn compaction_boundary(messages: &[ConversationMessage], preserve_recent: usize) -> usize {
+    let cut = messages.len().saturating_sub(preserve_recent);
+    let mut ends: Vec<usize> = (0..messages.len()).collect();
+    let mut calls = std::collections::HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { id, .. } if message.role == MessageRole::Assistant => {
+                    calls.insert(id.as_str(), index);
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    if let Some(start) = calls.remove(tool_use_id.as_str()) {
+                        ends[start] = index;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut start = 0;
+    while start < cut {
+        let mut end = ends[start];
+        let mut cursor = start;
+        while cursor <= end {
+            end = end.max(ends[cursor]);
+            cursor += 1;
+        }
+        if end >= cut {
+            return start;
+        }
+        start = end + 1;
+    }
+    cut
+}
+
 /// Compact a session without calling an LLM — builds a structural summary
 /// from the message metadata (useful as a fast fallback or for testing).
 ///
@@ -183,7 +221,8 @@ pub struct CompactionResult {
 /// then pass its response to `apply_compact_summary`.
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
-    if !should_compact(session, config) {
+    let keep_from = compaction_boundary(&session.messages, config.preserve_recent_messages);
+    if !should_compact(session, config) || keep_from == 0 {
         return CompactionResult {
             summary: String::new(),
             formatted_summary: String::new(),
@@ -193,10 +232,6 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     }
 
     // Phase 1: observation masking on older messages (keep last N untouched).
-    let keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
     let masked = mask_observations(&session.messages[..keep_from]);
     let preserved = session.messages[keep_from..].to_vec();
 
@@ -258,10 +293,15 @@ pub fn apply_compact_summary(
     summary: &str,
     config: CompactionConfig,
 ) -> CompactionResult {
-    let keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
+    let keep_from = compaction_boundary(&session.messages, config.preserve_recent_messages);
+    if keep_from == 0 {
+        return CompactionResult {
+            summary: String::new(),
+            formatted_summary: String::new(),
+            compacted_session: session.clone(),
+            removed_message_count: 0,
+        };
+    }
     let removed_count = keep_from;
     let preserved = session.messages[keep_from..].to_vec();
 
