@@ -28,6 +28,8 @@ mod completion_tests;
 #[cfg(test)]
 mod context_tests;
 #[cfg(test)]
+mod pressure_tests;
+#[cfg(test)]
 mod tool_response_tests;
 
 /// A channel the TUI can use to inject interjections mid-turn.
@@ -72,10 +74,10 @@ pub trait OutputSink: Send {
     /// can echo it visually). Default: no-op.
     fn on_interjection(&mut self, _text: &str) {}
 
-    /// Called with the context-window pressure after each turn completes
-    /// (cumulative input tokens / model window size, clamped to [0, 1]).
-    /// The TUI uses this to light up color thresholds in the footer and
-    /// future work will use it to trigger rolling-summary compaction.
+    /// Estimated input occupancy of the latest selected request in this turn,
+    /// divided by its model window and clamped to [0, 1]. Excludes the response.
+    /// Zero when no request was built; consumers can use ContextBuilt events
+    /// to distinguish that case from a small request. Billing usage is separate.
     /// Default: no-op.
     fn on_context_pressure(&mut self, _pressure: f32) {}
 
@@ -259,6 +261,7 @@ async fn run_turn_inner(
     let turn_start = std::time::Instant::now();
     let mut tracker = UsageTracker::default();
     let mut iterations = 0u32;
+    let mut request_pressure = 0.0;
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
 
@@ -425,6 +428,14 @@ async fn run_turn_inner(
         }
 
         let (request, manifest) = build_request(session, model, system_prompt, &tool_defs);
+        // Repeated or cached requests consume billing tokens without adding
+        // those same tokens repeatedly to one context window.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            request_pressure = (manifest.estimated_input_tokens as f32
+                / manifest.context_window_tokens.max(1) as f32)
+                .clamp(0.0, 1.0);
+        }
         sink.on_run_event(&crate::run_record::RunEvent::ContextBuilt { manifest });
 
         // stream the response
@@ -1056,14 +1067,7 @@ async fn run_turn_inner(
     };
     sink.on_run_event(&terminal);
 
-    // Context pressure: clamped input_tokens / model_window. We only need
-    // ~2 significant figures for a 0-1 ratio, so u32→f32 precision loss
-    // is fine. `pressure` is always in [0, 1].
-    #[allow(clippy::cast_precision_loss)]
-    let window = piku_context_window_for_model(model) as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let pressure = (tracker.cumulative.input_tokens as f32 / window).clamp(0.0, 1.0);
-    sink.on_context_pressure(pressure);
+    sink.on_context_pressure(request_pressure);
 
     // Stop hooks -- fire after turn completes (notifications, logging, cleanup).
     if let Some(hooks) = hook_registry {
@@ -2809,20 +2813,6 @@ mod curation_tests {
             .windows(2)
             .all(|w| w[0] < w[1] || w[0].len() < w[1].len());
         assert!(is_sorted, "order mangled: {kept_texts:?}");
-    }
-
-    #[test]
-    #[allow(clippy::cast_precision_loss, clippy::float_cmp)] // clamp(0,1) yields exact 1.0
-    fn pressure_matches_input_tokens_over_window() {
-        // Direct unit test for the calculation. The actual `on_context_pressure`
-        // wiring fires at end of run_turn — we exercise the formula only.
-        let window = piku_context_window_for_model("claude-sonnet-4-6") as f32;
-        // 50k input tokens against 200k window → 0.25 pressure.
-        let p = (50_000_f32 / window).clamp(0.0, 1.0);
-        assert!((p - 0.25).abs() < 0.01, "got {p}");
-        // Overflow: 1M tokens → clamped to 1.0
-        let p2 = (1_000_000_f32 / window).clamp(0.0, 1.0);
-        assert_eq!(p2, 1.0);
     }
 
     #[test]
