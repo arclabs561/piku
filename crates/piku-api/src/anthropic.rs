@@ -61,6 +61,9 @@ impl Provider for AnthropicProvider {
         let client = self.client.clone();
 
         Box::pin(async_stream::try_stream! {
+            if request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, crate::RequestContent::Replay { .. })) {
+                Err(ApiError::Provider("Responses replay cannot be sent to Anthropic".into()))?;
+            }
             let resp = client
                 .post(&url)
                 .header("x-api-key", &api_key)

@@ -85,9 +85,11 @@ impl Provider for OpenAiCompatProvider {
         let auth = self.auth.clone();
         let extra_headers = self.extra_headers.clone();
         let client = self.client.clone();
-        let body = build_openai_body(&request);
-
         Box::pin(async_stream::try_stream! {
+            if request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, RequestContent::Replay { .. })) {
+                Err(ApiError::Provider("Responses replay cannot be sent to Chat Completions".into()))?;
+            }
+            let body = build_openai_body(&request);
             let mut req = client
                 .post(&url)
                 .header("content-type", "application/json");
@@ -336,6 +338,7 @@ fn request_text(block: &RequestContent) -> Option<&str> {
 
 fn request_content_to_oai(block: &RequestContent) -> serde_json::Value {
     match block {
+        RequestContent::Replay { .. } => serde_json::Value::Null, // Rejected before transport serialization.
         RequestContent::Text { text } => serde_json::json!({ "type": "text", "text": text }),
         RequestContent::ToolResult {
             tool_use_id,

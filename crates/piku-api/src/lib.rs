@@ -6,6 +6,8 @@ pub mod ollama;
 pub mod openai_compat;
 pub mod openrouter;
 pub mod provider;
+pub mod replay;
+pub mod responses;
 pub mod sse;
 #[cfg(test)]
 mod tests;
@@ -14,7 +16,9 @@ pub mod types;
 pub use anthropic::AnthropicProvider;
 pub use error::ApiError;
 pub use openai_compat::OpenAiCompatProvider;
-pub use provider::Provider;
+pub use provider::{AccessToken, AccessTokenSource, Provider};
+pub use replay::{ReplayEnvelope, ReplayRoute, ResponsesOutputItem};
+pub use responses::{ChatgptModel, ResponsesProvider};
 pub use types::{
     CacheControl, Event, MessageRequest, RequestContent, RequestMessage, StopReason, SystemBlock,
     TokenUsage, ToolDefinition,
