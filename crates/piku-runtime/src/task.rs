@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(test)]
+mod waiter_tests;
+
 /// Maximum recursive spawn depth. Beyond this, `spawn_agent` returns an error.
 pub const MAX_SPAWN_DEPTH: u32 = 4;
 
@@ -693,17 +696,23 @@ impl TaskRegistry {
     }
 
     /// Register a waiter that will be notified when the task completes.
-    /// Returns a receiver; the sender is stored in the registry.
+    /// Unknown tasks return a closed receiver. Senders for dropped receivers
+    /// are pruned on registration; terminal tasks notify immediately.
     #[must_use]
     pub fn wait_for(&self, id: &AgentTaskId) -> oneshot::Receiver<TaskEntry> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner();
-        // If already done, notify immediately
-        if let Some(entry) = inner.tasks.get(id) {
-            if entry.status != TaskStatus::Running {
-                let _ = tx.send(entry.clone());
-                return rx;
-            }
+        inner.waiters.retain(|_, waiters| {
+            waiters.retain(|sender| !sender.is_closed());
+            !waiters.is_empty()
+        });
+        let Some(entry) = inner.tasks.get(id) else {
+            // Drop tx rather than retaining a sender no task can ever notify.
+            return rx;
+        };
+        if entry.status != TaskStatus::Running {
+            let _ = tx.send(entry.clone());
+            return rx;
         }
         inner.waiters.entry(id.clone()).or_default().push(tx);
         rx

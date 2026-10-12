@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
+
+mod writer;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -542,7 +544,8 @@ pub struct RunRecorder {
     artifact_relative_dir: PathBuf,
     session_id: String,
     next_sequence: u64,
-    writer: BufWriter<File>,
+    validated_bytes: u64,
+    writer: File,
 }
 
 /// Adds durable semantic recording to any existing presentation sink.
@@ -658,83 +661,6 @@ impl OutputSink for RecordingSink<'_> {
 }
 
 impl RunRecorder {
-    pub fn open(path: impl AsRef<Path>, session_id: impl Into<String>) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let session_id = session_id.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let existing = read_run_record(&path)?;
-        validate_existing(&existing, &session_id)?;
-        let next_sequence = u64::try_from(existing.len())
-            .map_err(|_| io::Error::other("run record contains too many events"))?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let artifact_dir = path.with_extension("artifacts");
-        let artifact_relative_dir = artifact_dir
-            .file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| io::Error::other("run record path has no file name"))?;
-
-        Ok(Self {
-            path,
-            artifact_dir,
-            artifact_relative_dir,
-            session_id,
-            next_sequence,
-            writer: BufWriter::new(file),
-        })
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn append(&mut self, turn_id: impl Into<String>, mut event: RunEvent) -> io::Result<u64> {
-        self.append_scoped(
-            EventScope::Turn {
-                turn_id: turn_id.into(),
-            },
-            &mut event,
-        )
-    }
-
-    pub fn append_run(&mut self, mut event: RunEvent) -> io::Result<u64> {
-        self.append_scoped(EventScope::Run, &mut event)
-    }
-
-    fn append_scoped(&mut self, scope: EventScope, event: &mut RunEvent) -> io::Result<u64> {
-        let actual_scope = match scope {
-            EventScope::Run => EventScopeKind::Run,
-            EventScope::Turn { .. } => EventScopeKind::Turn,
-        };
-        if actual_scope != event.scope_kind() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "run event has incompatible scope",
-            ));
-        }
-        let sequence = self.next_sequence;
-        self.materialize_large_content(sequence, event)?;
-        let envelope = RunEventEnvelope {
-            schema_version: RUN_RECORD_SCHEMA_VERSION,
-            sequence,
-            recorded_at_ms: now_ms()?,
-            session_id: self.session_id.clone(),
-            scope,
-            event: event.clone(),
-        };
-        serde_json::to_writer(&mut self.writer, &envelope).map_err(io::Error::other)?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("run event sequence overflow"))?;
-        Ok(sequence)
-    }
-
     fn materialize_large_content(&self, sequence: u64, event: &mut RunEvent) -> io::Result<()> {
         let target = match event {
             RunEvent::TurnStarted { input, .. } => Some(("input", input)),
@@ -851,7 +777,18 @@ fn validate_existing(events: &[RunEventEnvelope], session_id: &str) -> io::Resul
 }
 
 fn validate_record_structure(events: &[RunEventEnvelope]) -> io::Result<()> {
-    let session_id = events.first().map(|event| event.session_id.as_str());
+    validate_record_segment(
+        events,
+        0,
+        events.first().map(|event| event.session_id.as_str()),
+    )
+}
+
+fn validate_record_segment(
+    events: &[RunEventEnvelope],
+    first_sequence: u64,
+    session_id: Option<&str>,
+) -> io::Result<()> {
     for (index, event) in events.iter().enumerate() {
         if !(1..=RUN_RECORD_SCHEMA_VERSION).contains(&event.schema_version) {
             return Err(io::Error::new(
@@ -879,8 +816,12 @@ fn validate_record_structure(events: &[RunEventEnvelope]) -> io::Result<()> {
                 format!("run record changes session at line {}", index + 1),
             ));
         }
-        let expected = u64::try_from(index)
-            .map_err(|_| io::Error::other("run record contains too many events"))?;
+        let expected = first_sequence
+            .checked_add(
+                u64::try_from(index)
+                    .map_err(|_| io::Error::other("run record contains too many events"))?,
+            )
+            .ok_or_else(|| io::Error::other("run event sequence overflow"))?;
         if event.sequence != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -995,6 +936,59 @@ mod tests {
             serde_json::from_str::<RunEventEnvelope>(&encoded).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn overlapping_recorders_allocate_fresh_sequences_and_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        let mut first = RunRecorder::open(&path, "session-1").unwrap();
+        let mut second = RunRecorder::open(&path, "session-1").unwrap();
+        let large = "a".repeat(RUN_INLINE_CONTENT_LIMIT_BYTES + 1);
+        assert_eq!(
+            first
+                .append(
+                    "turn",
+                    RunEvent::AssistantMessage {
+                        content: ContentRef::Inline {
+                            text: large.clone()
+                        }
+                    }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            second
+                .append(
+                    "turn",
+                    RunEvent::AssistantMessage {
+                        content: ContentRef::Inline {
+                            text: "b".repeat(large.len())
+                        }
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(first.append("turn", started()).unwrap(), 2);
+        let events = read_run_record(&path).unwrap();
+        assert_eq!(events.len(), 3);
+        for (index, expected) in [large, "b".repeat(RUN_INLINE_CONTENT_LIMIT_BYTES + 1)]
+            .iter()
+            .enumerate()
+        {
+            let RunEvent::AssistantMessage {
+                content: ContentRef::Artifact(artifact),
+            } = &events[index].event
+            else {
+                panic!("expected artifact");
+            };
+            assert_eq!(
+                fs::read_to_string(dir.path().join(&artifact.relative_path)).unwrap(),
+                *expected
+            );
+        }
     }
 
     #[test]

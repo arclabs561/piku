@@ -2265,6 +2265,7 @@ pub async fn execute_agent_join(
                 false,
             )
         }
+        Ok(Err(_)) if registry.status(&id).is_none() => (format!("unknown task: {id_str}"), true),
         Ok(Err(_)) => (format!("task {id_str}: channel closed unexpectedly"), true),
         Err(_) => (
             format!("task {id_str}: timed out after {timeout_secs}s"),
