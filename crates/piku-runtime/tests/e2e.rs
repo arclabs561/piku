@@ -3099,6 +3099,7 @@ impl Provider for DelayedExtraction {
         Box::pin(async_stream::stream! {
             if first { self.entered.notify_one(); self.resume.notified().await; }
             yield Ok(Event::TextDelta { text: if judge { "ADD" } else { "- [importance:7] extracted C {tags: fixture}" }.into() });
+            yield Ok(Event::MessageStop { stop_reason: StopReason::EndTurn });
         })
     }
 }

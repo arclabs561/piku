@@ -885,15 +885,22 @@ async fn extract_raw(
 
     let timeout = std::time::Duration::from_secs(30);
     let result = tokio::time::timeout(timeout, async {
+        let mut completed = false;
         while let Some(event) = stream.next().await {
-            if let Ok(piku_api::Event::TextDelta { text }) = event {
-                response.push_str(&text);
+            match event {
+                Ok(piku_api::Event::TextDelta { text }) => response.push_str(&text),
+                Ok(piku_api::Event::MessageStop {
+                    stop_reason: piku_api::StopReason::EndTurn | piku_api::StopReason::StopSequence,
+                }) if !completed => completed = true,
+                Ok(piku_api::Event::MessageStop { .. }) | Err(_) => return false,
+                Ok(_) => {} // Usage may follow completion; keep draining for late errors.
             }
         }
+        completed
     })
     .await;
 
-    if result.is_err() || response.trim() == "NONE" || response.trim().is_empty() {
+    if result != Ok(true) || response.trim() == "NONE" || response.trim().is_empty() {
         return None;
     }
 
@@ -1205,16 +1212,23 @@ async fn judge_memory_conflict(
 
     let timeout = std::time::Duration::from_secs(10);
     let result = tokio::time::timeout(timeout, async {
+        let mut completed = false;
         while let Some(event) = stream.next().await {
-            if let Ok(piku_api::Event::TextDelta { text }) = event {
-                response.push_str(&text);
+            match event {
+                Ok(piku_api::Event::TextDelta { text }) => response.push_str(&text),
+                Ok(piku_api::Event::MessageStop {
+                    stop_reason: piku_api::StopReason::EndTurn | piku_api::StopReason::StopSequence,
+                }) if !completed => completed = true,
+                Ok(piku_api::Event::MessageStop { .. }) | Err(_) => return false,
+                Ok(_) => {} // Usage may follow completion; keep draining for late errors.
             }
         }
+        completed
     })
     .await;
 
-    if result.is_err() {
-        return MemoryJudgment::Add; // timeout → safe default: add
+    if result != Ok(true) {
+        return MemoryJudgment::Add; // incomplete/failed response → safe default: add
     }
 
     parse_judgment(&response)
@@ -2663,3 +2677,6 @@ pub mod tests {
         assert!(!store.entries[0].is_valid);
     }
 }
+
+#[cfg(test)]
+mod stream_tests;
