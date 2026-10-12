@@ -57,6 +57,14 @@ async fn server_with_request_id(
     responses: Vec<(u16, String)>,
     request_id: &'static str,
 ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    server_with_length_offset(responses, request_id, 0).await
+}
+
+async fn server_with_length_offset(
+    responses: Vec<(u16, String)>,
+    request_id: &'static str,
+    length_offset: usize,
+) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
@@ -105,12 +113,19 @@ async fn server_with_request_id(
             } else {
                 serde_json::from_slice(&bytes[end..end + length]).unwrap()
             });
-            stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nx-request-id: {request_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).as_bytes()).await.unwrap();
-            for chunk in response.as_bytes().chunks(7) {
-                stream.write_all(chunk).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nx-request-id: {request_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()+length_offset).as_bytes()).await.unwrap();
+            let chunk_size = if response.len() > MAX_EVENT_BYTES / 2 {
+                16 * 1024
+            } else {
+                7
+            };
+            for chunk in response.as_bytes().chunks(chunk_size) {
+                if stream.write_all(chunk).await.is_err() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-            stream.shutdown().await.unwrap();
+            let _ = stream.shutdown().await;
         }
         bodies
     });
@@ -712,4 +727,261 @@ fn public_preflight_rejects_mismatched_replay_without_credentials() {
         assert!(provider.validate_request(&request).is_err());
     }
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+}
+
+fn indexed_function_events() -> (Vec<Value>, Value) {
+    let read = json!({"type":"function_call","id":"item-read","call_id":"call-read","namespace":"piku","name":"read_file","arguments":"{\"path\":\"version.txt\"}","status":"completed"});
+    let edit = json!({"type":"function_call","id":"item-edit","call_id":"call-edit","namespace":"piku","name":"edit_file","arguments":"{\"path\":\"version.txt\",\"old_string\":\"1.0.0\",\"new_string\":\"2.0.0\"}","status":"completed"});
+    let mut rows = Vec::new();
+    for (index, item) in [&read, &edit].into_iter().enumerate() {
+        let mut added = item.clone();
+        added["arguments"] = json!("");
+        added["status"] = json!("in_progress");
+        rows.push(json!({"type":"response.output_item.added","output_index":index,"item":added}));
+        let args = item["arguments"].as_str().unwrap();
+        for fragment in [&args[..2], &args[2..]] {
+            rows.push(json!({"type":"response.function_call_arguments.delta","output_index":index,"item_id":item["id"],"delta":fragment}));
+        }
+        rows.push(json!({"type":"response.function_call_arguments.done","output_index":index,"item_id":item["id"],"arguments":args}));
+        rows.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
+    }
+    (rows, json!([read, edit]))
+}
+
+#[tokio::test]
+async fn indexed_done_items_reconstruct_empty_terminal_and_agree_with_full_terminal() {
+    let (rows, output) = indexed_function_events();
+    for terminal in [json!([]), output.clone()] {
+        let mut rows = rows.clone();
+        rows.push(completion(terminal));
+        let (url, server) = server(vec![(200, frames(&rows))]).await;
+        let (provider, _) = provider(url);
+        let mut request = request();
+        request.tools.as_mut().unwrap()[1].name = "edit_file".into();
+        let events: Vec<_> = collect(&provider, request)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let names: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if let Event::ToolUseStart { name, .. } = event {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(names, ["read_file", "edit_file"]);
+        let args: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if let Event::ToolUseDelta { id, partial_json } = event {
+                    Some((
+                        id.as_str(),
+                        serde_json::from_str::<Value>(partial_json).unwrap(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(args[0], ("call-read", json!({"path":"version.txt"})));
+        assert_eq!(args[1].1["new_string"], "2.0.0");
+        assert!(events.iter().any(|event| matches!(event, Event::Replay { envelope } if serde_json::to_value(&envelope.output).unwrap() == output)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::MessageStop {
+                        stop_reason: StopReason::ToolUse
+                    }
+                ))
+                .count(),
+            1
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn malformed_indexed_items_cannot_release_tools_or_replay() {
+    let (base, output) = indexed_function_events();
+    let mut cases = Vec::new();
+    let mut identity_rows = base.clone();
+    identity_rows.insert(
+        0,
+        json!({"type":"response.created","response":{"id":"other-response"}}),
+    );
+    cases.push(identity_rows);
+    let mut rows = base.clone();
+    rows.push(base[4].clone());
+    cases.push(rows); // duplicate done
+    let mut rows = base.clone();
+    rows.insert(1, base[0].clone());
+    cases.push(rows); // duplicate added
+    let mut rows = base.clone();
+    rows[4]["item"]["call_id"] = json!("changed");
+    cases.push(rows);
+    let mut rows = base.clone();
+    rows[4]["item"]["status"] = json!("incomplete");
+    cases.push(rows);
+    let mut rows = base.clone();
+    rows[4]["item"]["type"] = json!("unknown_future_tool");
+    cases.push(rows);
+    let mut rows = base.clone();
+    rows.remove(0);
+    cases.push(rows); // orphan delta
+    let mut rows = base.clone();
+    rows.remove(4);
+    cases.push(rows); // missing item done
+    let mut rows = base.clone();
+    rows[3]["arguments"] = json!("{}");
+    cases.push(rows);
+    for mut rows in cases {
+        rows.push(completion(json!([])));
+        assert_indexed_stream_fails(rows).await;
+    }
+    let mut rows = base.clone();
+    let mut changed = output;
+    changed[0]["arguments"] = json!("{}");
+    rows.push(completion(changed));
+    assert_indexed_stream_fails(rows).await;
+    assert_indexed_stream_fails(base.clone()).await; // no completed
+    let mut rows = base;
+    rows.push(completion(json!([])));
+    rows.push(json!({"type":"response.output_item.done","output_index":0,"item":{}}));
+    assert_indexed_stream_fails(rows).await;
+}
+
+async fn assert_indexed_stream_fails(rows: Vec<Value>) {
+    let (url, server) = server(vec![(200, frames(&rows))]).await;
+    let (provider, _) = provider(url);
+    let mut request = request();
+    request.tools.as_mut().unwrap()[1].name = "edit_file".into();
+    let events = collect(&provider, request).await;
+    assert!(events.iter().any(Result::is_err));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Ok(Event::ToolUseStart { .. }
+            | Event::Replay { .. }
+            | Event::UsageDelta { .. }
+            | Event::MessageStop { .. })
+    )));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn indexed_done_items_wait_for_clean_transport_eof() {
+    let (mut rows, _) = indexed_function_events();
+    rows.push(completion(json!([])));
+    let (url, server) =
+        server_with_length_offset(vec![(200, frames(&rows))], "req-fixture", 1).await;
+    let (provider, _) = provider(url);
+    let mut request = request();
+    request.tools.as_mut().unwrap()[1].name = "edit_file".into();
+    let events = collect(&provider, request).await;
+    assert!(events.iter().any(|event| matches!(event, Err(ApiError::Provider(error)) if error.contains("stream interrupted"))));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Ok(Event::ToolUseStart { .. } | Event::Replay { .. } | Event::MessageStop { .. })
+    )));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn indexed_done_reasoning_and_message_preserve_replay_and_visible_text() {
+    let output = json!([
+        {"type":"reasoning","id":"reasoning","summary":[],"encrypted_content":"opaque-fixture"},
+        {"type":"message","id":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"verified","annotations":[]}]}
+    ]);
+    let mut rows = vec![json!({"type":"response.created","response":{"id":"resp-fixture"}})];
+    for (index, item) in output.as_array().unwrap().iter().enumerate() {
+        rows.push(json!({"type":"response.output_item.added","output_index":index,"item":item}));
+        rows.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
+    }
+    rows.push(completion(json!([])));
+    let (url, server) = server(vec![(200, frames(&rows))]).await;
+    let (provider, _) = provider(url);
+    let events = collect(&provider, request()).await;
+    assert!(events.iter().all(Result::is_ok));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event,Ok(Event::TextDelta{text}) if text=="verified")));
+    assert!(events.iter().any(|event| matches!(event,Ok(Event::Replay{envelope}) if serde_json::to_value(&envelope.output).unwrap()==output)));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn indexed_assembly_has_aggregate_retained_payload_limit() {
+    for (payload_bytes, expected_ok) in [(64 * 1024, true), (2 * 1024 * 1024, false)] {
+        let (mut rows, _) = indexed_function_events();
+        for index in 2..5 {
+            let item = json!({"type":"reasoning","id":format!("reason-{index}"),"summary":[],"encrypted_content":"x".repeat(payload_bytes)});
+            rows.push(
+                json!({"type":"response.output_item.added","output_index":index,"item":item}),
+            );
+            rows.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
+        }
+        rows.push(completion(json!([])));
+        assert!(rows
+            .iter()
+            .all(|row| row.to_string().len() < MAX_EVENT_BYTES));
+        let (url, server) = server(vec![(200, frames(&rows))]).await;
+        let (provider, _) = provider(url);
+        let mut request = request();
+        request.tools.as_mut().unwrap()[1].name = "edit_file".into();
+        let events = collect(&provider, request).await;
+        if expected_ok {
+            assert!(events.iter().all(Result::is_ok));
+            assert!(events.iter().any(
+                |event| matches!(event,Ok(Event::Replay{envelope}) if envelope.output.len()==5)
+            ));
+        } else {
+            assert!(events.iter().any(|event|matches!(event,Err(ApiError::Provider(message)) if message.contains("aggregate output assembly exceeds limit"))));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                Ok(Event::ToolUseStart { .. } | Event::Replay { .. } | Event::MessageStop { .. })
+            )));
+        }
+        server.await.unwrap();
+    }
+}
+
+#[test]
+fn aggregate_limit_precedes_argument_append_and_done_copy() {
+    let mut items = OutputItems::default();
+    items.observe("response.output_item.added",&json!({"output_index":0,"item":{"type":"function_call","id":"item","call_id":"call","name":"read_file","namespace":"piku","arguments":""}})).unwrap();
+    let prefix = "x".repeat(5 * 1024 * 1024);
+    items
+        .observe(
+            "response.function_call_arguments.delta",
+            &json!({"output_index":0,"delta":prefix}),
+        )
+        .unwrap();
+    let retained = items.retained_bytes;
+    let error = items
+        .observe(
+            "response.function_call_arguments.done",
+            &json!({"output_index":0,"arguments":prefix}),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("aggregate output assembly exceeds limit"));
+    assert!(items.arguments_done.is_empty());
+    assert_eq!(items.retained_bytes, retained);
+    let error = items
+        .observe(
+            "response.function_call_arguments.delta",
+            &json!({"output_index":0,"delta":"y".repeat(4 * 1024 * 1024)}),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("aggregate output assembly exceeds limit"));
+    assert_eq!(items.arguments[&0].len(), prefix.len());
+    assert_eq!(items.retained_bytes, retained);
 }

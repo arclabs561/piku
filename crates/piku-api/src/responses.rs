@@ -1,5 +1,5 @@
 //! Account-bound, stateless Responses transport for `ChatGPT` plan usage.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,7 +165,7 @@ impl Provider for ResponsesProvider {
             // Wait through EOF: trailing errors or duplicate terminal events
             // must not authorize tools from an earlier completed frame.
             let completed = state.completed.take().ok_or(ApiError::UnexpectedStreamEnd)?;
-            let output: Vec<ResponsesOutputItem> = serde_json::from_value(completed.get("output").cloned().ok_or_else(|| protocol("completed response lacks output"))?)
+            let output: Vec<ResponsesOutputItem> = serde_json::from_value(state.items.reconcile(completed.get("output"))?)
                 .map_err(|_| protocol("unsupported or malformed Responses output"))?;
             let envelope = ReplayEnvelope { version: 1, route: ReplayRoute::ChatgptResponses, registration: self.registration.clone(), model: request.model.clone(), output };
             validate_replay(&envelope, &self.registration, &request.model, Some(&advertised))?;
@@ -381,6 +381,8 @@ struct ResponseState {
     completed: Option<Value>,
     text_seen: bool,
     streamed_text: String,
+    items: OutputItems,
+    response_id: Option<String>,
 }
 impl ResponseState {
     fn accept(
@@ -395,6 +397,23 @@ impl ResponseState {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| protocol("Responses event lacks type"))?;
+        if matches!(
+            kind,
+            "response.created" | "response.in_progress" | "response.queued" | "response.completed"
+        ) {
+            let id = event.pointer("/response/id").and_then(Value::as_str);
+            if self.response_id.as_deref().is_some_and(|observed| {
+                (id.is_some() || kind == "response.completed") && Some(observed) != id
+            }) {
+                return Err(protocol("Responses lifecycle identity changed"));
+            }
+            if let Some(id) = id {
+                if id.is_empty() {
+                    return Err(protocol("empty Responses lifecycle identity"));
+                }
+                self.response_id = Some(id.to_owned());
+            }
+        }
         match kind {
             "response.failed" | "response.incomplete" | "error" => Err(protocol(&format!(
                 "{kind}: {}",
@@ -426,17 +445,20 @@ impl ResponseState {
                 self.streamed_text.push_str(text);
                 Ok(Some(text.to_owned()))
             }
+            "response.output_item.added"
+            | "response.output_item.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done" => {
+                self.items.observe(kind, &event)?;
+                Ok(None)
+            }
             "response.created"
             | "response.in_progress"
             | "response.queued"
-            | "response.output_item.added"
-            | "response.output_item.done"
             | "response.content_part.added"
             | "response.content_part.done"
             | "response.output_text.done"
             | "response.refusal.done"
-            | "response.function_call_arguments.delta"
-            | "response.function_call_arguments.done"
             | "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
             | "response.reasoning_summary_text.delta"
@@ -509,4 +531,209 @@ async fn check_response(
         status: status.as_u16(),
         body: diagnostic(&value, request_id, secret),
     })
+}
+
+/// Item-done frames carry complete output even when the final response omits it.
+/// Keep them indexed until terminal validation and EOF authorize projection.
+#[derive(Default)]
+struct OutputItems {
+    added: BTreeMap<u64, Value>,
+    done: BTreeMap<u64, Value>,
+    arguments: BTreeMap<u64, String>,
+    arguments_done: BTreeMap<u64, String>,
+    retained_bytes: usize,
+}
+
+impl OutputItems {
+    fn observe(&mut self, kind: &str, event: &Value) -> Result<(), ApiError> {
+        if kind == "response.output_item.added" {
+            let index = output_index(event)?;
+            let item = event
+                .get("item")
+                .ok_or_else(|| protocol("added item missing"))?;
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| protocol("added item lacks identity"))?;
+            if !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("message" | "reasoning" | "function_call")
+            ) {
+                return Err(protocol("unsupported added output item"));
+            }
+            if self.added.contains_key(&index)
+                || self
+                    .added
+                    .values()
+                    .any(|other| other.get("id").and_then(Value::as_str) == Some(id))
+            {
+                return Err(protocol("duplicate output index or identity"));
+            }
+            self.retain_entry(index, item.to_string().len())?;
+            self.added.insert(index, item.clone());
+            return Ok(());
+        }
+        let index = self.resolve(event)?;
+        if self.done.contains_key(&index) {
+            return Err(protocol("event after output item done"));
+        }
+        if kind == "response.output_item.done" {
+            let item = event
+                .get("item")
+                .ok_or_else(|| protocol("done item missing"))?;
+            self.check_item(index, item)?;
+            self.retain_entry(index, item.to_string().len())?;
+            serde_json::from_value::<ResponsesOutputItem>(item.clone())
+                .map_err(|_| protocol("unsupported or malformed done output item"))?;
+            self.done.insert(index, item.clone());
+        } else {
+            if self.added[&index].get("type").and_then(Value::as_str) != Some("function_call") {
+                return Err(protocol("arguments event for non-function item"));
+            }
+            if self.arguments_done.contains_key(&index) {
+                return Err(protocol("arguments event after arguments done"));
+            }
+            if kind == "response.function_call_arguments.delta" {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| protocol("arguments delta missing"))?;
+                if self.arguments.contains_key(&index) {
+                    self.retain(delta.len())?;
+                } else {
+                    self.retain_entry(index, delta.len())?;
+                }
+                self.arguments.entry(index).or_default().push_str(delta);
+            } else {
+                let args = event
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| protocol("done arguments missing"))?;
+                if self
+                    .arguments
+                    .get(&index)
+                    .is_some_and(|observed| observed != args)
+                {
+                    return Err(protocol("done arguments disagree with deltas"));
+                }
+                self.retain_entry(index, args.len())?;
+                self.arguments_done.insert(index, args.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    // Charge every retained copy, not just each incoming frame. Serialized
+    // item fields and map/string delimiters keep many small entries bounded.
+    fn retain_entry(&mut self, index: u64, payload_bytes: usize) -> Result<(), ApiError> {
+        let bytes = payload_bytes
+            .checked_add(index.to_string().len() + 5)
+            .ok_or_else(|| protocol("aggregate output assembly exceeds limit"))?;
+        self.retain(bytes)
+    }
+
+    fn retain(&mut self, bytes: usize) -> Result<(), ApiError> {
+        let total = self
+            .retained_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_EVENT_BYTES)
+            .ok_or_else(|| protocol("aggregate output assembly exceeds limit"))?;
+        self.retained_bytes = total;
+        Ok(())
+    }
+
+    fn resolve(&self, event: &Value) -> Result<u64, ApiError> {
+        let index = if event.get("output_index").is_some() {
+            output_index(event)?
+        } else {
+            let id = event
+                .get("item_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| protocol("output event lacks index or item identity"))?;
+            *self
+                .added
+                .iter()
+                .find(|(_, item)| item.get("id").and_then(Value::as_str) == Some(id))
+                .map(|(index, _)| index)
+                .ok_or_else(|| protocol("orphan output event"))?
+        };
+        let item = self
+            .added
+            .get(&index)
+            .ok_or_else(|| protocol("orphan output index"))?;
+        if event
+            .get("item_id")
+            .is_some_and(|id| item.get("id") != Some(id))
+        {
+            return Err(protocol("output index and identity disagree"));
+        }
+        Ok(index)
+    }
+
+    fn check_item(&self, index: u64, item: &Value) -> Result<(), ApiError> {
+        let added = &self.added[&index];
+        for field in ["id", "type", "call_id", "name", "namespace"] {
+            if added
+                .get(field)
+                .is_some_and(|value| !value.is_null() && item.get(field) != Some(value))
+            {
+                return Err(protocol("output item identity changed"));
+            }
+        }
+        if item
+            .get("status")
+            .is_some_and(|status| !status.is_null() && status.as_str() != Some("completed"))
+        {
+            return Err(protocol("output item is not completed"));
+        }
+        for args in [self.arguments.get(&index), self.arguments_done.get(&index)]
+            .into_iter()
+            .flatten()
+        {
+            if item.get("arguments").and_then(Value::as_str) != Some(args) {
+                return Err(protocol("output item arguments disagree with stream"));
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile(&self, output: Option<&Value>) -> Result<Value, ApiError> {
+        let output = output
+            .and_then(Value::as_array)
+            .ok_or_else(|| protocol("completed response lacks output array"))?;
+        if output.is_empty() {
+            let mut items = Vec::new();
+            for (expected, index) in self.added.keys().enumerate() {
+                if *index != expected as u64 {
+                    return Err(protocol("incomplete output item indexes"));
+                }
+                items.push(
+                    self.done
+                        .get(index)
+                        .ok_or_else(|| protocol("output item never completed"))?
+                        .clone(),
+                );
+            }
+            return Ok(Value::Array(items));
+        }
+        for index in self.added.keys() {
+            let index_usize =
+                usize::try_from(*index).map_err(|_| protocol("invalid output index"))?;
+            let item = output
+                .get(index_usize)
+                .ok_or_else(|| protocol("terminal output omits tracked item"))?;
+            self.check_item(*index, item)?;
+            if self.done.get(index).is_some_and(|done| done != item) {
+                return Err(protocol("terminal output disagrees with done item"));
+            }
+        }
+        Ok(Value::Array(output.clone()))
+    }
+}
+fn output_index(event: &Value) -> Result<u64, ApiError> {
+    event
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| protocol("invalid output index"))
 }
