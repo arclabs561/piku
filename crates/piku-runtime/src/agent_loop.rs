@@ -27,6 +27,8 @@ mod cancellation_tests;
 mod completion_tests;
 #[cfg(test)]
 mod context_tests;
+#[cfg(test)]
+mod tool_response_tests;
 
 /// A channel the TUI can use to inject interjections mid-turn.
 /// Send a plain string; the agent wraps it in `<interjection>` tags so
@@ -1235,10 +1237,28 @@ async fn stream_response(
         blocks.push(ContentBlock::Text { text: text_buf });
     }
 
-    for id in tool_order.into_iter().filter(|_| !cancelled) {
+    // A token-limited response is incomplete even if one call's JSON happens
+    // to parse. Preserve its text and stop reason, but never dispatch its tools.
+    for id in tool_order
+        .into_iter()
+        .filter(|_| !cancelled && stop_reason != StopReason::MaxTokens)
+    {
         if let Some((name, json_str)) = tool_calls.remove(&id) {
-            let input: serde_json::Value = serde_json::from_str(&json_str)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            // No argument delta is valid for a parameterless call. Nonempty
+            // malformed arguments must not silently become an empty object.
+            let input = if json_str.is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_str(&json_str) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        stream_err.get_or_insert_with(|| {
+                            format!("invalid tool arguments for {name}: {error}")
+                        });
+                        break;
+                    }
+                }
+            };
             blocks.push(ContentBlock::ToolUse { id, name, input });
         }
     }
