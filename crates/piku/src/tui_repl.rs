@@ -2463,7 +2463,7 @@ async fn run_tui_repl_core(
                     }
                 });
 
-                let result: TurnResult = {
+                let (result, record_result): (TurnResult, io::Result<()>) = {
                     let mut turn = run.begin_turn(&mut sink, turn_id);
                     let (session, recording_sink) = turn.parts();
                     let result = run_turn_with_registry(
@@ -2484,13 +2484,7 @@ async fn run_tui_repl_core(
                         Some(&cancel_flag),
                     )
                     .await;
-                    turn.finish().map_err(|error| {
-                        anyhow::anyhow!(
-                            "could not persist run record {}: {error}",
-                            run_path.display()
-                        )
-                    })?;
-                    result
+                    (result, turn.finish())
                 };
 
                 // Stop the keypress reader.
@@ -2504,6 +2498,15 @@ async fn run_tui_repl_core(
                 // editing. Forcing cooked mode here is idempotent and keeps
                 // the leak from escaping the turn.
                 let _ = terminal::disable_raw_mode();
+
+                record_result.map_err(|error| {
+                    // Persistence errors must not bypass terminal restoration.
+                    teardown_layout(term_size().1);
+                    anyhow::anyhow!(
+                        "could not persist run record {}: {error}",
+                        run_path.display()
+                    )
+                })?;
 
                 total_usage.accumulate(&result.usage);
 

@@ -1058,3 +1058,58 @@ fn submit_does_not_blank_the_screen() {
     );
     pty.exit_cleanly();
 }
+
+/// A deferred recorder failure must restore the terminal before returning Err.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn recording_failure_restores_terminal_modes() {
+    use nix::sys::termios::{tcgetattr, LocalFlags};
+    let tmp = smoke_tempdir();
+    let config = isolated_config_home().join("piku");
+    let sessions = config.join("sessions");
+    let runs = config.join("runs");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&runs).unwrap();
+    let id = format!("record-fault-{}", std::process::id());
+    piku_runtime::Session::new(id.clone())
+        .save(&sessions.join(format!("{id}.json")))
+        .unwrap();
+    std::fs::write(runs.join(format!("{id}.artifacts")), "blocked").unwrap();
+    let prompt = "x".repeat(16 * 1024 + 1);
+    let mut pty = Pty::spawn_with_args(tmp.path(), ["--resume", &id]);
+    assert!(
+        pty.wait_for("Send a message or /help", Duration::from_secs(5)),
+        "{}",
+        pty.captured()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tcgetattr(&pty.writer)
+        .unwrap()
+        .local_flags
+        .contains(LocalFlags::ICANON)
+    {
+        assert!(Instant::now() < deadline, "input never entered raw mode");
+        pty.wait(Duration::from_millis(10));
+    }
+    // Reader and writer share nonblocking PTY flags. Bound each write so the
+    // smoke helper cannot silently truncate one large paste at WouldBlock.
+    pty.send(b"\x1b[200~");
+    for chunk in prompt.as_bytes().chunks(512) {
+        pty.writer.write_all(chunk).unwrap();
+        pty.wait(Duration::from_millis(25));
+    }
+    pty.send(b"\x1b[201~\r");
+    assert!(
+        pty.wait_for("could not persist run record", Duration::from_secs(10)),
+        "{}",
+        pty.captured()
+    );
+    let modes = tcgetattr(&pty.writer).unwrap();
+    assert!(
+        modes.local_flags.contains(LocalFlags::ICANON),
+        "record failure left terminal noncanonical"
+    );
+    // rexpect deliberately disables echo before exec, so ECHO is not a
+    // restoration oracle for this harness. Canonical mode is.
+}

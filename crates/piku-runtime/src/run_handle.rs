@@ -195,3 +195,7 @@ mod tests {
         assert!(matches!(events[2].event, RunEvent::Warning { .. }));
     }
 }
+
+#[cfg(test)]
+#[path = "recording_failure_tests.rs"]
+mod recording_failure_tests;
