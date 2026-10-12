@@ -318,7 +318,14 @@ async fn reply(
     headers: &str,
     body: &str,
 ) -> Result<(), AuthError> {
-    let response = format!("HTTP/1.1 {status}\r\n{headers}Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; form-action 'self' https://auth.openai.com; frame-ancestors 'none'\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    // Only the confirmation form must preserve the browser's same-origin POST Origin.
+    // no-referrer produces Origin:null; redirects and errors still suppress referrers.
+    let referrer_policy = if status == "200 OK" {
+        "same-origin"
+    } else {
+        "no-referrer"
+    };
+    let response = format!("HTTP/1.1 {status}\r\n{headers}Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: {referrer_policy}\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; form-action 'self' https://auth.openai.com; frame-ancestors 'none'\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     socket
         .write_all(response.as_bytes())
         .await

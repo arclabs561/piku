@@ -10,7 +10,9 @@ async fn form(client: &reqwest::Client, url: &str) -> String {
     let response = client.get(url).send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["cache-control"], "no-store");
-    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    // Real Chromium sends Origin:null for this form under no-referrer.
+    // Keep the browser's same-origin POST check usable without accepting null.
+    assert_eq!(response.headers()["referrer-policy"], "same-origin");
     let text = response.text().await.unwrap();
     assert!(!text.contains("id_token_hint"));
     text.split("name=\"confirm\" value=\"")
@@ -68,6 +70,7 @@ async fn bootstrap_waits_for_confirmed_post_and_finishes_native_oidc() {
     assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
     let redirect = continue_login(&client, &url, &nonce).await;
     assert_eq!(redirect.status(), 303);
+    assert_eq!(redirect.headers()["referrer-policy"], "no-referrer");
     let authorize = reqwest::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
     let query: HashMap<_, _> = authorize
         .query_pairs()
@@ -193,6 +196,15 @@ async fn bootstrap_rejects_cross_origin_and_capability_replay_without_network() 
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
+    let response = client
+        .post(&url)
+        .header("origin", "null")
+        .form(&[("confirm", &nonce)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
     let response = client
         .get(&url)
         .header("host", "attacker.invalid")
