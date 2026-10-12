@@ -19,6 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+mod browser;
+pub use browser::{BrowserLogin, LoginPhase, LoginStatus};
+
 const DIRECT_SCOPE: &str = "chatgpt.tokens.use.direct";
 const RESOURCE: &str = "https://api.openai.com/v1";
 const CALLBACK_PATH: &str = "/auth/callback";
@@ -42,6 +45,7 @@ pub enum AuthError {
     InvalidCallback,
     Declined,
     TimedOut,
+    Cancelled,
     InvalidIdentity,
     PlanPermissionMissing,
     SignInRequired,
@@ -58,6 +62,7 @@ impl fmt::Display for AuthError {
             Self::InvalidCallback => "invalid ChatGPT authorization callback",
             Self::Declined => "ChatGPT sign-in was declined",
             Self::TimedOut => "ChatGPT sign-in timed out",
+            Self::Cancelled => "ChatGPT sign-in was cancelled",
             Self::InvalidIdentity => "ChatGPT identity validation failed",
             Self::PlanPermissionMissing => "ChatGPT plan permission is not granted",
             Self::SignInRequired => "ChatGPT sign-in is required",
@@ -380,6 +385,14 @@ impl AuthManager {
         id: Option<&str>,
         request_consent: bool,
     ) -> Result<PendingLogin, AuthError> {
+        self.begin_login_with_hint(id, request_consent, true).await
+    }
+    async fn begin_login_with_hint(
+        &self,
+        id: Option<&str>,
+        request_consent: bool,
+        include_identity_hint: bool,
+    ) -> Result<PendingLogin, AuthError> {
         let (registration, expected) = {
             let _lock = self.lock().await?;
             let host_id = self.host()?;
@@ -440,8 +453,10 @@ impl AuthManager {
         if registration.client_id == "dynamic_agent_client" {
             request = request.add_extra_param("agent_name_hint", "piku");
         }
-        if let Some(tokens) = &registration.tokens {
-            request = request.add_extra_param("id_token_hint", tokens.id_token.clone());
+        if include_identity_hint {
+            if let Some(tokens) = &registration.tokens {
+                request = request.add_extra_param("id_token_hint", tokens.id_token.clone());
+            }
         }
         if request_consent {
             request = request.add_extra_param("prompt", "consent");

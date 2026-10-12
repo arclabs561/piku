@@ -62,6 +62,7 @@ struct Mock {
     url: String,
     state: Arc<std::sync::Mutex<MockState>>,
     refreshes: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Mock {
@@ -82,14 +83,17 @@ impl Mock {
             forms: Vec::new(),
         }));
         let refreshes = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn({
             let url = url.clone();
             let state = state.clone();
             let refreshes = refreshes.clone();
+            let requests = requests.clone();
             let key = CoreRsaPrivateSigningKey::from_pem(SYNTHETIC_KEY, None).unwrap();
             async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
+                    requests.fetch_add(1, Ordering::SeqCst);
                     let mut bytes = Vec::new();
                     let mut buffer = [0; 4096];
                     let header_end = loop {
@@ -230,6 +234,7 @@ impl Mock {
             url,
             state,
             refreshes,
+            requests,
             task,
         }
     }
@@ -704,3 +709,5 @@ async fn permissive_or_symlinked_credentials_fail_closed() {
         .file_type()
         .is_symlink());
 }
+
+mod browser;
