@@ -6,9 +6,9 @@ Read [the architecture note](docs/design.md) before changing a public boundary.
 
 ## Before you start
 
-Open an issue before a new public API, feature, data model, or large refactor so
-the scope and placement can be reviewed. Small fixes and documentation updates
-do not need one.
+Issues are optional. For a new public API, feature, data model, or large
+refactor, agree on scope and placement in the active discussion or a design
+note before implementation. Owner-directed work can proceed without an issue.
 
 Use the stable Rust toolchain and install `just`. Build from the repository root:
 
