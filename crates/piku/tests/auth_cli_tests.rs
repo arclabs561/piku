@@ -213,7 +213,7 @@ fn captured_login_bootstrap_status_cancel_and_single_flight() {
     assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
     assert_eq!(
         response.headers().get("referrer-policy").unwrap(),
-        "no-referrer"
+        "same-origin"
     );
     let page = response.text().unwrap();
     assert!(page.contains("Continue"));

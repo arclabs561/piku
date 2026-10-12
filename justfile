@@ -56,6 +56,10 @@ web-agent-focus-pair focus pair_ordinal="0" url="http://127.0.0.1:9090":
 codex-sandbox-probe:
     node scripts/codex-app-server-probe.mjs
 
+# Exercise the native sign-in form in a headless browser without starting OAuth.
+chatgpt-browser-smoke binary="target/release/piku":
+    PIKU_AUTH_BROWSER_BINARY={{quote(absolute_path(binary))}} node --test crates/piku/web-ui/scripts/chatgpt-login-browser.test.mjs
+
 # Generate the private, versioned browser write attestation with an explicitly
 # selected native Codex payload. Wrapper scripts are rejected.
 codex-write-attest executable:
