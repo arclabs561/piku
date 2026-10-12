@@ -37,7 +37,8 @@ just check
 
 The gate is defined in `scripts/ci.sh` and shared with CI. It runs formatting,
 shell self-tests, Clippy with warnings denied, deterministic workspace tests,
-isolated PTY smoke tests, and a release build.
+isolated PTY smoke tests, web bundle freshness and harness checks, and a release
+build.
 
 Live LLM suites are intentionally separate. Run a relevant `just live*`,
 `just agentic-user*`, or `just playground*` recipe when the change affects a

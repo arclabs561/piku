@@ -4,14 +4,22 @@ Status: proposal
 
 Reviewed: 2026-08-03
 
+Runtime and scope reconciliation: 2026-10-12. This is a focused update, not a
+fresh review of every phase or external source.
+
 ## Purpose
 
 Turn the harness survey, human-attention research, current design corpus, and a
 fresh repository orientation into a staged plan for Piku. This is a product and
 architecture roadmap, not a commitment to feature parity.
 
-The governing objective is verified change per unit of scarce human attention.
-That objective has two constraints:
+The broader investigation covers agentic functionality, collaboration,
+coordination and hierarchy, hooks, and agents learning from prior attempts.
+Each proposed capability needs current implementation evidence and a concrete
+Piku workflow before its architecture is chosen.
+
+Verified change per unit of scarce human attention is a working product metric
+within that investigation. It has two constraints:
 
 - reducing transcript volume must not hide evidence needed to understand,
   verify, modify, or debug a change;
@@ -20,7 +28,11 @@ That objective has two constraints:
 
 The tracked operational evidence loop remains in
 `docs/live-dogfood-roadmap.md`. This document is part of the intentionally
-owner-local design corpus and may refer to the local ADR ledger.
+tracked design corpus. Decision provenance stays in the local ADR ledger.
+
+Human learning and ownership in Phase 4 are distinct from agentic learning.
+Memory persistence and attribution in Phase 5 are prerequisites for evaluating
+learning, rather than evidence that an agent improves on held-out tasks.
 
 ## Inputs
 
@@ -33,13 +45,23 @@ owner-local design corpus and may refer to the local ADR ledger.
 
 ## Orientation reconciliation
 
+The original orientation below is a baseline, not a completion ledger. Current
+runtime repairs preserve delegated denial policy and authorize attached context,
+retain worktrees using actual Git state, bound hook IO and preserve allowed
+context, serialize cooperating memory writers, and distinguish capped children
+from final answers. These bounded repairs do not complete the phase gates.
+
+Task-required checks, parent acceptance, acknowledged delivery, and a complete
+execution-containment boundary remain open. Collaboration topologies and agentic
+learning require primary-source grounding and matched-cost, held-out evaluation.
+
 | Roadmap premise | Fresh Orient finding | Consequence |
 | --- | --- | --- |
 | Provider/runtime separation is already narrow and coherent. | `piku-api` owns provider protocols; `piku-runtime` owns resolution and the loop; the binary owns CLI and TUI wiring. | Do not schedule another provider refactor. Finish focused configuration cleanup only when a consumer requires it. |
 | Deterministic evaluation is a real strength. | Scripted-provider integration tests, isolated PTY smoke tests, trace-backed dogfood, and one canonical `just check` path exist. | Use these boundaries as gates for authority, lifecycle, and attention changes. |
-| Capability behavior differs by surface. | The entered TUI has prompts, hooks, a task registry, and completion injection. Every writable launch turn uses `AllowAll`, omits hooks and the task registry, yet advertises agent tools. | Make surface truth and non-interactive authority the first implementation work. |
-| Worktrees are not an enforcement boundary. | A worktree path is placed in the child prompt, but executor and file-tool working directories are unchanged. Bash-only changes can evade the dirty heuristic. | Decide and implement an executor-scoped workspace boundary before calling this isolation. |
-| Child notification is partial, not absent. | The TUI injects completions through a bounded channel; launch turns have no equivalent. Delivery is unacknowledged and output is unbounded. | Improve lifecycle semantics instead of adding a duplicate notification feature. |
+| Capability behavior differs by surface. | Writable launch uses configured denials through `ConfiguredAllowAll`; TUI children inherit a policy snapshot. Prompting and registry wiring remain surface-specific. | Test each actual entrypoint before generalizing its authority or capabilities. |
+| Worktrees are not an enforcement boundary. | Cleanup inspects tracked, untracked, ignored, and child-commit state. This preserves work but does not contain arbitrary shell effects. | Keep work preservation and execution containment as separate guarantees. |
+| Child notification is partial, not absent. | The production TUI drains bounded previews before model requests; full results remain in the task registry. Delivery is still unacknowledged. | Finish lifecycle acceptance and acknowledgement using the existing registry. |
 | Evidence precedence is narrower than the prose implied. | Scenario predicates do not cover every goal clause, and verifier infrastructure failures share the product-failure path. | Add pass, fail, and inconclusive states before relying on acceptance outcomes as roadmap authority. |
 | Tool discovery is not lazy. | `tool_search` searches metadata for schemas already included in the request. | Measure and implement actual schema disclosure only after tool-result semantics are dependable. |
 | Memory is implemented but weakly attributable. | Automatically extracted semantic entries lack source session, model, evidence, and authorization provenance. | Audit present memory before adding mutable skills or more automatic recall. |
@@ -52,7 +74,7 @@ owner-local design corpus and may refer to the local ADR ledger.
 The roadmap does not silently choose architecture where accepted decisions are
 missing. These ADRs should be written before their implementation phases:
 
-### ADR 0010: non-interactive authority lease
+### Pending decision: non-interactive authority lease
 
 Options:
 
@@ -65,7 +87,11 @@ Preferred direction: option 2 as the policy contract, with containment designed
 as a separate lower layer. A lease is not a sandbox and must never be described
 as one.
 
-### ADR 0011: task workspace execution boundary
+### Pending decision: task workspace execution boundary
+
+Assign the next available ADR identifier when this decision is recorded. The
+existing web write-lease decision is a separate boundary; do not reuse its
+identifier or infer runtime child guarantees from it.
 
 Options:
 
@@ -80,7 +106,7 @@ delegation. It does not contain absolute-path, network, process, or other shell
 effects; those require a lower execution boundary or an explicitly incomplete
 effect record.
 
-### ADR 0012: trace-backed dogfood evidence boundary
+### Pending decision: trace-backed dogfood evidence boundary
 
 The trace-backed dogfood design is already implemented and relied on by later
 decisions, but has no matching ADR. Record the existing distinction among trace,
@@ -131,7 +157,7 @@ Gate:
 
 Goal: make non-interactive and delegated execution honest, bounded, and testable.
 
-Prerequisites: ADRs 0010 and 0011.
+Prerequisites: accepted non-interactive authority and task workspace decisions.
 
 Work:
 
@@ -346,7 +372,8 @@ Revisit ordering when:
 
 ## First checkpoint
 
-Complete phase 0, then write ADRs 0010 and 0011 from observed tests and consumers.
+Reverify phase 0 against current behavior, then record the pending authority and
+workspace decisions from observed tests and consumers using free ADR identifiers.
 Do not begin lazy tools, more concurrency, or a presentation redesign while the
 current surfaces and evaluator still misclassify their own capabilities and
 evidence.

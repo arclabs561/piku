@@ -117,8 +117,8 @@ the full built-in tool catalog to the model on every request. Read-only mode is
 the exception; it advertises only `read_file`, `glob`, `grep`, and `list_dir`.
 
 Shell stdout and stderr are each capped at 256 KiB with an explicit truncation
-marker. This bounds one high-volume path, but Piku does not yet provide a uniform
-tool-result envelope or a durable full-output artifact behind truncated output.
+marker. Typed tool results carry observed effects and verification into run
+records, but truncated output does not yet have a durable full-output artifact.
 
 There is no implemented MCP client, LSP client, browser, web-search tool, image
 input, or patch-edit protocol. Those capabilities should remain described as
@@ -128,12 +128,12 @@ possible future integrations, not current behavior.
 
 Each tool classifies a call as `Safe`, `Likely`, or `Definite`.
 
-- `Safe` calls run before the configured prompter, so configuration deny rules
-  cannot block them. This includes new unprotected files, Markdown-memory writes,
-  and attempt recording.
-- For calls that reach the interactive TUI prompter, a prior per-turn allow-all
-  wins. Otherwise configured deny rules win over allow rules; remaining calls
-  prompt for one-time allow, deny, or allow-all for the rest of the turn.
+- Configured deny rules run before classification and per-turn allow-all.
+  Remaining `Safe` calls bypass interactive prompting, including new unprotected
+  files, Markdown-memory writes, and attempt recording.
+- For other calls, per-turn allow-all or configured allow rules can skip the
+  interactive TUI prompt; remaining calls prompt for one-time allow, deny, or
+  allow-all for the rest of the turn.
 - Pre-tool hooks run before the permission prompt and can deny a call.
 - `--read-only` removes mutating and agent tools from the advertised catalog,
   but does not confine reads, provider disclosure, or Piku's own persistence.
@@ -142,11 +142,11 @@ There is no AI safety classifier in the current implementation, despite older
 design text describing one. `Likely` and `Definite` differ in presentation, not
 in the decision mechanism.
 
-Every writable launch turn uses `AllowAll`, including `-p`, a prompt that later
-enters the TUI, and a resumed prompt. Permission prompts begin only inside the
-TUI loop. A launch turn is therefore an automation interface, not a sandbox or
-approval boundary. `--read-only` narrows the advertised tools, but its read
-paths are not workspace-confined and project/user memory can still reach the
+Every writable launch turn uses a noninteractive prompter that preserves
+configured denials, including `-p`, a prompt that later enters the TUI, and a
+resumed prompt. Permission prompts begin only inside the TUI loop. A launch turn
+is an automation interface, not a sandbox. `--read-only` narrows the advertised
+tools, but its read paths are not workspace-confined and project/user memory can still reach the
 provider, so it is not a confidentiality boundary.
 
 Path checks in individual file tools reduce some risk, but they do not create
@@ -174,10 +174,18 @@ provides:
   guidance;
 - lifecycle hooks around subagent start and stop.
 
-A changed worktree is left for the caller to inspect. Piku does not merge or
-apply a child branch automatically. The dirty check observes `write_file` and
-`edit_file` tool events, so changes made only through `bash` can be missed during
-cleanup. The `background: false` field changes the returned hint but does not
+Children use an owned permission snapshot. Configured denials and prior TUI
+approvals survive delegation; operations needing a new interactive decision are
+denied in the child. Custom prompters must explicitly provide a snapshot or
+spawning is refused. Context-file attachments are checked against both parent
+and child read policies before capture.
+
+Worktree cleanup inspects Git state and ancestry, preserving shell edits,
+ignored files, child-only commits, and unverifiable state. Early-exit cleanup
+uses the same gate, and removal does not force away changes. Piku does not merge
+or apply a child branch automatically. Incomplete children report failure with
+their actual exit cause and any retained-work recovery hint. The
+`background: false` field changes the returned hint but does not
 make spawning synchronous. Agent output is a report to the parent, not
 independent proof that the task succeeded.
 
@@ -201,15 +209,27 @@ or authorization provenance. The dogfood loop should measure whether retrieved
 material is relevant and used, and should make provenance inspectable, before
 the system adds more automatic recall.
 
-The interactive TUI loads hooks from global and project JSON files. They cover
+Runtime and TUI semantic-memory mutations lock a stable sidecar, reload current state, and
+atomically replace the store. Extraction runs outside the lock and retries when
+its snapshot changes. Symlink aliases resolve to the same target and lock;
+contention and persistence errors do not acknowledge a successful write.
+Direct callers of the low-level `save` method must use the same transaction
+boundary to cooperate with these writers.
+
+The interactive TUI loads global hooks and explicitly trusted project hooks
+from JSON files. They cover
 pre/post tool use, session start, stop, pre-compaction, and subagent lifecycle
 events. Read-only mode deliberately disables hooks, and launch turns do not load
 them. Hook names and schemas are modeled after Claude Code, but Piku
 executes them locally and does not inherit Claude Code's authorization boundary.
+One deadline bounds stdin, output draining, and exit, with a one-second reaping
+allowance after failure. Each output stream is limited to 256 KiB; overflow
+fails explicitly. Unix cleanup kills the invocation's process group, but cannot
+contain descendants that deliberately create another session or group.
 
 ## Configuration and CLI
 
-Settings are JSON, not TOML:
+Settings are TOML:
 
 ```text
 $XDG_CONFIG_HOME/piku/settings.toml   global settings (`~/.config` fallback)
@@ -235,7 +255,8 @@ The TUI currently truncates successful tool output to short cards and reports an
 omitted-line count, but does not provide a lossless expansion path. Each tool
 event still occupies a separate transcript row. Session resume shows a fixed
 recent tail rather than a semantic task checkpoint, and background-agent
-completion may inject the child's full final response into the parent. There is
+completion injects a bounded preview with an `agent_join` pointer to the full
+result. Queue delivery is best-effort, without acknowledgement. There is
 no first-class `/diff` or completion-review view.
 
 The intended direction is not simply less text. Routine successful activity can
@@ -273,9 +294,8 @@ inconclusive states, an acceptance result is not automatically a product verdict
 
 ## Known implementation gaps
 
-- Every writable launch turn lacks an explicit non-interactive approval policy
-  and currently allows every advertised tool call; TUI permission policy begins
-  only after that turn.
+- Writable launch turns allow advertised calls not blocked by configured deny
+  rules without interactive confirmation; TUI prompts begin after that turn.
 - Launch turns advertise agent tools without providing the task
   registry required to execute them. Memory, attempt-tree, and `tool_search`
   operations use shared runtime paths and remain available there.
@@ -283,9 +303,9 @@ inconclusive states, an acceptance result is not automatically a product verdict
   provider context, and Piku still writes its own runtime state.
 - The `Likely` versus `Definite` distinction does not change the decision path;
   the documented classifier layer is absent.
-- Configuration deny rules do not dominate `Safe` classification or a prior
-  per-turn allow-all. Some state-changing tools are classified `Safe`, including
-  creation of a new unprotected path, Markdown-memory writes, and attempt writes.
+- Some state-changing tools are classified `Safe`, including creation of a new
+  unprotected path, Markdown-memory writes, and attempt writes. Configured
+  denials still apply; otherwise these calls bypass interactive prompting.
 - The full tool schema is sent on normal requests, so `tool_search` improves
   naming discovery but not context size or tool-selection load.
 - Successful tool output is truncated without lossless expansion, while the
