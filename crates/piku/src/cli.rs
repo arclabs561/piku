@@ -23,7 +23,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Force provider: openrouter | anthropic | groq | ollama | custom"
+        help = "Force provider: chatgpt | openrouter | anthropic | groq | ollama | custom"
     )]
     pub provider: Option<String>,
 
@@ -48,6 +48,13 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Show provider status")]
     Providers,
+    #[command(about = "Manage explicitly selected subscription authentication")]
+    Auth {
+        #[arg(value_parser = ["chatgpt"])]
+        provider: String,
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     #[command(about = "Inspect a run record")]
     Inspect {
         #[arg(help = "Session ID")]
@@ -98,9 +105,60 @@ pub enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    #[command(about = "Sign in manually; print the authorization URL and await callback")]
+    Login {
+        #[arg(
+            long,
+            value_name = "REGISTRATION_ID",
+            help = "Reuse a stored registration"
+        )]
+        registration: Option<String>,
+        #[arg(long, help = "Request consent again during this login")]
+        request_consent: bool,
+    },
+    #[command(about = "List stored account metadata without contacting the provider")]
+    Accounts,
+    #[command(about = "Show selected account and funding status without a token probe")]
+    Status,
+    #[command(about = "Explicitly select an existing account for new runs")]
+    Select {
+        #[arg(value_name = "ACCOUNT_ID")]
+        account_id: String,
+    },
+    #[command(about = "Remove local credentials for one account")]
+    Logout {
+        #[arg(value_name = "ACCOUNT_ID")]
+        account_id: String,
+    },
+    #[command(about = "Fetch model availability for the selected account")]
+    Models,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_auth_requires_explicit_provider_and_action() {
+        assert!(Cli::try_parse_from(["piku", "auth"]).is_err());
+        assert!(Cli::try_parse_from(["piku", "auth", "anthropic", "login"]).is_err());
+        assert!(Cli::try_parse_from(["piku", "auth", "chatgpt", "select"]).is_err());
+        assert!(Cli::try_parse_from(["piku", "auth", "chatgpt", "logout"]).is_err());
+        let cli =
+            Cli::try_parse_from(["piku", "auth", "chatgpt", "login", "--request-consent"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Login {
+                    request_consent: true,
+                    registration: None
+                },
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn single_shot_defaults_to_interactive() {

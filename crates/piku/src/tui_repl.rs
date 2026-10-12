@@ -676,10 +676,14 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 
     // Cost — computed from provider + model + token usage. Omitted when
     // the model's pricing is unknown or when the estimate is $0 (local).
-    let cost_seg = match estimate_cost(s.provider, s.model, s.input_tokens, s.output_tokens) {
-        Some(c) if c >= 0.01 => format!(" ${c:.2} "),
-        Some(c) if c > 0.0 => format!(" ${c:.4} "),
-        _ => String::new(),
+    let cost_seg = if s.provider == "chatgpt" {
+        " ChatGPT plan ".to_string()
+    } else {
+        match estimate_cost(s.provider, s.model, s.input_tokens, s.output_tokens) {
+            Some(c) if c >= 0.01 => format!(" ${c:.2} "),
+            Some(c) if c > 0.0 => format!(" ${c:.4} "),
+            _ => String::new(),
+        }
     };
 
     // Running agents (amber, omitted when zero)
@@ -835,6 +839,10 @@ fn render_footer_inner(cols: u16, s: &FooterState) -> String {
 /// polluting the table. Unknown models return None so the footer omits
 /// the $ segment entirely rather than showing a wrong number.
 pub(crate) fn model_pricing_per_million(provider: &str, model: &str) -> Option<(f32, f32)> {
+    // A subscription route is not API-priced even when its model name matches.
+    if provider.eq_ignore_ascii_case("chatgpt") {
+        return None;
+    }
     // Local inference is always free (modulo electricity).
     if provider.eq_ignore_ascii_case("ollama") {
         return Some((0.0, 0.0));
@@ -1509,6 +1517,9 @@ async fn run_tui_repl_core(
         // Replay tail of session history into the scroll region (below header).
         goto(scroll_top(), 1);
         print_session_tail(run.session(), scroll_bot);
+        if resolved.name() == "chatgpt" {
+            println!("ChatGPT subscription funding; allowance and credits unknown. No hard output-token cap for foreground, children, or memory calls.\r");
+        }
 
         goto(scroll_bot, 1);
         let _ = io::stdout().flush();
@@ -1798,6 +1809,9 @@ async fn run_tui_repl_core(
                                     run.session_mut().select_actor(name);
                                     active_actor = name.to_string();
                                     resolved = next_provider;
+                                    if resolved.name() == "chatgpt" {
+                                        println!("ChatGPT subscription funding; allowance and credits unknown. No hard output-token cap for foreground, children, or memory calls.\r");
+                                    }
                                     model = next_model;
                                     request_context = None;
                                     let (cols, rows) = term_size();
@@ -2717,7 +2731,7 @@ fn print_session_tail(session: &Session, _scroll_bot: u16) {
                             let dname = tool_display_name(name);
                             println!("\x1b[2m  ● {dname}\x1b[0m\r");
                         }
-                        ContentBlock::ToolResult { .. } => {}
+                        ContentBlock::ToolResult { .. } | ContentBlock::Replay { .. } => {}
                     }
                 }
             }
@@ -2866,6 +2880,9 @@ fn handle_slash_cmd(
             );
         }
         "status" => {
+            if provider_name == "chatgpt" {
+                slash_line!("ChatGPT subscription funding; allowance and credits unknown. No hard output-token cap for foreground, children, or memory calls.\r");
+            }
             slash_line!(
                 "\x1b[1mStatus:\x1b[0m  provider={provider_name}  model={current_model}  msgs={}\r",
                 session.messages.len(),
@@ -3871,6 +3888,21 @@ mod tests {
         });
         std::fs::write(&path, session.to_string()).unwrap();
         assert!(first_user_message_preview(&path).is_none());
+    }
+
+    #[test]
+    fn subscription_route_never_uses_model_api_prices() {
+        assert!(estimate_cost("chatgpt", "gpt-5", 1_000_000, 1_000_000).is_none());
+        let mut footer = make_footer();
+        footer.provider = "chatgpt";
+        footer.model = "gpt-5";
+        footer.input_tokens = 1_000_000;
+        let line = strip_ansi(&render_footer(200, &footer));
+        assert!(line.contains("ChatGPT plan"), "{line}");
+        assert!(
+            !line.contains('$'),
+            "subscription route must not display API dollars: {line}"
+        );
     }
 
     #[test]

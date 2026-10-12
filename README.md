@@ -38,10 +38,33 @@ continues there. `-p` prints one result and exits; `--read-only` runs one turn
 with inspection tools and exits. Provider and model overrides are available as
 `--provider` and `--model`.
 
-Piku can use OpenRouter, Anthropic, Groq, Ollama, or a custom OpenAI-compatible
-server. It reads provider settings from the environment, user configuration,
-and `.piku/settings.toml`. Run `piku providers` to see what the current launch
-can use.
+Piku can use ChatGPT plan access, OpenRouter, Anthropic, Groq, Ollama, or a custom
+OpenAI-compatible server. It reads provider settings from the environment,
+user configuration, and `.piku/settings.toml`. Run `piku providers` to see what
+the current launch can use.
+
+For eligible ChatGPT accounts, Sign in with ChatGPT keeps Piku's own agent loop
+and tools. Login requires an interactive terminal and explicit browser consent:
+
+```bash
+piku auth chatgpt login
+piku auth chatgpt accounts
+piku auth chatgpt select ACCOUNT_ID
+piku auth chatgpt models
+piku --provider chatgpt --model MODEL
+```
+
+Select the account ID and model from the listed values. `auth chatgpt status`
+shows stored metadata; `auth chatgpt logout ACCOUNT_ID` removes local credentials
+and attempts remote revocation. Authorization URLs are private and may contain
+identity hints; keep them out of logs. Account credentials remain separate from
+project settings. Session replay is bound to the original account and model.
+
+This preview route requires plan-use permission and has no hard output-token
+cap, including child and memory calls. Allowance and optional credit usage are
+unknown; Piku shows token counts without applying API-dollar estimates. It does
+not switch to a paid API or another executor on failure. Embeddings remain a
+separate route. Live account interoperability still needs validation.
 
 Sessions are stored under `$XDG_CONFIG_HOME/piku/sessions/`, or
 `~/.config/piku/sessions/` when `XDG_CONFIG_HOME` is unset.

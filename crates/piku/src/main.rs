@@ -1,3 +1,5 @@
+mod auth_cli;
+
 use clap::Parser;
 
 use piku::cli::{Cli, Commands, InspectFormat};
@@ -35,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Commands::Auth { command, .. }) => {
+            auth_cli::run(command).await?;
+            return Ok(());
+        }
         Some(Commands::Providers) => {
             print_providers();
             return Ok(());
@@ -370,6 +376,13 @@ async fn run_resume(
     .await
 }
 
+fn print_route_status(provider: &str, model: &str) {
+    eprintln!("[piku] provider={provider} model={model}");
+    if provider == "chatgpt" {
+        eprintln!("[piku] ChatGPT subscription funding; allowance and credits unknown; no hard output-token cap for foreground, children, or memory calls");
+    }
+}
+
 async fn run_single_shot(
     prompt: &str,
     existing_session: Option<Session>,
@@ -384,7 +397,7 @@ async fn run_single_shot(
         .unwrap_or(&resolved.default_model)
         .to_string();
 
-    eprintln!("[piku] provider={} model={model}", resolved.name());
+    print_route_status(resolved.name(), &model);
 
     let cwd = env::current_dir()?;
     let date = piku::current_date();

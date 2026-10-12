@@ -125,6 +125,7 @@ fn message_contains_marker(blocks: &[ContentBlock]) -> bool {
         ContentBlock::Text { text } => text.contains(PRIOR_MARKER),
         ContentBlock::ToolResult { output, .. } => output.contains(PRIOR_MARKER),
         ContentBlock::ToolUse { input, .. } => input.to_string().contains(PRIOR_MARKER),
+        ContentBlock::Replay { .. } => false,
     })
 }
 
@@ -134,6 +135,7 @@ fn request_contains_marker(request: &MessageRequest) -> bool {
             RequestContent::Text { text } => text.contains(PRIOR_MARKER),
             RequestContent::ToolResult { content, .. } => content.contains(PRIOR_MARKER),
             RequestContent::ToolUse { input, .. } => input.to_string().contains(PRIOR_MARKER),
+            RequestContent::Replay { .. } => false,
         })
     })
 }

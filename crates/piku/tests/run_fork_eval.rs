@@ -154,7 +154,7 @@ fn request_text(request: &MessageRequest) -> String {
         .filter_map(|content| match content {
             RequestContent::Text { text } => Some(text.as_str()),
             RequestContent::ToolResult { content, .. } => Some(content.as_str()),
-            RequestContent::ToolUse { .. } => None,
+            RequestContent::ToolUse { .. } | RequestContent::Replay { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
