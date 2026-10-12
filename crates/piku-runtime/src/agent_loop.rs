@@ -1154,6 +1154,7 @@ async fn stream_response(
     let mut tool_order: Vec<String> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason = StopReason::EndTurn;
+    let mut saw_stop = false;
     let mut stream_err: Option<String> = None;
 
     // map __idx_N → real tool id for delta correlation
@@ -1226,12 +1227,25 @@ async fn stream_response(
             }
             Ok(Event::ToolUseEnd { .. }) => {} // nothing needed
             Ok(Event::MessageStop { stop_reason: sr }) => {
-                stop_reason = sr;
+                if saw_stop {
+                    stream_err.get_or_insert_with(|| {
+                        "provider stream emitted multiple MessageStop events".to_string()
+                    });
+                } else {
+                    saw_stop = true;
+                    stop_reason = sr;
+                }
             }
             Ok(Event::UsageDelta { usage: u }) => {
                 usage.accumulate(&u);
             }
         }
+    }
+
+    // EOF alone does not establish completion. Keep draining after the stop
+    // for trailing usage and errors, but never dispatch an incomplete response.
+    if !saw_stop && !cancelled {
+        stream_err.get_or_insert_with(|| "provider stream ended without MessageStop".to_string());
     }
 
     // assemble content blocks
@@ -1276,10 +1290,8 @@ async fn stream_response(
 
 const DYNAMIC_BOUNDARY: &str = "__PIKU_SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
-/// Context-window estimate used by curation. Mirrors (a subset of)
-/// piku's `context_window_for` in tui_repl.rs. Duplicated because
-/// piku-runtime can't depend on the piku binary crate. Override via
-/// `PIKU_CONTEXT_WINDOW=<tokens>`.
+/// Context-window estimate used by curation and reported context pressure.
+/// Override via `PIKU_CONTEXT_WINDOW=<tokens>`.
 fn piku_context_window_for_model(model: &str) -> usize {
     if let Ok(s) = std::env::var("PIKU_CONTEXT_WINDOW") {
         if let Ok(n) = s.parse::<usize>() {

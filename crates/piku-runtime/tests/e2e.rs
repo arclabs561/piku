@@ -1443,40 +1443,44 @@ async fn regression_bug_f_multi_tool_oai_delta_naming_second_tool_gets_params() 
     // Simulate OAI-compat streaming: two tool calls with index-based __tc_N ids
     // First tool call uses __tc_0 for its deltas
     // Second tool call uses __tc_1 for its deltas
-    let provider = ScriptedProvider::new(vec![
-        // Tool 1: start with real id, deltas use __tc_0
-        Event::ToolUseStart {
-            id: "call_abc".to_string(),
-            name: "read_file".to_string(),
-        },
-        Event::ToolUseDelta {
-            id: "__tc_0".to_string(),
-            partial_json: i1,
-        },
-        Event::ToolUseEnd {
-            id: "call_abc".to_string(),
-        },
-        // Tool 2: start with real id, deltas use __tc_1
-        Event::ToolUseStart {
-            id: "call_def".to_string(),
-            name: "read_file".to_string(),
-        },
-        Event::ToolUseDelta {
-            id: "__tc_1".to_string(),
-            partial_json: i2,
-        },
-        Event::ToolUseEnd {
-            id: "call_def".to_string(),
-        },
-        Event::MessageStop {
-            stop_reason: StopReason::ToolUse,
-        },
-        Event::TextDelta {
-            text: "read both files".to_string(),
-        },
-        Event::MessageStop {
-            stop_reason: StopReason::EndTurn,
-        },
+    let provider = SequenceProvider::new(vec![
+        vec![
+            // Tool 1: start with real id, deltas use __tc_0
+            Event::ToolUseStart {
+                id: "call_abc".to_string(),
+                name: "read_file".to_string(),
+            },
+            Event::ToolUseDelta {
+                id: "__tc_0".to_string(),
+                partial_json: i1,
+            },
+            Event::ToolUseEnd {
+                id: "call_abc".to_string(),
+            },
+            // Tool 2: start with real id, deltas use __tc_1
+            Event::ToolUseStart {
+                id: "call_def".to_string(),
+                name: "read_file".to_string(),
+            },
+            Event::ToolUseDelta {
+                id: "__tc_1".to_string(),
+                partial_json: i2,
+            },
+            Event::ToolUseEnd {
+                id: "call_def".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![
+            Event::TextDelta {
+                text: "read both files".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
     ]);
 
     let mut session = Session::new("bug-f".to_string());
@@ -2322,32 +2326,36 @@ async fn regression_anthropic_tool_args_survive_a_leading_text_block() {
     std::fs::write(&file, "the file content").unwrap();
     let input = serde_json::json!({"path": file}).to_string();
 
-    let provider = ScriptedProvider::new(vec![
-        // Content block 0 is text, so the tool is block 1 on the wire while
-        // being the first tool to arrive.
-        Event::TextDelta {
-            text: "Let me look.".to_string(),
-        },
-        Event::ToolUseStart {
-            id: "toolu_real".to_string(),
-            name: "read_file".to_string(),
-        },
-        Event::ToolUseDelta {
-            id: "__idx_1".to_string(),
-            partial_json: input,
-        },
-        Event::ToolUseEnd {
-            id: "__idx_1".to_string(),
-        },
-        Event::MessageStop {
-            stop_reason: StopReason::ToolUse,
-        },
-        Event::TextDelta {
-            text: "done".to_string(),
-        },
-        Event::MessageStop {
-            stop_reason: StopReason::EndTurn,
-        },
+    let provider = SequenceProvider::new(vec![
+        vec![
+            // Content block 0 is text, so the tool is block 1 on the wire while
+            // being the first tool to arrive.
+            Event::TextDelta {
+                text: "Let me look.".to_string(),
+            },
+            Event::ToolUseStart {
+                id: "toolu_real".to_string(),
+                name: "read_file".to_string(),
+            },
+            Event::ToolUseDelta {
+                id: "__idx_1".to_string(),
+                partial_json: input,
+            },
+            Event::ToolUseEnd {
+                id: "__idx_1".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![
+            Event::TextDelta {
+                text: "done".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
     ]);
 
     let mut session = Session::new("anthropic-idx".to_string());
@@ -2440,52 +2448,56 @@ async fn trace_ids_unique_per_turn() {
     // First iteration returns two tool calls; second iteration ends.
 
     // Manually craft two ToolUse in one iteration
-    let provider2 = ScriptedProvider::new(vec![
-        piku_api::Event::ToolUseStart {
-            id: "toolu_a".into(),
-            name: "read_file".into(),
-        },
-        piku_api::Event::ToolUseDelta {
-            id: "toolu_a".into(),
-            partial_json: ia.clone(),
-        },
-        piku_api::Event::ToolUseEnd {
-            id: "toolu_a".into(),
-        },
-        piku_api::Event::ToolUseStart {
-            id: "toolu_b".into(),
-            name: "read_file".into(),
-        },
-        piku_api::Event::ToolUseDelta {
-            id: "toolu_b".into(),
-            partial_json: ib.clone(),
-        },
-        piku_api::Event::ToolUseEnd {
-            id: "toolu_b".into(),
-        },
-        piku_api::Event::MessageStop {
-            stop_reason: piku_api::StopReason::ToolUse,
-        },
-        piku_api::Event::UsageDelta {
-            usage: piku_api::TokenUsage {
-                input_tokens: 100,
-                output_tokens: 30,
-                ..Default::default()
+    let provider2 = SequenceProvider::new(vec![
+        vec![
+            piku_api::Event::ToolUseStart {
+                id: "toolu_a".into(),
+                name: "read_file".into(),
             },
-        },
-        piku_api::Event::TextDelta {
-            text: "done".into(),
-        },
-        piku_api::Event::MessageStop {
-            stop_reason: piku_api::StopReason::EndTurn,
-        },
-        piku_api::Event::UsageDelta {
-            usage: piku_api::TokenUsage {
-                input_tokens: 50,
-                output_tokens: 20,
-                ..Default::default()
+            piku_api::Event::ToolUseDelta {
+                id: "toolu_a".into(),
+                partial_json: ia.clone(),
             },
-        },
+            piku_api::Event::ToolUseEnd {
+                id: "toolu_a".into(),
+            },
+            piku_api::Event::ToolUseStart {
+                id: "toolu_b".into(),
+                name: "read_file".into(),
+            },
+            piku_api::Event::ToolUseDelta {
+                id: "toolu_b".into(),
+                partial_json: ib.clone(),
+            },
+            piku_api::Event::ToolUseEnd {
+                id: "toolu_b".into(),
+            },
+            piku_api::Event::MessageStop {
+                stop_reason: piku_api::StopReason::ToolUse,
+            },
+            piku_api::Event::UsageDelta {
+                usage: piku_api::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 30,
+                    ..Default::default()
+                },
+            },
+        ],
+        vec![
+            piku_api::Event::TextDelta {
+                text: "done".into(),
+            },
+            piku_api::Event::MessageStop {
+                stop_reason: piku_api::StopReason::EndTurn,
+            },
+            piku_api::Event::UsageDelta {
+                usage: piku_api::TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+            },
+        ],
     ]);
 
     let mut session = Session::new("trace-unique".to_string());

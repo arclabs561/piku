@@ -1,7 +1,10 @@
 use super::*;
 use crate::run_record::{read_run_record, RecordingSink, RunEvent, RunRecorder};
 
-struct Scripted(Vec<Event>);
+struct Scripted {
+    events: Vec<Event>,
+    late_error: bool,
+}
 impl Provider for Scripted {
     fn name(&self) -> &'static str {
         "scripted-tool-response"
@@ -12,15 +15,22 @@ impl Provider for Scripted {
     ) -> std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<Event, piku_api::ApiError>> + Send + '_>,
     > {
-        Box::pin(futures_util::stream::iter(
-            self.0.clone().into_iter().map(Ok),
-        ))
+        let mut events: Vec<_> = self.events.clone().into_iter().map(Ok).collect();
+        if self.late_error {
+            events.push(Err(piku_api::ApiError::UnexpectedStreamEnd));
+        }
+        Box::pin(futures_util::stream::iter(events))
     }
 }
 
-struct Sink;
+#[derive(Default)]
+struct Sink {
+    text: String,
+}
 impl OutputSink for Sink {
-    fn on_text(&mut self, _: &str) {}
+    fn on_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
     fn on_tool_start(&mut self, _: &str, _: &str, _: &serde_json::Value) {}
     fn on_tool_end(&mut self, _: &str, _: &str, _: &str, _: bool) -> PostToolAction {
         PostToolAction::Continue
@@ -51,15 +61,29 @@ async fn run(
     Session,
     Vec<crate::run_record::RunEventEnvelope>,
 ) {
+    let (result, session, records, _) = run_with_error(events, false, dir).await;
+    (result, session, records)
+}
+
+async fn run_with_error(
+    events: Vec<Event>,
+    late_error: bool,
+    dir: &std::path::Path,
+) -> (
+    TurnResult,
+    Session,
+    Vec<crate::run_record::RunEventEnvelope>,
+    String,
+) {
     let path = dir.join("run.jsonl");
     let mut recorder = RunRecorder::open(&path, "tool-response").unwrap();
-    let mut inner = Sink;
+    let mut inner = Sink::default();
     let mut sink = RecordingSink::new(&mut inner, &mut recorder, "turn");
     let mut session = Session::new("tool-response".into());
     let result = run_turn(
         "test",
         &mut session,
-        &Scripted(events),
+        &Scripted { events, late_error },
         "scripted",
         &[],
         piku_tools::all_tool_definitions(),
@@ -72,7 +96,7 @@ async fn run(
     assert!(sink.take_record_error().is_none());
     drop(sink);
     drop(recorder);
-    (result, session, read_run_record(path).unwrap())
+    (result, session, read_run_record(path).unwrap(), inner.text)
 }
 
 #[tokio::test]
@@ -187,4 +211,146 @@ async fn parameterless_call_without_delta_remains_supported() {
     assert_eq!(records.iter().filter(|e| matches!(&e.event, RunEvent::ToolCompleted { tool_call_id, is_error: false, .. } if tool_call_id == "empty")).count(), 1);
     assert_eq!(session.messages.iter().flat_map(|m| &m.blocks).filter(|b| matches!(b, ContentBlock::ToolUse { id, name, input } if id == "empty" && name == "list_dir" && input == &serde_json::json!({}))).count(), 1);
     assert_eq!(session.messages.iter().flat_map(|m| &m.blocks).filter(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "empty")).count(), 1);
+}
+
+#[tokio::test]
+async fn eof_without_stop_never_executes_a_complete_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("must-not-exist");
+    let mut events = Vec::new();
+    tool(
+        &mut events,
+        "write",
+        "write_file",
+        &serde_json::json!({"path":target,"content":"incomplete"}).to_string(),
+    );
+    let (result, _, records) = run(events, dir.path()).await;
+    assert!(!target.exists(), "EOF must not authorize tool execution");
+    assert!(result.stream_error.is_some());
+    assert!(matches!(
+        records.last().unwrap().event,
+        RunEvent::TurnFailed { .. }
+    ));
+    assert!(!records
+        .iter()
+        .any(|e| matches!(e.event, RunEvent::ToolStarted { .. })));
+}
+
+#[tokio::test]
+async fn text_eof_is_presented_but_recorded_as_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, session, records, text) = run_with_error(
+        vec![Event::TextDelta {
+            text: "observed partial text".into(),
+        }],
+        false,
+        dir.path(),
+    )
+    .await;
+    assert!(text.contains("observed partial text"));
+    assert!(
+        result.stream_error.is_some(),
+        "EOF must not imply successful EndTurn"
+    );
+    assert!(matches!(
+        records.last().unwrap().event,
+        RunEvent::TurnFailed { .. }
+    ));
+    assert!(!session
+        .messages
+        .iter()
+        .any(|m| m.role == MessageRole::Assistant));
+}
+
+async fn assert_repeated_stop_rejected(second: StopReason) {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("must-not-exist");
+    let mut events = Vec::new();
+    tool(
+        &mut events,
+        "write",
+        "write_file",
+        &serde_json::json!({"path":target,"content":"ambiguous"}).to_string(),
+    );
+    events.extend([
+        Event::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        },
+        Event::MessageStop {
+            stop_reason: second,
+        },
+    ]);
+    let (result, _, records) = run(events, dir.path()).await;
+    assert!(
+        !target.exists(),
+        "ambiguous terminal must not authorize execution"
+    );
+    assert!(result.stream_error.is_some());
+    assert!(matches!(
+        records.last().unwrap().event,
+        RunEvent::TurnFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_stops_do_not_authorize_tools() {
+    assert_repeated_stop_rejected(StopReason::ToolUse).await;
+}
+
+#[tokio::test]
+async fn conflicting_stops_do_not_authorize_tools() {
+    assert_repeated_stop_rejected(StopReason::EndTurn).await;
+}
+
+#[tokio::test]
+async fn late_error_after_stop_still_prevents_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("must-not-exist");
+    let mut events = Vec::new();
+    tool(
+        &mut events,
+        "write",
+        "write_file",
+        &serde_json::json!({"path":target,"content":"late failure"}).to_string(),
+    );
+    events.push(Event::MessageStop {
+        stop_reason: StopReason::ToolUse,
+    });
+    let (result, _, records, _) = run_with_error(events, true, dir.path()).await;
+    assert!(!target.exists());
+    assert_eq!(
+        result.stream_error.as_deref(),
+        Some("stream ended unexpectedly")
+    );
+    assert!(matches!(
+        records.last().unwrap().event,
+        RunEvent::TurnFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn successful_stop_keeps_trailing_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        Event::TextDelta {
+            text: "complete".into(),
+        },
+        Event::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+        Event::UsageDelta {
+            usage: TokenUsage {
+                input_tokens: 17,
+                output_tokens: 5,
+                ..TokenUsage::default()
+            },
+        },
+    ];
+    let (result, _, records) = run(events, dir.path()).await;
+    assert!(result.stream_error.is_none());
+    assert_eq!(result.usage.input_tokens, 17);
+    assert_eq!(result.usage.output_tokens, 5);
+    assert!(
+        matches!(&records.last().unwrap().event, RunEvent::TurnCompleted { stop_reason:Some(reason), usage:Some(usage) } if reason == "end_turn" && usage.input_tokens == 17 && usage.output_tokens == 5)
+    );
 }

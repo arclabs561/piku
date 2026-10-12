@@ -1,3 +1,37 @@
+// These fixtures describe consecutive provider responses. Each stop ends one
+// response; a follow-up request receives the next response, never both at once.
+fn sequential_provider(events: &[piku_api::Event]) -> impl piku_api::Provider {
+    struct Queued(std::sync::Mutex<std::collections::VecDeque<Vec<piku_api::Event>>>);
+    impl piku_api::Provider for Queued {
+        fn name(&self) -> &'static str {
+            "queued-test-provider"
+        }
+        fn stream_message(
+            &self,
+            _: piku_api::MessageRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<piku_api::Event, piku_api::ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let events = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected provider request");
+            Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+    let responses = events
+        .split_inclusive(|event| matches!(event, piku_api::Event::MessageStop { .. }))
+        .map(<[piku_api::Event]>::to_vec)
+        .collect();
+    Queued(std::sync::Mutex::new(responses))
+}
+
 #[cfg(test)]
 mod session {
     use super::tempdir;
@@ -424,31 +458,29 @@ mod agent_loop {
 
         // Provider: one tool call then done
         let tool_input = serde_json::json!({ "path": path }).to_string();
-        let provider = MockProvider {
-            events: vec![
-                Event::ToolUseStart {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                },
-                Event::ToolUseDelta {
-                    id: "call_1".to_string(),
-                    partial_json: tool_input,
-                },
-                Event::ToolUseEnd {
-                    id: "call_1".to_string(),
-                },
-                Event::MessageStop {
-                    stop_reason: StopReason::ToolUse,
-                },
-                // second turn: just text
-                Event::TextDelta {
-                    text: "I read the file.".to_string(),
-                },
-                Event::MessageStop {
-                    stop_reason: StopReason::EndTurn,
-                },
-            ],
-        };
+        let provider = super::sequential_provider(&[
+            Event::ToolUseStart {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+            },
+            Event::ToolUseDelta {
+                id: "call_1".to_string(),
+                partial_json: tool_input,
+            },
+            Event::ToolUseEnd {
+                id: "call_1".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+            // second turn: just text
+            Event::TextDelta {
+                text: "I read the file.".to_string(),
+            },
+            Event::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
 
         let mut session = Session::new("t3".to_string());
         let mut sink = CaptureSink::default();
@@ -590,23 +622,6 @@ mod agent_loop_extended {
             self.denied.push(n.to_string());
         }
         fn on_turn_complete(&mut self, _: &TokenUsage, _: u32) {}
-    }
-
-    fn make_provider(events: Vec<Event>) -> impl Provider {
-        struct P(Vec<Event>);
-        impl Provider for P {
-            fn name(&self) -> &'static str {
-                "mock"
-            }
-            fn stream_message(
-                &self,
-                _: MessageRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
-                let ev = self.0.clone();
-                Box::pin(async_stream::stream! { for e in ev { yield Ok(e); } })
-            }
-        }
-        P(events)
     }
 
     fn make_error_provider() -> impl Provider {
@@ -771,7 +786,7 @@ mod agent_loop_extended {
                 stop_reason: StopReason::EndTurn,
             },
         ];
-        let provider = make_provider(events);
+        let provider = super::sequential_provider(&events);
         let mut session = Session::new("unk".to_string());
         let mut sink = CaptureSink::default();
 
@@ -841,7 +856,7 @@ mod agent_loop_extended {
                 stop_reason: StopReason::EndTurn,
             },
         ];
-        let provider = make_provider(events);
+        let provider = super::sequential_provider(&events);
         let mut session = Session::new("multi".to_string());
         let mut sink = CaptureSink::default();
 
@@ -922,7 +937,7 @@ mod agent_loop_extended {
                 stop_reason: StopReason::EndTurn,
             },
         ];
-        let provider = make_provider(events);
+        let provider = super::sequential_provider(&events);
         let mut session = Session::new("partial".to_string());
         let mut sink = CaptureSink::default();
 
