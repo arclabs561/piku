@@ -452,7 +452,8 @@ fn run_scenario(
     provider: &str,
     model: &str,
     key_var: &str,
-) -> Experience {
+    assertions: impl FnOnce(&Experience),
+) {
     let api_key = std::env::var(key_var).unwrap();
     let config_dir = workspace.join(".piku-config");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -483,10 +484,21 @@ fn run_scenario(
     let exit_ok = output.status.success();
 
     let trace_events = read_trace_events(&config_dir);
-    test_helpers::append_live_ledger("dogfood", provider, model, &config_dir, exit_ok, duration);
+    let record = test_helpers::build_live_ledger_record(
+        test_helpers::EvaluationSurface::Cli,
+        &config_dir,
+        "dogfood",
+        provider,
+        model,
+        exit_ok,
+        duration,
+    );
     let exp = parse_output(&stdout, &stderr, exit_ok, workspace, trace_events);
-    exp.assert_trace_tokens_bounded();
-    exp
+    let ledger_path = std::env::var_os("PIKU_LIVE_LEDGER").map(PathBuf::from);
+    test_helpers::complete_scenario_with_ledger(ledger_path.as_deref(), record, || {
+        exp.assert_trace_tokens_bounded();
+        assertions(&exp);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -525,43 +537,45 @@ pub fn subtract(a: i32, b: i32) -> i32 {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "In math.rs, add a `multiply(a: i32, b: i32) -> i32` function that returns a * b. \
          Add it after the subtract function.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("add_function_to_existing_file");
+        |exp| {
+            exp.report("add_function_to_existing_file");
 
-    // Structural: piku should have read or edited the file
-    assert!(
-        exp.tool_called("read_file")
-            || exp.tool_called("edit_file")
-            || exp.tool_called("write_file"),
-        "piku should have used at least one file tool"
-    );
+            // Structural: piku should have read or edited the file
+            assert!(
+                exp.tool_called("read_file")
+                    || exp.tool_called("edit_file")
+                    || exp.tool_called("write_file"),
+                "piku should have used at least one file tool"
+            );
 
-    // File must exist and contain multiply
-    let content = std::fs::read_to_string(workspace.join("math.rs")).unwrap();
-    assert!(
-        content.contains("multiply"),
-        "math.rs should contain multiply function.\ncontent:\n{content}"
-    );
-    assert!(
-        content.contains("a * b") || content.contains("a*b"),
-        "multiply should return a * b.\ncontent:\n{content}"
-    );
+            // File must exist and contain multiply
+            let content = std::fs::read_to_string(workspace.join("math.rs")).unwrap();
+            assert!(
+                content.contains("multiply"),
+                "math.rs should contain multiply function.\ncontent:\n{content}"
+            );
+            assert!(
+                content.contains("a * b") || content.contains("a*b"),
+                "multiply should return a * b.\ncontent:\n{content}"
+            );
 
-    // Original functions must still be there
-    assert!(
-        content.contains("pub fn add"),
-        "add should still be present"
-    );
-    assert!(
-        content.contains("pub fn subtract"),
-        "subtract should still be present"
+            // Original functions must still be there
+            assert!(
+                content.contains("pub fn add"),
+                "add should still be present"
+            );
+            assert!(
+                content.contains("pub fn subtract"),
+                "subtract should still be present"
+            );
+        },
     );
 }
 
@@ -589,26 +603,28 @@ fn dogfood_read_and_answer() {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Read config.toml and tell me the value of secret_token.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("read_and_answer");
+        |exp| {
+            exp.report("read_and_answer");
 
-    assert!(
-        exp.tool_called("read_file"),
-        "piku must use read_file to answer accurately"
-    );
-    assert!(exp.all_tools_ok(), "all tools should succeed");
+            assert!(
+                exp.tool_called("read_file"),
+                "piku must use read_file to answer accurately"
+            );
+            assert!(exp.all_tools_ok(), "all tools should succeed");
 
-    // Response must contain the secret
-    let full_output = strip_ansi(&exp.stdout);
-    assert!(
-        full_output.contains(secret),
-        "response should contain the secret token '{secret}'.\nfull output:\n{full_output}"
+            // Response must contain the secret
+            let full_output = strip_ansi(&exp.stdout);
+            assert!(
+                full_output.contains(secret),
+                "response should contain the secret token '{secret}'.\nfull output:\n{full_output}"
+            );
+        },
     );
 }
 
@@ -661,7 +677,7 @@ pub fn greet(name: &str) -> String {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Explore this Rust project. Use glob to find all .rs files, \
          then grep for functions (pattern: `pub fn`). \
          List what public functions exist.",
@@ -669,24 +685,26 @@ pub fn greet(name: &str) -> String {
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("explore_codebase");
+        |exp| {
+            exp.report("explore_codebase");
 
-    assert!(
-        exp.tool_called("glob"),
-        "piku should use glob to discover files"
-    );
-    assert!(
-        exp.tool_called("grep"),
-        "piku should use grep to find functions"
-    );
-    assert!(exp.all_tools_ok(), "all tools should succeed");
+            assert!(
+                exp.tool_called("glob"),
+                "piku should use glob to discover files"
+            );
+            assert!(
+                exp.tool_called("grep"),
+                "piku should use grep to find functions"
+            );
+            assert!(exp.all_tools_ok(), "all tools should succeed");
 
-    // Response should mention the functions it found
-    let full_output = strip_ansi(&exp.stdout);
-    assert!(
-        full_output.contains("compute") || full_output.contains("greet"),
-        "response should mention the public functions.\noutput:\n{full_output}"
+            // Response should mention the functions it found
+            let full_output = strip_ansi(&exp.stdout);
+            assert!(
+                full_output.contains("compute") || full_output.contains("greet"),
+                "response should mention the public functions.\noutput:\n{full_output}"
+            );
+        },
     );
 }
 
@@ -720,27 +738,29 @@ fn handle_post() -> &'static str {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         r#"In handlers.rs, change the return value of handle_post to "POST accepted". \
          Do not change handle_get."#,
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("targeted_edit_preserves_neighbor");
+        |exp| {
+            exp.report("targeted_edit_preserves_neighbor");
 
-    let content = std::fs::read_to_string(workspace.join("handlers.rs")).unwrap();
+            let content = std::fs::read_to_string(workspace.join("handlers.rs")).unwrap();
 
-    // handle_get must be untouched
-    assert!(
-        content.contains(r#""GET response""#),
-        "handle_get should be untouched.\ncontent:\n{content}"
-    );
-    // handle_post must be updated
-    assert!(
-        content.contains("POST accepted"),
-        "handle_post should be updated.\ncontent:\n{content}"
+            // handle_get must be untouched
+            assert!(
+                content.contains(r#""GET response""#),
+                "handle_get should be untouched.\ncontent:\n{content}"
+            );
+            // handle_post must be updated
+            assert!(
+                content.contains("POST accepted"),
+                "handle_post should be updated.\ncontent:\n{content}"
+            );
+        },
     );
 }
 
@@ -764,26 +784,28 @@ fn dogfood_bash_and_use_output() {
     let lines: Vec<String> = (1..=7).map(|i| format!("line {i}")).collect();
     std::fs::write(workspace.join("data.txt"), lines.join("\n") + "\n").unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Run `wc -l data.txt` and tell me how many lines the file has.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("bash_and_use_output");
+        |exp| {
+            exp.report("bash_and_use_output");
 
-    assert!(exp.tool_called("bash"), "piku should run bash");
-    assert!(exp.all_tools_ok(), "bash should succeed");
+            assert!(exp.tool_called("bash"), "piku should run bash");
+            assert!(exp.all_tools_ok(), "bash should succeed");
 
-    let full_output = strip_ansi(&exp.stdout);
-    assert!(
-        full_output.contains('7') || full_output.contains("seven"),
-        "response should mention 7 lines.\noutput:\n{full_output}"
+            let full_output = strip_ansi(&exp.stdout);
+            assert!(
+                full_output.contains('7') || full_output.contains("seven"),
+                "response should mention 7 lines.\noutput:\n{full_output}"
+            );
+            exp.assert_trace_ids_paired();
+            exp.assert_trace_tokens_bounded();
+            exp.assert_tool_order(&["bash"]);
+        },
     );
-    exp.assert_trace_ids_paired();
-    exp.assert_trace_tokens_bounded();
-    exp.assert_tool_order(&["bash"]);
 }
 
 /// Scenario: piku writes a new file from scratch.
@@ -802,7 +824,7 @@ fn dogfood_write_new_file_from_scratch() {
 
     let workspace = tempdir("write_new");
 
-    let exp = run_scenario(
+    run_scenario(
         "Create a new file called `greeter.rs` with a public function \
          `greet(name: &str) -> String` that returns `format!(\"Hello, {}!\", name)`. \
          No tests needed, just the function.",
@@ -810,16 +832,18 @@ fn dogfood_write_new_file_from_scratch() {
         &provider,
         &model,
         &key_var,
+        |exp| {
+            exp.report("write_new_file_from_scratch");
+
+            let path = workspace.join("greeter.rs");
+            assert!(path.exists(), "greeter.rs should have been created");
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(content.contains("pub fn greet"), "should have pub fn greet");
+            assert!(content.contains("name"), "should use the name parameter");
+            assert!(content.contains("Hello"), "should say Hello");
+        },
     );
-    exp.report("write_new_file_from_scratch");
-
-    let path = workspace.join("greeter.rs");
-    assert!(path.exists(), "greeter.rs should have been created");
-
-    let content = std::fs::read_to_string(&path).unwrap();
-    assert!(content.contains("pub fn greet"), "should have pub fn greet");
-    assert!(content.contains("name"), "should use the name parameter");
-    assert!(content.contains("Hello"), "should say Hello");
 }
 
 /// Scenario: piku reads a file, edits it, then verifies the edit by reading again.
@@ -840,52 +864,54 @@ fn dogfood_read_edit_verify_loop() {
 
     std::fs::write(workspace.join("version.txt"), "version = 1.0.0\n").unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Read version.txt, change the version from 1.0.0 to 2.0.0, \
          then read the file again to confirm the change was made.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("read_edit_verify_loop");
+        |exp| {
+            exp.report("read_edit_verify_loop");
 
-    exp.assert_trace_ids_paired();
-    exp.assert_trace_tokens_bounded();
-    // Should have read → edit/write → read; not deduped away after the edit
-    assert!(
-        exp.trace_tool_order()
-            .windows(2)
-            .any(|w| w[0] == "read_file" && (w[1] == "edit_file" || w[1] == "write_file")),
-        "expected read_file before edit: order={:?}",
-        exp.trace_tool_order()
-    );
-    assert!(
-        exp.trace_tool_order().contains(&"read_file".to_string()),
-        "should contain at least one read_file in order={:?}",
-        exp.trace_tool_order()
-    );
-    // At least 3 trace starts proves dedup did not swallow the verification read
-    assert!(
-        exp.trace_tool_order().len() >= 3 || exp.tool_names().len() >= 2,
-        "should use at least 2 tool calls. got traces {:?} fallback {:?}",
-        exp.trace_tool_order(),
-        exp.tool_names()
-    );
-    assert!(
-        exp.tool_names().len() >= 2,
-        "should use at least 2 tool calls. got: {:?}",
-        exp.tool_names()
-    );
+            exp.assert_trace_ids_paired();
+            exp.assert_trace_tokens_bounded();
+            // Should have read → edit/write → read; not deduped away after the edit
+            assert!(
+                exp.trace_tool_order()
+                    .windows(2)
+                    .any(|w| w[0] == "read_file" && (w[1] == "edit_file" || w[1] == "write_file")),
+                "expected read_file before edit: order={:?}",
+                exp.trace_tool_order()
+            );
+            assert!(
+                exp.trace_tool_order().contains(&"read_file".to_string()),
+                "should contain at least one read_file in order={:?}",
+                exp.trace_tool_order()
+            );
+            // At least 3 trace starts proves dedup did not swallow the verification read
+            assert!(
+                exp.trace_tool_order().len() >= 3 || exp.tool_names().len() >= 2,
+                "should use at least 2 tool calls. got traces {:?} fallback {:?}",
+                exp.trace_tool_order(),
+                exp.tool_names()
+            );
+            assert!(
+                exp.tool_names().len() >= 2,
+                "should use at least 2 tool calls. got: {:?}",
+                exp.tool_names()
+            );
 
-    let content = std::fs::read_to_string(workspace.join("version.txt")).unwrap();
-    assert!(
-        content.contains("2.0.0"),
-        "version should have been bumped to 2.0.0.\ncontent: {content}"
-    );
-    assert!(
-        !content.contains("1.0.0"),
-        "old version should be gone.\ncontent: {content}"
+            let content = std::fs::read_to_string(workspace.join("version.txt")).unwrap();
+            assert!(
+                content.contains("2.0.0"),
+                "version should have been bumped to 2.0.0.\ncontent: {content}"
+            );
+            assert!(
+                !content.contains("1.0.0"),
+                "old version should be gone.\ncontent: {content}"
+            );
+        },
     );
 }
 
@@ -945,7 +971,7 @@ pub fn print_sum(values: &[i32]) {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Rename the function `compute_total` to `sum_items` everywhere in src/. \
          Update the definition in lib.rs and all call sites in main.rs and utils.rs. \
          Do not change any logic.",
@@ -953,39 +979,41 @@ pub fn print_sum(values: &[i32]) {
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("multifile_rename");
+        |exp| {
+            exp.report("multifile_rename");
 
-    // All three files should now use sum_items
-    let lib_content = std::fs::read_to_string(workspace.join("src/lib.rs")).unwrap();
-    let main_content = std::fs::read_to_string(workspace.join("src/main.rs")).unwrap();
-    let utils_content = std::fs::read_to_string(workspace.join("src/utils.rs")).unwrap();
+            // All three files should now use sum_items
+            let lib_content = std::fs::read_to_string(workspace.join("src/lib.rs")).unwrap();
+            let main_content = std::fs::read_to_string(workspace.join("src/main.rs")).unwrap();
+            let utils_content = std::fs::read_to_string(workspace.join("src/utils.rs")).unwrap();
 
-    assert!(
-        lib_content.contains("sum_items"),
-        "lib.rs should define sum_items.\ncontent:\n{lib_content}"
-    );
-    assert!(
-        main_content.contains("sum_items"),
-        "main.rs should call sum_items.\ncontent:\n{main_content}"
-    );
-    assert!(
-        utils_content.contains("sum_items"),
-        "utils.rs should call sum_items.\ncontent:\n{utils_content}"
-    );
+            assert!(
+                lib_content.contains("sum_items"),
+                "lib.rs should define sum_items.\ncontent:\n{lib_content}"
+            );
+            assert!(
+                main_content.contains("sum_items"),
+                "main.rs should call sum_items.\ncontent:\n{main_content}"
+            );
+            assert!(
+                utils_content.contains("sum_items"),
+                "utils.rs should call sum_items.\ncontent:\n{utils_content}"
+            );
 
-    // Old name must be gone everywhere
-    assert!(
-        !lib_content.contains("compute_total"),
-        "lib.rs should not have old name.\ncontent:\n{lib_content}"
-    );
-    assert!(
-        !main_content.contains("compute_total"),
-        "main.rs should not have old name.\ncontent:\n{main_content}"
-    );
-    assert!(
-        !utils_content.contains("compute_total"),
-        "utils.rs should not have old name.\ncontent:\n{utils_content}"
+            // Old name must be gone everywhere
+            assert!(
+                !lib_content.contains("compute_total"),
+                "lib.rs should not have old name.\ncontent:\n{lib_content}"
+            );
+            assert!(
+                !main_content.contains("compute_total"),
+                "main.rs should not have old name.\ncontent:\n{main_content}"
+            );
+            assert!(
+                !utils_content.contains("compute_total"),
+                "utils.rs should not have old name.\ncontent:\n{utils_content}"
+            );
+        },
     );
 }
 
@@ -1024,39 +1052,41 @@ pub fn sum(values: &[i32]) -> i32 {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Read stats.rs. There is a bug in the `sum` function — it does not return \
          the correct sum. Identify the bug, explain it, and fix it.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("find_off_by_one_bug");
+        |exp| {
+            exp.report("find_off_by_one_bug");
 
-    assert!(
-        exp.tool_called("read_file"),
-        "piku must read the file to find the bug"
-    );
+            assert!(
+                exp.tool_called("read_file"),
+                "piku must read the file to find the bug"
+            );
 
-    // After the fix, the file should use `i < n` not `i < n - 1`
-    let content = std::fs::read_to_string(workspace.join("stats.rs")).unwrap();
-    assert!(
-        !content.contains("i < n - 1"),
-        "the original off-by-one condition should be gone. content:\n{content}"
-    );
-    assert!(
-        !content.contains("i <= n"),
-        "`i <= n` would read past the end of the slice. content:\n{content}"
-    );
-    // Either fixed the while condition or rewrote using iteration.
-    let fixed = content.contains("while i < n {")
-        || content.contains(".sum()")
-        || content.contains("for ")
-        || content.contains("iter()");
-    assert!(
-        fixed,
-        "the bug should be fixed (i < n, or iter().sum()). content:\n{content}"
+            // After the fix, the file should use `i < n` not `i < n - 1`
+            let content = std::fs::read_to_string(workspace.join("stats.rs")).unwrap();
+            assert!(
+                !content.contains("i < n - 1"),
+                "the original off-by-one condition should be gone. content:\n{content}"
+            );
+            assert!(
+                !content.contains("i <= n"),
+                "`i <= n` would read past the end of the slice. content:\n{content}"
+            );
+            // Either fixed the while condition or rewrote using iteration.
+            let fixed = content.contains("while i < n {")
+                || content.contains(".sum()")
+                || content.contains("for ")
+                || content.contains("iter()");
+            assert!(
+                fixed,
+                "the bug should be fixed (i < n, or iter().sum()). content:\n{content}"
+            );
+        },
     );
 }
 
@@ -1088,43 +1118,45 @@ pub fn parse_kv(s: &str) -> Option<(&str, &str)> {
     )
     .unwrap();
 
-    let exp = run_scenario(
+    run_scenario(
         "Read parser.rs and write a Rust #[cfg(test)] module inside the same file with \
          at least 3 unit tests for `parse_kv`. Cover: normal case, missing =, empty string.",
         &workspace,
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("write_tests_for_function");
+        |exp| {
+            exp.report("write_tests_for_function");
 
-    assert!(
-        exp.tool_called("read_file"),
-        "piku should read parser.rs first"
-    );
-    assert!(
-        exp.tool_called("edit_file") || exp.tool_called("write_file"),
-        "piku should write to the file"
-    );
+            assert!(
+                exp.tool_called("read_file"),
+                "piku should read parser.rs first"
+            );
+            assert!(
+                exp.tool_called("edit_file") || exp.tool_called("write_file"),
+                "piku should write to the file"
+            );
 
-    let parser_path = workspace.join("parser.rs");
-    let content = std::fs::read_to_string(&parser_path).unwrap();
-    assert!(
-        content.contains("#[cfg(test)]"),
-        "file should contain a test module.\ncontent:\n{content}"
-    );
-    assert!(
-        content.contains("#[test]"),
-        "file should have at least one #[test].\ncontent:\n{content}"
-    );
-    // Should have at least 3 #[test] annotations
-    let test_count = content.matches("#[test]").count();
-    assert!(
-        test_count >= 3,
-        "should have at least 3 tests, found {test_count}.\ncontent:\n{content}"
-    );
+            let parser_path = workspace.join("parser.rs");
+            let content = std::fs::read_to_string(&parser_path).unwrap();
+            assert!(
+                content.contains("#[cfg(test)]"),
+                "file should contain a test module.\ncontent:\n{content}"
+            );
+            assert!(
+                content.contains("#[test]"),
+                "file should have at least one #[test].\ncontent:\n{content}"
+            );
+            // Should have at least 3 #[test] annotations
+            let test_count = content.matches("#[test]").count();
+            assert!(
+                test_count >= 3,
+                "should have at least 3 tests, found {test_count}.\ncontent:\n{content}"
+            );
 
-    assert_rust_tests_pass(&parser_path, &workspace.join("parser_tests"));
+            assert_rust_tests_pass(&parser_path, &workspace.join("parser_tests"));
+        },
+    );
 }
 
 /// Scenario: piku explores its own source and summarises the architecture.
@@ -1150,7 +1182,7 @@ fn dogfood_self_describe_architecture() {
         .unwrap()
         .to_path_buf();
 
-    let exp = run_scenario(
+    run_scenario(
         "Use glob to list all Cargo.toml files in crates/ (pattern: crates/*/Cargo.toml). \
          Then read crates/piku-runtime/src/agent_loop.rs line 1 to 30. \
          Describe in one sentence: what is piku, and what does the agentic loop do?",
@@ -1158,27 +1190,29 @@ fn dogfood_self_describe_architecture() {
         &provider,
         &model,
         &key_var,
-    );
-    exp.report("self_describe_architecture");
+        |exp| {
+            exp.report("self_describe_architecture");
 
-    // It must have used glob to discover structure
-    assert!(
-        exp.tool_called("glob"),
-        "piku should use glob to discover Cargo.toml files"
-    );
-    assert!(
-        exp.tool_called("read_file"),
-        "piku should read agent_loop.rs"
-    );
+            // It must have used glob to discover structure
+            assert!(
+                exp.tool_called("glob"),
+                "piku should use glob to discover Cargo.toml files"
+            );
+            assert!(
+                exp.tool_called("read_file"),
+                "piku should read agent_loop.rs"
+            );
 
-    // Response should mention something about the loop or agent
-    let full_output = strip_ansi(&exp.stdout);
-    let mentions_agent = full_output.to_lowercase().contains("agent")
-        || full_output.to_lowercase().contains("loop")
-        || full_output.to_lowercase().contains("tool");
-    assert!(
-        mentions_agent,
-        "response should mention the agentic loop.\noutput:\n{full_output}"
+            // Response should mention something about the loop or agent
+            let full_output = strip_ansi(&exp.stdout);
+            let mentions_agent = full_output.to_lowercase().contains("agent")
+                || full_output.to_lowercase().contains("loop")
+                || full_output.to_lowercase().contains("tool");
+            assert!(
+                mentions_agent,
+                "response should mention the agentic loop.\noutput:\n{full_output}"
+            );
+        },
     );
 }
 
@@ -1278,4 +1312,98 @@ fn dogfood_trace_file_is_written() {
         "trace should contain tool_start events. events: {event_types:?}"
     );
     exp.assert_trace_ids_paired();
+}
+
+#[test]
+fn ledger_assertion_failure_overrides_successful_execution() {
+    for exit_ok in [true, false] {
+        let workspace = tempfile::tempdir().unwrap();
+        let ledger = workspace.path().join("ledger.jsonl");
+        let record = test_helpers::build_live_ledger_record(
+            test_helpers::EvaluationSurface::Cli,
+            workspace.path(),
+            "dogfood",
+            "fixture",
+            "fixture",
+            exit_ok,
+            std::time::Duration::ZERO,
+        );
+        let exp = parse_output("", "", exit_ok, workspace.path(), Vec::new());
+        let failure = std::panic::catch_unwind(|| {
+            test_helpers::complete_scenario_with_ledger(Some(&ledger), record, || {
+                assert!(exp.tool_called("read_file"), "required file read absent");
+            });
+        });
+        assert_eq!(
+            failure.unwrap_err().downcast_ref::<&str>(),
+            Some(&"required file read absent"),
+            "the original scenario assertion must still fail the test"
+        );
+        let records = std::fs::read_to_string(ledger).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(records.trim()).unwrap();
+        test_helpers::validate_evaluation_envelope(&record).unwrap();
+        assert_eq!(record["result"], "failure");
+        assert_eq!(
+            record["run_status"],
+            if exit_ok {
+                "product_failure"
+            } else {
+                "inconclusive"
+            }
+        );
+        assert_eq!(
+            record["failure_class"],
+            if exit_ok {
+                "assertion_failed"
+            } else {
+                "unknown_failure"
+            }
+        );
+    }
+}
+
+#[test]
+fn ledger_success_waits_for_final_assertion_and_preserves_execution_failure() {
+    for exit_ok in [true, false] {
+        let workspace = tempfile::tempdir().unwrap();
+        let ledger = workspace.path().join("ledger.jsonl");
+        let record = test_helpers::build_live_ledger_record(
+            test_helpers::EvaluationSurface::Cli,
+            workspace.path(),
+            "dogfood",
+            "fixture",
+            "fixture",
+            exit_ok,
+            std::time::Duration::ZERO,
+        );
+        test_helpers::complete_scenario_with_ledger(Some(&ledger), record, || {
+            assert!(!ledger.exists(), "acceptance cannot precede assertions");
+        });
+        let records = std::fs::read_to_string(ledger).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(records.trim()).unwrap();
+        test_helpers::validate_evaluation_envelope(&record).unwrap();
+        assert_eq!(
+            record["result"],
+            if exit_ok { "success" } else { "failure" }
+        );
+        assert_eq!(
+            record["run_status"],
+            if exit_ok { "completed" } else { "inconclusive" }
+        );
+    }
+}
+
+#[test]
+fn ledger_disabled_still_runs_and_propagates_assertions() {
+    let failure = std::panic::catch_unwind(|| {
+        test_helpers::complete_scenario_with_ledger(None, serde_json::Value::Null, || {
+            panic!("scenario failure without ledger");
+        });
+    });
+    assert_eq!(
+        failure.unwrap_err().downcast_ref::<&str>(),
+        Some(&"scenario failure without ledger")
+    );
 }

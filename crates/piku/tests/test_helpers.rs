@@ -113,6 +113,32 @@ pub fn append_live_ledger_for_surface(
     append_json_line(Path::new(&ledger_path), &record);
 }
 
+/// Finalize a dogfood scenario only after its structural assertions run.
+pub fn complete_scenario_with_ledger(
+    ledger_path: Option<&Path>,
+    mut record: serde_json::Value,
+    assertions: impl FnOnce(),
+) {
+    // Catch only the scenario assertions, then resume the same panic after recording.
+    // AssertUnwindSafe is sound here because captured state is never reused on failure.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(assertions));
+    if outcome.is_err() && record["result"] == "success" {
+        record["result"] = "failure".into();
+        record["run_status"] = "product_failure".into();
+        record["failure_class"] = "assertion_failed".into();
+    }
+    if let Some(path) = ledger_path {
+        if let Err(error) = validate_evaluation_envelope(&record) {
+            eprintln!("refusing to append invalid evaluation envelope: {error}");
+        } else {
+            append_json_line(path, &record);
+        }
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[must_use]
 pub fn build_live_ledger_record(
     surface: EvaluationSurface,
