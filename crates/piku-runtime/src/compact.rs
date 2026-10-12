@@ -63,6 +63,7 @@ fn estimate_message_tokens(msg: &ConversationMessage) -> usize {
                 (name.len() + input.to_string().len()) / 4 + 1
             }
             ContentBlock::ToolResult { output, .. } => output.len() / 4 + 1,
+            ContentBlock::Replay { .. } => 0,
         })
         .sum()
 }
@@ -338,6 +339,22 @@ const MASK_THRESHOLD: usize = 200;
 /// Preserves text blocks and tool-use blocks (reasoning chain) intact.
 /// Only `ToolResult` outputs above `MASK_THRESHOLD` chars are masked.
 fn mask_observations(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    // Retained replay and its tool results describe one exact exchange. Hard
+    // compaction can remove the whole exchange, but masking must not rewrite it.
+    let replay_calls: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Replay { .. }))
+        })
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
     messages
         .iter()
         .map(|msg| {
@@ -349,7 +366,9 @@ fn mask_observations(messages: &[ConversationMessage]) -> Vec<ConversationMessag
                         tool_use_id,
                         output,
                         is_error,
-                    } if output.len() > MASK_THRESHOLD => {
+                    } if output.len() > MASK_THRESHOLD
+                        && !replay_calls.contains(tool_use_id.as_str()) =>
+                    {
                         let preview: String = output.chars().take(100).collect();
                         ContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
@@ -469,6 +488,7 @@ fn summarise_block(b: &ContentBlock) -> String {
         ContentBlock::Text { text } => text.clone(),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult { output, .. } => output.clone(),
+        ContentBlock::Replay { .. } => String::new(),
     };
     truncate(&raw, 160)
 }
@@ -489,6 +509,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
                 ContentBlock::Text { text } => text.as_str(),
                 ContentBlock::ToolUse { input, .. } => input.as_str().unwrap_or(""),
                 ContentBlock::ToolResult { output, .. } => output.as_str(),
+                ContentBlock::Replay { .. } => "",
             };
             extract_file_candidates(text)
         })

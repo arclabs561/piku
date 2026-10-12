@@ -866,7 +866,7 @@ async fn extract_raw(
 
     let request = piku_api::MessageRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: crate::provider::request_output_cap(provider, 1024),
         messages: vec![piku_api::RequestMessage {
             role: "user".to_string(),
             content: vec![piku_api::RequestContent::Text {
@@ -1197,7 +1197,7 @@ async fn judge_memory_conflict(
 
     let request = piku_api::MessageRequest {
         model: model.to_string(),
-        max_tokens: 32,
+        max_tokens: crate::provider::request_output_cap(provider, 32),
         messages: vec![piku_api::RequestMessage {
             role: "user".to_string(),
             content: vec![piku_api::RequestContent::Text { text: user_msg }],

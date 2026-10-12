@@ -2,6 +2,43 @@ use super::*;
 use piku_api::{ApiError, Event, MessageRequest, Provider, StopReason, TokenUsage};
 use std::pin::Pin;
 
+#[tokio::test]
+async fn selected_chatgpt_auxiliary_requests_explicitly_omit_hard_output_caps() {
+    struct Capture {
+        name: &'static str,
+        caps: std::sync::Mutex<Vec<u32>>,
+    }
+    impl Provider for Capture {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn stream_message(
+            &self,
+            request: MessageRequest,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = Result<Event, ApiError>> + Send + '_>>
+        {
+            self.caps.lock().unwrap().push(request.max_tokens);
+            Box::pin(futures_util::stream::iter([
+                Ok(Event::TextDelta {
+                    text: "IGNORE".into(),
+                }),
+                Ok(Event::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ]))
+        }
+    }
+    for (name, expected) in [("chatgpt", vec![0, 0]), ("custom", vec![1024, 32])] {
+        let provider = Capture {
+            name,
+            caps: std::sync::Mutex::default(),
+        };
+        extract_raw("conversation", &provider, "model").await;
+        judge_memory_conflict("fact", &[], &provider, "model").await;
+        assert_eq!(*provider.caps.lock().unwrap(), expected);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Ending {
     Complete,

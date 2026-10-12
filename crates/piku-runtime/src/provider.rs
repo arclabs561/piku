@@ -1,3 +1,5 @@
+mod chatgpt;
+
 use std::env;
 
 use piku_api::{AnthropicProvider, ApiError, OpenAiCompatProvider, Provider};
@@ -6,6 +8,16 @@ pub const DEFAULT_MODEL_OPENROUTER: &str = "anthropic/claude-sonnet-4.6";
 pub const DEFAULT_MODEL_ANTHROPIC: &str = "claude-sonnet-4-5";
 pub const DEFAULT_MODEL_GROQ: &str = piku_api::groq::DEFAULT_MODEL;
 pub const DEFAULT_MODEL_OLLAMA: &str = piku_api::ollama::DEFAULT_MODEL;
+
+// This explicitly selected route does not support a hard output-token cap.
+// Keep other providers' existing caps, including caller-selected limits.
+pub(crate) fn request_output_cap(provider: &dyn Provider, existing: u32) -> u32 {
+    if provider.name() == "chatgpt" {
+        0
+    } else {
+        existing
+    }
+}
 
 /// Availability information for one supported provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +44,12 @@ impl ResolvedProvider {
 
     pub fn resolve_named(name: &str) -> Result<Self, ApiError> {
         match name {
+            "chatgpt" => Ok(Self {
+                provider: Box::new(chatgpt::ChatgptProvider::selected()?),
+                // Subscription model availability is account-specific. The user
+                // must explicitly choose a current catalog entry.
+                default_model: String::new(),
+            }),
             "openrouter" | "or" => {
                 let p = piku_api::openrouter::from_env()?;
                 Ok(Self::compat(p, DEFAULT_MODEL_OPENROUTER))
@@ -57,7 +75,7 @@ impl ResolvedProvider {
                 Ok(Self::compat(p, &default_model))
             }
             other => Err(ApiError::Provider(format!(
-                "unknown provider '{other}' - use: openrouter, anthropic, groq, ollama, custom"
+                "unknown provider '{other}' - use: chatgpt, openrouter, anthropic, groq, ollama, custom"
             ))),
         }
     }
@@ -119,7 +137,22 @@ impl ResolvedProvider {
 #[must_use]
 pub fn provider_availability() -> Vec<ProviderAvailability> {
     let custom_model = env::var(piku_api::custom::ENV_MODEL).unwrap_or_else(|_| "unknown".into());
+    let chatgpt_available = crate::chatgpt_auth::default_directory()
+        .ok()
+        .filter(|directory| directory.exists())
+        .and_then(|directory| crate::chatgpt_auth::AuthManager::open(directory).ok())
+        .and_then(|manager| manager.selected().ok().flatten())
+        .is_some();
     vec![
+        ProviderAvailability {
+            name: "chatgpt",
+            default_model: "explicit --model required".to_string(),
+            available: chatgpt_available,
+            note: format!(
+                "{}; stored selection only, not a live authentication check",
+                chatgpt::NOTICE
+            ),
+        },
         ProviderAvailability {
             name: "openrouter",
             default_model: DEFAULT_MODEL_OPENROUTER.to_string(),

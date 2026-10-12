@@ -220,6 +220,7 @@ fn extract_keywords(msg: &ConversationMessage) -> std::collections::HashSet<Stri
             ContentBlock::Text { text } => text.as_str(),
             ContentBlock::ToolUse { name, .. } => name.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
+            ContentBlock::Replay { .. } => "",
         };
         for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
             let lower = word.to_lowercase();
@@ -289,11 +290,13 @@ impl ConversationMessage {
     }
 
     /// Estimated token cost of this message (4 chars/token heuristic,
-    /// plus 1 for role framing).
+    /// plus 1 for role framing). Replay uses its visible projections only;
+    /// opaque reasoning cost is unknown, not estimated from ciphertext bytes.
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
         self.blocks
             .iter()
+            .filter(|block| !matches!(block, ContentBlock::Replay { .. }))
             .map(|b| b.text_len() / 4 + 1)
             .sum::<usize>()
             + 1
@@ -312,6 +315,10 @@ pub enum MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    /// Opaque provider continuation, persisted but never rendered as text.
+    Replay {
+        envelope: piku_api::ReplayEnvelope,
+    },
     Text {
         text: String,
     },
@@ -333,6 +340,7 @@ impl ContentBlock {
             Self::Text { text } => text.len(),
             Self::ToolUse { input, .. } => input.to_string().len(),
             Self::ToolResult { output, .. } => output.len(),
+            Self::Replay { .. } => 0,
         }
     }
 }

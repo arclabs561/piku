@@ -7,6 +7,7 @@
 pub mod agent_loop;
 pub mod agents;
 pub mod cell_view;
+pub mod chatgpt_auth;
 pub mod compact;
 pub mod context;
 pub mod embed_memory;

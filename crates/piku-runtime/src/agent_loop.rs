@@ -30,6 +30,8 @@ mod context_tests;
 #[cfg(test)]
 mod pressure_tests;
 #[cfg(test)]
+mod replay_tests;
+#[cfg(test)]
 mod tool_response_tests;
 
 /// A channel the TUI can use to inject interjections mid-turn.
@@ -427,7 +429,8 @@ async fn run_turn_inner(
             } // else compact_allowed
         }
 
-        let (request, manifest) = build_request(session, model, system_prompt, &tool_defs);
+        let (mut request, manifest) = build_request(session, model, system_prompt, &tool_defs);
+        request.max_tokens = crate::provider::request_output_cap(provider, request.max_tokens);
         // Repeated or cached requests consume billing tokens without adding
         // those same tokens repeatedly to one context window.
         #[allow(clippy::cast_precision_loss)]
@@ -487,7 +490,10 @@ async fn run_turn_inner(
         // A provider can legally end an SSE stream without text or a tool
         // call. Do not turn that into a silent user-visible no-op: preserve a
         // clear, retryable assistant message in both the sink and session.
-        if assistant_blocks.is_empty() {
+        if assistant_blocks
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Replay { .. }))
+        {
             const EMPTY_RESPONSE: &str =
                 "The model returned an empty response. Please retry your request.";
             sink.on_text(EMPTY_RESPONSE);
@@ -1149,6 +1155,7 @@ async fn stream_response(
     let mut stream = provider.stream_message(request);
 
     let mut text_buf = String::new();
+    let mut replay = None;
     let mut tool_calls: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut tool_order: Vec<String> = Vec::new();
@@ -1182,6 +1189,12 @@ async fn stream_response(
             Err(e) => {
                 stream_err = Some(e.to_string());
                 break;
+            }
+            Ok(Event::Replay { envelope }) => {
+                if replay.replace(envelope).is_some() {
+                    stream_err
+                        .get_or_insert_with(|| "multiple replay envelopes in one response".into());
+                }
             }
             Ok(Event::TextDelta { text }) => {
                 sink.on_text(&text);
@@ -1279,6 +1292,10 @@ async fn stream_response(
             };
             blocks.push(ContentBlock::ToolUse { id, name, input });
         }
+    }
+
+    if let Some(envelope) = replay.filter(|_| !cancelled && stop_reason != StopReason::MaxTokens) {
+        blocks.push(ContentBlock::Replay { envelope });
     }
 
     (blocks, usage, stop_reason, stream_err, cancelled)
@@ -1643,6 +1660,9 @@ fn build_request(
                     .blocks
                     .iter()
                     .map(|b| match b {
+                        ContentBlock::Replay { envelope } => RequestContent::Replay {
+                            envelope: envelope.clone(),
+                        },
                         ContentBlock::Text { text } => RequestContent::Text { text: text.clone() },
                         ContentBlock::ToolUse { id, name, input } => RequestContent::ToolUse {
                             id: id.clone(),
@@ -2499,6 +2519,7 @@ async fn try_llm_compact(
         };
         for block in &msg.blocks {
             let text = match block {
+                ContentBlock::Replay { .. } => continue,
                 ContentBlock::Text { text } => text.clone(),
                 ContentBlock::ToolUse { name, input, .. } => {
                     format!("[tool_use: {name}({input})]")
@@ -2524,7 +2545,7 @@ async fn try_llm_compact(
     let compact_prompt = crate::compact::compact_system_prompt(None);
     let request = MessageRequest {
         model: model.to_string(),
-        max_tokens: 4096,
+        max_tokens: crate::provider::request_output_cap(provider, 4096),
         messages: vec![RequestMessage {
             role: "user".to_string(),
             content: vec![RequestContent::Text {
@@ -2570,7 +2591,13 @@ fn coalesce_consecutive_roles(messages: Vec<RequestMessage>) -> Vec<RequestMessa
     let mut out: Vec<RequestMessage> = Vec::with_capacity(messages.len());
     for msg in messages {
         if let Some(last) = out.last_mut() {
-            if last.role == msg.role {
+            if last.role == msg.role
+                && !last
+                    .content
+                    .iter()
+                    .chain(&msg.content)
+                    .any(|block| matches!(block, RequestContent::Replay { .. }))
+            {
                 last.content.extend(msg.content);
                 continue;
             }

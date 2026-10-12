@@ -12,6 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "native-tls"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
 piku-api = { path = "../piku-api" }
 piku-tools = { path = "../piku-tools" }
 
