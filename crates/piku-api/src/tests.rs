@@ -452,11 +452,49 @@ mod anthropic_sse_parsing {
     }
 
     #[test]
-    fn message_delta_missing_delta_key_does_not_panic() {
-        // P1: was direct index `raw.rest["delta"]` — would panic
+    fn message_delta_missing_delta_does_not_invent_completion() {
         let data = r#"{"type":"message_delta"}"#;
-        let result = parse(Some(et("message_delta")), data);
-        assert!(result.is_ok());
+        assert!(parse(Some(et("message_delta")), data).unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_delta_without_stop_preserves_usage_without_completion() {
+        for delta in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"stop_reason": null})),
+        ] {
+            let mut data = serde_json::json!({"type":"message_delta", "usage":{"input_tokens":7,"output_tokens":42}});
+            if let Some(delta) = delta {
+                data["delta"] = delta;
+            }
+            let mut parser = crate::sse::SseParser::new();
+            assert!(parser.feed_line("event: message_delta").is_none());
+            assert!(parser.feed_line(&format!("data: {data}")).is_none());
+            let wire_event = parser.feed_line("").unwrap();
+            let events = parse(wire_event.event_type.as_deref(), &wire_event.data).unwrap();
+            assert!(
+                matches!(events.as_slice(), [Event::UsageDelta { usage }] if usage.input_tokens == 7 && usage.output_tokens == 42),
+                "missing/null stop must only report usage: {data}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_delta_explicit_stop_precedes_usage() {
+        for (wire, expected) in [
+            ("end_turn", StopReason::EndTurn),
+            ("tool_use", StopReason::ToolUse),
+            ("max_tokens", StopReason::MaxTokens),
+        ] {
+            let data = serde_json::json!({"type":"message_delta","delta":{"stop_reason":wire},"usage":{"input_tokens":0,"output_tokens":42}});
+            let events = parse(Some(et("message_delta")), &data.to_string()).unwrap();
+            assert!(
+                matches!(events.as_slice(), [Event::MessageStop { stop_reason }, Event::UsageDelta { usage }] if *stop_reason == expected && usage.output_tokens == 42),
+                "explicit stop ordering changed: {events:?}"
+            );
+        }
     }
 
     #[test]

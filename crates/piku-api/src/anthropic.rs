@@ -227,17 +227,17 @@ fn anthropic_input_json_delta(raw: &RawStreamEvent, delta: &serde_json::Value) -
 }
 
 fn anthropic_message_delta(raw: &RawStreamEvent) -> Vec<Event> {
-    let Some(delta) = raw.rest.get("delta") else {
-        return vec![Event::MessageStop {
-            stop_reason: StopReason::EndTurn,
-        }];
-    };
-    let stop_reason = delta
-        .get("stop_reason")
+    let mut events = Vec::new();
+    if let Some(reason) = raw
+        .rest
+        .get("delta")
+        .and_then(|delta| delta.get("stop_reason"))
         .and_then(|v| v.as_str())
-        .map_or(StopReason::EndTurn, StopReason::from_wire_str);
-
-    let mut events = vec![Event::MessageStop { stop_reason }];
+    {
+        events.push(Event::MessageStop {
+            stop_reason: StopReason::from_wire_str(reason),
+        });
+    }
 
     // usage may also be in message_delta
     if let Some(usage_val) = raw.rest.get("usage") {

@@ -7,6 +7,9 @@ use crate::types::{Event, MessageRequest};
 
 /// A provider that can stream messages from an LLM API.
 pub trait Provider: Send + Sync {
+    /// Stream one response. Successful responses emit exactly one
+    /// [`Event::MessageStop`]; usage may follow that event. Missing or repeated
+    /// terminal events do not establish valid completion.
     fn stream_message(
         &self,
         request: MessageRequest,
