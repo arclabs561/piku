@@ -9,6 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+// Exercise scenario evidence through the existing asset/manifest boundary.
+#[cfg(test)]
+#[path = "frozen_memory.rs"]
+mod frozen_memory;
+
 pub const EVALUATION_CONTRACT: &str = "piku-evaluation-envelope-v2";
 pub const EVALUATOR_VERSION: &str = concat!("agentic-playground-rust/", env!("CARGO_PKG_VERSION"));
 pub const EVALUATION_STAGE_ID: &str = "summary";
@@ -1180,7 +1185,7 @@ mod tests {
         );
     }
 
-    fn prompt_manifest(run_id: &str, prompt: &str) -> PromptManifest {
+    pub(super) fn prompt_manifest(run_id: &str, prompt: &str) -> PromptManifest {
         PromptManifest {
             schema_version: 1,
             run_id: run_id.to_string(),

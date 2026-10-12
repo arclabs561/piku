@@ -548,6 +548,8 @@ test("chat hides executors that only accept page requests", async ({
   await expect(send).toBeEnabled();
   await instruction.fill("make a bounded page edit");
   await instruction.press("Enter");
+  expect(requests).toHaveLength(0);
+  await change.getByRole("button", { name: "apply proposed change" }).click();
   await expect.poll(() => requests.length).toBe(1);
   expect(requests[0]).toMatchObject({ kind: "page", executor: "provider" });
 });
@@ -556,6 +558,16 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
   page,
   surfaceName,
 }) => {
+  await page.route("**/api/executors", (route) => route.fulfill({
+    json: {
+      default: "provider",
+      executors: [{
+        id: "provider", available: true, model: "fixture-model",
+        detail: "deterministic page fixture", request_kinds: ["page"],
+      }],
+    },
+  }));
+  await page.reload();
   await page.route("**/api/chat", async (route) => {
     const request = route.request().postDataJSON();
     expect(request).toMatchObject({
@@ -617,6 +629,8 @@ test("agent provenance timeline exposes authority, mutation, verification, and m
   await change.getByLabel("Change target").selectOption("page");
   await change.getByLabel("Change instruction").fill("Add an evidence panel");
   await change.getByLabel("Change instruction").press("Enter");
+  await expect(page.locator(".activity-card")).toHaveCount(0);
+  await change.getByRole("button", { name: "apply proposed change" }).click();
 
   const activity = page.locator(".activity-card");
   await expect(activity).toHaveClass(/activity-card(?!.*running)/);
@@ -737,6 +751,15 @@ test("chat cards persist isolated notebook history and rerun from edited turns",
   request,
   surfaceName,
 }) => {
+  await page.route("**/api/executors", (route) => route.fulfill({
+    json: {
+      default: "provider",
+      executors: [{
+        id: "provider", available: true, model: "fixture",
+        detail: "deterministic notebook fixture", request_kinds: ["chat"],
+      }],
+    },
+  }));
   const notebook = {
     version: 1,
     context: "Only discuss the selected parser.",
