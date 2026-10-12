@@ -114,8 +114,8 @@ const MAX_STREAM_BYTES: usize = 256 * 1024;
 /// The head is what a reader wants: a compiler's first errors, a test run's
 /// first failures. Truncating silently would let a model reason from a partial
 /// result it believes is complete.
-fn bound_stream(bytes: &[u8], label: &str) -> String {
-    if bytes.len() <= MAX_STREAM_BYTES {
+fn bound_stream(bytes: &[u8], total: usize, label: &str) -> String {
+    if total <= MAX_STREAM_BYTES {
         return String::from_utf8_lossy(bytes).into_owned();
     }
     // Back off to a UTF-8 boundary so the cut does not split a character;
@@ -125,12 +125,7 @@ fn bound_stream(bytes: &[u8], label: &str) -> String {
         end -= 1;
     }
     let mut out = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    let _ = write!(
-        out,
-        "\n[{label} truncated: {} of {} bytes shown]",
-        end,
-        bytes.len()
-    );
+    let _ = write!(out, "\n[{label} truncated: {end} of {total} bytes shown]");
     out
 }
 
@@ -180,7 +175,15 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
         }
     };
     let process_group = child.id();
-    let fut = child.wait_with_output();
+    let fut = async {
+        let output = capture_output(child).await?;
+        let stdout = bound_stream(&output.stdout, output.stdout_total, "stdout");
+        let stderr = bound_stream(&output.stderr, output.stderr_total, "stderr");
+        // Decoding is bounded by the retained prefixes. Yield before returning
+        // so the deadline also covers this last synchronous work.
+        tokio::task::yield_now().await;
+        Ok::<_, std::io::Error>((output.status, stdout, stderr))
+    };
 
     match timeout(timeout_duration, fut).await {
         Err(_) => {
@@ -203,23 +206,25 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                 },
             )
         }
-        Ok(Err(e)) => attach_verification(
-            ToolResult::error(format!("bash: spawn failed: {e}")).with_effect(
-                ToolEffect::ShellCommand {
-                    command: p.command.clone(),
-                    exit_code: None,
+        Ok(Err(e)) => {
+            #[cfg(unix)]
+            kill_process_group(process_group);
+            attach_verification(
+                ToolResult::error(format!("bash: spawn failed: {e}")).with_effect(
+                    ToolEffect::ShellCommand {
+                        command: p.command.clone(),
+                        exit_code: None,
+                    },
+                ),
+                p.purpose,
+                verification_description,
+                VerificationStatus::Indeterminate {
+                    reason: VerificationIndeterminate::SpawnFailed,
                 },
-            ),
-            p.purpose,
-            verification_description,
-            VerificationStatus::Indeterminate {
-                reason: VerificationIndeterminate::SpawnFailed,
-            },
-        ),
-        Ok(Ok(output)) => {
-            let stdout = bound_stream(&output.stdout, "stdout");
-            let stderr = bound_stream(&output.stderr, "stderr");
-            let code = output.status.code().unwrap_or(-1);
+            )
+        }
+        Ok(Ok((status, stdout, stderr))) => {
+            let code = status.code().unwrap_or(-1);
 
             let result = if code != 0 {
                 let mut msg = format!("exit code {code}");
@@ -245,17 +250,17 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
             }
             .with_effect(ToolEffect::ShellCommand {
                 command: p.command.clone(),
-                exit_code: output.status.code(),
+                exit_code: status.code(),
             });
             attach_verification(
                 result,
                 p.purpose,
                 verification_description,
-                if output.status.success() {
+                if status.success() {
                     VerificationStatus::Passed
                 } else {
                     VerificationStatus::Failed {
-                        exit_code: output.status.code(),
+                        exit_code: status.code(),
                     }
                 },
             )
@@ -289,5 +294,139 @@ fn attach_verification(
         })
     } else {
         result
+    }
+}
+
+struct CapturedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_total: usize,
+    stderr_total: usize,
+}
+
+async fn capture_output(mut child: tokio::process::Child) -> std::io::Result<CapturedOutput> {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let ((stdout, stdout_total), (stderr, stderr_total), status) =
+        tokio::try_join!(capture_stream(stdout), capture_stream(stderr), child.wait())?;
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_total,
+        stderr_total,
+    })
+}
+
+async fn capture_stream(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<(Vec<u8>, usize)> {
+    use tokio::io::AsyncReadExt;
+
+    // One lookahead byte lets bound_stream preserve its UTF-8 cut behavior.
+    // Continue draining excess: noisy commands retain their normal exit status.
+    let limit = MAX_STREAM_BYTES + 1;
+    let mut prefix = Vec::with_capacity(limit);
+    let mut total = 0_usize;
+    let mut buffer = Box::new([0_u8; 8192]);
+    loop {
+        let count = stream.read(&mut buffer[..]).await?;
+        if count == 0 {
+            return Ok((prefix, total));
+        }
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("shell output byte count overflow"))?;
+        let keep = count.min(limit - prefix.len());
+        prefix.extend_from_slice(&buffer[..keep]);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_capture_retains_only_bounded_prefixes() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("dd if=/dev/zero bs=65536 count=32 2>/dev/null; dd if=/dev/zero bs=65536 count=32 >&2 2>/dev/null")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let output = capture_output(child).await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout_total, 2 * 1024 * 1024);
+        assert_eq!(output.stderr_total, 2 * 1024 * 1024);
+        assert!(
+            output.stdout.capacity() <= MAX_STREAM_BYTES + 1,
+            "stdout allocation {} exceeds bounded capture",
+            output.stdout.capacity()
+        );
+        assert!(
+            output.stderr.capacity() <= MAX_STREAM_BYTES + 1,
+            "stderr allocation {} exceeds bounded capture",
+            output.stderr.capacity()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_noisy_streams_preserve_exit_and_disclose_totals() {
+        for code in [0, 7] {
+            let result = execute(serde_json::json!({
+                "command": format!("dd if=/dev/zero bs=65536 count=32 2>/dev/null & dd if=/dev/zero bs=65536 count=32 >&2 2>/dev/null & wait; exit {code}"),
+                "purpose": "verification",
+            })).await;
+            assert_eq!(result.is_error, code != 0);
+            assert!(result
+                .output
+                .contains("[stdout truncated: 262144 of 2097152 bytes shown]"));
+            assert!(result
+                .output
+                .contains("[stderr truncated: 262144 of 2097152 bytes shown]"));
+            assert!(result.output.len() < 2 * MAX_STREAM_BYTES + 200);
+            assert!(matches!(&result.effects[0],
+                ToolEffect::ShellCommand { exit_code: Some(actual), .. } if *actual == code));
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_infinite_output_respects_deadline() {
+        let start = std::time::Instant::now();
+        let result = execute(serde_json::json!({
+            "command": "yes noisy & yes noisy >&2 & wait",
+            "timeout_ms": 100,
+        }))
+        .await;
+        assert!(result.is_error && result.output.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn shell_truncation_keeps_utf8_boundary_and_small_output() {
+        let mut prefix = vec![b'a'; MAX_STREAM_BYTES - 1];
+        prefix.extend_from_slice("✓".as_bytes());
+        let output = bound_stream(&prefix[..=MAX_STREAM_BYTES], prefix.len(), "stdout");
+        assert!(!output.contains('�'));
+        assert!(output.ends_with("262143 of 262146 bytes shown]"));
+        assert_eq!(bound_stream("✓ ok".as_bytes(), 6, "stdout"), "✓ ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_kills_pipe_holding_descendant() {
+        let dir =
+            std::env::temp_dir().join(format!("piku-shell-descendant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived");
+        assert!(!marker.exists());
+        let result = execute(serde_json::json!({
+            "command": format!("(sleep 1; echo survived > '{}') & exit 0", marker.display()),
+            "timeout_ms": 100,
+        }))
+        .await;
+        assert!(result.is_error && result.output.contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "descendant survived timeout cleanup");
+        std::fs::remove_dir(&dir).unwrap();
     }
 }
