@@ -2361,7 +2361,7 @@ test("chat output renders safe Markdown, KaTeX, and Mermaid by default", async (
     "",
     "```mermaid",
     "flowchart LR",
-    "  Intent --> Action --> Evidence",
+    '  Intent --> Action["$$e^{i\\pi} + 1 = 0$$"] --> Evidence',
     "```",
     "",
     '<script>window.__markdownExecuted = true</script>',
@@ -2402,8 +2402,10 @@ test("chat output renders safe Markdown, KaTeX, and Mermaid by default", async (
   await page.reload();
   const output = page.locator(".chat-response");
   await expect(output.locator("h1")).toHaveText("Evidence");
-  await expect(output.locator(".katex")).toHaveCount(1);
+  await expect(output.locator(".katex")).toHaveCount(2);
   await expect(output.locator(".mermaid svg")).toBeVisible();
+  await expect(output.locator(".mermaid svg math")).toHaveCount(1);
+  await expect(output.locator(".mermaid-error")).toHaveCount(0);
   await expect(output.locator("script")).toHaveCount(0);
   expect(await page.evaluate(() => window.__markdownExecuted)).toBeUndefined();
 });

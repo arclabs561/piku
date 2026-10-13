@@ -22,6 +22,11 @@
     "marked-katex-extension": "^5.1.13",
     "mermaid": "^11.16.1"
   },
+  "overrides": {
+    "mermaid": {
+      "katex": "$katex"
+    }
+  },
   "devDependencies": {
     "@playwright/mcp": "0.0.78",
     "@playwright/test": "1.62.1",
