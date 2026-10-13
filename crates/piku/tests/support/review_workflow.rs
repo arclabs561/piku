@@ -79,11 +79,6 @@ pub(crate) fn scripted_server(
     file: &Path,
     resume_only: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&requests);
     let tool = |id: &str, debug: bool| json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"write_file","arguments":json!({"path":file,"content":format!("{{\"port\":9090,\"debug\":{debug},\"service\":\"fixture\"}}\n")}).to_string()}}]},"finish_reason":null}]});
     let final_answer =
         json!({"choices":[{"delta":{"content":"Configuration complete."},"finish_reason":null}]});
@@ -93,8 +88,25 @@ pub(crate) fn scripted_server(
         (tool("corrected-write", false), "tool_calls"),
         (final_answer, "stop"),
     ];
+    scripted_response_server(
+        responses
+            .into_iter()
+            .skip(if resume_only { 2 } else { 0 })
+            .collect(),
+    )
+}
+
+/// A partial SSE response with stop="interrupt" stays open until cancellation.
+pub(crate) fn scripted_response_server(
+    responses: Vec<(Value, &'static str)>,
+) -> (String, Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
     let handle = std::thread::spawn(move || {
-        for (delta, stop) in responses.into_iter().skip(if resume_only { 2 } else { 0 }) {
+        for (delta, stop) in responses {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut stream = loop {
                 match listener.accept() {
@@ -140,6 +152,14 @@ pub(crate) fn scripted_server(
                 .lock()
                 .unwrap()
                 .push(serde_json::from_slice(&request[header_end..header_end + length]).unwrap());
+            if stop == "interrupt" {
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {delta}\n\n").unwrap();
+                // The application must close its cancelled request. A timeout
+                // advances this bounded fixture, but cannot satisfy the test's
+                // independent durable cancellation predicate.
+                let _ = stream.read(&mut chunk);
+                continue;
+            }
             let finish = json!({"choices":[{"delta":{},"finish_reason":stop}]});
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n").unwrap();
         }

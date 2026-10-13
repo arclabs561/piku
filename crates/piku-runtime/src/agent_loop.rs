@@ -307,7 +307,11 @@ async fn run_turn_inner(
         // Deliver completions queued while the parent was idle before building
         // its next provider request. The channel is also drained after tools.
         if let Some(rx) = interjections.as_deref_mut() {
-            while let Ok(msg) = rx.try_recv() {
+            loop {
+                if let Some(registry) = task_registry {
+                    registry.retry_notifications();
+                }
+                let Ok(msg) = rx.try_recv() else { break };
                 sink.on_interjection(&msg);
                 session.push(ConversationMessage::user(&format!(
                     "<interjection>\n{msg}\n</interjection>"
@@ -1027,7 +1031,11 @@ async fn run_turn_inner(
         // tool-use alternation protocol.
         if let Some(rx) = interjections.as_deref_mut() {
             let mut injected = false;
-            while let Ok(msg) = rx.try_recv() {
+            loop {
+                if let Some(registry) = task_registry {
+                    registry.retry_notifications();
+                }
+                let Ok(msg) = rx.try_recv() else { break };
                 sink.on_interjection(&msg);
                 session.push(ConversationMessage::user(&format!(
                     "<interjection>\n{msg}\n</interjection>"
