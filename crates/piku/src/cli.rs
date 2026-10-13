@@ -114,6 +114,11 @@ pub enum Commands {
     Web {
         #[arg(long, default_value = "8080", help = "Port to listen on")]
         port: u16,
+        #[arg(
+            long,
+            help = "Allow the authenticated browser to open a host terminal for this launch"
+        )]
+        terminal: bool,
     },
 }
 
@@ -235,13 +240,34 @@ mod tests {
     #[test]
     fn web_subcommand() {
         let cli = Cli::try_parse_from(["piku", "web"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 8080 })));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web {
+                port: 8080,
+                terminal: false
+            })
+        ));
     }
 
     #[test]
     fn web_subcommand_with_port() {
         let cli = Cli::try_parse_from(["piku", "web", "--port", "3000"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Web { port: 3000 })));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web {
+                port: 3000,
+                terminal: false
+            })
+        ));
+    }
+
+    #[test]
+    fn web_terminal_requires_explicit_launch_flag() {
+        let cli = Cli::try_parse_from(["piku", "web", "--terminal"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web { terminal: true, .. })
+        ));
     }
 
     #[test]

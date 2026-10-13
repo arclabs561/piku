@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -36,23 +36,48 @@ pub(super) async fn terminal_pty_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let Ok(permit) = Arc::clone(&state.terminal_slots).try_acquire_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "terminal session limit reached",
-        )
-            .into_response();
+    if !state.terminal_enabled {
+        return (StatusCode::FORBIDDEN, "terminal unavailable").into_response();
+    }
+    let Ok(preauth) = Arc::clone(&state.preauth_slots).try_acquire_owned() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "connection limit reached").into_response();
     };
-    let root = state.workspace_root.as_ref().clone();
-    let terminal_id = crate::new_session_id();
-    tracing::info!(
-        terminal_id,
-        kind = "human_terminal",
-        shell = %configured_shell().display(),
-        "terminal opened"
-    );
-    ws.on_upgrade(move |socket| run_terminal(socket, root, permit, terminal_id))
-        .into_response()
+    ws.max_message_size(MAX_INPUT_BYTES).max_frame_size(MAX_INPUT_BYTES)
+        .on_upgrade(move |mut socket| async move {
+            // No PTY, private output, terminal slot, or user input processing is
+            // possible before this one bounded authentication message succeeds.
+            let authenticated = match tokio::time::timeout(Duration::from_secs(2), socket.recv()).await {
+                Ok(Some(Ok(Message::Text(text)))) if text.len() <= 256 => {
+                    serde_json::from_str::<Authentication>(&text)
+                        .is_ok_and(|auth| auth.kind == "authenticate" && state.launch_auth.matches(&auth.token))
+                }
+                _ => false,
+            };
+            if !authenticated {
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            let Ok(permit) = Arc::clone(&state.terminal_slots).try_acquire_owned() else {
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            };
+            drop(preauth);
+            if socket.send(Message::text(r#"{"type":"authenticated"}"#)).await.is_err() {
+                return;
+            }
+            let root = state.workspace_root.as_ref().clone();
+            let terminal_id = crate::new_session_id();
+            tracing::info!(terminal_id, kind = "human_terminal", shell = %configured_shell().display(), "terminal opened");
+            run_terminal(socket, root, permit, terminal_id).await;
+        }).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Authentication {
+    #[serde(rename = "type")]
+    kind: String,
+    token: String,
 }
 
 async fn run_terminal(

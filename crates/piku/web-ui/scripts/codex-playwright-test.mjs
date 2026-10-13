@@ -1,3 +1,4 @@
+import { readLaunchToken } from "./launch-auth.mjs";
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { access, mkdir, readFile } from "node:fs/promises";
@@ -79,7 +80,10 @@ try {
   process.exit(2);
 }
 
-const removed = await cleanupStaleAutomationSurfaces(parsed);
+const token = await readLaunchToken(process.env.PIKU_WEB_LAUNCH_FILE);
+const authHeaders = { Authorization: "Bearer " + token };
+const removed = process.env.PIKU_EVAL_SERVER_OWNERSHIP === "managed"
+  ? await cleanupStaleAutomationSurfaces(parsed, { headers: authHeaders }) : [];
 if (removed.length)
   console.error(`[piku qa] removed ${removed.length} stale automation surfaces`);
 
@@ -159,7 +163,7 @@ const stopChild = (signal) => {
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.once(signal, async () => {
     stopChild(signal);
-    try { await deleteSurface(parsed, surfaceName); } catch { /* Exit still owns process cleanup. */ }
+    try { await deleteSurface(parsed, surfaceName, authHeaders); } catch { /* Exit still owns process cleanup. */ }
     process.exit(128 + (signal === "SIGINT" ? 2 : signal === "SIGTERM" ? 15 : 1));
   });
 }
@@ -180,7 +184,7 @@ child.on("exit", async (code, signal) => {
   clearTimeout(timeout);
   clearTimeout(killTimer);
   await new Promise((resolve) => events.end(resolve));
-  try { await deleteSurface(parsed, surfaceName); }
+  try { await deleteSurface(parsed, surfaceName, authHeaders); }
   catch (error) { console.error(`[piku qa] ${error.message}`); }
   if (timedOut) {
     await appendEvaluationRecord(
@@ -322,7 +326,7 @@ child.on("exit", async (code, signal) => {
           throw new Error(`event stream does not prove screenshot capture: ${requiredScreenshots[index]}`);
       }),
     );
-    const surfacesResponse = await fetch(new URL("/api/surfaces", parsed));
+    const surfacesResponse = await fetch(new URL("/api/surfaces", parsed), { headers: authHeaders });
     if (!surfacesResponse.ok)
       throw new Error(`could not verify cleanup: HTTP ${surfacesResponse.status}`);
     const surfaces = await surfacesResponse.json();

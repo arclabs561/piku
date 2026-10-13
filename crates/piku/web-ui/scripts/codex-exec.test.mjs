@@ -14,7 +14,7 @@ test("judge Codex runs naked with an explicit model and task prompt", () => {
   assert.ok(args.includes("--ephemeral"));
   assert.ok(args.includes("--ignore-user-config"));
   assert.ok(args.includes("--ignore-rules"));
-  assert.equal(args[args.indexOf("--model") + 1], "gpt-5.6-sol");
+  assert.equal(args[args.indexOf("--model") + 1], "gpt-6.1-sol");
   assert.ok(args.includes('approval_policy="never"'));
   assert.ok(args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'));
   const mcpArgs = args.find((arg) => arg.startsWith("mcp_servers.playwright.args="));

@@ -13,10 +13,10 @@
       "properties": {
         "width": { "type": "integer", "minimum": 320 },
         "height": { "type": "integer", "minimum": 480 },
-        "device_scale_factor": { "type": "number", "exclusiveMinimum": 0 },
+        "device_scale_factor": { "type": ["number", "null"], "exclusiveMinimum": 0 },
         "color_scheme": { "type": "string", "enum": ["light", "dark", "no-preference"] },
-        "canvas_scroll_x": { "type": "number", "minimum": 0 },
-        "canvas_scroll_y": { "type": "number", "minimum": 0 }
+        "canvas_scroll_x": { "type": ["number", "null"], "minimum": 0 },
+        "canvas_scroll_y": { "type": ["number", "null"], "minimum": 0 }
       },
       "required": ["width", "height", "device_scale_factor", "color_scheme", "canvas_scroll_x", "canvas_scroll_y"]
     },

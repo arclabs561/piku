@@ -7,6 +7,8 @@
  * Codex, so recording cannot consume an evaluator action or become prompt
  * dependent.
  */
+import { readLaunchToken } from "./launch-auth.mjs";
+import { PLAYWRIGHT_TOOLS } from "./playwright-authority.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
@@ -22,6 +24,7 @@ export const RECORDER_TOOLS = new Set([
   "browser_video_show_actions",
   "browser_video_hide_actions",
 ]);
+const EVALUATOR_TOOLS = new Set(PLAYWRIGHT_TOOLS);
 const CAPTURED_ACTIONS = new Set([
   "browser_click", "browser_drag", "browser_fill_form", "browser_navigate",
   "browser_navigate_back", "browser_press_key", "browser_resize", "browser_select_option",
@@ -44,7 +47,21 @@ export function parseProxyArguments(argv) {
 }
 
 export function recorderToolList(tools) {
-  return tools.filter((tool) => !RECORDER_TOOLS.has(tool?.name));
+  return tools.filter((tool) => EVALUATOR_TOOLS.has(tool?.name));
+}
+
+export function isAdmittedNavigation(message, origin) {
+  const params = message.params;
+  const navigates = params?.name === "browser_navigate"
+    || (params?.name === "browser_tabs" && params.arguments?.action === "new" && params.arguments?.url);
+  if (!navigates) return true;
+  try {
+    const target = new URL(message.params.arguments?.url);
+    const expected = new URL(origin);
+    return target.protocol === "http:" && target.origin === expected.origin
+      && ["localhost", "127.0.0.1"].includes(target.hostname)
+      && Boolean(target.port) && !target.username && !target.password;
+  } catch { return false; }
 }
 
 export function isBrowserClose(message) {
@@ -141,8 +158,9 @@ function writeJsonLine(stream, value) {
 
 /** A minimal recorder state machine; protocol transport is deliberately thin. */
 export class BrowserRecorder {
-  constructor({ recordingDir, trace, sendInternal, renderFrames = renderFrameVideo, timeoutMs = 5_000, now = () => performance.now() }) {
+  constructor({ recordingDir, trace, sendInternal, renderFrames = renderFrameVideo, timeoutMs = 5_000, now = () => performance.now(), redact = (value) => value }) {
     this.recordingDir = recordingDir;
+    this.redact = redact;
     this.trace = trace;
     this.sendInternal = sendInternal;
     this.renderFrames = renderFrames;
@@ -156,7 +174,7 @@ export class BrowserRecorder {
   }
 
   event(kind, fields = {}) {
-    writeJsonLine(this.trace, { schema_version: 1, sequence: ++this.sequence, t_ms: Math.round(this.now() - this.startedAt), kind, ...fields });
+    this.trace.write(this.redact(JSON.stringify({ schema_version: 1, sequence: ++this.sequence, t_ms: Math.round(this.now() - this.startedAt), kind, ...fields })) + "\n");
   }
 
   async start() {
@@ -200,9 +218,14 @@ export class BrowserRecorder {
 
 export async function runProxy({ argv = process.argv.slice(2), stdin = process.stdin, stdout = process.stdout, stderr = process.stderr } = {}) {
   const { recordingDir, command, commandArgs } = parseProxyArguments(argv);
+  const token = process.env.PIKU_WEB_LAUNCH_FILE
+    ? await readLaunchToken(process.env.PIKU_WEB_LAUNCH_FILE) : null;
+  const redact = (value) => token ? String(value).replaceAll(token, "[redacted launch credential]") : String(value);
+  const emit = (message) => stdout.write(redact(JSON.stringify(message)) + "\n");
   await mkdir(recordingDir, { recursive: true });
   const trace = createWriteStream(path.join(recordingDir, "recorder.jsonl"), { flags: "wx", mode: 0o600 });
-  const child = spawn(command, commandArgs, { stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn(command, commandArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  createInterface({ input: child.stderr }).on("line", (line) => stderr.write(redact(line) + "\n"));
   const internal = new Map();
   let counter = 0;
   let closed = false;
@@ -210,6 +233,7 @@ export async function runProxy({ argv = process.argv.slice(2), stdin = process.s
   const recorder = new BrowserRecorder({
     recordingDir,
     trace,
+    redact,
     sendInternal: (name, arguments_, timeoutMs) => new Promise((resolve, reject) => {
       const id = `${RECORDER_PREFIX}${++counter}`;
       const timer = setTimeout(() => {
@@ -234,7 +258,7 @@ export async function runProxy({ argv = process.argv.slice(2), stdin = process.s
   serverReader.on("line", (line) => {
     let message;
     try { message = JSON.parse(line); }
-    catch { stdout.write(`${line}\n`); return; }
+    catch { stdout.write(redact(line) + "\n"); return; }
     if (typeof message.id === "string" && internal.has(message.id)) {
       const pending = internal.get(message.id);
       internal.delete(message.id);
@@ -249,14 +273,14 @@ export async function runProxy({ argv = process.argv.slice(2), stdin = process.s
     normalCalls.delete(message.id);
     if (tool && isCapturedAction(tool) && !message.error) {
       captureTail = captureTail.then(() => recorder.capture(tool));
-      void captureTail.finally(() => stdout.write(`${JSON.stringify(message)}\n`));
+      void captureTail.finally(() => emit(message));
       return;
     }
     if (tool === "browser_close") {
-      void finalize("browser_close").finally(() => stdout.write(`${JSON.stringify(message)}\n`));
+      void finalize("browser_close").finally(() => emit(message));
       return;
     }
-    stdout.write(`${JSON.stringify(message)}\n`);
+    emit(message);
   });
 
   let serial = Promise.resolve();
@@ -269,6 +293,13 @@ export async function runProxy({ argv = process.argv.slice(2), stdin = process.s
       catch { child.stdin.write(`${line}\n`); return; }
       if (isToolListRequest(message)) toolListIds.add(message.id);
       if (message.method === "tools/call") {
+        if (!EVALUATOR_TOOLS.has(message.params?.name) || !isAdmittedNavigation(message, process.env.PIKU_WEB_URL)) {
+          if (message.id !== undefined) emit({
+            jsonrpc: "2.0", id: message.id,
+            error: { code: -32601, message: "Tool is unavailable in this evaluator" },
+          });
+          return;
+        }
         await recorder.start();
         recorder.event("tool_started", { tool: message.params?.name || "unknown" });
         if (message.id !== undefined) normalCalls.set(message.id, message.params?.name || "unknown");
@@ -288,7 +319,7 @@ export async function runProxy({ argv = process.argv.slice(2), stdin = process.s
   child.once("error", async (error) => {
     recorder.event("recording_incomplete", { reason: "server_spawn_error", error: error.message });
     await finalize("server_spawn_error");
-    stderr.write(`[piku recorder] could not start underlying MCP: ${error.message}\n`);
+    stderr.write(`[piku recorder] could not start underlying MCP: ${redact(error.message)}\n`);
     process.exitCode = 1;
   });
 }

@@ -3,9 +3,9 @@ import { fileURLToPath } from "node:url";
 
 export const PLAYWRIGHT_TOOLS = Object.freeze([
   "browser_click", "browser_close", "browser_console_messages", "browser_drag",
-  "browser_evaluate", "browser_fill_form", "browser_find", "browser_handle_dialog",
-  "browser_hover", "browser_navigate", "browser_navigate_back", "browser_network_request",
-  "browser_network_requests", "browser_press_key", "browser_resize", "browser_select_option",
+  "browser_fill_form", "browser_find", "browser_handle_dialog",
+  "browser_hover", "browser_navigate", "browser_navigate_back",
+  "browser_press_key", "browser_resize", "browser_select_option",
   "browser_snapshot", "browser_take_screenshot", "browser_type", "browser_wait_for", "browser_tabs",
 ]);
 
@@ -33,7 +33,8 @@ export function withPlaywrightAuthority(args, outputDir) {
     result[settingIndex].slice(result[settingIndex].indexOf("=") + 1),
   );
   const root = path.resolve(outputDir);
-  underlying.push("--caps=devtools", "--output-dir", root);
+  const admission = fileURLToPath(new URL("./playwright-admission.mjs", import.meta.url));
+  underlying.push("--output-dir", root, "--codegen", "none", "--init-page", admission);
   const proxy = fileURLToPath(new URL("./browser-recorder-proxy.mjs", import.meta.url));
   result[commandIndex] = `mcp_servers.playwright.command=${JSON.stringify(process.execPath)}`;
   result[settingIndex] = `mcp_servers.playwright.args=${JSON.stringify([

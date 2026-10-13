@@ -368,11 +368,17 @@ test("live evaluation metadata records exact subject and evaluator versions", ()
   assert.equal(runtime.subject_revision, "a".repeat(40));
   assert.equal(runtime.subject_dirty, false);
   assert.equal(runtime.evaluator_version, "codex-cli 0.146.0");
-  assert.equal(runtime.explorer_model, "gpt-5.6-sol");
+  assert.equal(runtime.explorer_model, "gpt-6.1-sol");
   assert.equal(runtime.evaluation_contract, "piku-evaluation-v2");
   assert.deepEqual(commands, [
     { command: "git", args: ["rev-parse", "HEAD"], cwd: repoRoot },
     { command: "git", args: ["status", "--porcelain=v1"], cwd: repoRoot },
     { command: "codex", args: ["--version"], cwd: repoRoot },
   ]);
+});
+
+test("QA signal and child-exit cleanup both carry launch admission", async () => {
+  const runner = await readFile(path.join(scriptsDir, "codex-playwright-test.mjs"), "utf8");
+  const calls = [...runner.matchAll(/deleteSurface\(([^)]*)\)/g)].map((match) => match[1]);
+  assert.deepEqual(calls, ["parsed, surfaceName, authHeaders", "parsed, surfaceName, authHeaders"]);
 });

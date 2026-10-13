@@ -35,3 +35,18 @@ test("preflight cleanup deletes only expired timestamped automation surfaces", a
   assert.deepEqual(stale, ["e2e-1786200000000-0-0"]);
   assert.deepEqual(deleted, stale);
 });
+
+test("surface cleanup carries admission headers to its protected DELETE", async (t) => {
+  const { deleteSurface } = await import("./automation-surfaces.mjs");
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const headers = { Authorization: "Bearer synthetic-cleanup-admission" };
+  let deleted = false;
+  globalThis.fetch = async (_url, options) => {
+    deleted = options.method === "DELETE" && options.headers.Authorization === headers.Authorization;
+    return new Response(null, { status: deleted ? 204 : 401 });
+  };
+  await deleteSurface("http://localhost:9090", "e2e-cleanup", headers);
+  assert.equal(deleted, true);
+  await assert.rejects(deleteSurface("http://localhost:9090", "e2e-cleanup"), /HTTP 401/);
+});

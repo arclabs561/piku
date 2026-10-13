@@ -1,4 +1,4 @@
-import { expect, test as base } from "@playwright/test";
+import { expect, test as base, admitBrowserContext } from "./auth-fixture.js";
 
 const test = base.extend({
   surfaceName: async ({ page, request }, use, testInfo) => {
@@ -28,6 +28,7 @@ const test = base.extend({
     );
     await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
     await expect(page.locator("#canvas")).toBeVisible();
+    await expect(page.locator(".surface-btn.active")).toHaveText(surfaceName);
 
     try {
       await use(surfaceName);

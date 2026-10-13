@@ -85,13 +85,13 @@ async fn main() -> anyhow::Result<()> {
             conclude_run(&config, session_id, status, note)?;
             return Ok(());
         }
-        Some(Commands::Web { port }) => {
+        Some(Commands::Web { port, terminal }) => {
             let config = PikuConfig::load(
                 cli.provider.as_deref(),
                 cli.model.as_deref(),
                 cwd.as_deref(),
             );
-            piku::web::serve(&config, *port).await?;
+            piku::web::serve(&config, *port, *terminal).await?;
             return Ok(());
         }
         None => {}

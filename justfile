@@ -19,14 +19,15 @@ web-bundle:
 web-harness:
     ./scripts/ci.sh web-harness
 
-# Test the web workspace against an already-running local Piku server.
-web-e2e url="http://127.0.0.1:9090":
-    cd crates/piku/web-ui && PIKU_WEB_URL={{url}} npm run test:e2e
+# Build and test a managed, isolated workspace; an explicit URL also needs
+# PIKU_WEB_LAUNCH_FILE for that operator-selected server.
+web-e2e url="":
+    cd crates/piku/web-ui && PIKU_WEB_URL={{quote(url)}} npm run test:e2e:managed
 
 # Build Piku, launch an isolated held-out repository, and drive one real
 # reviewed Codex write through the browser. Requires a current write attestation.
 web-write-live:
-    RUSTC_WRAPPER= cargo build -p piku
+    cargo build -p piku
     cd crates/piku/web-ui && npm run test:e2e:write-live
 
 # Run a full Codex + Playwright user journey against the rendered workspace.

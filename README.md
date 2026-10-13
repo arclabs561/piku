@@ -79,6 +79,14 @@ Sessions are stored under `$XDG_CONFIG_HOME/piku/sessions/`, or
 piku web --port 9090
 ```
 
+Open the private launch HTML file whose path Piku prints. It admits the browser
+for that server launch; the ordinary server URL contains no credential. The
+admitted tab can reload, while a restarted server requires fresh admission.
+Keep the launch file private.
+
+Terminal access is disabled by default. To allow the admitted browser to open a
+host terminal for this launch, use `piku web --port 9090 --terminal`.
+
 The local browser workspace is under active development. Its canvas can hold
 chat, source-change, file, note, page-preview, and terminal cards. Chat cards
 keep their own editable turn history and optional context. Page previews render
@@ -89,7 +97,9 @@ Markdown, KaTeX, and Mermaid.
 Piku is not a sandbox. Writable launch turns may run advertised file and shell
 tools without confirmation. `--read-only` narrows the tool catalog, but it does
 not confine filesystem reads or provider disclosure. The browser terminal is an
-unrestricted host shell and requires an explicit start action.
+unrestricted host shell and requires both `web --terminal` at launch and an
+explicit start action in the admitted browser. Browser admission is an
+application access check, not OS confinement.
 
 Developer self-update is disabled unless `--self-update-root` names an approved
 absolute Cargo target directory. See [self-update behavior](docs/self-update.md)

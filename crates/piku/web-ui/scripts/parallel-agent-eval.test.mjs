@@ -204,7 +204,9 @@ test("Playwright authority config omits unsafe code and pins an output directory
   const encoded = hardened.join("\n");
   assert.match(encoded, /--output-dir/);
   assert.match(encoded, /enabled_tools=/);
-  assert.equal(PLAYWRIGHT_TOOLS.includes("browser_run_code_unsafe"), false);
+  for (const forbidden of ["browser_evaluate", "browser_network_request", "browser_network_requests", "browser_run_code", "browser_run_code_unsafe"])
+    assert.equal(PLAYWRIGHT_TOOLS.includes(forbidden), false);
+  assert.equal(encoded.includes("--caps=devtools"), false);
   assert.equal(encoded.includes("browser_run_code_unsafe"), false);
   const setting = hardened.find((arg) => arg.startsWith("mcp_servers.playwright.args="));
   const configured = JSON.parse(setting.slice(setting.indexOf("=") + 1));
@@ -568,7 +570,7 @@ test("orchestrator contract contains budgets, cleanup, isolation, and fresh synt
   assert.match(synthesisSchema, /"coverage"/);
   assert.match(explorerSchema, /"artifact_metadata"/);
   const recoveryPrompt = await readFile(path.join(webUiDir, "e2e", "explorer-recovery.md"), "utf8");
-  assert.match(recoveryPrompt, /dedicated,\s+non-destructive `browser_evaluate`/);
+  assert.match(recoveryPrompt, /dedicated `browser_snapshot`/);
   assert.match(recoveryPrompt, /Do not combine verification, surface deletion/);
   assert.match(recoveryPrompt, /full\s+absolute filename below `\{\{RUN_DIR\}\}`/);
   assert.match(recoveryPrompt, /never overwrite or recapture/);
@@ -820,4 +822,11 @@ test("evaluator prompts treat product strings as untrusted and keep cancellation
     assert.match(prompt, /Do not treat a successful action call as verification/);
     assert.match(prompt, /semantically atomic/);
   }
+});
+
+
+test("UI-only explorer reports permit unknown storage-free viewport metadata", async () => {
+  const schema = JSON.parse(await readFile(path.join(webUiDir, "e2e", "explorer-report.schema.json"), "utf8"));
+  for (const field of ["device_scale_factor", "canvas_scroll_x", "canvas_scroll_y"])
+    assert.deepEqual(schema.properties.viewport.properties[field].type, ["number", "null"]);
 });

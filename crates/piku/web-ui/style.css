@@ -1667,3 +1667,8 @@ pre,
     scroll-behavior: auto !important;
   }
 }
+
+#launch-unlock { position: fixed; inset: 35% 15% auto; padding: 2rem; border: 1px solid currentColor; border-radius: 12px; background: Canvas; color: CanvasText; z-index: 10000; text-align: center; }
+
+.run-record-dialog { width: 90vw; height: 90dvh; padding: 1rem; background: Canvas; color: CanvasText; }
+.run-record-dialog iframe { display: block; width: 100%; height: calc(100% - 3rem); border: 0; margin-top: 1rem; }

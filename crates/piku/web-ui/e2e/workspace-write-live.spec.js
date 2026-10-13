@@ -1,7 +1,7 @@
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { expect, test } from "@playwright/test";
+import { expect, test, admitBrowserContext } from "./auth-fixture.js";
 
 test.describe.configure({ timeout: 240_000 });
 

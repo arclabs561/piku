@@ -1,3 +1,4 @@
+import { readLaunchToken } from "./launch-auth.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
@@ -890,7 +891,8 @@ export async function runCodex({ label = "judge", prompt, schemaPath, reportPath
 }
 
 export async function cleanupSurface(baseUrl, surface) {
-  await deleteSurface(baseUrl, surface);
+  const token = await readLaunchToken(process.env.PIKU_WEB_LAUNCH_FILE);
+  await deleteSurface(baseUrl, surface, { Authorization: "Bearer " + token });
 }
 
 export async function writeRunManifest(runDir, runId, explorers, synthesis = null, metadata = null, promptManifest = null) {
@@ -1038,7 +1040,9 @@ export async function runEvaluation({
     throw new Error("PIKU_WEB_URL must be a loopback HTTP origin with an explicit port");
   const response = await fetchImpl(baseUrl, { signal: AbortSignal.timeout(3_000) });
   if (!response.ok) throw new Error(`Piku returned HTTP ${response.status}`);
-  const removed = await cleanupStaleAutomationSurfaces(baseUrl);
+  const token = await readLaunchToken(environment.PIKU_WEB_LAUNCH_FILE);
+  const removed = environment.PIKU_EVAL_SERVER_OWNERSHIP === "managed"
+    ? await cleanupStaleAutomationSurfaces(baseUrl, { headers: { Authorization: "Bearer " + token } }) : [];
   if (removed.length)
     console.error(`[piku eval] removed ${removed.length} stale automation surfaces`);
   const runId = safeRunId(environment.PIKU_EVAL_RUN_ID);
