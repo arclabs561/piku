@@ -1,3 +1,4 @@
+import { readLaunchToken } from "./launch-auth.mjs";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:net";
@@ -56,11 +57,13 @@ const harnessSha256 = createHash("sha256")
 const playwrightVersion = JSON.parse(await readFile(path.join(uiRoot, "node_modules", "@playwright", "test", "package.json"), "utf8")).version;
 
 const port = await freePort();
-const url = `http://127.0.0.1:${port}`;
+let url = `http://localhost:${port}`;
+const readyFile = path.join(temporary, "ready.json");
+let launchFile;
 const serverLog = [];
 const server = spawn(binary, ["web", "--port", String(port)], {
   cwd: fixtureRoot,
-  env: { ...process.env, XDG_CONFIG_HOME: configRoot },
+  env: { ...process.env, XDG_CONFIG_HOME: configRoot, PIKU_WEB_READY_FILE: readyFile },
   stdio: ["ignore", "pipe", "pipe"],
   detached: true,
 });
@@ -74,7 +77,11 @@ async function waitForServer() {
   while (Date.now() < deadline) {
     if (server.exitCode !== null) throw new Error(`Piku server exited ${server.exitCode}`);
     try {
-      const response = await fetch(`${url}/api/executors`);
+      const ready = JSON.parse(await readFile(readyFile, "utf8"));
+      url = ready.url;
+      launchFile = ready.launch_file;
+      const token = await readLaunchToken(launchFile);
+      const response = await fetch(`${url}/api/executors`, { headers: { Authorization: "Bearer " + token } });
       if (response.ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -96,6 +103,7 @@ try {
     env: {
       ...process.env,
       PIKU_WEB_URL: url,
+      PIKU_WEB_LAUNCH_FILE: launchFile,
       PIKU_LIVE_WRITE: "1",
       PIKU_WRITE_FIXTURE_ROOT: fixtureRoot,
       PIKU_WRITE_ARTIFACT_DIR: artifactDir,

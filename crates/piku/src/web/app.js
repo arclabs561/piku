@@ -196016,6 +196016,88 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
   var mermaid_default = mermaid;
 
   // app.js
+  var launchStorageKey = "piku.launchToken";
+  var launchFragment = new URLSearchParams(location.hash.slice(1));
+  var launchToken = launchFragment.get("token") || "";
+  var admissionGeneration = 0;
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  try {
+    if (launchToken) sessionStorage.setItem(launchStorageKey, launchToken);
+    else launchToken = sessionStorage.getItem(launchStorageKey) || "";
+  } catch {
+  }
+  if (!/^[a-f0-9]{64}$/.test(launchToken)) launchToken = "";
+  function lockWorkspace() {
+    admissionGeneration += 1;
+    launchToken = "";
+    try {
+      sessionStorage.removeItem(launchStorageKey);
+    } catch {
+    }
+    clearTimeout(saveTimer);
+    active = "";
+    currentPageHtml = "";
+    selectedPageId = null;
+    document.querySelectorAll(".run-record-dialog").forEach((dialog) => {
+      dialog.close();
+      dialog.remove();
+    });
+    overlay.querySelectorAll(".workspace-object").forEach((object3) => object3.disposeCapability?.());
+    overlay.replaceChildren();
+    messages.replaceChildren();
+    surfacesEl.replaceChildren();
+    let notice = document.getElementById("launch-unlock");
+    if (!notice) {
+      notice = document.createElement("div");
+      notice.id = "launch-unlock";
+      notice.setAttribute("role", "status");
+      notice.textContent = "Open this launch\u2019s private browser link to unlock the workspace. If Piku restarted, use the new link.";
+      document.body.append(notice);
+    }
+    document.querySelectorAll("button, input, textarea, select").forEach((control) => {
+      control.disabled = true;
+    });
+    canvas.inert = true;
+  }
+  async function authenticatedFetch(path4, options2 = {}) {
+    const target = new URL(path4, location.origin);
+    if (target.origin !== location.origin || target.username || target.password || !/^\/(?:api\/|run\/)/.test(target.pathname))
+      throw new Error("Workspace requests must stay on this origin");
+    if (!launchToken) {
+      lockWorkspace();
+      return new Response(null, { status: 401 });
+    }
+    const admittedToken = launchToken;
+    const generation = admissionGeneration;
+    const headers = new Headers(options2.headers);
+    headers.set("Authorization", "Bearer " + admittedToken);
+    const response = await fetch(target, { ...options2, headers, credentials: "omit", redirect: "error" });
+    if (generation !== admissionGeneration || admittedToken !== launchToken) {
+      await response.body?.cancel();
+      return new Response(null, { status: 401 });
+    }
+    if (response.status === 401) lockWorkspace();
+    if ([204, 205, 304].includes(response.status) || !response.ok || !response.body) return response;
+    const reader = response.body.getReader();
+    const body = new ReadableStream({
+      async pull(controller) {
+        try {
+          const chunk = await reader.read();
+          if (generation !== admissionGeneration || admittedToken !== launchToken) {
+            await reader.cancel();
+            controller.error(new Error("Workspace admission expired"));
+          } else if (chunk.done) controller.close();
+          else controller.enqueue(chunk.value);
+        } catch (error3) {
+          controller.error(error3);
+        }
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      }
+    });
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  }
   var markdownParser = new Z(
     markedKatex({
       nonStandard: true,
@@ -196074,7 +196156,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
   var executorCatalogLoaded = false;
   async function refreshExecutorCatalog() {
     try {
-      const response = await fetch("/api/executors");
+      const response = await authenticatedFetch("/api/executors");
       if (response.ok) executorCatalog = await response.json();
     } catch {
     }
@@ -196082,8 +196164,8 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     overlay.querySelectorAll('[data-kind="chat"]').forEach((card2) => renderChatExecutor(card2, card2.chatNotebookState));
     updatePageTargetLabels();
   }
-  var executorCatalogReady = refreshExecutorCatalog();
-  var terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled !== false;
+  var executorCatalogReady = Promise.resolve().then(refreshExecutorCatalog);
+  var terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled === true;
   if (!terminalEnabled) terminalBtn.hidden = true;
   function viewportKey(surface) {
     return `piku:viewport:${surface}:${narrowWorkspace() ? "narrow" : "desktop"}`;
@@ -196103,7 +196185,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     }
   }
   async function loadSurface(name) {
-    const res = await fetch("/api/surfaces/" + encodeURIComponent(name));
+    const res = await authenticatedFetch("/api/surfaces/" + encodeURIComponent(name));
     if (!res.ok) return;
     const data6 = await res.json();
     if (active === name)
@@ -196116,10 +196198,12 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
       )?.replaceChildren("finish the running thread before switching surfaces");
       return;
     }
+    const activation = await authenticatedFetch("/api/surfaces/" + encodeURIComponent(name) + "/activate", { method: "POST" });
+    if (!activation.ok) return;
     saveViewport(active);
     active = name;
     history.replaceState(null, "", "/?surface=" + encodeURIComponent(name));
-    const res = await fetch("/api/surfaces/" + encodeURIComponent(name));
+    const res = await authenticatedFetch("/api/surfaces/" + encodeURIComponent(name));
     if (!res.ok) return;
     const data6 = await res.json();
     if (active !== name) return;
@@ -196131,6 +196215,23 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; media-src data: blob:; frame-src 'none'; form-action 'none'; base-uri 'none';">`, parsed = new DOMParser().parseFromString(html2, "text/html");
     parsed.head.insertAdjacentHTML("afterbegin", policy);
     return "<!doctype html>" + parsed.documentElement.outerHTML;
+  }
+  async function showRunRecord(url) {
+    const response = await authenticatedFetch(url);
+    if (!response.ok) return;
+    const dialog = document.createElement("dialog");
+    dialog.className = "run-record-dialog";
+    const close2 = document.createElement("button");
+    close2.textContent = "close record";
+    close2.addEventListener("click", () => dialog.close());
+    const frame2 = document.createElement("iframe");
+    frame2.title = "Full session record";
+    frame2.sandbox = "allow-scripts";
+    frame2.srcdoc = sandboxHtml(await response.text());
+    dialog.append(close2, frame2);
+    dialog.addEventListener("close", () => dialog.remove());
+    document.body.append(dialog);
+    dialog.showModal();
   }
   function renderPage(html2, targetId = null) {
     currentPageHtml = html2 || "";
@@ -196179,7 +196280,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     setSaveStatus("saved");
   }
   async function refreshList() {
-    const res = await fetch("/api/surfaces");
+    const res = await authenticatedFetch("/api/surfaces");
     if (!res.ok) return;
     const list = await res.json();
     surfacesEl.replaceChildren();
@@ -196277,7 +196378,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
   newBtn.addEventListener("click", async () => {
     const name = prompt("surface name:");
     if (!name || !name.trim()) return;
-    const res = await fetch("/api/surfaces", {
+    const res = await authenticatedFetch("/api/surfaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim() })
@@ -196290,7 +196391,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
   });
   delBtn.addEventListener("click", async () => {
     if (!confirm('delete "' + active + '"?')) return;
-    const res = await fetch("/api/surfaces/" + encodeURIComponent(active), {
+    const res = await authenticatedFetch("/api/surfaces/" + encodeURIComponent(active), {
       method: "DELETE"
     });
     if (!res.ok) {
@@ -196362,7 +196463,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
         thread_id: options2.threadId || null,
         authority: "read_only"
       };
-      const res = await fetch("/api/chat", {
+      const res = await authenticatedFetch("/api/chat", {
         method: "POST",
         signal: options2.signal,
         headers: { "Content-Type": "application/json" },
@@ -196421,7 +196522,12 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
               if (turnId) activity.dataset.turnId = turnId;
               const link2 = activity.querySelector(".activity-run-link");
               if (link2 && runUrl) {
-                link2.href = runUrl;
+                link2.href = "#";
+                link2.removeAttribute("target");
+                link2.onclick = (event4) => {
+                  event4.preventDefault();
+                  showRunRecord(runUrl).catch(() => setSaveStatus("record unavailable", true));
+                };
                 link2.hidden = false;
               }
               setActivityIdentity(activity, "", "recording");
@@ -197218,7 +197324,7 @@ ${checks.join("\n")}`;
           renderFile();
         }
         try {
-          const res = await fetch("/api/terminal/read", {
+          const res = await authenticatedFetch("/api/terminal/read", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ operation: "read", path: path4 })
@@ -197720,7 +197826,7 @@ ${checks.join("\n")}`;
     await persistChatNotebook(object3, state4, true);
     renderChatTurns(object3, state4);
     try {
-      const response = await fetch("/api/chat/write-lease", {
+      const response = await authenticatedFetch("/api/chat/write-lease", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request)
@@ -197892,15 +197998,32 @@ ${checks.join("\n")}`;
       const cell = document.createElement("article");
       cell.className = "chat-turn";
       cell.dataset.turnId = turn.id;
-      cell.innerHTML = '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><details class="chat-turn-evidence" hidden><summary>session evidence</summary><div class="chat-turn-evidence-body"><iframe loading="lazy"></iframe><a class="chat-turn-run" target="_blank" rel="noopener">open full record</a></div></details><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="review-write">review write turn</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-write-state" role="status" hidden></div><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
+      cell.innerHTML = '<header><span class="chat-turn-index"></span><span class="chat-turn-status"></span><details class="chat-turn-evidence" hidden><summary>session evidence</summary><div class="chat-turn-evidence-body"><iframe loading="lazy"></iframe></div></details><a class="chat-turn-run" hidden rel="noopener">open full record</a><button type="button" data-action="run">run</button><button type="button" data-action="run-from">run from here</button><button type="button" data-action="review-write">review write turn</button><button type="button" data-action="delete">delete</button></header><textarea aria-label="User turn"></textarea><div class="chat-write-state" role="status" hidden></div><div class="chat-turn-activity"></div><div class="chat-response" aria-live="polite"></div>';
       cell.querySelector(".chat-turn-index").textContent = "IN [" + (index + 1) + "]";
       const attempt = Number(turn.attempt) || 0;
       cell.querySelector(".chat-turn-status").textContent = (turn.status || "idle") + (attempt ? " \xB7 attempt " + attempt : "") + (turn.completedAt ? " \xB7 " + turn.completedAt : "");
       const evidence = cell.querySelector(".chat-turn-evidence");
-      const runLink = evidence.querySelector(".chat-turn-run");
+      const runLink = cell.querySelector(".chat-turn-run");
       if (turn.runUrl || turn.runId) {
         const url = turn.runUrl || "/run/" + encodeURIComponent(turn.runId);
-        runLink.href = url;
+        runLink.hidden = false;
+        runLink.href = "#";
+        runLink.removeAttribute("target");
+        runLink.addEventListener("click", async (event3) => {
+          event3.preventDefault();
+          await showRunRecord(url).catch(() => setSaveStatus("record unavailable", true));
+        });
+        let recordLoaded = false;
+        async function loadRecord() {
+          if (recordLoaded) return;
+          const response = await authenticatedFetch(url);
+          if (!response.ok) return;
+          const frame2 = evidence.querySelector("iframe");
+          frame2.sandbox = "allow-scripts";
+          frame2.srcdoc = sandboxHtml(await response.text());
+          frame2.title = `Saved session evidence for ${turn.runId || turn.id}`;
+          recordLoaded = true;
+        }
         runLink.title = [
           turn.requestId ? `request ${turn.requestId}` : "",
           turn.runId ? `session ${turn.runId}` : "",
@@ -197909,11 +198032,8 @@ ${checks.join("\n")}`;
         evidence.hidden = false;
         evidence.addEventListener("toggle", () => {
           if (!evidence.open) return;
-          const frame2 = evidence.querySelector("iframe");
-          if (!frame2.src) {
-            frame2.src = url;
-            frame2.title = `Saved session evidence for ${turn.runId || turn.id}`;
-          }
+          loadRecord().catch(() => {
+          });
         });
       }
       const prompt2 = cell.querySelector("textarea");
@@ -198262,8 +198382,9 @@ ${checks.join("\n")}`;
     const socket = new WebSocket(`${scheme}://${location.host}/api/terminal/pty`);
     socket.binaryType = "arraybuffer";
     const encoder = new TextEncoder();
+    let authenticated = false;
     const sendSize = () => {
-      if (socket.readyState === WebSocket.OPEN)
+      if (authenticated && socket.readyState === WebSocket.OPEN)
         socket.send(
           JSON.stringify({
             type: "resize",
@@ -198273,13 +198394,31 @@ ${checks.join("\n")}`;
         );
     };
     socket.addEventListener("open", () => {
-      status.dataset.state = "connected";
-      status.textContent = "connected \xB7 workspace root \xB7 unrestricted host shell";
-      fit2.fit();
-      sendSize();
-      terminal.focus();
+      if (!launchToken) {
+        socket.close();
+        return;
+      }
+      socket.send(JSON.stringify({ type: "authenticate", token: launchToken }));
     });
     socket.addEventListener("message", (event3) => {
+      if (!authenticated) {
+        try {
+          if (typeof event3.data !== "string" || JSON.parse(event3.data).type !== "authenticated") {
+            socket.close();
+            return;
+          }
+        } catch {
+          socket.close();
+          return;
+        }
+        authenticated = true;
+        status.dataset.state = "connected";
+        status.textContent = "connected \xB7 workspace root \xB7 unrestricted host shell";
+        fit2.fit();
+        sendSize();
+        terminal.focus();
+        return;
+      }
       if (typeof event3.data === "string") terminal.write(event3.data);
       else terminal.write(new Uint8Array(event3.data));
     });
@@ -198294,7 +198433,7 @@ ${checks.join("\n")}`;
       terminal.write("\r\n\x1B[31m[piku terminal connection failed]\x1B[0m\r\n");
     });
     const dataSubscription = terminal.onData((data6) => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data6));
+      if (authenticated && socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data6));
     });
     const resizeSubscription = terminal.onResize(sendSize);
     const observer = new ResizeObserver(() => {
@@ -198342,7 +198481,7 @@ ${checks.join("\n")}`;
       })
     );
     try {
-      const response = await fetch(
+      const response = await authenticatedFetch(
         "/api/surfaces/" + encodeURIComponent(surface) + "/workspace",
         {
           method: "PUT",
@@ -198414,12 +198553,15 @@ ${checks.join("\n")}`;
     d3.textContent = s16;
     return d3.innerHTML;
   }
-  renderingWorkspace = true;
-  restoreWorkspace(window.PIKU_BOOTSTRAP.objects || []);
-  renderPage(currentPageHtml);
-  renderingWorkspace = false;
-  refreshList();
-  requestAnimationFrame(() => restoreViewport(active));
+  async function initializeWorkspace() {
+    const response = await authenticatedFetch("/api/surfaces");
+    if (!response.ok) return;
+    const names = await response.json();
+    const selected = new URLSearchParams(location.search).get("surface");
+    const name = names.includes(selected) ? selected : names[0];
+    if (name) await switchSurface(name);
+  }
+  initializeWorkspace().catch(() => setSaveStatus("workspace unavailable", true));
 })();
 /*! Bundled license information:
 

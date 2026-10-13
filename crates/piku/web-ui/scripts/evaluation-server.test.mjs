@@ -1,3 +1,4 @@
+import { readLaunchToken } from "./launch-auth.mjs";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -51,7 +52,10 @@ test("managed evaluation server verifies fixture readiness and records teardown"
     child.stdio = [null, child.stdout, child.stderr, new PassThrough()];
     spawned = { args, child, command, options };
     setTimeout(async () => {
+      const launchFile = path.join(root, "launch.html");
+      await writeFile(launchFile, `<a href="http://localhost:43210/#token=${"a".repeat(64)}">open</a>`, { mode: 0o600 });
       await writeFile(options.env.PIKU_WEB_READY_FILE, JSON.stringify({
+        launch_file: launchFile,
         schema_version: 1,
         url: "http://localhost:43210",
         fixture_enabled: true,
@@ -248,21 +252,23 @@ test("real managed server exchanges a page proposal over inherited fd 3", {
           usage: { prompt_tokens: 10, completion_tokens: 12 },
         }), {
           status: 200,
-          headers: { "content-type": "application/json" },
+          headers: { ...authHeaders, "content-type": "application/json" },
         });
       },
     },
   });
+  const token = await readLaunchToken(server.metadata.launch_file);
+  const authHeaders = { Authorization: "Bearer " + token };
   const surface = "broker-proof";
   let response = await fetch(new URL("/api/surfaces", server.baseUrl), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({ name: surface }),
   });
   assert.equal(response.ok, true);
   response = await fetch(new URL(`/api/surfaces/${surface}/workspace`, server.baseUrl), {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({
       objects: [{
         id: "page-proof",
@@ -280,7 +286,7 @@ test("real managed server exchanges a page proposal over inherited fd 3", {
   assert.equal(response.ok, true, await response.text());
   response = await fetch(new URL("/api/chat", server.baseUrl), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({
       message: "create the broker proof marker",
       surface,
@@ -293,7 +299,7 @@ test("real managed server exchanges a page proposal over inherited fd 3", {
   });
   const events = await response.text();
   assert.match(events, /"kind":"completed"/);
-  response = await fetch(new URL(`/api/surfaces/${surface}`, server.baseUrl));
+  response = await fetch(new URL(`/api/surfaces/${surface}`, server.baseUrl), { headers: authHeaders });
   const saved = await response.json();
   assert.equal(
     saved.html,

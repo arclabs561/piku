@@ -45,6 +45,418 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// The real web process is isolated from operator settings, credentials and shell.
+struct AdmissionServer {
+    child: std::process::Child,
+    root: tempfile::TempDir,
+    url: String,
+    token: String,
+}
+
+impl Drop for AdmissionServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl AdmissionServer {
+    fn launch(terminal: bool, disable_env: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let shell = root.path().join("fixture-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\n: > fixture-started\nprintf 'PIKU_AUTH_FIXTURE_OUTPUT\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ready = root.path().join("ready.json");
+        let log = root.path().join("server.log");
+        let log_file = std::fs::File::create(log).unwrap();
+        let mut command = Command::new(piku_binary());
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_STATE_HOME", &home)
+            .env("XDG_CACHE_HOME", &home)
+            .env("SHELL", &shell)
+            .env("PIKU_NO_DOTENV", "1")
+            .env("PIKU_WEB_READY_FILE", &ready)
+            .env("PIKU_BASE_URL", "http://127.0.0.1:1/v1")
+            .current_dir(workspace)
+            .args(["--provider", "custom", "web", "--port", "0"])
+            .stdout(log_file.try_clone().unwrap())
+            .stderr(log_file);
+        if terminal {
+            command.arg("--terminal");
+        }
+        if disable_env {
+            command.env("PIKU_WEB_DISABLE_TERMINAL", "1");
+        }
+        // Install the kill/reap guard before any fallible readiness assertions.
+        let mut server = Self {
+            child: command.spawn().unwrap(),
+            root,
+            url: String::new(),
+            token: String::new(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                server.child.try_wait().unwrap().is_none(),
+                "web exited early"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "web readiness timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+        metadata["url"]
+            .as_str()
+            .unwrap()
+            .clone_into(&mut server.url);
+        let launch = std::fs::read_to_string(metadata["launch_file"].as_str().unwrap()).unwrap();
+        launch
+            .split_once("#token=")
+            .expect("private launch fragment")
+            .1
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next()
+            .unwrap()
+            .clone_into(&mut server.token);
+        assert_eq!(server.token.len(), 64, "capability length");
+        server
+    }
+
+    fn fixture_started(&self) -> bool {
+        self.root.path().join("workspace/fixture-started").exists()
+    }
+
+    fn assert_public_artifacts_redacted(&self) {
+        for path in ["ready.json", "server.log"] {
+            let text = std::fs::read_to_string(self.root.path().join(path)).unwrap();
+            assert!(
+                !text.contains(&self.token),
+                "capability leaked into public artifact"
+            );
+        }
+    }
+
+    fn websocket(&self) -> (u16, std::net::TcpStream) {
+        use std::io::{Read, Write};
+        let authority = self.url.strip_prefix("http://").unwrap();
+        let port: u16 = authority.rsplit_once(':').unwrap().1.parse().unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /api/terminal/pty HTTP/1.1\r\nHost: {authority}\r\nOrigin: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            self.url
+        ).unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            header.push(byte[0]);
+            assert!(header.len() < 8192, "bounded handshake response");
+        }
+        let header = String::from_utf8(header).unwrap();
+        let status = header.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, stream)
+    }
+}
+
+fn admission_ws_send(stream: &mut std::net::TcpStream, opcode: u8, payload: &[u8]) {
+    use std::io::Write;
+    let mut frame = vec![0x80 | opcode];
+    if payload.len() < 126 {
+        frame.push(0x80 | u8::try_from(payload.len()).unwrap());
+    } else {
+        frame.push(0x80 | 0x7e);
+        frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    }
+    let mask = [0x13, 0x24, 0x35, 0x46];
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    stream.write_all(&frame).unwrap();
+}
+
+fn admission_ws_read(stream: &mut std::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    use std::io::Read;
+    let mut header = [0; 2];
+    stream.read_exact(&mut header)?;
+    assert_eq!(header[1] & 0x80, 0, "server frames must be unmasked");
+    let length = match header[1] & 0x7f {
+        126 => {
+            let mut bytes = [0; 2];
+            stream.read_exact(&mut bytes)?;
+            u16::from_be_bytes(bytes) as usize
+        }
+        127 => {
+            let mut bytes = [0; 8];
+            stream.read_exact(&mut bytes)?;
+            usize::try_from(u64::from_be_bytes(bytes)).unwrap()
+        }
+        length => length as usize,
+    };
+    assert!(length <= 65536, "bounded terminal output frame");
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload)?;
+    Ok((header[0] & 0x0f, payload))
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One two-launch admission journey preserves the state/effect oracle.
+fn web_binary_capabilities_protect_http_and_are_launch_specific() {
+    let a = AdmissionServer::launch(false, false);
+    let b = AdmissionServer::launch(false, false);
+    assert_ne!(a.url, b.url, "actual distinct listeners");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let root = client.get(&a.url).send().unwrap();
+    assert_eq!(root.status().as_u16(), 200);
+    let shell = root.text().unwrap();
+    assert!(
+        !shell.contains(&a.token),
+        "public bootstrap contains no capability"
+    );
+    let surfaces_url = format!("{}/api/surfaces", a.url);
+    let before: serde_json::Value = client
+        .get(&surfaces_url)
+        .bearer_auth(&a.token)
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        client.get(&surfaces_url).send().unwrap().status().as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/run/synthetic-run", a.url))
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    let denied = client
+        .post(&surfaces_url)
+        .header("Origin", &a.url)
+        .json(&serde_json::json!({"name":"unauthorized-synthetic-surface"}))
+        .send()
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 401);
+    for origin in [b.url.as_str(), "null", "http://foreign.invalid"] {
+        assert_eq!(
+            client
+                .post(&surfaces_url)
+                .bearer_auth(&a.token)
+                .header("Origin", origin)
+                .json(&serde_json::json!({"name":"unauthorized-synthetic-surface"}))
+                .send()
+                .unwrap()
+                .status()
+                .as_u16(),
+            403
+        );
+    }
+    assert_eq!(
+        client
+            .get(&surfaces_url)
+            .bearer_auth(&a.token)
+            .header("Host", "localhost:1")
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        403
+    );
+    let after: serde_json::Value = client
+        .get(&surfaces_url)
+        .bearer_auth(&a.token)
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "rejected mutation preserves surface inventory"
+    );
+    assert!(!a
+        .root
+        .path()
+        .join("home/piku/_web/unauthorized-synthetic-surface")
+        .exists());
+    assert_eq!(
+        client
+            .get(format!("{}/api/surfaces", b.url))
+            .bearer_auth(&a.token)
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    // A valid non-browser bearer can mutate without an Origin header.
+    let created: serde_json::Value = client
+        .post(&surfaces_url)
+        .bearer_auth(&a.token)
+        .json(&serde_json::json!({"name":"authorized-synthetic-surface"}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(created
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "authorized-synthetic-surface"));
+    a.assert_public_artifacts_redacted();
+    b.assert_public_artifacts_redacted();
+}
+
+#[test]
+fn web_binary_terminal_auth_precedes_real_fixture_spawn() {
+    let server = AdmissionServer::launch(true, false);
+    for attempt in 0..5 {
+        let (status, mut socket) = server.websocket();
+        assert_eq!(
+            status, 101,
+            "enabled WS upgrades before capability admission"
+        );
+        match attempt {
+            0 => admission_ws_send(
+                &mut socket,
+                1,
+                br#"{"type":"authenticate","token":"wrong"}"#,
+            ),
+            1 => admission_ws_send(&mut socket, 1, br#"{"type":"input","data":"ignored"}"#),
+            2 => admission_ws_send(&mut socket, 2, b"binary authentication is forbidden"),
+            3 => admission_ws_send(&mut socket, 1, &vec![b'x'; 16384]),
+            4 => {} // No first frame: the server must close on its auth deadline.
+            _ => unreachable!(),
+        }
+        match admission_ws_read(&mut socket) {
+            Ok((opcode, _)) => assert_eq!(opcode, 8, "rejected auth emits only a close frame"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ),
+                "rejected auth must close before the socket deadline"
+            ),
+        }
+        assert!(
+            !server.fixture_started(),
+            "pre-auth socket spawned a terminal"
+        );
+    }
+    let (status, mut socket) = server.websocket();
+    assert_eq!(
+        status, 101,
+        "rejections leave capacity for admitted terminal"
+    );
+    assert!(
+        !server.fixture_started(),
+        "upgrade alone must not spawn fixture"
+    );
+    let auth = serde_json::json!({"type":"authenticate","token":server.token});
+    admission_ws_send(&mut socket, 1, &serde_json::to_vec(&auth).unwrap());
+    let (opcode, payload) = admission_ws_read(&mut socket).unwrap();
+    assert_eq!(opcode, 1, "authentication acknowledgement is a text frame");
+    let acknowledgement: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(acknowledgement["type"], "authenticated");
+    let mut output = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !String::from_utf8_lossy(&output).contains("PIKU_AUTH_FIXTURE_OUTPUT") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture output deadline"
+        );
+        let (opcode, bytes) = admission_ws_read(&mut socket).unwrap();
+        assert!(
+            opcode == 1 || opcode == 2,
+            "fixture must emit output before closure"
+        );
+        output.extend_from_slice(&bytes);
+    }
+    assert!(
+        server.fixture_started(),
+        "valid capability reached actual PTY factory"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains(&server.token),
+        "PTY output leaked capability"
+    );
+    server.assert_public_artifacts_redacted();
+}
+
+#[test]
+fn web_binary_terminal_requires_flag_and_disable_env_narrows_it() {
+    for (terminal, disable_env) in [(false, false), (true, true)] {
+        let server = AdmissionServer::launch(terminal, disable_env);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(format!("{}/api/executors", server.url))
+                .bearer_auth(&server.token)
+                .send()
+                .unwrap()
+                .status()
+                .as_u16(),
+            200,
+            "launch capability is valid even when terminal authority is disabled"
+        );
+        let disabled = client
+            .get(format!("{}/api/terminal/pty", server.url))
+            .bearer_auth(&server.token)
+            .header("Origin", &server.url)
+            .send()
+            .unwrap();
+        assert_eq!(
+            disabled.status().as_u16(),
+            404,
+            "valid capability cannot enable a disabled terminal route"
+        );
+        let (status, _socket) = server.websocket();
+        assert_ne!(status, 101, "disabled terminal exposes no upgrade route");
+        assert!(
+            !server.fixture_started(),
+            "disabled launch must never spawn fixture"
+        );
+        server.assert_public_artifacts_redacted();
+    }
+}
+
 #[test]
 fn providers_ignore_project_dotenv() {
     let project = tempfile::tempdir().unwrap();
@@ -130,12 +542,22 @@ fn web_honors_provider_and_model_overrides() {
         }
         let ready: serde_json::Value =
             serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
+        let launch = std::fs::read_to_string(ready["launch_file"].as_str().unwrap()).unwrap();
+        let token = launch
+            .split_once("#token=")
+            .expect("private launch file carries a fragment credential")
+            .1
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .next()
+            .unwrap();
+        assert_eq!(token.len(), 64, "launch credential has the required length");
         let catalog: serde_json::Value = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap()
             .get(format!("{}/api/executors", ready["url"].as_str().unwrap()))
+            .bearer_auth(token)
             .send()
             .unwrap()
             .error_for_status()

@@ -32,7 +32,7 @@ test("model-driven managed runs use a parent-only page broker when configured", 
   assert.equal(managedPageBroker("e2e", { OPENROUTER_API_KEY: "secret" }), null);
   assert.throws(() => managedPageBroker("parallel", {}), /requires OPENROUTER_API_KEY/);
   assert.deepEqual(managedPageBroker("parallel", { OPENROUTER_API_KEY: "secret" }), {
-    model: "openai/gpt-5.6-terra",
+    model: "anthropic/claude-haiku-5.5",
   });
   assert.deepEqual(managedPageBroker("single", {
     OPENROUTER_API_KEY: "secret",

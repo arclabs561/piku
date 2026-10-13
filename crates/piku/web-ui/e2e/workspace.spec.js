@@ -1,4 +1,4 @@
-import { expect, test as base } from "@playwright/test";
+import { expect, test as base, admitBrowserContext } from "./auth-fixture.js";
 
 const test = base.extend({
   surfaceName: async ({ page, request }, use, testInfo) => {
@@ -11,6 +11,7 @@ const test = base.extend({
 
     await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
     await expect(page.locator("#canvas")).toBeVisible();
+    await expect(page.locator(".surface-btn.active")).toHaveText(surfaceName);
     try {
       await use(surfaceName);
     } finally {
@@ -1435,6 +1436,7 @@ test("managed evaluation fixture completes and persists ordinary chat output", a
   await expect(page.locator("#save-status")).toHaveText("saved");
 
   const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  await admitBrowserContext(freshContext, process.env.PIKU_WEB_LAUNCH_FILE, process.env.PIKU_WEB_URL);
   const freshPage = await freshContext.newPage();
   await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
   const restored = freshPage.locator('[data-object-id="managed-complete"]');
@@ -1582,6 +1584,7 @@ test("managed evaluation fixture cancellation survives fresh context", async ({
   }).toEqual({ request_id: requestId, acknowledged: true });
 
   const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  await admitBrowserContext(freshContext, process.env.PIKU_WEB_LAUNCH_FILE, process.env.PIKU_WEB_URL);
   const freshPage = await freshContext.newPage();
   try {
     await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
@@ -1641,6 +1644,7 @@ test("object picker reveals an offscreen persisted card in a fresh context", asy
   expect(saved.ok()).toBeTruthy();
 
   const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  await admitBrowserContext(context, process.env.PIKU_WEB_LAUNCH_FILE, process.env.PIKU_WEB_URL);
   const freshPage = await context.newPage();
   await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
   await freshPage.getByLabel("Workspace objects").selectOption("offscreen-note");
@@ -1832,7 +1836,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
   await expect(trace).toContainText("Context assembled");
   await expect(trace.getByRole("link", { name: "inspect session record" })).toHaveAttribute(
     "href",
-    "/run/durable-trace-run",
+    "#",
   );
   await expect(trace).toHaveAttribute("data-persistence", "transient");
   await expect(page.locator("#object-picker option")).toHaveCount(2);
@@ -1875,7 +1879,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
   const restoredEvidence = restored.locator(".chat-turn-evidence");
   await expect(restoredEvidence).toBeVisible();
   await restoredEvidence.locator("summary").click();
-  const restoredRun = restoredEvidence.locator(".chat-turn-run");
+  const restoredRun = restored.locator(".chat-turn-run");
   await expect(restoredRun).toBeVisible();
   await expect(restoredRun).toHaveText("open full record");
   await expect(restoredRun).toHaveAttribute(
@@ -1884,10 +1888,11 @@ test("execution traces stay visibly transient and outside workspace persistence"
   );
   await expect(restoredRun).toHaveAttribute(
     "href",
-    "/run/durable-trace-run",
+    "#",
   );
   const frame = restoredEvidence.locator("iframe");
-  await expect(frame).toHaveAttribute("src", "/run/durable-trace-run");
+  await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+  await expect(frame).toHaveAttribute("srcdoc", /durable session evidence/);
   await expect(frame.contentFrame().locator("main")).toHaveText("durable session evidence");
   await restoredEvidence.locator("summary").click();
   await expect(restoredEvidence).not.toHaveAttribute("open", "");
@@ -1947,6 +1952,7 @@ test("workspace state crosses browser contexts while viewport state does not", a
   await page.waitForTimeout(180);
 
   const freshContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  await admitBrowserContext(freshContext, process.env.PIKU_WEB_LAUNCH_FILE, process.env.PIKU_WEB_URL);
   const freshPage = await freshContext.newPage();
   try {
     await freshPage.goto(`/?surface=${encodeURIComponent(surfaceName)}`);

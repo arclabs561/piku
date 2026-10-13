@@ -46,6 +46,11 @@ tool implementations in `piku-tools`, and presentation/configuration in `piku`.
 - Project instructions come from `PIKU.md`, `PIKU.local.md`, and
   `.piku/PIKU.md`. Piku does not load `AGENTS.md` and has no MCP, LSP,
   browser/web-search, or image integration.
+- The loopback browser surface requires per-launch admission for private reads
+  and actions. The printed private launch file admits a tab; HTTP requests use
+  bearer credentials, and terminal WebSockets authenticate before PTY creation.
+  Host/Origin checks bind to the listener. Browser terminals require the explicit
+  `web --terminal` launch flag and retain ambient host authority.
 
 ## Working in this repository
 

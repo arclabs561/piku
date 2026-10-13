@@ -4,7 +4,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -28,6 +28,7 @@ use crate::config::PikuConfig;
 
 mod codex;
 mod codex_attestation;
+mod launch_auth;
 mod page_broker;
 mod pty;
 mod workspace_inventory;
@@ -340,6 +341,8 @@ pub(super) struct AppState {
     write_leases: Arc<write_lease::WriteLeaseStore>,
     workspace_write_attestation: Option<Arc<codex_attestation::VerifiedWriteAttestation>>,
     terminal_enabled: bool,
+    launch_auth: Arc<launch_auth::LaunchAuth>,
+    preauth_slots: Arc<Semaphore>,
     evaluation_fixtures: bool,
     fixture_cancellation_acks: Arc<RwLock<HashMap<String, Instant>>>,
 }
@@ -450,11 +453,6 @@ struct WorkspaceUpdate {
 }
 
 #[derive(Deserialize)]
-struct SurfaceQuery {
-    surface: Option<String>,
-}
-
-#[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum TerminalReadRequest {
     List {
@@ -545,12 +543,17 @@ enum WorkspaceOperation {
 // Server
 // ---------------------------------------------------------------------------
 
-pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
-    if page_broker::PageBroker::is_configured()
-        && std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1")
-    {
-        anyhow::bail!("PIKU_PAGE_BROKER_FD requires PIKU_WEB_DISABLE_TERMINAL=1");
+pub async fn serve(config: &PikuConfig, port: u16, terminal_enabled: bool) -> anyhow::Result<()> {
+    let terminal_enabled = terminal_enabled
+        && std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1");
+    if page_broker::PageBroker::is_configured() && terminal_enabled {
+        anyhow::bail!("PIKU_PAGE_BROKER_FD requires terminal disabled");
     }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let local_addr = listener.local_addr()?;
+    let launch_auth = Arc::new(launch_auth::LaunchAuth::new(local_addr.port())?);
+    let url = launch_auth.origin().to_string();
+    let launch_file = launch_auth.write_launch_file(&config.config_dir)?;
     let root = surfaces_root(config);
     let _ = std::fs::create_dir_all(&root);
 
@@ -568,8 +571,6 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
             None
         }
     };
-    let terminal_enabled =
-        std::env::var_os("PIKU_WEB_DISABLE_TERMINAL").is_none_or(|value| value != "1");
     let state = Arc::new(AppState {
         config: Arc::new(config.clone()),
         surfaces: Arc::new(RwLock::new(SurfacesState {
@@ -585,11 +586,45 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
         write_leases: Arc::new(write_lease::WriteLeaseStore::default()),
         workspace_write_attestation,
         terminal_enabled,
+        launch_auth,
+        preauth_slots: Arc::new(Semaphore::new(8)),
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
         fixture_cancellation_acks: Arc::new(RwLock::new(HashMap::new())),
     });
 
+    let app = app_router(Arc::clone(&state));
+    if let Some(path) = std::env::var_os("PIKU_WEB_READY_FILE") {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let ready = serde_json::json!({
+            "schema_version": 1,
+            "url": url,
+            "launch_file": launch_file,
+            "fixture_enabled": state.evaluation_fixtures,
+            "pid": std::process::id(),
+        });
+        std::fs::write(&temporary, serde_json::to_vec(&ready)?)?;
+        std::fs::rename(&temporary, &path)?;
+    }
+    tracing::info!(
+        url = %url,
+        launch_file = %launch_file.display(),
+        workspace = %state.workspace_root.display(),
+        storage = %state.surfaces.read().await.root.display(),
+        terminal = if state.terminal_enabled { "pty" } else { "disabled" },
+        loopback_only = true,
+        evaluation_fixtures = state.evaluation_fixtures,
+        "web surface listening"
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn app_router(state: Arc<AppState>) -> Router {
     let mut app = Router::new()
         .route("/", get(home))
         .route("/api/surfaces", get(list_surfaces_api).post(create_surface))
@@ -597,6 +632,7 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
             "/api/surfaces/{name}",
             get(get_surface).delete(delete_surface),
         )
+        .route("/api/surfaces/{name}/activate", post(activate_surface))
         .route("/api/surfaces/{name}/workspace", put(update_workspace))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/write-lease", post(write_lease_handler))
@@ -614,40 +650,11 @@ pub async fn serve(config: &PikuConfig, port: u16) -> anyhow::Result<()> {
             get(evaluation_fixture_cancellation_ack),
         );
     }
-    let app = app
-        .layer(middleware::from_fn(local_request_guard))
-        .with_state(Arc::clone(&state));
-
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let local_addr = listener.local_addr()?;
-    let url = format!("http://localhost:{}", local_addr.port());
-    if let Some(path) = std::env::var_os("PIKU_WEB_READY_FILE") {
-        let path = std::path::PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let ready = serde_json::json!({
-            "schema_version": 1,
-            "url": url,
-            "fixture_enabled": state.evaluation_fixtures,
-            "pid": std::process::id(),
-        });
-        std::fs::write(&temporary, serde_json::to_vec(&ready)?)?;
-        std::fs::rename(&temporary, &path)?;
-    }
-    tracing::info!(
-        url = %url,
-        workspace = %state.workspace_root.display(),
-        storage = %state.surfaces.read().await.root.display(),
-        terminal = if state.terminal_enabled { "pty" } else { "disabled" },
-        loopback_only = true,
-        evaluation_fixtures = state.evaluation_fixtures,
-        "web surface listening"
-    );
-    axum::serve(listener, app).await?;
-    Ok(())
+    app.layer(middleware::from_fn_with_state(
+        Arc::clone(&state),
+        local_request_guard,
+    ))
+    .with_state(state)
 }
 
 async fn executor_catalog(State(state): State<Arc<AppState>>) -> Json<ExecutorCatalog> {
@@ -736,42 +743,41 @@ fn provider_request_kinds(
     }
 }
 
-async fn local_request_guard(request: Request<axum::body::Body>, next: Next) -> Response {
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !is_allowed_host(host) {
-        return (StatusCode::FORBIDDEN, "local host required").into_response();
-    }
-    let websocket_upgrade = request
-        .headers()
-        .get(header::UPGRADE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    if websocket_upgrade {
-        let origin = request
-            .headers()
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !is_same_local_origin(origin, host) {
-            return (StatusCode::FORBIDDEN, "same origin required").into_response();
-        }
-    } else if request.method() != Method::GET && request.method() != Method::HEAD {
-        if let Some(origin) = request
-            .headers()
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-        {
-            if !is_same_local_origin(origin, host) {
-                return (StatusCode::FORBIDDEN, "same origin required").into_response();
-            }
-        }
-    }
+async fn local_request_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let host = launch_auth::single_header(headers, header::HOST);
+    let origin = launch_auth::single_header(headers, header::ORIGIN);
+    let websocket = request.uri().path() == "/api/terminal/pty";
+    let valid_host = host.is_some_and(|host| state.launch_auth.accepts_host(host));
+    let valid_origin = if headers.contains_key(header::ORIGIN) {
+        origin.is_some_and(|origin| origin == state.launch_auth.origin())
+    } else {
+        !websocket
+    };
+    let malformed_authorization = headers.contains_key(header::AUTHORIZATION)
+        && launch_auth::single_header(headers, header::AUTHORIZATION).is_none();
+    let public_shell =
+        request.uri().path() == "/" && matches!(*request.method(), Method::GET | Method::HEAD);
+    let admitted = public_shell
+        || websocket
+        || launch_auth::single_header(headers, header::AUTHORIZATION)
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| state.launch_auth.matches(token));
+    let response = if !valid_host || !valid_origin {
+        (StatusCode::FORBIDDEN, "request rejected").into_response()
+    } else if malformed_authorization || !admitted {
+        (StatusCode::UNAUTHORIZED, "admission required").into_response()
+    } else {
+        next.run(request).await
+    };
+    security_headers(response)
+}
 
-    let mut response = next.run(request).await;
+fn security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -782,60 +788,18 @@ async fn local_request_guard(request: Request<axum::body::Body>, next: Next) -> 
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-        ),
-    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    ));
     response
-}
-
-fn is_allowed_host(host: &str) -> bool {
-    let (name, port) = host
-        .split_once(':')
-        .map_or((host, None), |(name, port)| (name, Some(port)));
-    matches!(name, "localhost" | "127.0.0.1") && port.is_none_or(|port| port.parse::<u16>().is_ok())
-}
-
-fn is_same_local_origin(origin: &str, host: &str) -> bool {
-    origin == format!("http://{host}")
 }
 
 // ---------------------------------------------------------------------------
 // Home page
 // ---------------------------------------------------------------------------
 
-async fn home(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<SurfaceQuery>,
-) -> impl IntoResponse {
-    let mut s = state.surfaces.write().await;
-    if let Some(ref name) = q.surface {
-        if !name.is_empty() {
-            let name = surface_name(name);
-            let dir = surface_dir(&s.root, &name);
-            if !s.cache.contains_key(&name) {
-                s.cache.insert(name.clone(), CanvasState::load(&dir));
-            }
-            s.active = name;
-        }
-    }
-    let active = s.active.clone();
-    let _surfaces = list_surfaces(&s.root);
-    let (canvas_html, objects) = s
-        .cache
-        .get(&active)
-        .map(|c| (c.html.clone(), c.objects.clone()))
-        .unwrap_or_default();
-    drop(s);
-
-    Html(render_home(
-        &active,
-        &canvas_html,
-        &objects,
-        state.terminal_enabled,
-    ))
+async fn home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Html(render_home("", "", &[], state.terminal_enabled))
 }
 
 fn render_home(
@@ -930,14 +894,14 @@ async fn get_surface(
     Path(name): Path<String>,
 ) -> Json<SurfaceData> {
     let name = surface_name(&name);
-    let mut s = state.surfaces.write().await;
+    let s = state.surfaces.read().await;
     let dir = surface_dir(&s.root, &name);
-    if !s.cache.contains_key(&name) {
-        s.cache.insert(name.clone(), CanvasState::load(&dir));
-    }
-    s.active.clone_from(&name);
     let running = s.running.contains(&name);
-    let cs = s.cache.get(&name).cloned().unwrap_or_default();
+    let cs = s
+        .cache
+        .get(&name)
+        .cloned()
+        .unwrap_or_else(|| CanvasState::load(&dir));
     Json(SurfaceData {
         name,
         html: cs.html,
@@ -945,6 +909,19 @@ async fn get_surface(
         objects: cs.objects,
         running,
     })
+}
+
+async fn activate_surface(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> StatusCode {
+    let name = surface_name(&name);
+    let mut s = state.surfaces.write().await;
+    if !surface_dir(&s.root, &name).is_dir() {
+        return StatusCode::NOT_FOUND;
+    }
+    s.active = name;
+    StatusCode::NO_CONTENT
 }
 
 async fn update_workspace(
@@ -4363,15 +4340,14 @@ mod tests {
         canvas_system_prompt, chat_system_prompt, compact_canvas_turn, emit, emit_lossy,
         ensure_default_surface, execute_terminal_read, extract_canvas_html, extract_canvas_noop,
         extract_partial_canvas_html, extract_workspace_operations, has_chat_target,
-        has_page_edit_target, has_sensitive_path_component, is_allowed_host, is_same_local_origin,
-        open_web_run, page_completion_event, provider_request_kinds, render_home,
-        resolve_chat_context, resolve_or_find_terminal_file, resolve_terminal_path,
-        sanitize_terminal_text, validate_authority_fields, validate_chat_notebook_input,
-        validate_request_message, validate_run_id, validate_workspace_objects, workspace_input,
-        write_request_digest, CanvasNoopStatus, CanvasState, ChatExecutor, ChatMessage,
-        ChatRequest, PageEditBinding, RequestKind, ResolvedChatContext, TerminalReadRequest,
-        WebSink, WorkspaceObject, WorkspaceObjectKind, MAX_CANVAS_INSTRUCTION_CHARS,
-        MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
+        has_page_edit_target, has_sensitive_path_component, open_web_run, page_completion_event,
+        provider_request_kinds, render_home, resolve_chat_context, resolve_or_find_terminal_file,
+        resolve_terminal_path, sanitize_terminal_text, validate_authority_fields,
+        validate_chat_notebook_input, validate_request_message, validate_run_id,
+        validate_workspace_objects, workspace_input, write_request_digest, CanvasNoopStatus,
+        CanvasState, ChatExecutor, ChatMessage, ChatRequest, PageEditBinding, RequestKind,
+        ResolvedChatContext, TerminalReadRequest, WebSink, WorkspaceObject, WorkspaceObjectKind,
+        MAX_CANVAS_INSTRUCTION_CHARS, MAX_RUN_ID_LEN, SSE_CONTROL_RESERVE,
     };
     use piku_runtime::{
         read_run_record, ContentBlock, ConversationMessage, OutputSink, RunEvent, Session,
@@ -4386,6 +4362,278 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("temporary directory exists");
         dir
+    }
+
+    async fn boundary_fixture(
+        terminal_enabled: bool,
+    ) -> (
+        std::sync::Arc<super::AppState>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use super::*;
+        let root = temp_dir("piku-web-auth-boundary");
+        CanvasState {
+            html: "private-marker".into(),
+            ..CanvasState::default()
+        }
+        .save(&root.join("saved"))
+        .unwrap();
+        let config = PikuConfig {
+            provider: None,
+            model: None,
+            max_turns: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            actors: std::collections::BTreeMap::default(),
+            provider_configs: crate::config::ProviderConfigMap::default(),
+            config_dir: root.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            surfaces: Arc::new(RwLock::new(SurfacesState {
+                cache: HashMap::new(),
+                running: HashSet::new(),
+                active: "saved".into(),
+                root: root.clone(),
+            })),
+            workspace_root: Arc::new(root.clone()),
+            terminal_slots: Arc::new(Semaphore::new(8)),
+            model_slots: Arc::new(Semaphore::new(MODEL_REQUEST_SLOTS)),
+            codex_root: Arc::new(root.join("_codex")),
+            write_leases: Arc::new(write_lease::WriteLeaseStore::default()),
+            workspace_write_attestation: None,
+            terminal_enabled,
+            launch_auth: Arc::new(launch_auth::LaunchAuth::new(port).unwrap()),
+            preauth_slots: Arc::new(Semaphore::new(8)),
+            evaluation_fixtures: false,
+            fixture_cancellation_acks: Arc::new(RwLock::new(HashMap::new())),
+        });
+        let router = app_router(Arc::clone(&state));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (state, format!("http://127.0.0.1:{port}"), task)
+    }
+
+    #[tokio::test]
+    async fn routed_http_admission_preserves_private_state_and_headers() {
+        let (state, url, task) = boundary_fixture(false).await;
+        let client = reqwest::Client::new();
+        for path in [
+            "/api/surfaces",
+            "/api/surfaces/saved",
+            "/api/executors",
+            "/api/runs/unknown/cells",
+            "/run/unknown",
+        ] {
+            for token in [
+                None,
+                Some("Bearer invalid".into()),
+                Some(super::launch_auth::LaunchAuth::new(1).unwrap().bearer()),
+            ] {
+                let mut request = client.get(format!("{url}{path}"));
+                if let Some(token) = token {
+                    request = request.header("Authorization", token);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 401, "{path}");
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+                assert!(response.headers().contains_key("content-security-policy"));
+                assert!(!response.text().await.unwrap().contains("private-marker"));
+            }
+        }
+        let response = client
+            .post(format!("{url}/api/surfaces"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"unauthorized"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert!(!state
+            .surfaces
+            .read()
+            .await
+            .root
+            .join("unauthorized")
+            .exists());
+        let bootstrap = client
+            .get(format!("{url}/?surface=unauthorized"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!bootstrap.contains("private-marker"));
+        assert_eq!(state.surfaces.read().await.active, "saved");
+        assert!(state.surfaces.read().await.cache.is_empty());
+        let authorization = state.launch_auth.bearer();
+        let mut duplicate = reqwest::header::HeaderMap::new();
+        duplicate.append(
+            reqwest::header::AUTHORIZATION,
+            authorization.parse().unwrap(),
+        );
+        duplicate.append(
+            reqwest::header::AUTHORIZATION,
+            "Bearer invalid".parse().unwrap(),
+        );
+        let response = client
+            .get(format!("{url}/api/surfaces"))
+            .headers(duplicate)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        for origin in ["null", "http://localhost:1", "http://evil.example"] {
+            let response = client
+                .get(format!("{url}/api/surfaces"))
+                .header("Authorization", &authorization)
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403);
+            assert!(response.headers().contains_key("content-security-policy"));
+        }
+        let response = client
+            .get(format!("{url}/api/surfaces"))
+            .header("Authorization", &authorization)
+            .header("Host", "localhost:1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        let response = client
+            .get(format!("{url}/api/surfaces/saved"))
+            .header("Authorization", &authorization)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("private-marker"));
+        assert!(state.surfaces.read().await.cache.is_empty());
+        assert_eq!(state.surfaces.read().await.active, "saved");
+        assert_eq!(state.terminal_slots.available_permits(), 8);
+        assert_eq!(
+            state.model_slots.available_permits(),
+            super::MODEL_REQUEST_SLOTS
+        );
+        task.abort();
+        fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
+    }
+
+    async fn websocket_fixture(url: &str, origin: &str) -> (tokio::net::TcpStream, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = url.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        let handshake = format!("GET /api/terminal/pty HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        stream.write_all(handshake.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        (stream, String::from_utf8(response).unwrap())
+    }
+
+    #[tokio::test]
+    async fn websocket_preauthentication_is_bounded_and_cannot_take_terminal_slots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (state, url, task) = boundary_fixture(true).await;
+        let origin = state.launch_auth.origin();
+        let (_, rejected) = websocket_fixture(&url, "null").await;
+        assert!(rejected.starts_with("HTTP/1.1 403"));
+        assert!(rejected.contains("content-security-policy"));
+        // Fill only the pre-auth pool. Upgraded sockets have not authenticated.
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            let (stream, response) = websocket_fixture(&url, origin).await;
+            assert!(response.starts_with("HTTP/1.1 101"));
+            streams.push(stream);
+        }
+        assert_eq!(state.terminal_slots.available_permits(), 8);
+        let (_, full) = websocket_fixture(&url, origin).await;
+        assert!(full.starts_with("HTTP/1.1 429"));
+        let mut closed = [0; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            streams[0].read_exact(&mut closed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(closed[0] & 15, 8, "timeout produces only a close frame");
+        for stream in streams.iter_mut().skip(1) {
+            stream.read_exact(&mut closed).await.unwrap();
+            assert_eq!(closed[0] & 15, 8);
+        }
+        drop(streams);
+        // Rejected first frames never reach terminal input or produce private output.
+        let previous_launch = super::launch_auth::LaunchAuth::new(1).unwrap().bearer();
+        let stale_token = previous_launch.strip_prefix("Bearer ").unwrap();
+        let valid = state.launch_auth.bearer();
+        let valid_token = valid.strip_prefix("Bearer ").unwrap();
+        let frames = [
+            (
+                0x81,
+                r#"{"type":"authenticate","token":"invalid"}"#.to_string(),
+            ),
+            (
+                0x81,
+                format!(r#"{{"type":"authenticate","token":"{stale_token}"}}"#),
+            ),
+            (0x81, "{".to_string()),
+            (
+                0x82,
+                format!(r#"{{"type":"authenticate","token":"{valid_token}"}}"#),
+            ),
+            (0x81, "x".repeat(257)),
+            (
+                0x81,
+                format!(r#"{{"type":"authenticate","token":"{valid_token}","extra":true}}"#),
+            ),
+        ];
+        for (opcode, body) in frames {
+            let (mut stream, response) = websocket_fixture(&url, origin).await;
+            assert!(response.starts_with("HTTP/1.1 101"));
+            let mut frame = vec![opcode];
+            if body.len() < 126 {
+                frame.push(0x80 | u8::try_from(body.len()).unwrap());
+            } else {
+                frame.push(0xfe);
+                frame.extend(u16::try_from(body.len()).unwrap().to_be_bytes());
+            }
+            frame.extend([1, 2, 3, 4]);
+            frame.extend(
+                body.bytes()
+                    .enumerate()
+                    .map(|(i, byte)| byte ^ [1, 2, 3, 4][i % 4]),
+            );
+            stream.write_all(&frame).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_exact(&mut closed),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(closed[0] & 15, 8);
+            assert_eq!(state.terminal_slots.available_permits(), 8);
+        }
+        task.abort();
+        fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
+        let (state, url, task) = boundary_fixture(false).await;
+        let (_, disabled) = websocket_fixture(&url, state.launch_auth.origin()).await;
+        assert!(disabled.starts_with("HTTP/1.1 404"));
+        assert_eq!(state.terminal_slots.available_permits(), 8);
+        task.abort();
+        fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
     }
 
     #[test]
@@ -5209,23 +5457,6 @@ mod tests {
         assert!(!serialized.contains(&"x".repeat(100)));
         assert!(!serialized.contains(&"y".repeat(100)));
         assert!(serialized.contains("make the heading clearer"));
-    }
-
-    #[test]
-    fn web_authority_accepts_only_loopback_hosts_and_same_origin() {
-        assert!(is_allowed_host("localhost:9090"));
-        assert!(is_allowed_host("127.0.0.1:9090"));
-        assert!(!is_allowed_host("0.0.0.0:9090"));
-        assert!(!is_allowed_host("localhost:attacker"));
-        assert!(!is_allowed_host("attacker.example"));
-        assert!(is_same_local_origin(
-            "http://localhost:9090",
-            "localhost:9090"
-        ));
-        assert!(!is_same_local_origin(
-            "https://attacker.example",
-            "localhost:9090"
-        ));
     }
 
     #[test]

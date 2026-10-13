@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { readLaunchToken } from "./launch-auth.mjs";
 import { supervisePageBroker } from "./evaluation-page-broker.mjs";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -93,17 +94,18 @@ export function validateEvaluationOrigin(value) {
   return url;
 }
 
-async function executorCatalog(baseUrl, fetchImpl) {
+async function executorCatalog(baseUrl, fetchImpl, token) {
   const response = await fetchImpl(new URL("/api/executors", baseUrl), {
     signal: AbortSignal.timeout(2_000),
+    headers: token ? { Authorization: "Bearer " + token } : {},
   });
   if (!response.ok) throw new Error(`executor catalog returned HTTP ${response.status}`);
   return response.json();
 }
 
-export async function connectExternalEvaluationServer(value, { fetchImpl = fetch } = {}) {
+export async function connectExternalEvaluationServer(value, { fetchImpl = fetch, launchFile = process.env.PIKU_WEB_LAUNCH_FILE } = {}) {
   const baseUrl = validateEvaluationOrigin(value);
-  const catalog = await executorCatalog(baseUrl, fetchImpl);
+  const catalog = await executorCatalog(baseUrl, fetchImpl, launchFile ? await readLaunchToken(launchFile, baseUrl) : null);
   const fixture = catalog.executors?.find((item) => item.id === "evaluation_fixture");
   return {
     baseUrl,
@@ -168,6 +170,7 @@ export async function startManagedEvaluationServer({
       "--port",
       "0",
     ];
+  if (terminalEnabled) args.push("--terminal");
   const child = spawnImpl(command, args, {
     cwd: workspaceDir,
     env: { ...env, PIKU_WEB_READY_FILE: readyPath },
@@ -206,7 +209,8 @@ export async function startManagedEvaluationServer({
         || !Number.isSafeInteger(ready.pid) || ready.pid !== child.pid)
         throw new Error("ready file failed its strict contract");
       const baseUrl = validateEvaluationOrigin(ready.url);
-      const catalog = await executorCatalog(baseUrl, fetchImpl);
+      const token = await readLaunchToken(ready.launch_file, baseUrl);
+      const catalog = await executorCatalog(baseUrl, fetchImpl, token);
       const fixture = catalog.executors?.find((item) => item.id === "evaluation_fixture");
       if (fixture?.available !== true) throw new Error("evaluation fixture is unavailable");
       const metadata = {
@@ -216,6 +220,7 @@ export async function startManagedEvaluationServer({
         page_broker_enabled: Boolean(pageBroker),
         page_broker_model: pageBroker?.model ?? null,
         ready_file: readyPath,
+        launch_file: ready.launch_file,
         workspace_root: workspaceDir,
         url: baseUrl.toString(),
         pid: child.pid,

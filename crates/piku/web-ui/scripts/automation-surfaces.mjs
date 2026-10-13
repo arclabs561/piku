@@ -7,10 +7,10 @@ export function automationSurfaceCreatedAt(name) {
   return Number.isSafeInteger(timestamp) ? timestamp : null;
 }
 
-export async function deleteSurface(baseUrl, name) {
+export async function deleteSurface(baseUrl, name, headers = {}) {
   const response = await fetch(
     new URL(`/api/surfaces/${encodeURIComponent(name)}`, baseUrl),
-    { method: "DELETE", signal: AbortSignal.timeout(3_000) },
+    { method: "DELETE", headers, signal: AbortSignal.timeout(3_000) },
   );
   if (!response.ok && response.status !== 404)
     throw new Error(`cleanup of ${name} failed with HTTP ${response.status}`);
@@ -18,10 +18,11 @@ export async function deleteSurface(baseUrl, name) {
 
 export async function cleanupStaleAutomationSurfaces(
   baseUrl,
-  { now = Date.now(), maxAgeMs = 30 * 60 * 1_000 } = {},
+  { now = Date.now(), maxAgeMs = 30 * 60 * 1_000, headers = {} } = {},
 ) {
   const response = await fetch(new URL("/api/surfaces", baseUrl), {
     signal: AbortSignal.timeout(3_000),
+    headers,
   });
   if (!response.ok)
     throw new Error(`automation cleanup inventory failed with HTTP ${response.status}`);
@@ -30,6 +31,6 @@ export async function cleanupStaleAutomationSurfaces(
     const createdAt = automationSurfaceCreatedAt(name);
     return createdAt !== null && now - createdAt >= maxAgeMs;
   });
-  await Promise.all(stale.map((name) => deleteSurface(baseUrl, name)));
+  await Promise.all(stale.map((name) => deleteSurface(baseUrl, name, headers)));
   return stale;
 }

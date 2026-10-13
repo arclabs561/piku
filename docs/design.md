@@ -254,6 +254,15 @@ status, saved sessions, background tasks, permission rules, hooks, clear, and
 exit. Older design entries for `/diff`, `/init`, `/export`, and interactive
 session switching are not implemented.
 
+The local web surface has a separate launch admission boundary. Its public
+bootstrap contains no saved workspace data; private HTTP reads and actions
+require the current launch bearer. Listener-bound Host/Origin checks supplement
+that credential. A private fragment link admits one browser tab, with tab-scoped
+reload continuity. Terminal WebSockets authenticate their first message before
+PTY creation and require the explicit `web --terminal` launch flag. Run records
+are fetched with admission and rendered in opaque sandboxed snapshots. These
+application checks do not confine the launching user's host authority.
+
 ## Human attention and review
 
 The TUI currently truncates successful tool output to short cards and reports an

@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-export const DEFAULT_JUDGE_MODEL = "gpt-5.6-sol";
+export const DEFAULT_JUDGE_MODEL = "gpt-6.1-sol";
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const playwrightMcpEntrypoint = path.join(scriptsDir, "..", "node_modules", "@playwright", "mcp", "cli.js");
 
@@ -59,6 +59,6 @@ export function codexExecArgs({
 }
 
 export function codexJudgeEnvironment(source = process.env) {
-  const allowed = ["HOME", "LANG", "LC_ALL", "PATH", "SHELL", "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR"];
+  const allowed = ["HOME", "LANG", "LC_ALL", "PATH", "SHELL", "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR", "PIKU_WEB_LAUNCH_FILE", "PIKU_WEB_URL"];
   return Object.fromEntries(allowed.flatMap((key) => source[key] === undefined ? [] : [[key, source[key]]]));
 }

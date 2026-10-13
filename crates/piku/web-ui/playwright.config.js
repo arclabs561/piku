@@ -29,7 +29,8 @@ export default defineConfig({
     // A successful managed evaluator run is evidence too. Ordinary local and
     // CI checks stay lean; review runs retain the complete visual record.
     screenshot: reviewCapture ? "on" : "only-on-failure",
-    trace: reviewCapture ? "on" : "retain-on-failure",
+    // Authentication headers and first WS frames must never enter traces.
+    trace: "off",
     video: reviewCapture
       ? { mode: "on", size: { width: 1280, height: 720 } }
       : "retain-on-failure",

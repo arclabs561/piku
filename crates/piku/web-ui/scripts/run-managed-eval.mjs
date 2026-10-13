@@ -53,7 +53,7 @@ export function managedPageBroker(mode, environment) {
     || !environment.OPENROUTER_API_KEY.trim())
     throw new Error("managed model-driven evaluation requires OPENROUTER_API_KEY");
   return {
-    model: environment.PIKU_EVAL_PAGE_MODEL || "openai/gpt-5.6-terra",
+    model: environment.PIKU_EVAL_PAGE_MODEL || "anthropic/claude-haiku-5.5",
   };
 }
 
@@ -258,6 +258,7 @@ export async function runManagedEval({ argv = process.argv.slice(2), environment
         PIKU_EVAL_REVIEW_DIR: evaluationReviewRoot(environment),
         ...(mode === "focus-pair" ? { PIKU_EVAL_PAIR_ID: runId } : {}),
         PIKU_WEB_URL: server.baseUrl.toString(),
+        PIKU_WEB_LAUNCH_FILE: server.metadata.launch_file || parentEnvironment.PIKU_WEB_LAUNCH_FILE,
         PIKU_EVAL_SERVER_OWNERSHIP: server.metadata.ownership,
         PIKU_EVAL_FIXTURE_AVAILABLE: String(server.metadata.fixture_available),
         PIKU_WEB_EVAL_OUTPUT: path.join(reviewDir, "playwright-output"),

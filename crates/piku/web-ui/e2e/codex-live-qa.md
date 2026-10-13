@@ -92,8 +92,7 @@ the most useful usability evidence.
 6. STRESS — Maintain at least five objects. Rapidly switch selection, edit text
    while another result is visible, dismiss a menu, and reload. If a visible
    request can be safely cancelled without another model call, test it;
-   otherwise record cancellation as untested. Inspect console errors and failed
-   network requests. For every failure, distinguish denied-by-design,
+   otherwise record cancellation as untested. Inspect console errors and visible failed-request states. For every failure, distinguish denied-by-design,
    unavailable capability, infrastructure failure, and product defect.
 
 7. REFLOW — Resize to 390x844. Use the object picker to reach an offscreen
