@@ -3,6 +3,7 @@ mod login_helper;
 use std::sync::Arc;
 
 use piku::cli::AuthCommand;
+use piku::terminal_text;
 use piku_runtime::chatgpt_auth::{default_directory, AccountInfo, AuthManager};
 
 const FUNDING: &str = "ChatGPT subscription funding; allowance and credits unknown; no hard output-token cap for foreground, children, or memory calls";
@@ -119,20 +120,6 @@ fn print_account(account: &AccountInfo, selected: bool) {
         account.signed_in,
         account.plan_enabled
     );
-}
-
-// Remote catalog labels are data, never terminal control sequences.
-fn terminal_text(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| {
-            if ch.is_control() {
-                ch.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![ch]
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

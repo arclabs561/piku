@@ -106,7 +106,15 @@ impl Pty {
         Self::spawn_command(cmd, cwd)
     }
 
-    fn spawn_command(mut cmd: Command, cwd: &std::path::Path) -> Self {
+    fn spawn_command(cmd: Command, cwd: &std::path::Path) -> Self {
+        Self::spawn_command_with_env(cmd, cwd, &[])
+    }
+
+    fn spawn_command_with_env(
+        mut cmd: Command,
+        cwd: &std::path::Path,
+        environment: &[(&str, &str)],
+    ) -> Self {
         cmd.current_dir(cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -127,6 +135,10 @@ impl Pty {
             // keep the handler. See signal-hook research 2026-04-20.
             .env("PIKU_NO_SIGNAL_HANDLERS", "1")
             .env("PIKU_RESTARTED", "1");
+
+        for (key, value) in environment {
+            cmd.env(key, value);
+        }
 
         let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
         proc.set_kill_timeout(Some(3_000));
@@ -250,6 +262,101 @@ impl Pty {
             self.drain();
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// Runs only inside the isolated PTY child, using the application's runtime
+/// description producer and interactive prompter. No tool is executed.
+#[test]
+#[ignore = "PTY child fixture"]
+fn permission_control_fixture() {
+    if std::env::var("PIKU_PERMISSION_FIXTURE").as_deref() != Ok("1") {
+        return;
+    }
+    println!("PERMISSION_FIXTURE_READY");
+    std::io::stdout().flush().unwrap();
+    let mut release = String::new();
+    std::io::stdin().read_line(&mut release).unwrap();
+    print!("\x1b[1;1Hneighbor intact");
+    std::io::stdout().flush().unwrap();
+    // CP-G21: ESC clear/repaint, C0 carriage return/backspace/bell, and C1
+    // CSI in model-controlled fields must not reach the terminal interpreter.
+    let params = serde_json::json!({
+        "command": "rm x\necho\t日\x1b[1;1HX\r\x08\x07\u{009b}2J",
+        "description": "日é🦀\x1b[2J\n\t"
+    });
+    let original = params.clone();
+    let outcome = piku_runtime::permission::check_permission(
+        "bash",
+        &params,
+        &piku::tui_repl::TuiPrompter::default(),
+    );
+    assert!(matches!(
+        outcome,
+        piku_runtime::PermissionOutcome::Deny { .. }
+    ));
+    assert_eq!(params, original, "display must not rewrite tool arguments");
+    println!("PERMISSION_FIXTURE_DONE");
+}
+
+#[test]
+#[ignore = "isolated PTY permission display regression"]
+#[serial]
+fn permission_controls_cannot_repaint_prompt_or_receipt() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "permission_control_fixture",
+        "--ignored",
+        "--nocapture",
+    ]);
+    let mut pty = Pty::spawn_command_with_env(
+        command,
+        &smoke_temp_root(),
+        &[("PIKU_PERMISSION_FIXTURE", "1")],
+    );
+    // The fixture waits for a release line so winsize is set before rendering.
+    assert!(pty.wait_for("PERMISSION_FIXTURE_READY", Duration::from_secs(5)));
+    set_winsize(&pty.writer, TEST_ROWS, 160);
+    pty.send(b"start\n");
+    assert!(
+        pty.wait_for("y/n/a?", Duration::from_secs(5)),
+        "prompt missing: {:?}",
+        pty.captured()
+    );
+    let mut parser = vt100::Parser::new(TEST_ROWS, 160, 0);
+    parser.process(&pty.buf);
+    assert!(
+        parser.screen().contents().contains("neighbor intact"),
+        "description repainted neighboring content"
+    );
+    assert!(
+        parser.screen().contents().contains("日é🦀"),
+        "ordinary Unicode lost"
+    );
+    assert!(
+        pty.captured().contains(
+            "bash: 日é🦀\\u{1b}[2J\\n\\t — `rm x\\necho\\t日\\u{1b}[1;1HX\\r\\u{8}\\u{7}\\u{9b}2J`"
+        ),
+        "control escapes must retain readable command separators and description"
+    );
+    for control in ["\x1b[2J", "\x1b[1;1HX", "\x08", "\x07", "\u{009b}"] {
+        assert!(
+            !pty.captured().contains(control),
+            "model terminal control emitted: {control:?}"
+        );
+    }
+    pty.send(b"n");
+    assert!(
+        pty.wait_for("PERMISSION_FIXTURE_DONE", Duration::from_secs(5)),
+        "decision did not finish"
+    );
+    assert!(pty.captured().contains("denied"));
+    for control in ["\x1b[2J", "\x1b[1;1HX", "\x08", "\x07", "\u{009b}"] {
+        assert!(
+            !pty.captured().contains(control),
+            "model terminal control emitted in receipt: {control:?}"
+        );
     }
 }
 
