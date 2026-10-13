@@ -22,7 +22,8 @@ The legacy basis is preferred whenever it already contains both references.
 Other layouts fail closed, and both modes retain Normal-only relative paths.
 The basis is context metadata, not an immutable host identity: relocation or
 config rebinding requires current config-aware review. No automatic dereference
-or cross-run reader is introduced; the workbench follows only a validated bundle.
+or cross-run reader is introduced; the current UI displays metadata only. Any
+future resolver must use the current configured basis and validate the bundle.
 No absolute paths in the browser; no ambient directory scans.
 
 Scope: the event is turn-scoped (emitted during the spawn turn), not run-scoped,
