@@ -319,13 +319,15 @@ pub fn render_text(events: &[RunEventEnvelope]) -> String {
                 relationship,
                 child_session_id,
                 task_id,
+                reference_root,
                 run_record_ref,
                 ..
             } => {
                 let _ = writeln!(
                     output,
-                    "  ⇄ {relationship} → child session {child_session_id} (task {task_id}) · run {}",
-                    run_record_ref.display()
+                    "  ⇄ {relationship} → child session {child_session_id} (task {task_id}) · run {} · basis {}",
+                    run_record_ref.display(),
+                    reference_root.map_or("parent_record_directory", |_| "configured_evidence_root")
                 );
             }
         }

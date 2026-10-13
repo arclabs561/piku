@@ -269,15 +269,28 @@ pub enum RunEvent {
     ///
     /// This replaces parsing `agent_join` prose: a child relationship is
     /// real evidence only when the durable record carries it. References are
-    /// relative to the parent run record's directory so the workbench can
-    /// resolve them without scanning ambient local directories.
+    /// relative to the parent run record's directory unless `reference_root`
+    /// explicitly selects the configured evidence root. Neither basis grants
+    /// permission to scan or open ambient local paths.
     ChildRunRef {
         relationship: String,
         child_session_id: String,
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference_root: Option<ChildReferenceRoot>,
         run_record_ref: PathBuf,
         session_ref: PathBuf,
     },
+}
+
+/// A child reference basis supplied by the operator's configured stores.
+/// Absence preserves the legacy parent-record-directory interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildReferenceRoot {
+    /// Common owner of sibling run/session stores; requires current config to
+    /// resolve and does not attest to an immutable host or workspace identity.
+    ConfiguredEvidenceRoot,
 }
 
 /// A configured foreground participant, distinct from a background subagent.
@@ -850,6 +863,37 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn child_reference_basis_roundtrips_with_legacy_omission() {
+        let legacy = serde_json::json!({
+            "event": "child_run_ref", "relationship": "spawn_agent",
+            "child_session_id": "child", "task_id": "task",
+            "run_record_ref": "runs/child.jsonl", "session_ref": "sessions/child.json",
+        });
+        let decoded: RunEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            RunEvent::ChildRunRef {
+                reference_root: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        let mut configured = legacy;
+        configured["reference_root"] = serde_json::json!("configured_evidence_root");
+        let decoded: RunEvent = serde_json::from_value(configured.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            RunEvent::ChildRunRef {
+                reference_root: Some(ChildReferenceRoot::ConfiguredEvidenceRoot),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), configured);
+        configured["reference_root"] = serde_json::json!("/arbitrary/host/path");
+        assert!(serde_json::from_value::<RunEvent>(configured).is_err());
+    }
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
