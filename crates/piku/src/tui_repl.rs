@@ -3491,7 +3491,11 @@ mod tests {
         std::fs::create_dir(".ssh").unwrap();
         symlink(".env", "alias-env").unwrap();
         symlink(".ssh", "alias-ssh").unwrap();
-        symlink(".ssh", "src/redirected").unwrap();
+        symlink("../.ssh", "src/redirected").unwrap();
+        assert_eq!(
+            std::fs::canonicalize("src/redirected").unwrap(),
+            base.join(".ssh")
+        );
         let deny = vec![
             "write_file(.env)".into(),
             "edit_file(.env)".into(),
