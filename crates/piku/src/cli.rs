@@ -31,6 +31,13 @@ pub struct Cli {
     pub read_only: bool,
 
     #[arg(
+        long,
+        value_name = "ABSOLUTE_BUILD_ROOT",
+        help = "Enable developer self-update from an approved Cargo target directory"
+    )]
+    pub self_update_root: Option<std::path::PathBuf>,
+
+    #[arg(
         short = 'p',
         long = "print",
         help = "Headless: run the prompt, print the result, and exit. Tool calls run without prompting except those matching deny rules in settings.toml"
@@ -46,6 +53,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    #[command(about = "Review and approve this project's tool permission rules")]
+    Permissions {
+        #[command(subcommand)]
+        command: PermissionCommand,
+    },
     #[command(about = "Show provider status")]
     Providers,
     #[command(about = "Manage explicitly selected subscription authentication")]
@@ -102,6 +114,19 @@ pub enum Commands {
     Web {
         #[arg(long, default_value = "8080", help = "Port to listen on")]
         port: u16,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PermissionCommand {
+    #[command(about = "Display the current project rules and their approval digest")]
+    Review,
+    #[command(about = "Approve the exact reviewed rules for this canonical project root")]
+    Approve {
+        #[arg(long, value_name = "CANONICAL_ROOT")]
+        root: std::path::PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        digest: String,
     },
 }
 

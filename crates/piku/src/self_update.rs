@@ -4,12 +4,12 @@
     clippy::map_unwrap_or
 )]
 
-/// Self-update support for piku.
+/// Explicitly approved developer self-update support for piku.
 ///
-/// Handles the "piku builds itself" use case:
+/// With an operator-selected build root, handles the "piku builds itself" use case:
 ///
 ///   1. piku runs `cargo build --release` via the bash tool
-///   2. cargo writes a new binary to `target/release/piku`
+///   2. cargo writes a new binary to `<approved root>/release/piku`
 ///   3. piku detects the new binary is different from the running one
 ///   4. piku saves session state to disk (already happens per-turn)
 ///   5. piku atomically replaces itself on disk: do_replace(new_binary)
@@ -22,7 +22,23 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SelfUpdateError {
+    #[error("developer self-update is disabled; select --self-update-root explicitly")]
+    Disabled,
+
+    #[error("invalid self-update build root {path}: {reason}")]
+    InvalidRoot { path: PathBuf, reason: String },
+
+    #[error("self-update candidate could not be inspected at {path}: {source}")]
+    CandidateIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("self-update candidate is no longer ready or does not match the approved path")]
+    CandidateNotReady,
+
     #[error("could not determine current executable path: {0}")]
     CurrentExe(#[source] std::io::Error),
 
@@ -32,7 +48,7 @@ pub enum SelfUpdateError {
         source: std::io::Error,
     },
 
-    #[error("new binary is empty — build may have failed")]
+    #[error("new binary must be a nonempty regular executable file")]
     NotExecutable,
 
     #[error("atomic self-replace failed: {0}")]
@@ -215,53 +231,223 @@ pub fn mtime_newer_than(a: &Path, b: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Cargo build detection
+// Developer approval and build detection
 // ---------------------------------------------------------------------------
 
-/// Returns the default path where `cargo build --release` writes the piku binary.
-/// Relative to the process working directory.
-pub fn default_build_output() -> PathBuf {
-    PathBuf::from("target/release/piku")
+/// Immutable operator approval for local developer replacement.
+///
+/// Default is disabled. Project configuration, the working directory, Cargo
+/// output, and environment variables cannot enable this policy. This is an
+/// application admission rule, not an OS sandbox or binary authenticity check.
+#[derive(Clone, Debug, Default)]
+pub struct SelfUpdatePolicy {
+    approved_root: Option<ApprovedRoot>,
+    baseline: Option<std::time::SystemTime>,
 }
 
-/// Detect whether a bash command output indicates a successful **piku** rebuild.
-///
-/// Returns the path to the new binary if:
-///   1. The command exited successfully (`exit_success = true`)
-///   2. The output looks like `cargo build` of the piku binary specifically
-///      (contains "Finished" AND the piku binary name appears)
-///   3. `target/release/piku` exists and is newer than the running binary
-///
-/// The double check (Finished + piku-specific) guards against false positives
-/// when building other crates in the workspace (e.g. `cargo build -p piku-api`).
-pub fn detect_self_build(bash_output: &str, exit_success: bool) -> Option<PathBuf> {
-    if !exit_success {
-        return None;
+#[derive(Clone, Debug)]
+struct ApprovedRoot {
+    path: PathBuf,
+    directory: std::sync::Arc<std::fs::File>,
+}
+
+/// Pin the canonical directory without following a replaced path component.
+fn open_root_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::Mode;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut directory = open(Path::new("/"), flags, Mode::empty())?;
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            directory = openat(&directory, Path::new(name), flags, Mode::empty())?;
+        }
+    }
+    Ok(directory.into())
+}
+
+/// Snapshot the already-open approved source; never reopen its pathname.
+fn snapshot_source(
+    mut source: std::fs::File,
+    target: &Path,
+) -> Result<tempfile::NamedTempFile, SelfUpdateError> {
+    let parent = target.parent().ok_or_else(|| {
+        SelfUpdateError::Replace(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target has no parent directory",
+        ))
+    })?;
+    let mut snapshot = tempfile::Builder::new()
+        .prefix(".piku-update-")
+        .tempfile_in(parent)
+        .map_err(SelfUpdateError::Replace)?;
+    std::io::copy(&mut source, snapshot.as_file_mut()).map_err(SelfUpdateError::Replace)?;
+    let permissions = source
+        .metadata()
+        .map_err(SelfUpdateError::Replace)?
+        .permissions();
+    snapshot
+        .as_file()
+        .set_permissions(permissions)
+        .map_err(SelfUpdateError::Replace)?;
+    snapshot
+        .as_file()
+        .sync_all()
+        .map_err(SelfUpdateError::Replace)?;
+    Ok(snapshot)
+}
+
+impl SelfUpdatePolicy {
+    /// Capture an explicitly selected absolute Cargo target root once at launch.
+    /// Read-only launches disable replacement even if a root was supplied.
+    pub fn from_operator_root(
+        root: Option<&Path>,
+        read_only: bool,
+    ) -> Result<Self, SelfUpdateError> {
+        let Some(root) = root.filter(|_| !read_only) else {
+            return Ok(Self::default());
+        };
+        if !root.is_absolute() {
+            return Err(SelfUpdateError::InvalidRoot {
+                path: root.to_path_buf(),
+                reason: "must be an absolute directory path".to_string(),
+            });
+        }
+        let approved_root = root
+            .canonicalize()
+            .map_err(|error| SelfUpdateError::InvalidRoot {
+                path: root.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        if !approved_root.is_dir() {
+            return Err(SelfUpdateError::InvalidRoot {
+                path: root.to_path_buf(),
+                reason: "must be a directory".to_string(),
+            });
+        }
+        let directory =
+            open_root_directory(&approved_root).map_err(|error| SelfUpdateError::InvalidRoot {
+                path: root.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        let baseline = running_mtime().ok_or_else(|| {
+            SelfUpdateError::CurrentExe(std::io::Error::other(
+                "could not capture executable modification time",
+            ))
+        })?;
+        Ok(Self {
+            approved_root: Some(ApprovedRoot {
+                path: approved_root,
+                directory: std::sync::Arc::new(directory),
+            }),
+            baseline: Some(baseline),
+        })
     }
 
-    // Require BOTH conditions to avoid false positives:
-    //   1. "Finished" — cargo's success marker (present on build AND check)
-    //   2. piku-specific signal — distinguishes `cargo build -p piku` from
-    //      `cargo check`, `cargo build -p piku-api`, etc.
-    //
-    // "Compiling piku v" (with space+v) matches only the `piku` binary crate.
-    // "piku-api", "piku-tools", "piku-runtime" do not match (hyphen, not space+v).
-    // "target/release/piku" matches if cargo prints the output path.
-    let has_finished = bash_output.contains("Finished");
-    let mentions_piku_binary =
-        bash_output.contains("Compiling piku v") || bash_output.contains("target/release/piku");
-
-    // Both required — `cargo check` has Finished but no binary; other crates
-    // have mentions but don't produce the piku binary.
-    if !has_finished || !mentions_piku_binary {
-        return None;
+    /// Open the candidate relative to the pinned approved root. Both release
+    /// and piku must be real entries, never symlinks. Missing builds are normal.
+    fn open_candidate(&self) -> Result<Option<std::fs::File>, SelfUpdateError> {
+        use nix::fcntl::{openat, OFlag};
+        use nix::sys::stat::Mode;
+        let Some(root) = &self.approved_root else {
+            return Ok(None);
+        };
+        let path = root.path.join("release/piku");
+        let inspect_error = |source: nix::errno::Errno| SelfUpdateError::CandidateIo {
+            path: path.clone(),
+            source: source.into(),
+        };
+        let directory = match openat(
+            root.directory.as_ref(),
+            "release",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(inspect_error(error)),
+        };
+        let source: std::fs::File = match openat(
+            &directory,
+            "piku",
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(source) => source.into(),
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(inspect_error(error)),
+        };
+        let meta = source
+            .metadata()
+            .map_err(|source| SelfUpdateError::CandidateIo {
+                path: path.clone(),
+                source,
+            })?;
+        if !meta.is_file() || meta.len() == 0 {
+            return Err(SelfUpdateError::NotExecutable);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(SelfUpdateError::NotExecutable);
+        }
+        let modified = meta
+            .modified()
+            .map_err(|source| SelfUpdateError::CandidateIo { path, source })?;
+        Ok(self
+            .baseline
+            .is_some_and(|baseline| modified > baseline)
+            .then_some(source))
     }
 
-    let candidate = default_build_output();
-    if is_newer_than_running(&candidate) {
-        Some(candidate)
-    } else {
-        None
+    /// Inspect only the approved candidate using metadata from its open handle.
+    pub fn check_for_update(&self) -> Result<Option<PathBuf>, SelfUpdateError> {
+        Ok(self.open_candidate()?.and_then(|_| {
+            self.approved_root
+                .as_ref()
+                .map(|root| root.path.join("release/piku"))
+        }))
+    }
+
+    /// Cargo text is a readiness hint only within an already approved root.
+    pub fn detect_self_build(
+        &self,
+        output: &str,
+        exit_success: bool,
+    ) -> Result<Option<PathBuf>, SelfUpdateError> {
+        if !exit_success
+            || !output.contains("Finished")
+            || !(output.contains("Compiling piku v") || output.contains("target/release/piku"))
+        {
+            return Ok(None);
+        }
+        self.check_for_update()
+    }
+
+    /// Recheck admission immediately before the filesystem replacement.
+    /// No automatic caller may use the lower-level replacement primitives.
+    pub fn replace_and_exec(
+        &self,
+        candidate: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), SelfUpdateError> {
+        if self.approved_root.is_none() {
+            return Err(SelfUpdateError::Disabled);
+        }
+        let root = self
+            .approved_root
+            .as_ref()
+            .ok_or(SelfUpdateError::Disabled)?;
+        if candidate != root.path.join("release/piku") {
+            return Err(SelfUpdateError::CandidateNotReady);
+        }
+        let source = self
+            .open_candidate()?
+            .ok_or(SelfUpdateError::CandidateNotReady)?;
+        let current_exe = std::env::current_exe().map_err(SelfUpdateError::CurrentExe)?;
+        let snapshot = snapshot_source(source, &current_exe)?;
+        do_replace(snapshot.path(), &current_exe)?;
+        // Close/remove the snapshot before exec, which never runs Rust Drop.
+        drop(snapshot);
+        exec_self(&current_exe, extra_env)
     }
 }
 
@@ -362,12 +548,18 @@ mod tests {
 
     #[test]
     fn detect_self_build_false_on_failed_exit() {
-        assert!(detect_self_build("Finished release [optimized]", false).is_none());
+        assert!(SelfUpdatePolicy::default()
+            .detect_self_build("Finished release [optimized]", false)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn detect_self_build_false_when_no_finished() {
-        assert!(detect_self_build("Compiling piku v0.1.0", true).is_none());
+        assert!(SelfUpdatePolicy::default()
+            .detect_self_build("Compiling piku v0.1.0", true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -377,47 +569,150 @@ mod tests {
         // BUT: "Finished" alone still passes the `has_finished` check.
         // The guard is: require `has_finished`. If binary isn't newer → None.
         // So this correctly returns None if binary is not newer.
-        let result = detect_self_build(
+        let result = SelfUpdatePolicy::default().detect_self_build(
             "Compiling piku-api v0.1.0\nFinished release [optimized]",
             true,
         );
         // Returns None because target/release/piku doesn't exist / isn't newer in test env
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
-    fn detect_self_build_some_when_binary_is_newer() {
-        // Use a mutex to serialize cwd-changing tests across parallel test threads.
-        static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CWD_MUTEX.lock().unwrap();
-
+    fn detect_self_build_some_only_with_approved_root() {
         let dir = tempdir();
-        let release_dir = dir.join("target").join("release");
-        std::fs::create_dir_all(&release_dir).unwrap();
-        let fake_binary = release_dir.join("piku");
-
-        let exe_content = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        write_binary(&fake_binary, &exe_content);
-
-        // Write again after sleep so mtime is definitively newer
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        write_binary(&fake_binary, &exe_content);
-
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
-        let result = detect_self_build(
-            "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 3.14s",
-            true,
-        );
-
-        std::env::set_current_dir(original_cwd).unwrap();
-
+        let policy = SelfUpdatePolicy::from_operator_root(Some(&dir), false).unwrap();
+        let release = dir.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        let candidate = release.join("piku");
+        write_binary(&candidate, b"approved build");
+        let output = "Compiling piku v0.1.0\nFinished release [optimized]";
+        assert!(SelfUpdatePolicy::default()
+            .detect_self_build(output, true)
+            .unwrap()
+            .is_none());
         assert_eq!(
-            result,
-            Some(PathBuf::from("target/release/piku")),
-            "should detect newer binary"
+            policy.detect_self_build(output, true).unwrap(),
+            Some(candidate.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn cargo_hints_are_checked_only_inside_approved_root() {
+        let root = tempdir();
+        std::fs::create_dir_all(root.join("release")).unwrap();
+        write_binary(&root.join("release/piku"), b"approved");
+        let mut policy = SelfUpdatePolicy::from_operator_root(Some(&root), false).unwrap();
+        policy.baseline = Some(std::time::UNIX_EPOCH);
+        for (output, success) in [
+            ("Finished release", true),
+            ("Compiling piku v0.1.0", true),
+            ("Compiling piku-api v0.1.0\nFinished release", true),
+            ("Compiling piku-tools v0.1.0\nFinished release", true),
+            ("Compiling piku v0.1.0\nFinished release", false),
+        ] {
+            assert!(
+                policy.detect_self_build(output, success).unwrap().is_none(),
+                "{output}"
+            );
+        }
+        assert!(policy
+            .detect_self_build("Compiling piku v0.1.0\nFinished release", true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn read_only_disables_explicit_root() {
+        let dir = tempdir();
+        let policy = SelfUpdatePolicy::from_operator_root(Some(&dir), true).unwrap();
+        assert!(policy.check_for_update().unwrap().is_none());
+        assert!(matches!(
+            policy.replace_and_exec(Path::new("unused"), &[]),
+            Err(SelfUpdateError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn relative_or_file_root_is_rejected() {
+        assert!(matches!(
+            SelfUpdatePolicy::from_operator_root(Some(Path::new("target")), false),
+            Err(SelfUpdateError::InvalidRoot { .. })
+        ));
+        let dir = tempdir();
+        let file = dir.join("file");
+        write_binary(&file, b"content");
+        assert!(matches!(
+            SelfUpdatePolicy::from_operator_root(Some(&file), false),
+            Err(SelfUpdateError::InvalidRoot { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_candidate_is_rejected_before_detection_and_replacement() {
+        let dir = tempdir();
+        let outside = tempdir().join("outside-piku");
+        write_binary(&outside, b"outside");
+        let release = dir.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::os::unix::fs::symlink(&outside, release.join("piku")).unwrap();
+        let policy = SelfUpdatePolicy::from_operator_root(Some(&dir), false).unwrap();
+        assert!(matches!(
+            policy.check_for_update(),
+            Err(SelfUpdateError::CandidateIo { .. })
+        ));
+        assert!(matches!(
+            policy.replace_and_exec(&dir.canonicalize().unwrap().join("release/piku"), &[]),
+            Err(SelfUpdateError::CandidateIo { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_uses_open_source_after_path_is_swapped_to_outside_symlink() {
+        let root = tempdir();
+        let release = root.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        let candidate = release.join("piku");
+        write_binary(&candidate, b"approved source bytes");
+        let policy = SelfUpdatePolicy::from_operator_root(Some(&root), false).unwrap();
+        // Test this race independently of wall-clock mtime precision.
+        let mut policy = policy;
+        policy.baseline = Some(std::time::UNIX_EPOCH);
+        let source = policy.open_candidate().unwrap().unwrap();
+        let outside = tempdir().join("outside");
+        write_binary(&outside, b"outside source bytes");
+        std::fs::rename(&candidate, release.join("piku-original")).unwrap();
+        std::os::unix::fs::symlink(&outside, &candidate).unwrap();
+        let target = tempdir().join("copy-target");
+        write_binary(&target, b"old target");
+        let snapshot = snapshot_source(source, &target).unwrap();
+        do_replace(snapshot.path(), &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"approved source bytes");
+        assert!(matches!(
+            policy.check_for_update(),
+            Err(SelfUpdateError::CandidateIo { .. })
+        ));
+    }
+
+    #[test]
+    fn release_directory_symlink_is_rejected_and_root_identity_is_pinned() {
+        let root = tempdir();
+        let policy = SelfUpdatePolicy::from_operator_root(Some(&root), false).unwrap();
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tempdir();
+        std::fs::create_dir_all(outside.join("release")).unwrap();
+        write_binary(&outside.join("release/piku"), b"outside");
+        std::os::unix::fs::symlink(&outside, root.join("release")).unwrap();
+        // The old approved directory has no release entry; the new pathname
+        // and its outside symlink cannot supply a candidate to the pinned root.
+        assert!(policy.check_for_update().unwrap().is_none());
+        std::os::unix::fs::symlink(outside.join("release"), moved.join("release")).unwrap();
+        assert!(matches!(
+            policy.check_for_update(),
+            Err(SelfUpdateError::CandidateIo { .. })
+        ));
     }
 
     // -----------------------------------------------------------------------

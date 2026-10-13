@@ -30,13 +30,14 @@ tool implementations in `piku-tools`, and presentation/configuration in `piku`.
   disables hooks. It does not confine reads or provider disclosure, and Piku's
   own persistence still writes session/history state; prompt-at-launch runs also
   write trace state.
-- Every writable launch turn uses `AllowAll`, including a prompt that later
-  enters the TUI. It has no confirmation or sandbox and advertises agent tools
-  without a task registry, so those calls return unavailable stubs. Permission
-  prompts and agent lifecycle support begin only inside the TUI loop.
-- In the TUI, `Safe` calls bypass configuration rules and a prior per-turn
-  allow-all precedes deny rules. New unprotected files and agent-memory writes
-  are among the mutations currently classified `Safe`.
+- Writable launch turns permit tool calls after configured deny rules, including
+  a prompt that later enters the TUI. They have no interactive confirmation or
+  sandbox and advertise agent tools without a task registry, so those calls
+  return unavailable stubs. Permission prompts and agent lifecycle support begin
+  only inside the TUI loop.
+- Configured deny rules precede `Safe` classification and per-turn allow-all.
+  New unprotected files and agent-memory writes are among the mutations
+  classified `Safe` after restrictions have been checked.
 - Project instructions come from `PIKU.md`, `PIKU.local.md`, and
   `.piku/PIKU.md`. Piku does not load `AGENTS.md` and has no MCP, LSP,
   browser/web-search, or image integration.
@@ -64,12 +65,16 @@ from an inconclusive verifier timeout or transport failure.
 
 ## Self-hosting
 
-`cargo build --release -p piku` writes the default candidate binary. A writable
-source-built piku may detect it, save the current session, atomically replace
-its executable, and restart via `exec`. Do not assume that happened: verify the
-restart banner or process behavior. Read-only mode does not self-update, and
-the mechanism provides no confirmation, signature verification, or automatic
-rollback.
+Self-update is disabled by default. Developer launches can explicitly approve
+one absolute Cargo target directory with `--self-update-root /absolute/build/root`.
+A writable opted-in Piku checks only that pinned directory's `release/piku`,
+saves the session, snapshots the opened candidate, atomically replaces its
+executable, and restarts via `exec`. Release-directory and candidate symlinks
+are rejected. Working-directory builds, project settings, environment values,
+and Cargo output cannot enable replacement. Read-only mode never self-updates.
+Verify the restart banner or process behavior; the mechanism has no signature
+verification or automatic rollback. This approval is an application rule, not
+OS containment: executed code retains the process's host authority.
 
 ## Key references
 

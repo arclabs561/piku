@@ -39,9 +39,10 @@ with inspection tools and exits. Provider and model overrides are available as
 `--provider` and `--model`.
 
 Piku can use ChatGPT plan access, OpenRouter, Anthropic, Groq, Ollama, or a custom
-OpenAI-compatible server. It reads provider settings from the environment,
-user configuration, and `.piku/settings.toml`. Run `piku providers` to see what
-the current launch can use.
+OpenAI-compatible server. Provider selection comes from the launch environment,
+user configuration and explicit flags. Repository `.env` files and project
+settings cannot choose credential destinations or override provider/model
+selection. Run `piku providers` to see what the current launch can use.
 
 For eligible ChatGPT accounts, Sign in with ChatGPT keeps Piku's own agent loop
 and tools. Login works from captured command runners as well as terminals and
@@ -90,9 +91,9 @@ tools without confirmation. `--read-only` narrows the tool catalog, but it does
 not confine filesystem reads or provider disclosure. The browser terminal is an
 unrestricted host shell and requires an explicit start action.
 
-Source-built writable sessions can replace a running Piku process with a newer
-local release binary. See [self-update behavior](docs/self-update.md) before
-using that workflow.
+Developer self-update is disabled unless `--self-update-root` names an approved
+absolute Cargo target directory. See [self-update behavior](docs/self-update.md)
+before using that workflow.
 
 ## Develop
 

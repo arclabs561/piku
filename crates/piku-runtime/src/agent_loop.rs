@@ -44,7 +44,7 @@ pub type InterjectionTx = mpsc::Sender<String>;
 /// Shared cancellation flag. Set to `true` to abort the current turn.
 pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
-const DEFAULT_MAX_TURNS: u32 = 20;
+pub const DEFAULT_MAX_TURNS: u32 = 20;
 
 /// Action the loop should take after a tool call completes.
 #[derive(Debug, Default)]

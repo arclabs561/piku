@@ -455,39 +455,24 @@ mod detect_self_build {
             "new file should be newer than old"
         );
 
-        // Now verify detect_self_build with a controlled path
-        // We can't easily change cwd safely in parallel tests, so test the
-        // underlying logic: build a scenario where we know the binary is newer.
-        // The `is_newer_than_running` call in detect_self_build uses current_exe()
-        // as the reference. We test the pieces separately:
-        // 1. mtime comparison is correct (tested above)
-        // 2. output parsing is correct (tested in other tests)
-        // 3. detect_self_build returns None when binary doesn't exist at relative path
-        let result = self_update::detect_self_build(
-            "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
-            true,
-        );
-        // In the test environment, target/release/piku either doesn't exist or
-        // isn't newer. The test verifies it doesn't panic and returns the expected type.
-        match result {
-            None => {} // expected in test env
-            Some(p) => {
-                // If it returns Some, the binary must actually be newer
-                assert!(p.exists(), "returned path must exist");
-                assert!(
-                    self_update::is_newer_than_running(&p),
-                    "returned binary must be newer than current_exe"
-                );
-            }
-        }
+        let release = dir.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        let candidate = release.join("piku");
+        write_binary(&candidate, b"approved build");
+        let policy = self_update::SelfUpdatePolicy::from_operator_root(Some(&dir), false).unwrap();
+        let result = policy
+            .detect_self_build(
+                "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
+                true,
+            )
+            .unwrap();
+        assert_eq!(result, Some(candidate.canonicalize().unwrap()));
     }
 
     #[test]
     fn returns_none_when_binary_not_newer() {
-        // detect_self_build uses default_build_output() = "target/release/piku"
-        // relative to cwd. We test the component parts:
-        // - is_newer_than_running returns false for a file with old mtime
-        // - detect_self_build returns None when is_newer_than_running is false
+        // The unchanged running file is not newer, and default policy has
+        // no approved candidate regardless of ambient build outputs.
 
         // Same-file comparison is always false (not newer than itself)
         let exe = std::env::current_exe().unwrap();
@@ -496,11 +481,13 @@ mod detect_self_build {
             "current_exe should not be newer than itself"
         );
 
-        // Nonexistent path → None (test CWD has no target/release/piku)
-        let result = self_update::detect_self_build(
-            "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
-            true,
-        );
+        // No operator approval → None, without checking a guessed cwd path.
+        let result = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(
+                "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
+                true,
+            )
+            .unwrap();
         assert!(
             result.is_none(),
             "detect_self_build should return None when binary doesn't exist at default path"
@@ -509,10 +496,9 @@ mod detect_self_build {
 
     #[test]
     fn returns_none_on_failed_exit() {
-        let result = self_update::detect_self_build(
-            "Finished release [optimized] target(s) in 1.23s",
-            false,
-        );
+        let result = self_update::SelfUpdatePolicy::default()
+            .detect_self_build("Finished release [optimized] target(s) in 1.23s", false)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -520,10 +506,12 @@ mod detect_self_build {
     fn returns_none_on_failed_exit_even_with_piku_marker() {
         // Isolates the exit_success guard: output has both "Compiling piku v"
         // and "Finished" but exit_success=false. Must return None.
-        let result = self_update::detect_self_build(
-            "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
-            false,
-        );
+        let result = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(
+                "Compiling piku v0.1.0\nFinished release [optimized] target(s) in 1.23s",
+                false,
+            )
+            .unwrap();
         assert!(
             result.is_none(),
             "failed exit should prevent self-update even with valid output markers"
@@ -532,10 +520,12 @@ mod detect_self_build {
 
     #[test]
     fn returns_none_without_finished_marker() {
-        let result = self_update::detect_self_build(
-            "Compiling piku v0.1.0\nerror[E0308]: mismatched types",
-            true,
-        );
+        let result = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(
+                "Compiling piku v0.1.0\nerror[E0308]: mismatched types",
+                true,
+            )
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -544,10 +534,12 @@ mod detect_self_build {
         // "Compiling piku-api" does NOT match "Compiling piku v" (the " v" suffix is
         // what distinguishes the piku binary crate from sibling crates).
         // The mentions_piku_binary check prevents this from triggering.
-        let result = self_update::detect_self_build(
-            "Compiling piku-api v0.1.0\nFinished release [optimized]",
-            true,
-        );
+        let result = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(
+                "Compiling piku-api v0.1.0\nFinished release [optimized]",
+                true,
+            )
+            .unwrap();
         assert!(
             result.is_none(),
             "building piku-api should not trigger self-update (no 'Compiling piku v' match)"
@@ -966,7 +958,9 @@ mod bash_detect_integration {
         );
 
         // cargo --version does not print "Finished" — no detection
-        let detected = self_update::detect_self_build(&result.output, !result.is_error);
+        let detected = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(&result.output, !result.is_error)
+            .unwrap();
         assert!(
             detected.is_none(),
             "cargo --version should not trigger self-build detection"
@@ -982,7 +976,9 @@ mod bash_detect_integration {
 
         assert!(result.is_error, "should fail with exit 1");
         // Even though output contains "Finished", exit_success=false → None
-        let detected = self_update::detect_self_build(&result.output, !result.is_error);
+        let detected = self_update::SelfUpdatePolicy::default()
+            .detect_self_build(&result.output, !result.is_error)
+            .unwrap();
         assert!(
             detected.is_none(),
             "failed command should never trigger detection"
@@ -1015,84 +1011,404 @@ mod bash_detect_integration {
 mod bug_a_detect_self_build {
     use piku::self_update;
 
+    fn approved_policy() -> (tempfile::TempDir, self_update::SelfUpdatePolicy) {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        super::write_binary(&release.join("piku"), b"approved build");
+        let policy =
+            self_update::SelfUpdatePolicy::from_operator_root(Some(root.path()), false).unwrap();
+        assert!(policy.check_for_update().unwrap().is_some());
+        (root, policy)
+    }
+
     #[test]
     fn cargo_check_does_not_trigger() {
+        let (_root, policy) = approved_policy();
         // `cargo check` emits "Finished" but no binary — should not trigger.
         let output = "   Checking piku-api v0.1.0\n\
                       Finished `check` profile [unoptimized] target(s) in 0.10s";
         assert!(
-            self_update::detect_self_build(output, true).is_none(),
+            policy.detect_self_build(output, true).unwrap().is_none(),
             "cargo check should not trigger self-update"
         );
     }
 
     #[test]
     fn cargo_build_piku_api_does_not_trigger() {
+        let (_root, policy) = approved_policy();
         // "Compiling piku-api v..." does NOT match "Compiling piku v..."
         let output = "   Compiling piku-api v0.1.0\n\
                       Finished release [optimized] target(s) in 1.0s";
         assert!(
-            self_update::detect_self_build(output, true).is_none(),
+            policy.detect_self_build(output, true).unwrap().is_none(),
             "building piku-api should not trigger piku self-update"
         );
     }
 
     #[test]
     fn cargo_build_piku_tools_does_not_trigger() {
+        let (_root, policy) = approved_policy();
         let output = "   Compiling piku-tools v0.1.0\n\
                       Finished release [optimized] target(s) in 0.8s";
         assert!(
-            self_update::detect_self_build(output, true).is_none(),
+            policy.detect_self_build(output, true).unwrap().is_none(),
             "building piku-tools should not trigger piku self-update"
         );
     }
 
     #[test]
     fn cargo_build_piku_runtime_does_not_trigger() {
+        let (_root, policy) = approved_policy();
         let output = "   Compiling piku-runtime v0.1.0\n\
                       Finished release [optimized] target(s) in 1.2s";
         assert!(
-            self_update::detect_self_build(output, true).is_none(),
+            policy.detect_self_build(output, true).unwrap().is_none(),
             "building piku-runtime should not trigger piku self-update"
         );
     }
 
     #[test]
     fn failed_build_never_triggers() {
+        let (_root, policy) = approved_policy();
         let output = "   Compiling piku v0.1.0\n\
                       error[E0308]: mismatched types\n\
                       error: could not compile `piku`";
         assert!(
-            self_update::detect_self_build(output, false).is_none(),
+            policy.detect_self_build(output, false).unwrap().is_none(),
             "failed build should never trigger self-update"
         );
     }
 
     #[test]
     fn genuine_piku_build_with_correct_marker() {
+        let (_root, policy) = approved_policy();
         // "Compiling piku v" (with space+v) is the discriminating marker.
-        // Can't easily make binary newer in test, but verify no panic.
+        // A ready approved candidate makes this a positive detection test.
         let output = "   Compiling piku v0.1.0 (crates/piku)\n\
                       Finished release [optimized] target(s) in 2.0s";
-        let result = self_update::detect_self_build(output, true);
-        // Either None (binary not newer) or Some (if it is) — both valid
-        match result {
-            None => {}
-            Some(p) => assert!(p.to_string_lossy().contains("piku")),
-        }
+        let result = policy.detect_self_build(output, true).unwrap();
+        assert!(
+            result.is_some(),
+            "ready approved Piku build must be detected"
+        );
     }
 
     #[test]
     fn only_finished_without_piku_marker_does_not_trigger() {
+        let (_root, policy) = approved_policy();
         // Before the fix: `!has_finished && !mentions_piku` (AND) meant that
         // having only has_finished=true would fall through to is_newer_than_running.
         // After the fix: requires has_finished AND mentions_piku_binary (OR).
         let output = "Finished release [optimized] target(s) in 0.5s";
         // No "Compiling piku v" → should not trigger
-        let result = self_update::detect_self_build(output, true);
+        let result = policy.detect_self_build(output, true).unwrap();
         assert!(
             result.is_none(),
             "output with Finished but no 'Compiling piku v' should not trigger self-update"
         );
+    }
+}
+
+// These probes execute copies of the real application. A shell-script candidate
+// writes a marker so replacement is independently observable; the Cargo-built
+// executable and installed Piku are never replacement targets.
+mod developer_admission {
+    use super::write_binary;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        exe: PathBuf,
+        project: PathBuf,
+        home: PathBuf,
+        approved: PathBuf,
+        marker: PathBuf,
+        original: Vec<u8>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("piku-copy");
+            std::fs::copy(env!("CARGO_BIN_EXE_piku"), &exe).unwrap();
+            let original = std::fs::read(&exe).unwrap();
+            let project = dir.path().join("project");
+            let home = dir.path().join("home");
+            let approved = dir.path().join("operator-build");
+            for path in [&project, &home, &approved] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            Self {
+                marker: dir.path().join("restart-marker"),
+                _dir: dir,
+                exe,
+                project,
+                home,
+                approved,
+                original,
+            }
+        }
+
+        fn candidate(root: &Path, label: &str) -> PathBuf {
+            let path = root.join("release/piku");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            write_binary(
+                &path,
+                format!("#!/bin/sh\nprintf '{label}:%s\\n' \"$PIKU_SESSION_ID\" > \"$PIKU_TEST_RESTART_MARKER\"\nexit 0\n").as_bytes(),
+            );
+            path
+        }
+
+        fn command(&self) -> Command {
+            let mut cmd = Command::new(&self.exe);
+            cmd.env_clear()
+                .env("HOME", &self.home)
+                .env("PATH", "/usr/bin:/bin")
+                .env("TERM", "xterm-256color")
+                .env("PIKU_NO_DOTENV", "1")
+                .env("PIKU_TEST_RESTART_MARKER", &self.marker)
+                .current_dir(&self.project)
+                .stdin(Stdio::null());
+            cmd
+        }
+
+        fn assert_unchanged(&self, output: &Output) {
+            assert!(
+                !self.marker.exists(),
+                "unapproved candidate executed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&self.exe).unwrap(), self.original);
+        }
+    }
+
+    #[test]
+    fn default_ignores_newer_project_candidate_and_environment_opt_in() {
+        let f = Fixture::new();
+        let ambient = f.project.join("target");
+        Fixture::candidate(&ambient, "unapproved");
+        let output = f
+            .command()
+            .args(["--provider", "ollama"])
+            .env("PIKU_SELF_UPDATE_ROOT", &ambient)
+            .output()
+            .unwrap();
+        f.assert_unchanged(&output);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("restarting"));
+    }
+
+    #[test]
+    fn explicit_root_restarts_copy_and_passes_tui_session_from_other_cwd() {
+        let f = Fixture::new();
+        let approved = Fixture::candidate(&f.approved, "approved");
+        Fixture::candidate(&f.project.join("target"), "unapproved");
+        let output = f
+            .command()
+            .args(["--provider", "ollama", "--self-update-root"])
+            .arg(&f.approved)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&f.exe).unwrap(),
+            std::fs::read(approved).unwrap()
+        );
+        let marker = std::fs::read_to_string(&f.marker).unwrap();
+        assert!(marker.starts_with("approved:session-"), "{marker}");
+    }
+
+    #[test]
+    fn read_only_disables_operator_opt_in_and_project_candidate() {
+        let f = Fixture::new();
+        Fixture::candidate(&f.approved, "approved");
+        Fixture::candidate(&f.project.join("target"), "unapproved");
+        let output = f
+            .command()
+            .args(["--read-only", "--provider", "ollama", "--self-update-root"])
+            .arg(&f.approved)
+            .output()
+            .unwrap();
+        f.assert_unchanged(&output);
+    }
+
+    #[test]
+    fn relative_operator_root_is_an_explicit_startup_error() {
+        let f = Fixture::new();
+        let output = f
+            .command()
+            .args(["--provider", "ollama", "--self-update-root", "target"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must be an absolute"));
+        f.assert_unchanged(&output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaping_symlink_reports_error_without_replacing_copy() {
+        let f = Fixture::new();
+        let outside = Fixture::candidate(&f.project.join("target"), "outside");
+        let release = f.approved.join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::os::unix::fs::symlink(outside, release.join("piku")).unwrap();
+        let output = f
+            .command()
+            .args(["--provider", "ollama", "--self-update-root"])
+            .arg(&f.approved)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("self-update check failed"));
+        f.assert_unchanged(&output);
+    }
+
+    /// Canned OpenAI-compatible stream using the same protocol as `binary_tests`.
+    /// One bash turn prints forged Cargo text; the next turn ends normally.
+    fn forged_cargo_server(expect_continuation: bool) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let tool = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"forged-build","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":"printf 'Compiling piku v0.1.0\\nFinished release [optimized]\\n'"}).to_string()}}]},"finish_reason":null}]});
+            let answer = serde_json::json!({"choices":[{"delta":{"content":"continued without update"},"finish_reason":null}]});
+            for (delta, stop) in [(tool, "tool_calls"), (answer, "stop")]
+                .into_iter()
+                .take(if expect_continuation { 2 } else { 1 })
+            {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "application did not continue to the next provider request"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                let (end, length) = loop {
+                    let read = stream.read(&mut buf).unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < end + length {
+                    let read = stream.read(&mut buf).unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let finish = serde_json::json!({"choices":[{"delta":{},"finish_reason":stop}]});
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n").unwrap();
+            }
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn headless_forged_cargo_output_cannot_replace_unapproved_copy() {
+        let f = Fixture::new();
+        Fixture::candidate(&f.project.join("target"), "unapproved");
+        let (url, server) = forged_cargo_server(true);
+        let output = f
+            .command()
+            .args([
+                "--print",
+                "--provider",
+                "custom",
+                "--model",
+                "fixture",
+                "check",
+            ])
+            .env("PIKU_BASE_URL", url)
+            .env("PIKU_API_KEY", "test-key")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("continued without update"));
+        f.assert_unchanged(&output);
+        let sessions = f.home.join(".config/piku/sessions");
+        let saved = std::fs::read_dir(sessions)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                (path
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .then_some(path)
+            })
+            .unwrap();
+        let session = piku_runtime::Session::load(&saved).unwrap();
+        assert!(session.messages.iter().flat_map(|message| &message.blocks).any(|block| {
+            matches!(block, piku_runtime::ContentBlock::ToolResult { output, .. } if output.contains("Finished release"))
+        }));
+    }
+    #[test]
+    fn headless_operator_opt_in_restarts_copy_after_tool_output() {
+        let f = Fixture::new();
+        let candidate = Fixture::candidate(&f.approved, "approved");
+        let (url, server) = forged_cargo_server(false);
+        let output = f
+            .command()
+            .args([
+                "--print",
+                "--provider",
+                "custom",
+                "--model",
+                "fixture",
+                "--self-update-root",
+            ])
+            .arg(&f.approved)
+            .arg("check")
+            .env("PIKU_BASE_URL", url)
+            .env("PIKU_API_KEY", "test-key")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&f.exe).unwrap(),
+            std::fs::read(candidate).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&f.marker).unwrap(), "approved:\n");
     }
 }

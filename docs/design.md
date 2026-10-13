@@ -233,13 +233,18 @@ Settings are TOML:
 
 ```text
 $XDG_CONFIG_HOME/piku/settings.toml   global settings (`~/.config` fallback)
-.piku/settings.toml           project overrides
+.piku/settings.toml           project restrictions and reviewed tool grants
 CLI flags                      provider and model overrides
 ```
 
 Settings cover provider/model choice, maximum turns, and tool allow/deny
-patterns. Environment variables carry provider endpoints, credentials, and
-embedding configuration.
+patterns. Operator environment variables carry provider endpoints, credentials,
+and embedding configuration; Piku does not import repository dotenv files.
+Project settings cannot change provider/model routing, actor connections or
+provider blocks. Project deny rules apply immediately; project allow rules need
+explicit canonical-root/digest review and approval. A project may lower the
+effective turn limit. See [repository authority](design/repository-authority.md)
+for the approval contract and independent developer self-update boundary.
 
 The CLI supports interactive use, one-shot prompts, `-p` headless output,
 read-only mode, provider/model selection, session resume, and provider status.
