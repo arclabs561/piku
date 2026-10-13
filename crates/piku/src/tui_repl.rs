@@ -3458,6 +3458,118 @@ mod tests {
             .is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_policy_boundary_in_isolated_process() {
+        const CHILD: &str = "PIKU_FILE_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tui_repl::tests::file_policy_boundary_in_isolated_process",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("PIKU_ALLOW_WRITE_ANY")
+                .current_dir(fixture.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use piku_runtime::permission::check_permission;
+        use std::os::unix::fs::symlink;
+        let base = std::env::current_dir().unwrap().canonicalize().unwrap();
+        std::fs::write(".env", "original").unwrap();
+        std::fs::create_dir("src").unwrap();
+        std::fs::create_dir(".ssh").unwrap();
+        symlink(".env", "alias-env").unwrap();
+        symlink(".ssh", "alias-ssh").unwrap();
+        symlink("../.ssh", "src/redirected").unwrap();
+        assert_eq!(
+            std::fs::canonicalize("src/redirected").unwrap(),
+            base.join(".ssh")
+        );
+        let deny = vec![
+            "write_file(.env)".into(),
+            "edit_file(.env)".into(),
+            "read_file(.env)".into(),
+            "write_file(.ssh/*)".into(),
+        ];
+        let prompter = TuiPrompter::new(&[], &deny);
+        prompter
+            .allow_all
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let child = prompter.delegated_policy().unwrap();
+        let grandchild = child.delegated_policy().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for policy in [
+            &prompter as &dyn PermissionPrompter,
+            child.as_ref(),
+            grandchild.as_ref(),
+        ] {
+            for target in [
+                ".env".to_owned(),
+                "./.env".to_owned(),
+                base.join(".env").to_str().unwrap().to_owned(),
+                "alias-env".to_owned(),
+            ] {
+                for tool in ["write_file", "edit_file", "read_file"] {
+                    let params = serde_json::json!({"path": target, "content":"changed", "old_string":"original", "new_string":"changed"});
+                    let outcome = check_permission(tool, &params, policy);
+                    // Same permission-before-dispatch ordering as the agent loop.
+                    if matches!(outcome, PermissionOutcome::Allow) {
+                        runtime.block_on(piku_tools::execute_tool(tool, params));
+                    }
+                    assert!(
+                        matches!(outcome, PermissionOutcome::Deny { .. }),
+                        "{tool} {target}"
+                    );
+                    assert_eq!(std::fs::read_to_string(".env").unwrap(), "original");
+                }
+            }
+            let params = serde_json::json!({"path":"alias-ssh/new.txt", "content":"changed"});
+            let outcome = check_permission("write_file", &params, policy);
+            if matches!(outcome, PermissionOutcome::Allow) {
+                runtime.block_on(piku_tools::execute_tool("write_file", params));
+            }
+            assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
+            assert!(!base.join(".ssh/new.txt").exists());
+        }
+        let scoped = TuiPrompter::new(&["write_file(src/*)".into()], &[])
+            .delegated_policy()
+            .unwrap();
+        for target in ["src/../.env", "src/redirected/new.txt", "alias-ssh/new.txt"] {
+            let params = serde_json::json!({"path":target, "content":"changed"});
+            let outcome = check_permission("write_file", &params, scoped.as_ref());
+            if matches!(outcome, PermissionOutcome::Allow) {
+                runtime.block_on(piku_tools::execute_tool("write_file", params));
+            }
+            assert!(
+                matches!(outcome, PermissionOutcome::Deny { .. }),
+                "{target}"
+            );
+            assert_eq!(std::fs::read_to_string(".env").unwrap(), "original");
+            assert!(!base.join(".ssh/new.txt").exists());
+        }
+        let params = serde_json::json!({"path":"src/new.txt", "content":"created"});
+        assert!(matches!(
+            check_permission("write_file", &params, scoped.as_ref()),
+            PermissionOutcome::Allow
+        ));
+        let result = runtime
+            .block_on(piku_tools::execute_tool("write_file", params))
+            .unwrap();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string("src/new.txt").unwrap(), "created");
+    }
+
     #[test]
     fn permission_description_truncation_keeps_unicode_boundaries() {
         // At 80 columns the 54-byte prefix budget falls inside `日`.
