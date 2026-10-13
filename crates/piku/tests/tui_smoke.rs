@@ -933,6 +933,245 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
     );
 }
 
+#[path = "support/review_workflow.rs"]
+#[allow(dead_code)]
+mod review_workflow;
+
+/// Compose ambiguity, a genuinely unfinished stream, and fresh-process repair
+/// through the real terminal. Scripted answers establish application plumbing.
+#[test]
+#[serial]
+#[ignore = "PTY acceptance: run isolated via scripts/ci.sh pty"]
+fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
+    use review_workflow::*;
+    use serde_json::{json, Value};
+
+    let fixture = if let Ok(destination) = std::env::var("PIKU_TERMINAL_ACCEPTANCE_EVIDENCE") {
+        std::fs::create_dir_all(&destination).unwrap();
+        tempfile::tempdir_in(destination).unwrap()
+    } else {
+        smoke_tempdir()
+    };
+    let fixture_path = fixture.path().to_path_buf();
+    let _fixture_guard = if std::env::var_os("PIKU_TERMINAL_ACCEPTANCE_EVIDENCE").is_some() {
+        eprintln!("retained terminal fixture: {}", fixture.keep().display());
+        None
+    } else {
+        Some(fixture)
+    };
+    let repo = fixture_path.join("parent");
+    let retained = fixture_path.join("retained");
+    let config = fixture_path.join("config");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    let original = prepare_worktree(&repo, &retained);
+    let text =
+        |content: &str| json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
+    let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"recovery-write","type":"function","function":{"name":"write_file","arguments":json!({"path":retained.join("settings.json"),"content":"{\"port\":9090,\"debug\":false,\"service\":\"fixture\"}\n"}).to_string()}}]},"finish_reason":null}]});
+    let (url, requests, server) = scripted_response_server(vec![
+        (
+            text("AMBIGUITY: Which port and debug setting should deployment use?"),
+            "stop",
+        ),
+        (
+            text("INTERRUPTED: preparing the clarified configuration\n"),
+            "interrupt",
+        ),
+        // Normal writable exits acquire a separate memory-extraction response.
+        (text("[]"), "stop"),
+        (tool, "tool_calls"),
+        (text("RECOVERY_COMPLETE"), "stop"),
+        (text("[]"), "stop"),
+    ]);
+    let config_text = config.to_str().unwrap();
+    let environment = [
+        ("XDG_CONFIG_HOME", config_text),
+        ("HOME", config_text),
+        ("PIKU_NO_DOTENV", "1"),
+        ("PIKU_MODEL", "canned-model"),
+        ("PIKU_BASE_URL", url.as_str()),
+    ];
+    let prompt = "Make settings.json deployment-ready; preserve service and all other files.";
+    let clarification = "Use port 9090 and debug false; preserve service fixture.";
+    let correction = "The previous turn was interrupted. Apply port 9090 and debug false now, preserving service fixture and all other files.";
+    let mut first =
+        Pty::spawn_command_with_env(Command::new(piku_binary()), &retained, &environment);
+    assert!(first.wait_for("❯", Duration::from_secs(5)));
+    first.send(format!("{prompt}\r").as_bytes());
+    assert!(first.wait_for("AMBIGUITY:", Duration::from_secs(10)));
+    first.wait(Duration::from_millis(300));
+    let ambiguity_screen = first.screen().contents;
+    assert!(ambiguity_screen.contains("AMBIGUITY:"));
+    assert_eq!(
+        std::fs::read_to_string(retained.join("settings.json")).unwrap(),
+        original
+    );
+    first.send(format!("{clarification}\r").as_bytes());
+    assert!(
+        first.wait_for("INTERRUPTED:", Duration::from_secs(10)),
+        "{}",
+        first.captured()
+    );
+    let interrupted_screen = first.screen().contents;
+    assert!(interrupted_screen.contains("INTERRUPTED:"));
+    first.send(b"\x03");
+    first.wait(Duration::from_secs(1));
+    assert!(!first.eof, "cancellation exited the application");
+    first.exit_cleanly();
+    assert!(first.eof, "first process did not exit cleanly");
+    let first_transcript = first.captured();
+    drop(first);
+    let session_path = std::fs::read_dir(config.join("piku/sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let session = session_path.file_stem().unwrap().to_str().unwrap();
+    let record_path = config.join("piku/runs").join(format!("{session}.jsonl"));
+    let prefix = std::fs::read_to_string(&record_path).unwrap();
+    let prior: Vec<Value> = prefix
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        prior
+            .iter()
+            .filter(|event| event["event"] == "turn_cancelled")
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(retained.join("settings.json")).unwrap(),
+        original
+    );
+    let mut cmd = Command::new(piku_binary());
+    // --resume executes its supplied prompt before entering the interactive
+    // loop; omitting it would acquire an unintended "Continue" turn.
+    cmd.args(["--resume", session, correction]);
+    let mut resumed = Pty::spawn_command_with_env(cmd, &retained, &environment);
+    // Existing-file edits can require terminal permission approval.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !resumed.captured().contains("RECOVERY_COMPLETE") {
+        resumed.wait(Duration::from_millis(50));
+        if resumed.captured().contains("y/n/a?") {
+            resumed.send(b"y\r");
+        }
+    }
+    assert!(resumed.captured().contains("RECOVERY_COMPLETE"));
+    resumed.wait(Duration::from_millis(300));
+    resumed.exit_cleanly();
+    assert!(resumed.eof);
+    let resumed_transcript = resumed.captured();
+    drop(resumed);
+    server.join().unwrap();
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(retained.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings,
+        json!({"port":9090,"debug":false,"service":"fixture"})
+    );
+    // Count product-owned memory lock creation explicitly, without admitting
+    // arbitrary untracked files or treating lifecycle state as a task edit.
+    assert_eq!(
+        git(
+            &retained,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        " M settings.json\n?? .piku/embed-memory/memories.json.lock\n"
+    );
+    assert_eq!(
+        std::fs::metadata(retained.join(".piku/embed-memory/memories.json.lock"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("settings.json")).unwrap(),
+        original
+    );
+    assert!(git(&repo, &["status", "--porcelain"]).is_empty());
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 6);
+    assert_eq!(
+        captured[2]["tools"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        0
+    );
+    assert_eq!(
+        captured[5]["tools"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        0
+    );
+    let recovered_context = captured[3]["messages"].to_string();
+    for expected in [prompt, clarification, correction, "AMBIGUITY:"] {
+        assert!(
+            recovered_context.contains(expected),
+            "recovered context lost {expected}"
+        );
+    }
+    let final_record = std::fs::read_to_string(&record_path).unwrap();
+    assert!(
+        final_record.starts_with(&prefix),
+        "interrupted evidence was rewritten"
+    );
+    let events = piku_runtime::read_run_record(&record_path).unwrap();
+    assert!(events
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event.sequence == index as u64 && event.session_id == session));
+    let audit = piku_runtime::audit_run_record(&events);
+    assert!(audit.is_structurally_complete(), "{audit:?}");
+    assert_eq!(audit.turn_count, 3);
+    assert_eq!(audit.completed_turn_count, 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                piku_runtime::RunEvent::ToolCompleted {
+                    is_error: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    if let Ok(destination) = std::env::var("PIKU_TERMINAL_ACCEPTANCE_EVIDENCE") {
+        let destination = std::path::Path::new(&destination);
+        std::fs::create_dir_all(destination).unwrap();
+        for (name, bytes) in [
+            ("first-pty.txt", first_transcript.as_bytes()),
+            ("resumed-pty.txt", resumed_transcript.as_bytes()),
+            ("run.jsonl", final_record.as_bytes()),
+            (
+                "requests.json",
+                serde_json::to_vec_pretty(&*captured).unwrap().as_slice(),
+            ),
+        ] {
+            std::fs::write(destination.join(name), bytes).unwrap();
+        }
+        std::fs::copy(&session_path, destination.join("session.json")).unwrap();
+        std::fs::copy(
+            retained.join("settings.json"),
+            destination.join("settings.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join("viewports.json"),
+            serde_json::to_vec_pretty(
+                &json!({"ambiguity":ambiguity_screen,"interrupted":interrupted_screen}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    eprintln!("terminal acceptance PASS: clarification preserved; one cancelled turn; fresh-process same-session correction; exact workspace predicates; append-only run; scripted local provider canned-model; no funded acquisition");
+}
+
 // ── PTY window size ───────────────────────────────────────────────────────────
 
 /// Set a PTY's window size via `ioctl(TIOCSWINSZ)`.
