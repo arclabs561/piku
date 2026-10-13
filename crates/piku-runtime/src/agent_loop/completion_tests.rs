@@ -286,3 +286,202 @@ async fn setup_failure_join_reports_retained_work_recovery() {
         assert!(joined.contains("Branch: setup-recovery"), "{joined}");
     }
 }
+
+struct RecordingFaultProvider {
+    write_path: std::path::PathBuf,
+    requested: std::sync::atomic::AtomicBool,
+}
+
+impl Provider for RecordingFaultProvider {
+    fn name(&self) -> &'static str {
+        "scripted-recording-fault"
+    }
+
+    fn stream_message(
+        &self,
+        _: MessageRequest,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Event, piku_api::ApiError>> + Send + '_>,
+    > {
+        if self
+            .requested
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Exceed the recorder's real inline boundary after the file effect.
+            Box::pin(futures_util::stream::iter([
+                Ok(Event::TextDelta {
+                    text: "x".repeat(crate::run_record::RUN_INLINE_CONTENT_LIMIT_BYTES + 1),
+                }),
+                Ok(Event::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ]))
+        } else {
+            Box::pin(futures_util::stream::iter([
+                Ok(Event::ToolUseStart {
+                    id: "write".into(),
+                    name: "write_file".into(),
+                }),
+                Ok(Event::ToolUseDelta {
+                    id: "write".into(),
+                    partial_json:
+                        serde_json::json!({"path": self.write_path, "content": "retained work"})
+                            .to_string(),
+                }),
+                Ok(Event::ToolUseEnd { id: "write".into() }),
+                Ok(Event::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ]))
+        }
+    }
+}
+
+async fn child_with_recording_fault(
+    root: &std::path::Path,
+    block_session: bool,
+) -> (TaskRegistry, crate::task::AgentTaskId) {
+    let registry = TaskRegistry::with_persistence(
+        "parent",
+        root.join("sessions"),
+        root.join("runs"),
+        root.join("links"),
+    );
+    let id = registry.register("writer".into(), "write and summarize".into(), 1, None);
+    let evidence = registry.evidence(&id).unwrap();
+    std::fs::create_dir_all(evidence.run_record_path.parent().unwrap()).unwrap();
+    // Same artifact obstruction used by the real PTY recording-failure test.
+    std::fs::write(
+        evidence.run_record_path.with_extension("artifacts"),
+        "blocked",
+    )
+    .unwrap();
+    if block_session {
+        std::fs::write(root.join("sessions"), "blocked").unwrap();
+    }
+    run_subagent_task(
+        id.clone(),
+        "write and summarize".into(),
+        Box::new(RecordingFaultProvider {
+            write_path: root.join("work.txt"),
+            requested: std::sync::atomic::AtomicBool::new(false),
+        }),
+        "scripted".into(),
+        vec![],
+        piku_tools::all_tool_definitions()
+            .into_iter()
+            .filter(|tool| tool.name == "write_file")
+            .collect(),
+        2,
+        registry.clone(),
+        1,
+        None,
+        None,
+        vec![],
+        None,
+        std::sync::Arc::new(crate::permission::AllowAll),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("work.txt")).unwrap(),
+        "retained work"
+    );
+    let records = crate::run_record::read_run_record(&evidence.run_record_path).unwrap();
+    let audit = crate::run_audit::audit_run_record(&records);
+    assert_eq!(audit.tool_calls_completed, 1);
+    assert_eq!(audit.files_created, 1);
+    assert_eq!(audit.completed_turn_count, 0);
+    assert!(!audit.is_structurally_complete());
+    (registry, id)
+}
+
+#[tokio::test]
+async fn recording_failure_preserves_child_session_for_manual_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let (registry, id) = child_with_recording_fault(root.path(), false).await;
+    let entry = registry.status(&id).unwrap();
+    assert_eq!(entry.status, crate::task::TaskStatus::Failed);
+    assert_eq!(entry.turns_used, 2);
+    let evidence = entry.evidence.as_ref().unwrap();
+    let (joined, is_error) = execute_agent_join(
+        &serde_json::json!({"task_id": id.to_string(), "timeout_secs": 1}),
+        &registry,
+    )
+    .await;
+    assert!(!is_error);
+    assert!(joined.contains("run record failed"), "{joined}");
+    assert!(joined.contains(&evidence.session_path.display().to_string()));
+    let mut resumed = Session::load(&evidence.session_path)
+        .expect("a recording failure must not suppress the independent session snapshot");
+    assert!(resumed
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "write_file")));
+    let prior_content: Vec<_> = resumed
+        .messages
+        .iter()
+        .map(|message| serde_json::to_value((&message.role, &message.blocks)).unwrap())
+        .collect();
+    let result = run_turn(
+        "review the retained write",
+        &mut resumed,
+        &ChildProvider {
+            tool: false,
+            stop: StopReason::EndTurn,
+            write_path: None,
+        },
+        "scripted",
+        &[],
+        vec![],
+        &crate::permission::AllowAll,
+        &mut crate::task::DevNullSink,
+        Some(1),
+        None,
+    )
+    .await;
+    assert!(result.stream_error.is_none());
+    assert_eq!(resumed.messages.len(), prior_content.len() + 2);
+    // Request construction may refresh importance scores; retained content is
+    // the recovery invariant, rather than those derived selection weights.
+    for (message, expected) in resumed.messages.iter().zip(prior_content) {
+        assert!(
+            serde_json::to_value((&message.role, &message.blocks)).unwrap() == expected,
+            "manual resume changed retained message content"
+        );
+    }
+    resumed.save(&evidence.session_path).unwrap();
+    assert_eq!(
+        Session::load(&evidence.session_path)
+            .unwrap()
+            .messages
+            .len(),
+        resumed.messages.len()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("work.txt")).unwrap(),
+        "retained work"
+    );
+    assert_eq!(
+        registry.status(&id).unwrap().status,
+        crate::task::TaskStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn recording_and_session_failures_are_both_reported_by_child_join() {
+    let root = tempfile::tempdir().unwrap();
+    let (registry, id) = child_with_recording_fault(root.path(), true).await;
+    let (joined, is_error) = execute_agent_join(
+        &serde_json::json!({"task_id": id.to_string(), "timeout_secs": 1}),
+        &registry,
+    )
+    .await;
+    assert!(!is_error);
+    assert!(joined.contains("run record failed"), "{joined}");
+    assert!(joined.contains("session save failed"), "{joined}");
+    assert_eq!(
+        registry.status(&id).unwrap().status,
+        crate::task::TaskStatus::Failed
+    );
+}
