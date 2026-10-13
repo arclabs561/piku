@@ -28,7 +28,16 @@ pub fn destructiveness(params: &serde_json::Value) -> Destructiveness {
     if crate::is_protected_path(path) {
         return Destructiveness::Definite;
     }
-    if Path::new(path).exists() {
+    let resolved = std::env::current_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|base| crate::resolve_policy_path(path, &base));
+    let Ok(resolved) = resolved else {
+        return Destructiveness::Definite;
+    };
+    if crate::is_protected_path(&resolved.to_string_lossy()) {
+        return Destructiveness::Definite;
+    }
+    if resolved.exists() {
         Destructiveness::Likely
     } else {
         Destructiveness::Safe

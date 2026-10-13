@@ -139,6 +139,48 @@ pub fn is_protected_path(path: &str) -> bool {
     })
 }
 
+/// Resolve a file-tool target against its actual filesystem base.
+/// Existing prefixes follow symlinks; missing components remain available for
+/// creation. This is a policy snapshot, not protection against replacement races.
+pub fn resolve_policy_path(target: &str, base: &std::path::Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let path = std::path::Path::new(target);
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        base.canonicalize()
+            .map_err(|e| format!("cannot resolve base: {e}"))?
+    };
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => resolved.push(component.as_os_str()),
+            Component::Normal(part) => {
+                resolved.push(part);
+                match resolved.canonicalize() {
+                    Ok(path) => resolved = path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match resolved.symlink_metadata() {
+                            Ok(meta) if meta.file_type().is_symlink() => {
+                                return Err(format!("unresolvable symlink: {target}"));
+                            }
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(format!("cannot resolve path: {error}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(error) => return Err(format!("cannot resolve path: {error}")),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Apply a limited write-path guard for traversal and selected system roots.
 /// This is a heuristic, not workspace containment or an authorization boundary.
 /// Most absolute paths outside `base` are allowed.
@@ -165,36 +207,7 @@ pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), St
         let canonical_base = base
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize base {}: {e}", base.display()))?;
-        // Resolve one component at a time: existing prefixes are canonicalized
-        // (following symlinks), and `..` pops the resolved path. Popping only
-        // the longest existing prefix would drop `..` after a missing
-        // directory, so `nope/../../x` would look like it stays inside.
-        let mut canonical_target = canonical_base.clone();
-        for component in target_path.components() {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    canonical_target.pop();
-                }
-                std::path::Component::Normal(part) => {
-                    canonical_target.push(part);
-                    if let Ok(resolved) = canonical_target.canonicalize() {
-                        canonical_target = resolved;
-                    } else if canonical_target
-                        .symlink_metadata()
-                        .is_ok_and(|m| m.file_type().is_symlink())
-                    {
-                        // A dangling symlink would be followed on write.
-                        return Err(format!(
-                            "relative path goes through unresolvable symlink: {target}"
-                        ));
-                    }
-                }
-                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                    return Err(format!("relative path escapes project root: {target}"));
-                }
-            }
-        }
+        let canonical_target = resolve_policy_path(target, &canonical_base)?;
         if !canonical_target.starts_with(&canonical_base) {
             return Err(format!(
                 "relative path escapes project root: {} resolves to {} (outside {})",

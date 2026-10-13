@@ -38,6 +38,11 @@ tool implementations in `piku-tools`, and presentation/configuration in `piku`.
 - Configured deny rules precede `Safe` classification and per-turn allow-all.
   New unprotected files and agent-memory writes are among the mutations
   classified `Safe` after restrictions have been checked.
+- Direct-file rules check resolved target identity against the process cwd.
+  Scoped grants require both the raw spelling and resolved literal scope to
+  match; symlink aliases and exact `./` spellings can require fresh approval.
+  Protected resolved parents also classify missing file targets as `Definite`.
+  This application policy does not provide OS confinement or race protection.
 - Project instructions come from `PIKU.md`, `PIKU.local.md`, and
   `.piku/PIKU.md`. Piku does not load `AGENTS.md` and has no MCP, LSP,
   browser/web-search, or image integration.

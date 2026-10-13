@@ -33,17 +33,16 @@ pub fn destructiveness(params: &serde_json::Value) -> Destructiveness {
     if crate::is_protected_path(path) {
         return Destructiveness::Definite;
     }
-    // Check if path is outside cwd
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let abs = if std::path::Path::new(path).is_absolute() {
-        std::path::PathBuf::from(path)
-    } else {
-        cwd.join(path)
+    let Ok(cwd) = std::env::current_dir().and_then(|p| p.canonicalize()) else {
+        return Destructiveness::Definite;
     };
-    if abs.starts_with(&cwd) {
-        Destructiveness::Likely
-    } else {
+    let Ok(resolved) = crate::resolve_policy_path(path, &cwd) else {
+        return Destructiveness::Definite;
+    };
+    if crate::is_protected_path(&resolved.to_string_lossy()) || !resolved.starts_with(&cwd) {
         Destructiveness::Definite
+    } else {
+        Destructiveness::Likely
     }
 }
 

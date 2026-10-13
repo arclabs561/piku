@@ -248,11 +248,77 @@ pub fn matches_tool_pattern(pattern: &str, tool_name: &str, params: &serde_json:
                 "glob" | "grep" => params.get("pattern").and_then(|v| v.as_str()),
                 _ => None,
             };
-            return primary_arg.is_some_and(|arg| glob_match(glob, arg));
+            return primary_arg.is_some_and(|arg| {
+                if matches!(tool_name, "read_file" | "write_file" | "edit_file") {
+                    file_rule_matches(glob, arg, false)
+                } else {
+                    glob_match(glob, arg)
+                }
+            });
         }
     }
     // Exact tool name match
     pattern == tool_name
+}
+
+// Keep raw allow compatibility while checking its resolved scope. Wildcard
+// scopes are lexical: following their symlinks would silently redefine a grant.
+fn file_rule_matches(pattern: &str, target: &str, allow: bool) -> bool {
+    let Ok(base) = std::env::current_dir().and_then(|p| p.canonicalize()) else {
+        return !allow;
+    };
+    file_rule_matches_in(pattern, target, allow, &base)
+}
+
+fn file_rule_matches_in(pattern: &str, target: &str, allow: bool, base: &Path) -> bool {
+    let raw_match = glob_match(pattern, target);
+    if allow && !raw_match {
+        return false;
+    }
+    let Ok(resolved) = piku_tools::resolve_policy_path(target, base) else {
+        return !allow;
+    };
+    let identity = |path: &Path| {
+        let path = if Path::new(pattern).is_absolute() {
+            path
+        } else {
+            path.strip_prefix(base).unwrap_or(path)
+        };
+        path.to_str().map(str::to_owned)
+    };
+    let Some(resolved_identity) = identity(&resolved) else {
+        return !allow;
+    };
+    if allow {
+        return glob_match(pattern, &resolved_identity);
+    }
+    let lexical = |value: &str| {
+        let mut path = if Path::new(value).is_absolute() {
+            PathBuf::new()
+        } else {
+            base.to_path_buf()
+        };
+        for component in Path::new(value).components() {
+            if component == std::path::Component::ParentDir {
+                path.pop();
+            } else if component != std::path::Component::CurDir {
+                path.push(component.as_os_str());
+            }
+        }
+        path
+    };
+    let requested = lexical(target);
+    let Some(normalized_pattern) = identity(&lexical(pattern)) else {
+        return true;
+    };
+    // Resolve exact deny paths too, so a denial written using an alias remains
+    // attached to the same target. Wildcard scopes must never follow symlinks.
+    let exact_identity_match = !pattern.contains('*')
+        && piku_tools::resolve_policy_path(pattern, base).is_ok_and(|p| p == resolved);
+    raw_match
+        || glob_match(&normalized_pattern, &resolved_identity)
+        || identity(&requested).is_some_and(|p| glob_match(&normalized_pattern, &p))
+        || exact_identity_match
 }
 
 /// Simple glob: `*` at start, end, or both. `*` alone matches all.
@@ -335,6 +401,17 @@ pub fn matches_allow_tool_pattern(
 ) -> bool {
     if tool_name == "bash" && pattern.contains('(') && shell_command_uncertain(params) {
         return false;
+    }
+    if matches!(tool_name, "read_file" | "write_file" | "edit_file") {
+        if let Some(scope) = pattern
+            .strip_prefix(&format!("{tool_name}("))
+            .and_then(|p| p.strip_suffix(')'))
+        {
+            return params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|path| file_rule_matches(scope, path, true));
+        }
     }
     matches_tool_pattern(pattern, tool_name, params)
 }
@@ -607,6 +684,46 @@ model = "llama3.1""#,
         assert_eq!(existing.instructions.as_deref(), Some("Review tests"));
         assert!(operator.actors["new"].provider.is_none());
         assert!(operator.actors["new"].model.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_policy_resolved_identity_preserves_denies_and_narrows_grants() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        std::fs::write(base.join(".env"), "secret fixture").unwrap();
+        std::fs::create_dir(base.join("src")).unwrap();
+        symlink(base.join(".env"), base.join("alias-env")).unwrap();
+        for target in [
+            ".env".to_owned(),
+            "./.env".to_owned(),
+            base.join(".env").to_str().unwrap().to_owned(),
+            "alias-env".to_owned(),
+        ] {
+            assert!(
+                file_rule_matches_in(".env", &target, false, &base),
+                "{target}"
+            );
+        }
+        assert!(file_rule_matches_in("./.env", "alias-env", false, &base));
+        assert!(file_rule_matches_in("alias-env", ".env", false, &base));
+        assert!(!file_rule_matches_in("src/*", "src/../.env", true, &base));
+        assert!(file_rule_matches_in("src/*", "src/new.txt", true, &base));
+        assert!(file_rule_matches_in("./src/*", "src/new.txt", false, &base));
+        // A redirected scope must not redefine the approved prefix.
+        symlink(base.join("src"), base.join("redirected")).unwrap();
+        assert!(!file_rule_matches_in(
+            "redirected/*",
+            "redirected/new.txt",
+            true,
+            &base
+        ));
+        // Exact grants retain their raw spellings and cannot add alias grants.
+        assert!(!file_rule_matches_in(".env", "./.env", true, &base));
+        symlink(base.join("absent"), base.join("dangling")).unwrap();
+        assert!(file_rule_matches_in(".env", "dangling", false, &base));
+        assert!(!file_rule_matches_in("*", "dangling", true, &base));
     }
 
     #[test]

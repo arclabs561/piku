@@ -1154,3 +1154,46 @@ mod grep_extended {
         assert!(lines.len() <= 6, "expected ≤6 lines, got {}", lines.len());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn resolved_file_policy_classifies_symlink_targets_and_missing_protected_leaves() {
+    use crate::{resolve_policy_path, Destructiveness};
+    use std::os::unix::fs::symlink;
+    let dir = tempdir();
+    let base = dir.canonicalize().unwrap();
+    std::fs::create_dir(base.join(".ssh")).unwrap();
+    std::fs::create_dir_all(base.join("nested/deep")).unwrap();
+    std::fs::write(base.join(".env"), "fixture").unwrap();
+    symlink(base.join(".env"), base.join("alias-env")).unwrap();
+    symlink(base.join(".ssh"), base.join("alias-ssh")).unwrap();
+    symlink(base.join("nested/deep"), base.join("alias-deep")).unwrap();
+    assert_eq!(
+        resolve_policy_path("alias-deep/../new", &base).unwrap(),
+        base.join("nested/new")
+    );
+    assert_eq!(
+        resolve_policy_path("alias-ssh/new.txt", &base).unwrap(),
+        base.join(".ssh/new.txt")
+    );
+    for target in [base.join("alias-env"), base.join("alias-ssh/new.txt")] {
+        let params = serde_json::json!({"path": target});
+        assert_eq!(
+            crate::tool_destructiveness("write_file", &params),
+            Destructiveness::Definite
+        );
+        assert_eq!(
+            crate::tool_destructiveness("edit_file", &params),
+            Destructiveness::Definite
+        );
+    }
+    symlink(base.join("absent"), base.join("dangling")).unwrap();
+    assert!(resolve_policy_path("dangling/new", &base).is_err());
+    assert_eq!(
+        crate::tool_destructiveness(
+            "write_file",
+            &serde_json::json!({"path": base.join("dangling/new")})
+        ),
+        Destructiveness::Definite
+    );
+}
