@@ -15,7 +15,7 @@
 ///
 /// `TaskRegistry` is `Clone + Send + Sync` — it wraps an `Arc<Mutex<_>>`
 /// so it can be handed to the TUI, the agent loop, and tool executors.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, MutexGuard,
@@ -441,6 +441,9 @@ struct RegistryInner {
     /// If set, background task completions inject a notification message
     /// into the parent agent's interjection channel.
     notification_tx: Option<mpsc::Sender<String>>,
+    /// Bounded previews that have not entered the local channel. Successful
+    /// enqueue removes them; this is not provider or operator acknowledgement.
+    pending_notifications: VecDeque<String>,
 }
 
 impl Default for TaskRegistry {
@@ -458,6 +461,7 @@ impl TaskRegistry {
                 persistence: None,
                 waiters: HashMap::new(),
                 notification_tx: None,
+                pending_notifications: VecDeque::new(),
             })),
         }
     }
@@ -578,7 +582,27 @@ impl TaskRegistry {
     /// Register an interjection channel so background task completions
     /// auto-inject a notification into the parent's agent loop.
     pub fn set_notification_channel(&self, tx: mpsc::Sender<String>) {
-        self.inner().notification_tx = Some(tx);
+        let mut inner = self.inner();
+        inner.notification_tx = Some(tx);
+        Self::flush_notifications(&mut inner);
+    }
+
+    /// Retry previews that could not enter the channel, without replaying any
+    /// successful enqueue. Called at the parent's existing drain boundaries.
+    pub(crate) fn retry_notifications(&self) {
+        Self::flush_notifications(&mut self.inner());
+    }
+
+    fn flush_notifications(inner: &mut RegistryInner) {
+        let Some(tx) = &inner.notification_tx else {
+            return;
+        };
+        while let Some(preview) = inner.pending_notifications.pop_front() {
+            if let Err(error) = tx.try_send(preview) {
+                inner.pending_notifications.push_front(error.into_inner());
+                break;
+            }
+        }
     }
 
     /// Register a new running task. Returns the id.
@@ -678,8 +702,11 @@ impl TaskRegistry {
             None
         };
         Self::notify_waiters(&mut inner, id);
-        if let (Some(msg), Some(tx)) = (notification, &inner.notification_tx) {
-            let _ = tx.try_send(notification_preview(id, &msg));
+        if let Some(msg) = notification.filter(|_| inner.notification_tx.is_some()) {
+            inner
+                .pending_notifications
+                .push_back(notification_preview(id, &msg));
+            Self::flush_notifications(&mut inner);
         }
     }
 
@@ -702,8 +729,11 @@ impl TaskRegistry {
             None
         };
         Self::notify_waiters(&mut inner, id);
-        if let (Some(msg), Some(tx)) = (notification, &inner.notification_tx) {
-            let _ = tx.try_send(notification_preview(id, &msg));
+        if let Some(msg) = notification.filter(|_| inner.notification_tx.is_some()) {
+            inner
+                .pending_notifications
+                .push_back(notification_preview(id, &msg));
+            Self::flush_notifications(&mut inner);
         }
     }
 
@@ -762,6 +792,39 @@ impl TaskRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn closed_notification_channel_retries_only_unsent_previews_on_replacement() {
+        let registry = TaskRegistry::new();
+        let (tx, rx) = mpsc::channel(1);
+        registry.set_notification_channel(tx);
+        let delivered = registry.register("delivered".into(), "check".into(), 1, None);
+        registry.complete(&delivered, "done", 1);
+        drop(rx);
+        let pending = registry.register("pending".into(), "check".into(), 1, None);
+        let output = "✓".repeat(4096);
+        registry.fail(&pending, &output);
+        registry.retry_notifications();
+        assert_eq!(registry.inner().pending_notifications.len(), 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.set_notification_channel(tx);
+        let preview = rx.try_recv().unwrap();
+        assert!(preview.contains(&pending.to_string()));
+        assert!(!preview.contains(&delivered.to_string()));
+        assert!(preview.chars().count() < 1200);
+        assert_eq!(
+            registry.status(&pending).unwrap().output.as_deref(),
+            Some(output.as_str())
+        );
+        registry.retry_notifications();
+        assert!(rx.is_empty());
+        assert!(registry.inner().pending_notifications.is_empty());
     }
 }
 

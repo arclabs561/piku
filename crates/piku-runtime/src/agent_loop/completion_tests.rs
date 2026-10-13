@@ -138,6 +138,158 @@ async fn provider_token_limit_is_incomplete() {
 }
 
 #[tokio::test]
+async fn child_completion_overflow_reaches_parent_once_across_repeated_drains() {
+    let registry = TaskRegistry::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    registry.set_notification_channel(tx);
+    let mut ids = Vec::new();
+    for (tool, stop, expected) in [
+        (false, StopReason::EndTurn, crate::task::TaskStatus::Done),
+        (true, StopReason::ToolUse, crate::task::TaskStatus::Failed),
+        (
+            false,
+            StopReason::MaxTokens,
+            crate::task::TaskStatus::Failed,
+        ),
+    ] {
+        let id = registry.register("child".into(), "check".into(), 1, None);
+        run_subagent_task(
+            id.clone(),
+            "check".into(),
+            Box::new(ChildProvider {
+                tool,
+                stop,
+                write_path: None,
+            }),
+            "scripted".into(),
+            vec![],
+            vec![],
+            1,
+            registry.clone(),
+            1,
+            None,
+            None,
+            vec![],
+            None,
+            std::sync::Arc::new(crate::permission::AllowAll),
+        )
+        .await;
+        assert_eq!(registry.status(&id).unwrap().status, expected);
+        ids.push(id);
+    }
+    assert_eq!(rx.len(), 1, "exercise the full production channel");
+    let mut session = Session::new("overflow-parent".into());
+    for _ in 0..2 {
+        run_turn_with_registry(
+            "review child evidence",
+            &mut session,
+            &ChildProvider {
+                tool: false,
+                stop: StopReason::EndTurn,
+                write_path: None,
+            },
+            "scripted",
+            &[],
+            vec![],
+            &crate::permission::AllowAll,
+            &mut crate::task::DevNullSink,
+            Some(1),
+            Some(&mut rx),
+            &registry,
+            0,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        let previews: Vec<_> = session
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } if text.starts_with("<interjection>") => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            previews.len(),
+            3,
+            "all child previews must be recoverable without replay"
+        );
+        for id in &ids {
+            assert_eq!(
+                previews
+                    .iter()
+                    .filter(|text| text.contains(&id.to_string()))
+                    .count(),
+                1
+            );
+        }
+        assert!(rx.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn child_previews_overflowing_during_parent_request_are_drained_after_stream() {
+    struct CompletingProvider {
+        registry: TaskRegistry,
+        provider: ChildProvider,
+    }
+    impl Provider for CompletingProvider {
+        fn name(&self) -> &'static str {
+            "completion-during-parent-request"
+        }
+        fn stream_message(
+            &self,
+            request: MessageRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<Event, piku_api::ApiError>> + Send + '_>,
+        > {
+            // Reproduce children finishing while the parent is streaming.
+            // The actual child runner is exercised by the preceding regression.
+            for _ in 0..3 {
+                let id = self
+                    .registry
+                    .register("child".into(), "check".into(), 1, None);
+                self.registry.complete(&id, "finished", 1);
+            }
+            self.provider.stream_message(request)
+        }
+    }
+    let registry = TaskRegistry::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    registry.set_notification_channel(tx);
+    let mut session = Session::new("streaming-parent".into());
+    run_turn_with_registry(
+        "check",
+        &mut session,
+        &CompletingProvider {
+            registry: registry.clone(),
+            provider: ChildProvider {
+                tool: false,
+                stop: StopReason::EndTurn,
+                write_path: None,
+            },
+        },
+        "scripted",
+        &[],
+        vec![],
+        &crate::permission::AllowAll,
+        &mut crate::task::DevNullSink,
+        Some(1),
+        Some(&mut rx),
+        &registry,
+        0,
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(session.messages.iter().flat_map(|message| &message.blocks).filter(|block| matches!(block, ContentBlock::Text { text } if text.starts_with("<interjection>"))).count(), 3);
+    assert!(rx.is_empty());
+}
+
+#[tokio::test]
 async fn exhausted_child_join_reports_retained_work_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("work.txt");
