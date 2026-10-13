@@ -171,3 +171,72 @@ fn hook_small_json_output_is_preserved() {
     let result = super::run_hook_command_raw(&format!("printf '%s' '{json}'"), "{}", 3, None);
     assert!(matches!(result, super::HookCommandResult::Success(ref output) if output == json));
 }
+
+#[test]
+fn async_observers_honor_declared_timeout_before_delayed_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let hooks_dir = dir.path().join(".piku");
+    std::fs::create_dir(&hooks_dir).unwrap();
+    let handler = |tag: &str| {
+        serde_json::json!({
+            "async": true,
+            "timeout": 1,
+            "command": format!(
+                "printf started > \"$PIKU_PROJECT_DIR/started_{tag}\"; sleep 2; printf late > \"$PIKU_PROJECT_DIR/late_{tag}\""
+            )
+        })
+    };
+    std::fs::write(
+        hooks_dir.join("hooks.json"),
+        serde_json::json!({
+            "PostToolUse": [{"hooks": [handler("post")]}],
+            "Stop": [{"hooks": [handler("stop")]}],
+            "SubagentStop": [{"hooks": [handler("child")]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let hooks = HookRegistry::load_project_only(dir.path());
+    hooks.run_post_tool_use(
+        "read_file",
+        &serde_json::json!({}),
+        "ok",
+        false,
+        "deadline",
+        dir.path(),
+    );
+    hooks.run_stop(
+        "deadline",
+        dir.path(),
+        1,
+        "end_turn",
+        &piku_api::TokenUsage::default(),
+        1,
+    );
+    hooks.run_subagent_stop("child", Some("explorer"), "done", 1, dir.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let tags = ["post", "stop", "child"];
+    while tags
+        .iter()
+        .any(|tag| !dir.path().join(format!("started_{tag}")).exists())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "observer never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Observe after the commands' delayed effects would occur, rather than
+    // inferring timeout from missing output or from a task that never started.
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+    for tag in tags {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("started_{tag}"))).unwrap(),
+            "started"
+        );
+        assert!(
+            !dir.path().join(format!("late_{tag}")).exists(),
+            "{tag} ignored its configured timeout"
+        );
+    }
+}

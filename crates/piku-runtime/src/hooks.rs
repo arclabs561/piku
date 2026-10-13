@@ -376,8 +376,10 @@ impl HookRegistry {
                     let cmd = handler.command.clone();
                     let input_str = input.to_string();
                     let project_dir = self.project_dir.clone();
+                    let timeout = handler.timeout;
                     let h = std::thread::spawn(move || {
-                        let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
+                        let _ =
+                            run_hook_command_raw(&cmd, &input_str, timeout, project_dir.as_deref());
                     });
                     if let Ok(mut pending) = self.pending.lock() {
                         // Opportunistically drop any finished handles to
@@ -472,8 +474,10 @@ impl HookRegistry {
                     let cmd = handler.command.clone();
                     let input_str = input.to_string();
                     let project_dir = self.project_dir.clone();
+                    let timeout = handler.timeout;
                     std::thread::spawn(move || {
-                        let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
+                        let _ =
+                            run_hook_command_raw(&cmd, &input_str, timeout, project_dir.as_deref());
                     });
                 } else if let HookCommandResult::Error(msg) = run_hook_command(
                     &handler.command,
@@ -593,8 +597,10 @@ impl HookRegistry {
                     let cmd = handler.command.clone();
                     let input_str = input.to_string();
                     let project_dir = self.project_dir.clone();
+                    let timeout = handler.timeout;
                     let h = std::thread::spawn(move || {
-                        let _ = run_hook_command_raw(&cmd, &input_str, 30, project_dir.as_deref());
+                        let _ =
+                            run_hook_command_raw(&cmd, &input_str, timeout, project_dir.as_deref());
                     });
                     if let Ok(mut pending) = self.pending.lock() {
                         pending.retain(|h| !h.is_finished());
