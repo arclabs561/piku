@@ -14,11 +14,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ -n "${CODEX_SANDBOX:-}" ]]; then
-  # sccache can fail inside the Codex seatbelt while direct rustc still works.
-  export RUSTC_WRAPPER=
-fi
-
 fmt() {
   cargo fmt --all -- --check
 }
@@ -28,6 +23,7 @@ scripts() {
   for script in scripts/*.sh; do
     bash -n "$script"
   done
+  bash scripts/ci-wrapper-selftest.sh
   ./scripts/github-corpus-prompt-selftest.sh
   ./scripts/github-corpus-run-selftest.sh
   node --test scripts/evaluation-focus.test.mjs scripts/evaluation-focus-cli.test.mjs scripts/evaluation-surfaces.test.mjs scripts/codex-app-server-probe.test.mjs
