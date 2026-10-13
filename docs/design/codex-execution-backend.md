@@ -125,12 +125,12 @@ adapter can expose `read_page_source`, `apply_page_patch`, and
 `verify_page_render` without repository or shell authority. Dynamic tools are
 currently experimental, so this is a gate rather than an assumption.
 
-Credential discovery is fixed independently. Inherited environment remains the
-first authority. Piku may selectively read only recognized provider variables
-from the nearest `.env` when absent, without importing arbitrary entries.
-Explicit settings may select provider/model/endpoints, but durable config should
-reference a secret source rather than store raw keys. Startup and the web UI
-report backend readiness using booleans and stable reasons, never values.
+Credential discovery is fixed independently. Inherited operator environment and
+explicit operator configuration remain authoritative. Repository or ancestor
+`.env` files cannot supply Piku provider variables; project settings cannot
+override provider/model selection or credential destinations. Durable config
+should reference a secret source rather than store raw keys. Startup and the web
+UI report backend readiness using booleans and stable reasons, never values.
 
 ## Tradeoffs
 
