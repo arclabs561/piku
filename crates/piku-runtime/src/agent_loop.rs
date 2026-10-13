@@ -2260,13 +2260,19 @@ async fn run_subagent_task(
     };
 
     let TurnOutcome { result, exit } = result;
-    let durability_error = record_error.map(|error| format!("run record failed: {error}"));
-    let durability_error = match (durability_error, evidence.as_ref()) {
-        (None, Some(item)) => session
+    let record_error = record_error.map(|error| format!("run record failed: {error}"));
+    // Recording failure does not undo tool effects. Preserve the independent
+    // transcript for manual recovery even when the run evidence is incomplete.
+    let session_error = evidence.as_ref().and_then(|item| {
+        session
             .save(&item.session_path)
             .err()
-            .map(|error| format!("session save failed: {error}")),
-        (error, _) => error,
+            .map(|error| format!("session save failed: {error}"))
+    });
+    let durability_error = match (record_error, session_error) {
+        (Some(record), Some(session)) => Some(format!("{record}; {session}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     };
 
     // Inspect actual Git state, including shell writes and child-only commits.

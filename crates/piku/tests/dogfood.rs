@@ -27,6 +27,9 @@
 /// The experience report is always printed so you can read what happened.
 mod test_helpers;
 
+#[path = "dogfood/operator_journey.rs"]
+mod operator_journey;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
