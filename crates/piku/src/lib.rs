@@ -34,6 +34,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Shared utilities
 // ---------------------------------------------------------------------------
 
+/// Render control characters as visible escapes, preserving ordinary Unicode.
+/// Used only for terminal display; tool arguments retain their original bytes.
+#[must_use]
+pub fn terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| {
+            if ch.is_control() {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
 #[must_use]
 pub fn read_only_system_prompt_section() -> String {
     "# Read-only mode\n\n\

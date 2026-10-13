@@ -165,6 +165,7 @@ impl PermissionPrompter for TuiPrompter {
             Destructiveness::Likely => ("\x1b[33m", req.tool_name.as_str()),
             Destructiveness::Safe => return PermissionOutcome::Allow,
         };
+        let label = crate::terminal_text(label);
         let reset = "\x1b[0m";
         let dim = "\x1b[2m";
         let desc = &req.description;
@@ -535,12 +536,14 @@ fn term_size() -> (u16, u16) {
     }
 }
 
-/// Bound a permission description by terminal bytes without splitting UTF-8.
+/// Escape terminal controls and bound a permission description without splitting UTF-8.
 ///
 /// The description comes from tool arguments and can contain arbitrary model or
 /// user text. A byte slice at the display budget therefore must use a character
 /// boundary, just like the other piku output truncators.
 fn truncate_permission_description(description: &str, cols: u16) -> String {
+    let clean = crate::terminal_text(description);
+    let description = clean.as_str();
     let max_desc = usize::from(cols).saturating_sub(25);
     if description.len() <= max_desc {
         return description.to_string();
