@@ -92,6 +92,68 @@ production memory-consolidation subsystem nor automatic task acceptance.
 Scripted providers can test pool exclusion, provenance, budgets and recording;
 they cannot demonstrate learned capability from a real model.
 
+## Bounded feasibility and admission recipe
+
+Before a comparison, run one existing application task on the explicit route.
+Use `gpt-6.1-sol` on ChatGPT subscription execution while the requested
+Luna6.1 is unavailable; on an explicitly selected OpenRouter route use
+`anthropic/claude-haiku-5.5`. Do not substitute `gpt-6-luna`, change funding, or
+let a generic random-model recipe choose this calibration's route. Record the
+exact provider/model, execution owner and allowance/credits uncertainty.
+
+The earlier native feasibility call consumed 14,183 reported input/output
+tokens against a declared 12,000 admission, so it supplies a rejected admission
+observation, not an acquisition experience. Start with the existing
+`dogfood_read_edit_verify_loop` on OpenRouter and fresh isolated configuration.
+For Piku's own-loop ChatGPT route, reuse that synthetic read/edit/read task
+through the CLI with the explicitly selected authentication reference; the
+dogfood helper currently requires an API key and does not admit ChatGPT auth.
+Native Codex remains an optional, explicitly selected executor rather than an
+automatic substitute for Piku's own loop. The application
+system prompt and advertised tool schemas count toward context, even when the
+operator task is short. The offline operator journey can inspect full request
+bodies and context manifests; scripted fixture token counts cannot calibrate a
+real model's tokenizer or billing.
+
+Freeze the following *provisional feasibility* limits before that one scenario:
+
+| Measure | Admission or stopping rule |
+| --- | --- |
+| Model-visible task | Only a synthetic workspace; no private data, expected patch, hidden check, previous verdict or held-out outcome. |
+| Initial context | At most 8,192 estimated input tokens including system, tools and injected context. Reserve 1,024 estimated tokens for any experimental experience; equalize that allowance across arms. |
+| One scenario | At most 32,768 reported input plus output tokens and 120 seconds, including all repeated tool requests. Record missing usage as unavailable. |
+| Calls | One scenario, no retries, extraction, alternate provider or automatic funding fallback during calibration. |
+| Evidence | Exact workspace bytes and changed-file scope; ordered successful tool results; retained terminal status; full context manifest; realized tokens/time. |
+
+Estimates are admission evidence, not exact tokenizer counts. Piku's ChatGPT
+route has no hard foreground output-token cap, and the scenario admission is
+not a server-enforced total-token cap. Check realized usage after this bounded
+scenario and stop if it exceeds admission or is unavailable. A timeout or
+missing terminal/usage evidence is inconclusive. Never repair an exceeded
+budget by changing its denominator or retrospectively raising the limit. If
+the initial context cannot fit, narrow the existing tool/context projection
+through an authorized execution surface before a further call; do not build a
+new learning store to bypass that gate.
+
+After feasibility passes, freeze a small disjoint task-family split, pool and
+context hashes before any held-out execution. Acquisition contains executed
+failure/success evidence; independently label it and exclude the calibration
+task from both the scored pool and held-out set. Compare no memory, raw
+experience and conditional lesson with fresh per-task state; add an irrelevant
+memory and a deliberately stale/conflicting lesson control. Match the declared
+context/resource ceiling and record realized retrieval/extraction/acquisition
+work separately. A minimal two-task pilot establishes instrument feasibility
+only. Repeated seeds, adequate sample size and a prospectively declared gain
+and regression criterion are required for a learning claim.
+
+For collaboration, choose one task whose two independently checkable concerns
+can be split without shared file writes. Compare solo execution with a parent
+and two bounded children on that same fixture and aggregate all actor/context,
+summary, verification and integration resources. Admission failure, unavailable
+evidence or an unsettled ownership/acknowledgement contract stops comparison;
+it does not select a richer topology. This recipe selects neither production
+memory nor a new lifecycle contract.
+
 ## Decision gates
 
 - Evidence gate: every scored outcome has an executed acceptance predicate and
