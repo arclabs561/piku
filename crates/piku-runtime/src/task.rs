@@ -519,18 +519,54 @@ impl TaskRegistry {
             .join(format!("{child_session_id}.json"));
         let rel_run = relative_within(parent_dir, &run_record_ref)?;
         let rel_session = relative_within(parent_dir, &session_ref)?;
-        if rel_run.is_absolute()
-            || rel_session.is_absolute()
-            || rel_run
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            || rel_session
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
+        if !normal_relative_reference(&rel_run) || !normal_relative_reference(&rel_session) {
             return None;
         }
         Some((rel_run, rel_session))
+    }
+
+    /// Build a durable pointer without redefining legacy parent-relative refs.
+    /// A configured-root basis is allowed only for declared sibling stores and
+    /// a parent record directly in the declared run store.
+    pub(crate) fn child_run_reference(
+        &self,
+        id: &AgentTaskId,
+    ) -> Option<crate::run_record::RunEvent> {
+        let evidence = self.evidence(id)?;
+        let (reference_root, run_record_ref, session_ref) = if let Some((run, session)) =
+            self.child_refs_relative_to_parent(&evidence.child_session_id)
+        {
+            (None, run, session)
+        } else {
+            let inner = self.inner();
+            let persistence = inner.persistence.as_ref()?;
+            let parent_dir = persistence.parent_run_path.as_ref()?.parent()?;
+            let root = persistence.runs_dir.parent()?;
+            if parent_dir != persistence.runs_dir
+                || persistence.sessions_dir.parent()? != root
+                || persistence.sessions_dir == persistence.runs_dir
+            {
+                return None;
+            }
+            let run = relative_within(root, &evidence.run_record_path)?;
+            let session = relative_within(root, &evidence.session_path)?;
+            if !normal_relative_reference(&run) || !normal_relative_reference(&session) {
+                return None;
+            }
+            (
+                Some(crate::run_record::ChildReferenceRoot::ConfiguredEvidenceRoot),
+                run,
+                session,
+            )
+        };
+        Some(crate::run_record::RunEvent::ChildRunRef {
+            relationship: "spawn_agent".to_owned(),
+            child_session_id: evidence.child_session_id,
+            task_id: id.to_string(),
+            reference_root,
+            run_record_ref,
+            session_ref,
+        })
     }
 
     fn inner(&self) -> MutexGuard<'_, RegistryInner> {
@@ -889,4 +925,81 @@ fn relative_within(base: &std::path::Path, target: &std::path::Path) -> Option<s
         relative.push(part.as_os_str());
     }
     Some(relative)
+}
+
+fn normal_relative_reference(path: &std::path::Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod child_reference_tests {
+    use super::*;
+    use crate::run_record::{ChildReferenceRoot, RunEvent};
+
+    #[test]
+    fn reference_basis_preserves_legacy_and_handles_only_declared_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let runs = root.path().join("runs");
+        let sessions = root.path().join("sessions");
+        for (parent, expected_basis) in [
+            (root.path().join("parent.jsonl"), None),
+            (
+                runs.join("parent.jsonl"),
+                Some(ChildReferenceRoot::ConfiguredEvidenceRoot),
+            ),
+        ] {
+            let registry = TaskRegistry::with_persistence_run_path(
+                "parent",
+                &sessions,
+                &runs,
+                root.path().join("links"),
+                Some(parent),
+            );
+            let id = registry.register("fixture".into(), "task".into(), 1, None);
+            let evidence = registry.evidence(&id).unwrap();
+            assert_eq!(
+                registry
+                    .child_refs_relative_to_parent(&evidence.child_session_id)
+                    .is_some(),
+                expected_basis.is_none()
+            );
+            let RunEvent::ChildRunRef {
+                reference_root,
+                run_record_ref,
+                session_ref,
+                ..
+            } = registry.child_run_reference(&id).unwrap()
+            else {
+                panic!("expected typed pointer")
+            };
+            assert_eq!(reference_root, expected_basis);
+            assert_eq!(root.path().join(run_record_ref), evidence.run_record_path);
+            assert_eq!(root.path().join(session_ref), evidence.session_path);
+        }
+        for (sessions, parent) in [
+            (
+                root.path().join("external/sessions"),
+                runs.join("parent.jsonl"),
+            ),
+            (
+                root.path().join("sessions"),
+                runs.join("nested/parent.jsonl"),
+            ),
+            (root.path().join("../sessions"), runs.join("parent.jsonl")),
+        ] {
+            let registry = TaskRegistry::with_persistence_run_path(
+                "parent",
+                sessions,
+                &runs,
+                root.path().join("links"),
+                Some(parent),
+            );
+            let id = registry.register("fixture".into(), "task".into(), 1, None);
+            assert!(registry.child_run_reference(&id).is_none());
+        }
+    }
 }

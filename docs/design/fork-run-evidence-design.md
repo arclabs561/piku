@@ -13,9 +13,16 @@ view either parsed prose (brittle) or scanned ambient local directories
 ## Chosen approach
 
 Record a typed `RunEvent::ChildRunRef` in the durable parent run record at the
-moment of spawn. References are stored relative to the parent run record's
-directory (`runs/<child>.jsonl`, `sessions/<child>.json`) and validated to stay
-inside the run-record graph; the workbench follows only that validated bundle.
+moment of spawn. Legacy references without `reference_root` remain relative to
+the parent run record's directory. For configured sibling run/session stores
+with the parent record directly in the run store, the optional typed
+`reference_root: "configured_evidence_root"` selects their configured common
+owner; references then name `runs/<child>.jsonl` and `sessions/<child>.json`.
+The legacy basis is preferred whenever it already contains both references.
+Other layouts fail closed, and both modes retain Normal-only relative paths.
+The basis is context metadata, not an immutable host identity: relocation or
+config rebinding requires current config-aware review. No automatic dereference
+or cross-run reader is introduced; the workbench follows only a validated bundle.
 No absolute paths in the browser; no ambient directory scans.
 
 Scope: the event is turn-scoped (emitted during the spawn turn), not run-scoped,

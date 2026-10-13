@@ -65,7 +65,7 @@ pub use run_audit::{
 };
 pub use run_handle::{RunHandle, RunTurn};
 pub use run_record::{
-    read_run_record, ActorRef, ArtifactRef, AuthorityLeaseOutcome,
+    read_run_record, ActorRef, ArtifactRef, AuthorityLeaseOutcome, ChildReferenceRoot,
     ContentChange as RunContentChange, ContentRef as RunContentRef, ContextManifest,
     ContextMessage, ContextSection, ContextSourceSummary, ContextTool,
     EffectCategory as RunEffectCategory, EventScope as RunEventScope,

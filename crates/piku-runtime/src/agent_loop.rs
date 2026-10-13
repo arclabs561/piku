@@ -2105,19 +2105,7 @@ fn execute_spawn_agent(
     // This is the evidence the static browser follows; parsing `agent_join`
     // prose is not sufficient because the relationship must survive reopening
     // the run from disk. The caller emits it through the parent sink.
-    let child_ref = registry.evidence(&task_id).and_then(|evidence| {
-        registry
-            .child_refs_relative_to_parent(&evidence.child_session_id)
-            .map(
-                |(run_record_ref, session_ref)| crate::run_record::RunEvent::ChildRunRef {
-                    relationship: "spawn_agent".to_string(),
-                    child_session_id: evidence.child_session_id.clone(),
-                    task_id: task_id.to_string(),
-                    run_record_ref,
-                    session_ref,
-                },
-            )
-    });
+    let child_ref = registry.child_run_reference(&task_id);
 
     (hint, false, child_ref)
 }

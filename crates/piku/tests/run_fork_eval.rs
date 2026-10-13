@@ -16,6 +16,9 @@ use piku_runtime::{
     TaskRegistry, TokenUsage,
 };
 
+#[path = "support/review_workflow.rs"]
+mod review_workflow;
+
 const PARENT_MARKER: &str = "parent-context-cobalt-4182";
 const CHILD_MARKER: &str = "child-result-amber-9271";
 const CHILD_TASK: &str = "Inspect the delegated fork-context continuity fixture.";
@@ -67,6 +70,7 @@ struct ForkRoutingProvider {
     registry: TaskRegistry,
     fork: bool,
     observations: Arc<Mutex<ProviderObservations>>,
+    child_file: Option<std::path::PathBuf>,
 }
 
 impl ForkRoutingProvider {
@@ -75,6 +79,7 @@ impl ForkRoutingProvider {
             registry,
             fork,
             observations: Arc::new(Mutex::new(ProviderObservations::default())),
+            child_file: None,
         }
     }
 
@@ -103,7 +108,18 @@ impl Provider for ForkRoutingProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .child_requests
                 .push(request_text);
-            text_response(CHILD_MARKER)
+            if let Some(path) = self.child_file.as_ref().filter(|_| {
+                !request.messages.iter().flat_map(|message| &message.content).any(|content| {
+                    matches!(content, RequestContent::ToolResult { tool_use_id, .. } if tool_use_id == "partial-write")
+                })
+            }) {
+                tool_response("partial-write", "write_file", &serde_json::json!({
+                    "path": path,
+                    "content": "{\"port\":9090,\"debug\":true,\"service\":\"fixture\"}\n",
+                }))
+            } else {
+                text_response(CHILD_MARKER)
+            }
         } else if request_text.contains(CHILD_MARKER) {
             text_response(&format!("parent received {CHILD_MARKER}"))
         } else if request_text.contains("spawned agent") {
@@ -381,5 +397,261 @@ async fn fork_context_continuity_is_measured_against_a_no_fork_control() {
             child_execution_durable: true,
             typed_child_run_ref_in_parent_record: true,
         }
+    );
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Descriptive review evidence follows option 1 in task-review-contract.md.
+/// The fixture is bounded to Git-listed tracked/untracked files; this snapshot
+/// does not claim containment of shell effects outside that workspace.
+fn review_snapshot(workspace: &std::path::Path, record: &std::path::Path) -> serde_json::Value {
+    use review_workflow::git;
+    let prefix = std::fs::read(record).unwrap();
+    let events = read_run_record(record).unwrap();
+    let files: serde_json::Map<String, serde_json::Value> = git(
+        workspace,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    )
+    .lines()
+    .map(|name| {
+        (
+            name.to_owned(),
+            serde_json::json!(sha256(&std::fs::read(workspace.join(name)).unwrap())),
+        )
+    })
+    .collect();
+    serde_json::json!({
+        "prefix_sha256": sha256(&prefix),
+        "prefix_events": events.len(),
+        "last_sequence": events.last().unwrap().sequence,
+        "files": files,
+        "coverage": "Git-listed tracked and untracked fixture files; external effects excluded",
+        "path": workspace,
+        "branch": git(workspace, &["branch", "--show-current"]).trim(),
+        "head": git(workspace, &["rev-parse", "HEAD"]).trim(),
+        "status": git(workspace, &["status", "--porcelain"]),
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // Keep the ordered human-review journey visible together.
+async fn spawned_child_human_reject_resume_accept_preserves_reviewed_evidence() {
+    use review_workflow::*;
+
+    // Freeze the human-review requirement and checker identity before execution.
+    let required = "port=9090 integer; debug=false boolean; service=fixture; exact key set; only settings.json modified; parent unchanged";
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = fixture.path().join("parent");
+    let retained = fixture.path().join("retained");
+    let config = fixture.path().join("config");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    let original = prepare_worktree(&repo, &retained);
+    let initial_sha256 = sha256(original.as_bytes());
+    let checker_sha256 = sha256(include_bytes!("support/review_workflow.rs"));
+    let parent_id = "spawned-child-human-review";
+    let root_record = config.join("piku/runs").join(format!("{parent_id}.jsonl"));
+    let registry = TaskRegistry::with_persistence_run_path(
+        parent_id,
+        config.join("piku/sessions"),
+        config.join("piku/runs"),
+        config.join("piku/links"),
+        Some(root_record.clone()),
+    );
+    let mut provider = ForkRoutingProvider::new(registry.clone(), true);
+    provider.child_file = Some(retained.join("settings.json"));
+    let mut parent = piku_runtime::Session::new(parent_id.to_owned());
+    let mut capture = CaptureSink::default();
+    let mut recorder = RunRecorder::open(&root_record, parent_id).unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut sink = RecordingSink::new(&mut capture, &mut recorder, "root-turn");
+            let result = run_turn_with_registry(
+                &format!("Preserve {PARENT_MARKER}; required outcome: {required}"),
+                &mut parent,
+                &provider,
+                "fixture-model",
+                &[],
+                piku_tools::all_tool_definitions(),
+                &AllowAll,
+                &mut sink,
+                Some(5),
+                None,
+                &registry,
+                1,
+                &[],
+                None,
+                None,
+            )
+            .await;
+            assert!(result.stream_error.is_none());
+            assert!(sink.take_record_error().is_none());
+        })
+        .await;
+    let tasks = registry.all();
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, piku_runtime::TaskStatus::Done);
+    let evidence = task.evidence.as_ref().unwrap();
+    let child_id = evidence.child_session_id.clone();
+    let record_path = evidence.run_record_path.clone();
+    let parent_events = read_run_record(&root_record).unwrap();
+    assert!(typed_child_run_ref_present(&parent_events, &registry));
+    let references: Vec<_> = parent_events
+        .iter()
+        .filter_map(|event| match &event.event {
+            RunEvent::ChildRunRef {
+                reference_root,
+                run_record_ref,
+                session_ref,
+                task_id,
+                ..
+            } => {
+                assert_eq!(
+                    *reference_root,
+                    Some(piku_runtime::ChildReferenceRoot::ConfiguredEvidenceRoot)
+                );
+                assert_eq!(*task_id, task.id.to_string());
+                Some((run_record_ref, session_ref))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(references.len(), 1);
+    let (run_ref, session_ref) = references[0];
+    let evidence_root = config.join("piku");
+    assert_eq!(evidence_root.join(run_ref), evidence.run_record_path);
+    assert_eq!(evidence_root.join(session_ref), evidence.session_path);
+    assert!(piku::run_view::render_text(&parent_events).contains("basis configured_evidence_root"));
+    assert!(child_execution_is_durable(&registry, parent_id));
+    assert!(recorded_tool_pair(
+        &parent_events,
+        "agent_join",
+        "root-join"
+    ));
+    assert!(capture.text.contains(CHILD_MARKER));
+    assert!(
+        !workspace_accepted(&retained),
+        "Done must not establish task success"
+    );
+    let failed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(retained.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        failed,
+        serde_json::json!({"port":9090,"debug":true,"service":"fixture"})
+    );
+    let (url, requests, server) = scripted_server(&retained.join("settings.json"), true);
+    let inspect = checked(cli(&config, &retained, &url).args(["inspect", &child_id]));
+    assert!(String::from_utf8_lossy(&inspect.stdout).contains(CHILD_MARKER));
+    let first_prefix = std::fs::read_to_string(&record_path).unwrap();
+    let rejected_snapshot = review_snapshot(&retained, &record_path);
+    let provenance = serde_json::json!({
+        "task": task.id.to_string(), "parent": parent_id, "child": child_id,
+        "reviewer": "fixture-human-reviewer", "owner": "fixture-retained-work-owner",
+        "required": required, "checker_sha256": checker_sha256,
+        "initial_sha256": initial_sha256,
+    });
+    let rejection = serde_json::json!({"provenance": provenance, "snapshot": rejected_snapshot,
+        "result": "failed: debug=true", "disposition": "retain for explicit correction"})
+    .to_string();
+    checked(cli(&config, &retained, &url).args([
+        "conclude",
+        &child_id,
+        "--status",
+        "needs-work",
+        "--note",
+        &rejection,
+    ]));
+    let rejected = std::fs::read_to_string(&record_path).unwrap();
+    assert!(rejected.starts_with(&first_prefix));
+    assert_eq!(
+        sha256(&std::fs::read(retained.join("settings.json")).unwrap()),
+        rejected_snapshot["files"]["settings.json"]
+            .as_str()
+            .unwrap()
+    );
+    let link_bytes = std::fs::read(&evidence.link_path).unwrap();
+    let link_path = evidence.link_path.clone();
+    let task_id = task.id.clone();
+    drop(provider);
+    drop(registry);
+    drop(recorder);
+    // Fresh registry intentionally does not reconstruct old live task state.
+    let reopened_registry = TaskRegistry::with_persistence_run_path(
+        parent_id,
+        config.join("piku/sessions"),
+        config.join("piku/runs"),
+        config.join("piku/links"),
+        Some(root_record.clone()),
+    );
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reopened_registry.wait_for(&task_id),
+    )
+    .await
+    .unwrap()
+    .is_err());
+    assert!(piku_runtime::Session::load(
+        &config
+            .join("piku/sessions")
+            .join(format!("{child_id}.json"))
+    )
+    .is_ok());
+    assert_eq!(read_run_record(&root_record).unwrap(), parent_events);
+    let correction = format!("Independent human review found debug=true. Correct debug to false in settings.json; preserve port=9090 and service=fixture. Review references: {rejection}");
+    checked(cli(&config, &retained, &url).args(["--resume", &child_id, "-p", &correction]));
+    server.join().unwrap();
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    let resumed = captured[0]["messages"].to_string();
+    assert!(resumed.contains(CHILD_TASK));
+    assert!(resumed.contains("partial-write"));
+    assert!(resumed.contains(&checker_sha256));
+    assert!(resumed.contains("Independent human review found debug=true"));
+    assert!(workspace_accepted(&retained));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("settings.json")).unwrap(),
+        original
+    );
+    assert!(git(&repo, &["status", "--porcelain"]).is_empty());
+    let accepted_snapshot = review_snapshot(&retained, &record_path);
+    assert_ne!(accepted_snapshot["files"], rejected_snapshot["files"]);
+    assert_ne!(
+        accepted_snapshot["prefix_sha256"],
+        rejected_snapshot["prefix_sha256"]
+    );
+    let acceptance = serde_json::json!({"provenance": provenance, "snapshot": accepted_snapshot,
+        "result": "passed: exact JSON keys/types/values; only settings.json changed; parent unchanged",
+        "disposition": "retain unmerged work; integration and cleanup separate"}).to_string();
+    let before_acceptance = std::fs::read_to_string(&record_path).unwrap();
+    checked(cli(&config, &retained, &url).args([
+        "conclude",
+        &child_id,
+        "--status",
+        "accepted",
+        "--note",
+        &acceptance,
+    ]));
+    assert_review_history(&record_path, &rejected, &child_id, &rejection, &acceptance);
+    assert!(std::fs::read_to_string(&record_path)
+        .unwrap()
+        .starts_with(&before_acceptance));
+    let final_inspect =
+        checked(cli(&config, &retained, &url).args(["inspect", &child_id, "--json"]));
+    let text = String::from_utf8_lossy(&final_inspect.stdout);
+    assert!(text.contains(&checker_sha256));
+    assert!(text.contains(accepted_snapshot["prefix_sha256"].as_str().unwrap()));
+    assert_eq!(std::fs::read(link_path).unwrap(), link_bytes);
+    assert_eq!(
+        git(&retained, &["branch", "--show-current"]),
+        "recovery-fixture\n"
+    );
+    assert!(
+        workspace_accepted(&retained),
+        "Accepted must retain unmerged work"
     );
 }
