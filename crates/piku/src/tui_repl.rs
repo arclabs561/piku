@@ -107,10 +107,9 @@ impl PermissionPrompter for DelegatedTuiPrompter {
     }
     fn decide(&self, req: &PermissionRequest) -> PermissionOutcome {
         if self.allow_all
-            || self
-                .allow_rules
-                .iter()
-                .any(|rule| crate::config::matches_tool_pattern(rule, &req.tool_name, &req.params))
+            || self.allow_rules.iter().any(|rule| {
+                crate::config::matches_allow_tool_pattern(rule, &req.tool_name, &req.params)
+            })
         {
             PermissionOutcome::Allow
         } else {
@@ -148,7 +147,7 @@ impl PermissionPrompter for TuiPrompter {
         // Deny rules are evaluated in `denies`, before this runs and before
         // the allow-all fast path above, so only allow rules remain here.
         for pattern in &self.allow_rules {
-            if crate::config::matches_tool_pattern(pattern, &req.tool_name, &req.params) {
+            if crate::config::matches_allow_tool_pattern(pattern, &req.tool_name, &req.params) {
                 return PermissionOutcome::Allow;
             }
         }
@@ -1047,11 +1046,8 @@ pub struct TuiSink {
     stdout: io::Stdout,
     request_model: Option<String>,
     request_context: Option<(String, f32)>,
-    /// Mtime of the running binary at startup — used to detect self-rebuilds
-    /// even when `current_exe()` and the build output path resolve to the same file.
-    binary_mtime_baseline: Option<std::time::SystemTime>,
-    /// Path to check for a new build.
-    build_candidate: std::path::PathBuf,
+    /// Immutable operator approval for developer self-update.
+    self_update: self_update::SelfUpdatePolicy,
     /// Whether the thinking indicator on the input row needs clearing.
     needs_indicator_clear: bool,
     /// Signal to stop the background thinking ticker.
@@ -1079,15 +1075,14 @@ fn lock_indicator_label(label: &Mutex<String>) -> MutexGuard<'_, String> {
 impl TuiSink {
     fn new(
         _model: &str,
-        binary_mtime_baseline: Option<std::time::SystemTime>,
+        self_update: self_update::SelfUpdatePolicy,
         trace: crate::trace::TraceWriter,
     ) -> Self {
         Self {
             stdout: io::stdout(),
             request_model: None,
             request_context: None,
-            binary_mtime_baseline,
-            build_candidate: self_update::default_build_output(),
+            self_update,
             needs_indicator_clear: true,
             thinking_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indicator_label: std::sync::Arc::new(std::sync::Mutex::new("thinking".to_string())),
@@ -1188,20 +1183,10 @@ impl OutputSink for TuiSink {
         let _ = self.stdout.flush();
 
         if tool_name == "bash" {
-            // Use the mtime baseline if available — this correctly detects a
-            // rebuild even when current_exe() and build_candidate are the same path.
-            let is_new = if let Some(baseline) = self.binary_mtime_baseline {
-                self_update::is_newer_than_mtime(&self.build_candidate, baseline)
-            } else {
-                self_update::is_newer_than_running(&self.build_candidate)
-            };
-            // Also require the bash call itself to have succeeded and mentioned cargo
-            let cargo_output_ok = !is_error
-                && (result.contains("Finished")
-                    && (result.contains("Compiling piku v")
-                        || result.contains("target/release/piku")));
-            if cargo_output_ok && is_new {
-                return PostToolAction::ReplaceAndExec(self.build_candidate.clone());
+            match self.self_update.detect_self_build(result, !is_error) {
+                Ok(Some(candidate)) => return PostToolAction::ReplaceAndExec(candidate),
+                Ok(None) => {}
+                Err(error) => self.println(&format!("[piku] self-update check failed: {error}")),
             }
         }
 
@@ -1295,7 +1280,15 @@ pub async fn run_tui_repl_with_session_mode(
     initial_usage: TokenUsage,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(config, existing_session, initial_usage, false, read_only).await
+    run_tui_repl_with_policy(
+        config,
+        existing_session,
+        initial_usage,
+        false,
+        read_only,
+        &self_update::SelfUpdatePolicy::default(),
+    )
+    .await
 }
 
 /// Like `run_tui_repl_with_session` but shows a "restarted" banner --
@@ -1305,12 +1298,39 @@ pub async fn run_tui_repl_post_restart(
     existing_session: Option<Session>,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    run_tui_repl_inner(
+    run_tui_repl_with_policy(
         config,
         existing_session,
         TokenUsage::default(),
         true,
         read_only,
+        &self_update::SelfUpdatePolicy::default(),
+    )
+    .await
+}
+
+/// Enter the TUI with an operator-selected developer update policy.
+/// Existing convenience entry points keep self-update disabled.
+pub async fn run_tui_repl_with_policy(
+    config: &crate::config::PikuConfig,
+    existing_session: Option<Session>,
+    initial_usage: TokenUsage,
+    post_restart: bool,
+    read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
+) -> anyhow::Result<()> {
+    let policy = if read_only {
+        self_update::SelfUpdatePolicy::default()
+    } else {
+        self_update.clone()
+    };
+    run_tui_repl_inner(
+        config,
+        existing_session,
+        initial_usage,
+        post_restart,
+        read_only,
+        &policy,
     )
     .await
 }
@@ -1321,6 +1341,7 @@ async fn run_tui_repl_inner(
     initial_usage: TokenUsage,
     post_restart: bool,
     read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
     // Wrap the entire REPL in a LocalSet so `tokio::task::spawn_local` works
     // for background subagents. Without this, spawn_local panics at runtime
@@ -1333,6 +1354,7 @@ async fn run_tui_repl_inner(
             initial_usage,
             post_restart,
             read_only,
+            self_update,
         ))
         .await
 }
@@ -1343,6 +1365,7 @@ async fn run_tui_repl_core(
     initial_usage: TokenUsage,
     post_restart: bool,
     read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
     let mut resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let mut model = config
@@ -1429,36 +1452,22 @@ async fn run_tui_repl_core(
         );
     }
 
-    // Capture the running binary's mtime as a baseline. After a `cargo build`
-    // the file is overwritten in-place (we exec a new copy), so comparing
-    // against this baseline is the only reliable way to detect a newer build
-    // when current_exe and the build output resolve to the same inode.
-    let binary_mtime_baseline = self_update::running_mtime();
-    let build_candidate = self_update::default_build_output();
-
-    // ── Startup self-update check ─────────────────────────────────────────────
-    // If a newer binary exists at the default cargo output path, replace and
-    // exec before drawing any UI. The session (possibly empty) is persisted
-    // first so the restarted process can resume it via PIKU_SESSION_ID.
-    if !read_only && !post_restart {
-        let newer = binary_mtime_baseline.map_or_else(
-            || self_update::is_newer_than_running(&build_candidate),
-            |b| self_update::is_newer_than_mtime(&build_candidate, b),
-        );
-        if newer {
-            // Persist session (may be empty — that's fine)
-            if !run.session().messages.is_empty() {
-                let _ = run.session().save(&session_path);
+    // Only an operator-approved root can provide a startup candidate.
+    if !post_restart {
+        match self_update.check_for_update() {
+            Ok(Some(candidate)) => {
+                if !run.session().messages.is_empty() {
+                    let _ = run.session().save(&session_path);
+                }
+                eprintln!("[piku] approved newer binary detected — restarting...");
+                if let Err(error) =
+                    self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
+                {
+                    eprintln!("[piku] self-update failed: {error}");
+                }
             }
-            // No TUI layout yet — just print a plain status line and exec.
-            eprintln!("[piku] newer binary detected — restarting...");
-            if let Err(e) = self_update::replace_and_exec_with_env(
-                &build_candidate,
-                &[("PIKU_SESSION_ID", &session_id)],
-            ) {
-                eprintln!("[piku] self-update failed: {e}");
-                // Fall through and start normally with old binary
-            }
+            Ok(None) => {}
+            Err(error) => eprintln!("[piku] self-update check failed: {error}"),
         }
     }
 
@@ -1535,29 +1544,21 @@ async fn run_tui_repl_core(
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
-        // Check for a newer binary on every iteration — catches the case where
-        // `cargo build` was run externally while the REPL was already running.
-        {
-            let newer = if read_only {
-                false
-            } else {
-                binary_mtime_baseline.map_or_else(
-                    || self_update::is_newer_than_running(&build_candidate),
-                    |b| self_update::is_newer_than_mtime(&build_candidate, b),
-                )
-            };
-            if newer {
+        // External builds are checked only inside the approved developer root.
+        match self_update.check_for_update() {
+            Ok(Some(candidate)) => {
                 let _ = run.session().save(&session_path);
                 let (_, rows) = term_size();
-                let scroll_bot = rows.saturating_sub(2);
-                goto(scroll_bot, 1);
-                announce_self_update(&build_candidate);
-                let _ = self_update::replace_and_exec_with_env(
-                    &build_candidate,
-                    &[("PIKU_SESSION_ID", &session_id)],
-                );
-                // only reached on failure — fall through and keep running
+                goto(rows.saturating_sub(2), 1);
+                announce_self_update(&candidate);
+                if let Err(error) =
+                    self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
+                {
+                    eprintln!("[piku] self-update failed: {error}");
+                }
             }
+            Ok(None) => {}
+            Err(error) => eprintln!("[piku] self-update check failed: {error}"),
         }
 
         // Position editor at the bottom row.
@@ -2341,7 +2342,7 @@ async fn run_tui_repl_core(
                 let prompter = TuiPrompter::new(&config.allow, &config.deny);
                 let mut sink = TuiSink::new(
                     &model,
-                    binary_mtime_baseline,
+                    self_update.clone(),
                     crate::trace::TraceWriter::open(&config.traces_dir(), &session_id),
                 );
                 // The harness rotates models between runs, so a trace that
@@ -2557,10 +2558,9 @@ async fn run_tui_repl_core(
                     let scroll_bot = rows.saturating_sub(2);
                     goto(scroll_bot, 1);
                     announce_self_update(&new_binary);
-                    if let Err(e) = self_update::replace_and_exec_with_env(
-                        &new_binary,
-                        &[("PIKU_SESSION_ID", &session_id)],
-                    ) {
+                    if let Err(e) = self_update
+                        .replace_and_exec(&new_binary, &[("PIKU_SESSION_ID", &session_id)])
+                    {
                         eprintln!("\x1b[31m[piku]\x1b[0m self-update failed: {e}");
                         // Re-enter layout on failure so REPL stays usable
                         let (cols, rows) = term_size();
@@ -3051,17 +3051,19 @@ fn handle_slash_cmd(
         "permissions" | "perms" => {
             if config.allow.is_empty() && config.deny.is_empty() {
                 slash_line!("\x1b[2m[no permission rules configured]\x1b[0m\r");
-                slash_line!("\x1b[2mAdd \"allow\"/\"deny\" arrays to the XDG-aware Piku settings.toml or .piku/settings.toml\x1b[0m\r");
+                slash_line!("\x1b[2mGlobal settings grant tool access; review project grants with piku permissions review\x1b[0m\r");
             } else {
                 if !config.allow.is_empty() {
                     slash_line!("\x1b[32mAllow:\x1b[0m\r");
                     for rule in &config.allow {
+                        let rule = crate::terminal_text(rule);
                         slash_line!("  {rule}\r");
                     }
                 }
                 if !config.deny.is_empty() {
                     slash_line!("\x1b[31mDeny:\x1b[0m\r");
                     for rule in &config.deny {
+                        let rule = crate::terminal_text(rule);
                         slash_line!("  {rule}\r");
                     }
                 }
@@ -3273,6 +3275,42 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::*;
+
+    #[test]
+    fn tool_output_self_update_requires_operator_policy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let policy =
+            self_update::SelfUpdatePolicy::from_operator_root(Some(root.path()), false).unwrap();
+        let release = root.path().join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        let candidate = release.join("piku");
+        std::fs::write(&candidate, b"approved candidate").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = policy.check_for_update().unwrap().unwrap();
+        let output = "Compiling piku v0.1.0\nFinished release";
+        let mut disabled = TuiSink::new(
+            "fixture",
+            self_update::SelfUpdatePolicy::default(),
+            crate::trace::TraceWriter::disabled(),
+        );
+        assert!(matches!(
+            disabled.on_tool_end("bash", "b1", output, false),
+            PostToolAction::Continue
+        ));
+        let mut enabled = TuiSink::new("fixture", policy, crate::trace::TraceWriter::disabled());
+        assert!(matches!(
+            enabled.on_tool_end("bash", "b2", output, true),
+            PostToolAction::Continue
+        ));
+        assert!(matches!(
+            enabled.on_tool_end("read_file", "r1", output, false),
+            PostToolAction::Continue
+        ));
+        assert!(
+            matches!(enabled.on_tool_end("bash", "b3", output, false), PostToolAction::ReplaceAndExec(path) if path == expected)
+        );
+    }
 
     #[tokio::test]
     async fn task_completion_reaches_the_next_parent_request() {
@@ -3724,8 +3762,11 @@ mod tests {
                         ]))
                     }
                 }
-                let mut sink =
-                    TuiSink::new("scripted", None, crate::trace::TraceWriter::disabled());
+                let mut sink = TuiSink::new(
+                    "scripted",
+                    self_update::SelfUpdatePolicy::default(),
+                    crate::trace::TraceWriter::disabled(),
+                );
                 sink.needs_indicator_clear = false;
                 sink.on_context_pressure(0.0);
                 assert!(sink.request_context.is_none());

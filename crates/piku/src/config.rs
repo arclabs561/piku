@@ -1,6 +1,8 @@
 /// Unified Piku settings loaded from global and project files plus CLI overrides.
 ///
-/// Precedence: CLI flags > project settings > global settings > defaults.
+/// Provider authority: CLI flags > operator-global settings > defaults.
+/// Project settings may restrict permissions and budgets; reviewed allow rules
+/// require a separate root- and policy-bound operator approval.
 /// Provider-specific environment variables are resolved separately by the
 /// runtime's provider resolver.
 ///
@@ -9,19 +11,6 @@
 /// Project-local overrides: `.piku/settings.toml` (merged on top).
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-const PROVIDER_ENV_KEYS: &[&str] = &[
-    "OPENROUTER_API_KEY",
-    "OPENROUTER_BASE_URL",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
-    "GROQ_API_KEY",
-    "GROQ_BASE_URL",
-    "OLLAMA_HOST",
-    "PIKU_BASE_URL",
-    "PIKU_API_KEY",
-    "PIKU_MODEL",
-];
 
 // ---------------------------------------------------------------------------
 // Provider-specific config block
@@ -99,12 +88,12 @@ pub struct PikuConfig {
     pub model: Option<String>,
     /// Max turns per agent turn.
     pub max_turns: Option<u32>,
-    /// Tool names/patterns to auto-allow (global + project merged).
+    /// Operator-global and explicitly reviewed project auto-allow rules.
     pub allow: Vec<String>,
     /// Tool names to always deny (global + project merged).
     pub deny: Vec<String>,
     pub actors: BTreeMap<String, ActorConfig>,
-    /// Per-provider config blocks (global + project merged).
+    /// Operator-global provider blocks, currently parsed without activation.
     pub provider_configs: ProviderConfigMap,
     /// Resolved user-global config dir (`XDG_CONFIG_HOME` or `~/.config` fallback).
     pub config_dir: PathBuf,
@@ -121,15 +110,22 @@ pub struct ProviderConfigMap {
 }
 
 impl PikuConfig {
-    /// Load config: global settings file, then project-local, then CLI overrides.
+    /// Load operator settings, project restrictions/reviewed grants, and CLI overrides.
     #[must_use]
     pub fn load(
         cli_provider: Option<&str>,
         cli_model: Option<&str>,
         project_dir: Option<&Path>,
     ) -> Self {
-        let config_dir = global_config_dir();
+        Self::load_in(cli_provider, cli_model, project_dir, global_config_dir())
+    }
 
+    fn load_in(
+        cli_provider: Option<&str>,
+        cli_model: Option<&str>,
+        project_dir: Option<&Path>,
+        config_dir: PathBuf,
+    ) -> Self {
         // Layer 1: global settings file
         let global_path = config_dir.join("settings.toml");
         let mut settings = load_settings_file(&global_path);
@@ -138,7 +134,11 @@ impl PikuConfig {
         if let Some(proj) = project_dir {
             let project_path = proj.join(".piku").join("settings.toml");
             let project_settings = load_settings_file(&project_path);
-            merge_settings(&mut settings, &project_settings);
+            merge_project_settings(
+                &mut settings,
+                &project_settings,
+                crate::project_permissions::approved(&config_dir, proj, &project_settings),
+            );
         }
 
         // Layer 3: CLI overrides (highest precedence)
@@ -211,7 +211,7 @@ impl PikuConfig {
             }
         }
         for pattern in &self.allow {
-            if matches_tool_pattern(pattern, tool_name, params) {
+            if matches_allow_tool_pattern(pattern, tool_name, params) {
                 return Some(true);
             }
         }
@@ -219,14 +219,22 @@ impl PikuConfig {
     }
 }
 
-/// Match a tool permission pattern against a tool name and its params.
+/// Match a deny rule against a tool name and its params.
 /// Supports: exact tool name (`"bash"`), tool with arg glob (`"bash(git *)"`)
-/// using the same syntax as hook `if` conditions.
+/// with stars only at the edges. Scoped bash denies fail closed when command
+/// structure involves shell controls or expansion; use
+/// `matches_allow_tool_pattern` when considering an auto-grant.
 #[must_use]
 pub fn matches_tool_pattern(pattern: &str, tool_name: &str, params: &serde_json::Value) -> bool {
+    if tool_name == "bash" && pattern.starts_with("bash(") && shell_command_uncertain(params) {
+        return true;
+    }
     // Parse `ToolName(glob)` syntax
     if let Some(paren_start) = pattern.find('(') {
         if let Some(paren_end) = pattern.rfind(')') {
+            if paren_end != pattern.len() - 1 {
+                return false;
+            }
             let pat_tool = &pattern[..paren_start];
             if pat_tool != tool_name {
                 return false;
@@ -269,7 +277,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn global_config_dir() -> PathBuf {
+pub(crate) fn global_config_dir() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {
             std::env::var("HOME").map_or_else(
@@ -282,85 +290,87 @@ fn global_config_dir() -> PathBuf {
     base.join("piku")
 }
 
-/// Load only recognized provider variables from the nearest `.env` when the
-/// launching environment did not already define them.
-///
-/// This deliberately does not source the complete file: unrelated project
-/// secrets must not become ambient authority for Piku or its tools.
-pub fn load_provider_dotenv(project_dir: Option<&Path>) -> Result<usize, dotenvy::Error> {
-    let Some(path) = nearest_dotenv(project_dir) else {
-        return Ok(0);
-    };
-    let updates = provider_dotenv_updates(&path, |key| std::env::var_os(key).is_some())?;
-    let count = updates.len();
-    for (key, value) in updates {
-        std::env::set_var(key, value);
-    }
-    Ok(count)
-}
-
-fn nearest_dotenv(project_dir: Option<&Path>) -> Option<PathBuf> {
-    project_dir?
-        .ancestors()
-        .map(|dir| dir.join(".env"))
-        .find(|path| path.is_file())
-}
-
-fn provider_dotenv_updates(
-    path: &Path,
-    is_set: impl Fn(&str) -> bool,
-) -> Result<Vec<(String, String)>, dotenvy::Error> {
-    let mut updates = Vec::new();
-    for entry in dotenvy::from_path_iter(path)? {
-        let (key, value) = entry?;
-        if PROVIDER_ENV_KEYS.contains(&key.as_str()) && !is_set(&key) {
-            updates.push((key, value));
-        }
-    }
-    Ok(updates)
-}
-
-fn load_settings_file(path: &Path) -> SettingsFile {
+pub(crate) fn load_settings_file(path: &Path) -> SettingsFile {
     match std::fs::read_to_string(path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-            tracing::warn!(path = %path.display(), error = %e, "settings file could not be parsed");
+        Ok(content) => toml::from_str(&content).unwrap_or_else(|_| {
+            tracing::warn!(path = %path.display(), "settings file could not be parsed (invalid TOML)");
             SettingsFile::default()
         }),
         Err(_) => SettingsFile::default(),
     }
 }
 
-fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
-    if overlay.provider.is_some() {
-        base.provider.clone_from(&overlay.provider);
+fn merge_project_settings(base: &mut SettingsFile, overlay: &SettingsFile, approved: bool) {
+    if let Some(limit) = overlay.max_turns {
+        base.max_turns = Some(
+            limit.min(
+                base.max_turns
+                    .unwrap_or(piku_runtime::agent_loop::DEFAULT_MAX_TURNS),
+            ),
+        );
     }
-    if overlay.model.is_some() {
-        base.model.clone_from(&overlay.model);
-    }
-    if overlay.max_turns.is_some() {
-        base.max_turns = overlay.max_turns;
-    }
-    // Allow/deny: append (project rules extend global rules).
-    base.allow.extend(overlay.allow.iter().cloned());
     base.deny.extend(overlay.deny.iter().cloned());
-    base.actors.extend(overlay.actors.clone());
+    if approved {
+        base.allow.extend(overlay.allow.iter().cloned());
+    }
+    for (name, project_actor) in &overlay.actors {
+        let actor = base.actors.entry(name.clone()).or_default();
+        if project_actor.label.is_some() {
+            actor.label.clone_from(&project_actor.label);
+        }
+        if project_actor.instructions.is_some() {
+            actor.instructions.clone_from(&project_actor.instructions);
+        }
+    }
+    // Provider connections, models and actor routing are operator authority.
+}
 
-    // Provider config blocks: overlay wins when set.
-    if overlay.openrouter.is_some() {
-        base.openrouter.clone_from(&overlay.openrouter);
+/// Auto-grants for scoped shell commands require a simple command. Explicit
+/// whole-tool grants remain broad and are displayed as such during review.
+#[must_use]
+pub fn matches_allow_tool_pattern(
+    pattern: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+) -> bool {
+    if tool_name == "bash" && pattern.contains('(') && shell_command_uncertain(params) {
+        return false;
     }
-    if overlay.anthropic.is_some() {
-        base.anthropic.clone_from(&overlay.anthropic);
-    }
-    if overlay.groq.is_some() {
-        base.groq.clone_from(&overlay.groq);
-    }
-    if overlay.ollama.is_some() {
-        base.ollama.clone_from(&overlay.ollama);
-    }
-    if overlay.custom.is_some() {
-        base.custom.clone_from(&overlay.custom);
-    }
+    matches_tool_pattern(pattern, tool_name, params)
+}
+
+fn shell_command_uncertain(params: &serde_json::Value) -> bool {
+    params
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|command| {
+            command.chars().any(|c| {
+                matches!(
+                    c,
+                    ';' | '&'
+                        | '|'
+                        | '$'
+                        | '`'
+                        | '\n'
+                        | '\r'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '\\'
+                        | '\''
+                        | '"'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '~'
+                        | '#'
+                )
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -371,26 +381,46 @@ fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
 mod tests {
     use super::*;
 
+    fn isolated_load(
+        provider: Option<&str>,
+        model: Option<&str>,
+        project: Option<&Path>,
+    ) -> PikuConfig {
+        let config = tempfile::tempdir().unwrap();
+        PikuConfig::load_in(provider, model, project, config.path().to_path_buf())
+    }
+
+    fn approved_load(project: &Path) -> PikuConfig {
+        let config = tempfile::tempdir().unwrap();
+        let settings = load_settings_file(&project.join(".piku/settings.toml"));
+        std::fs::write(
+            config.path().join("approved-permissions.json"),
+            serde_json::to_vec(&BTreeMap::from([(
+                project.canonicalize().unwrap(),
+                crate::project_permissions::digest(&settings),
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        PikuConfig::load_in(None, None, Some(project), config.path().to_path_buf())
+    }
+
     #[test]
     fn load_empty_config() {
-        let dir = tempfile::tempdir().unwrap();
-        // Isolate from real ~/.config/piku/settings.toml
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let cfg = PikuConfig::load(None, None, None);
+        let cfg = isolated_load(None, None, None);
         assert!(cfg.provider.is_none());
         assert!(cfg.model.is_none());
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
     fn cli_overrides_file() {
-        let cfg = PikuConfig::load(Some("ollama"), Some("gemma4"), None);
+        let cfg = isolated_load(Some("ollama"), Some("gemma4"), None);
         assert_eq!(cfg.provider.as_deref(), Some("ollama"));
         assert_eq!(cfg.model.as_deref(), Some("gemma4"));
     }
 
     #[test]
-    fn project_overrides_global() {
+    fn project_cannot_select_provider_or_model() {
         let dir = tempfile::tempdir().unwrap();
         let piku_dir = dir.path().join(".piku");
         std::fs::create_dir_all(&piku_dir).unwrap();
@@ -401,9 +431,9 @@ model = "llama-3""#,
         )
         .unwrap();
 
-        let cfg = PikuConfig::load(None, None, Some(dir.path()));
-        assert_eq!(cfg.provider.as_deref(), Some("groq"));
-        assert_eq!(cfg.model.as_deref(), Some("llama-3"));
+        let cfg = isolated_load(None, None, Some(dir.path()));
+        assert!(cfg.provider.is_none());
+        assert!(cfg.model.is_none());
     }
 
     #[test]
@@ -413,17 +443,17 @@ model = "llama-3""#,
         std::fs::create_dir_all(&piku_dir).unwrap();
         std::fs::write(piku_dir.join("settings.toml"), r#"provider = "groq""#).unwrap();
 
-        let cfg = PikuConfig::load(Some("anthropic"), None, Some(dir.path()));
+        let cfg = isolated_load(Some("anthropic"), None, Some(dir.path()));
         assert_eq!(cfg.provider.as_deref(), Some("anthropic"));
     }
 
     #[test]
     fn sessions_traces_and_runs_dirs() {
-        let cfg = PikuConfig::load(None, None, None);
-        assert!(cfg.sessions_dir().ends_with("piku/sessions"));
-        assert!(cfg.traces_dir().ends_with("piku/traces"));
-        assert!(cfg.runs_dir().ends_with("piku/runs"));
-        assert!(cfg.agent_links_dir().ends_with("piku/agent-links"));
+        let cfg = isolated_load(None, None, None);
+        assert!(cfg.sessions_dir().ends_with("sessions"));
+        assert!(cfg.traces_dir().ends_with("traces"));
+        assert!(cfg.runs_dir().ends_with("runs"));
+        assert!(cfg.agent_links_dir().ends_with("agent-links"));
     }
 
     #[test]
@@ -437,7 +467,7 @@ model = "llama-3""#,
         )
         .unwrap();
 
-        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let cfg = approved_load(dir.path());
         assert_eq!(
             cfg.check_permission_rule("bash", &serde_json::json!({})),
             Some(true)
@@ -459,7 +489,7 @@ model = "llama-3""#,
         std::fs::create_dir_all(&piku_dir).unwrap();
         std::fs::write(piku_dir.join("settings.toml"), r#"allow = ["bash(git *)"]"#).unwrap();
 
-        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let cfg = approved_load(dir.path());
         let git_push = serde_json::json!({"command": "git push origin main"});
         let rm_rf = serde_json::json!({"command": "rm -rf /"});
         assert_eq!(cfg.check_permission_rule("bash", &git_push), Some(true));
@@ -478,7 +508,7 @@ deny = ["bash(rm *)"]"#,
         )
         .unwrap();
 
-        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let cfg = approved_load(dir.path());
         let git = serde_json::json!({"command": "git status"});
         let rm = serde_json::json!({"command": "rm -rf /"});
         assert_eq!(cfg.check_permission_rule("bash", &git), Some(true));
@@ -505,7 +535,7 @@ model = "llama3.1""#,
         )
         .unwrap();
 
-        let cfg = PikuConfig::load(None, None, Some(dir.path()));
+        let cfg = PikuConfig::load_in(None, None, None, piku_dir);
         assert_eq!(cfg.provider.as_deref(), Some("openrouter"));
 
         let or = cfg.provider_configs.openrouter.unwrap();
@@ -519,30 +549,183 @@ model = "llama3.1""#,
     }
 
     #[test]
-    fn provider_dotenv_import_is_allowlisted_and_non_overriding() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(
-            &path,
-            "OPENROUTER_API_KEY=file-key\nOPENROUTER_BASE_URL=https://example.test/v1\nDATABASE_PASSWORD=do-not-import\n",
-        )
-        .unwrap();
-
-        let updates = provider_dotenv_updates(&path, |key| key == "OPENROUTER_BASE_URL").unwrap();
+    fn project_restrictions_apply_without_approval_and_cannot_raise_budget() {
+        let mut operator = SettingsFile {
+            max_turns: Some(5),
+            allow: vec!["bash".into()],
+            ..SettingsFile::default()
+        };
+        let project = SettingsFile {
+            max_turns: Some(50),
+            allow: vec!["write_file".into()],
+            deny: vec!["bash".into()],
+            ..SettingsFile::default()
+        };
+        merge_project_settings(&mut operator, &project, false);
+        assert_eq!(operator.max_turns, Some(5));
+        assert_eq!(operator.allow, ["bash"]);
+        assert_eq!(operator.deny, ["bash"]);
+        let mut defaults = SettingsFile::default();
+        merge_project_settings(&mut defaults, &project, false);
         assert_eq!(
-            updates,
-            vec![("OPENROUTER_API_KEY".to_string(), "file-key".to_string())]
+            defaults.max_turns,
+            Some(piku_runtime::agent_loop::DEFAULT_MAX_TURNS)
         );
+        let restrictive = SettingsFile {
+            max_turns: Some(2),
+            ..SettingsFile::default()
+        };
+        merge_project_settings(&mut operator, &restrictive, false);
+        assert_eq!(operator.max_turns, Some(2));
     }
 
     #[test]
-    fn nearest_dotenv_prefers_the_project_over_its_parent() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
-        std::fs::create_dir(&project).unwrap();
-        std::fs::write(dir.path().join(".env"), "OPENROUTER_API_KEY=parent\n").unwrap();
-        std::fs::write(project.join(".env"), "OPENROUTER_API_KEY=project\n").unwrap();
+    fn project_actor_task_data_preserves_operator_connection() {
+        let mut operator = SettingsFile::default();
+        operator.actors.insert(
+            "reviewer".into(),
+            ActorConfig {
+                provider: Some("custom".into()),
+                model: Some("operator-model".into()),
+                ..ActorConfig::default()
+            },
+        );
+        let actor = ActorConfig {
+            label: Some("Reviewer".into()),
+            instructions: Some("Review tests".into()),
+            provider: Some("groq".into()),
+            model: Some("project-model".into()),
+        };
+        let project = SettingsFile {
+            actors: BTreeMap::from([("reviewer".into(), actor.clone()), ("new".into(), actor)]),
+            ..SettingsFile::default()
+        };
+        merge_project_settings(&mut operator, &project, true);
+        let existing = &operator.actors["reviewer"];
+        assert_eq!(existing.provider.as_deref(), Some("custom"));
+        assert_eq!(existing.model.as_deref(), Some("operator-model"));
+        assert_eq!(existing.instructions.as_deref(), Some("Review tests"));
+        assert!(operator.actors["new"].provider.is_none());
+        assert!(operator.actors["new"].model.is_none());
+    }
 
-        assert_eq!(nearest_dotenv(Some(&project)), Some(project.join(".env")));
+    #[test]
+    fn shell_scoped_grants_reject_compounds_and_denies_fail_closed() {
+        for command in [
+            "git status; rm -rf /",
+            "git status && echo x",
+            "git $(echo status)",
+            "git `echo status`",
+            "git status\nrm x",
+            "git 'status'",
+            "git status > x",
+        ] {
+            let params = serde_json::json!({"command": command});
+            assert!(
+                !matches_allow_tool_pattern("bash(git *)", "bash", &params),
+                "{command}"
+            );
+            assert!(
+                matches_tool_pattern("bash(rm *)", "bash", &params),
+                "{command}"
+            );
+        }
+        assert!(matches_allow_tool_pattern(
+            "bash(git status)",
+            "bash",
+            &serde_json::json!({"command":"git status"})
+        ));
+        assert!(!matches_allow_tool_pattern(
+            "bash(git * status)",
+            "bash",
+            &serde_json::json!({"command":"git foo status"})
+        ));
+        assert!(!matches_tool_pattern(
+            "bash(git *)suffix",
+            "bash",
+            &serde_json::json!({"command":"git status"})
+        ));
+    }
+
+    #[test]
+    fn loading_project_policy_preserves_operator_routes_and_denials() {
+        let config = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".piku")).unwrap();
+        std::fs::write(config.path().join("settings.toml"), "provider = \"custom\"\nmodel = \"operator-model\"\nallow = [\"bash\"]\ndeny = [\"bash(rm *)\"]\n[custom]\nbase_url = \"http://operator.test\"\n").unwrap();
+        let path = project.path().join(".piku/settings.toml");
+        std::fs::write(&path, "provider = \"groq\"\nmodel = \"repo-model\"\nallow = [\"write_file\"]\ndeny = [\"edit_file\"]\n[custom]\nbase_url = \"http://repo.test\"\n").unwrap();
+        let cfg = PikuConfig::load_in(
+            None,
+            None,
+            Some(project.path()),
+            config.path().to_path_buf(),
+        );
+        assert_eq!(cfg.provider.as_deref(), Some("custom"));
+        assert_eq!(cfg.model.as_deref(), Some("operator-model"));
+        assert_eq!(
+            cfg.provider_configs
+                .custom
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("http://operator.test")
+        );
+        assert_eq!(
+            cfg.check_permission_rule("write_file", &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            cfg.check_permission_rule("edit_file", &serde_json::json!({})),
+            Some(false)
+        );
+        assert_eq!(
+            cfg.check_permission_rule("bash", &serde_json::json!({"command":"rm file"})),
+            Some(false)
+        );
+        let settings = load_settings_file(&path);
+        std::fs::write(
+            config.path().join("approved-permissions.json"),
+            serde_json::to_vec(&BTreeMap::from([(
+                project.path().canonicalize().unwrap(),
+                crate::project_permissions::digest(&settings),
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = PikuConfig::load_in(
+            None,
+            None,
+            Some(project.path()),
+            config.path().to_path_buf(),
+        );
+        assert_eq!(
+            cfg.check_permission_rule("write_file", &serde_json::json!({})),
+            Some(true)
+        );
+        assert_eq!(
+            cfg.check_permission_rule("bash", &serde_json::json!({"command":"rm file"})),
+            Some(false)
+        );
+        std::fs::write(
+            path,
+            "allow = [\"write_file\", \"edit_file\"]\ndeny = [\"edit_file\"]\n",
+        )
+        .unwrap();
+        let cfg = PikuConfig::load_in(
+            None,
+            None,
+            Some(project.path()),
+            config.path().to_path_buf(),
+        );
+        assert_eq!(
+            cfg.check_permission_rule("write_file", &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            cfg.check_permission_rule("edit_file", &serde_json::json!({})),
+            Some(false)
+        );
     }
 }

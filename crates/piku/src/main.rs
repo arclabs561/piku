@@ -3,7 +3,7 @@ mod auth_cli;
 use clap::Parser;
 
 use piku::cli::{Cli, Commands, InspectFormat};
-use piku::config::{load_provider_dotenv, PikuConfig};
+use piku::config::PikuConfig;
 use piku::self_update;
 use piku::trace::TraceWriter;
 use piku::tui_repl;
@@ -26,20 +26,16 @@ async fn main() -> anyhow::Result<()> {
     }
     piku::telemetry::init();
     let cwd = env::current_dir().ok();
-    if env::var_os("PIKU_NO_DOTENV").is_none() {
-        match load_provider_dotenv(cwd.as_deref()) {
-            Ok(0) => {}
-            Ok(count) => {
-                tracing::info!(count, source = "nearest_dotenv", "provider settings loaded");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "provider dotenv could not be read");
-            }
-        }
-    }
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Commands::Permissions { command }) => {
+            piku::project_permissions::run(
+                command,
+                cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+            )?;
+            return Ok(());
+        }
         Some(Commands::Auth { command, .. }) => {
             auth_cli::run(command).await?;
             return Ok(());
@@ -101,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    let self_update = self_update::SelfUpdatePolicy::from_operator_root(
+        cli.self_update_root.as_deref(),
+        cli.read_only,
+    )?;
     let config = PikuConfig::load(
         cli.provider.as_deref(),
         cli.model.as_deref(),
@@ -120,22 +120,41 @@ async fn main() -> anyhow::Result<()> {
             &config,
             cli.print,
             cli.read_only,
+            &self_update,
         )
         .await?;
     } else if let Some(prompt) = prompt_str {
         if !cli.print && !cli.read_only && self_update::was_restarted() {
             if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(session, &config, cli.read_only).await;
+                return run_tui_repl_post_restart(session, &config, cli.read_only, &self_update)
+                    .await;
             }
         }
-        run_single_shot(&prompt, None, &config, cli.print, cli.read_only).await?;
+        run_single_shot(
+            &prompt,
+            None,
+            &config,
+            cli.print,
+            cli.read_only,
+            &self_update,
+        )
+        .await?;
     } else {
         if self_update::was_restarted() {
             if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(session, &config, cli.read_only).await;
+                return run_tui_repl_post_restart(session, &config, cli.read_only, &self_update)
+                    .await;
             }
         }
-        tui_repl::run_tui_repl_with_mode(&config, cli.read_only).await?;
+        tui_repl::run_tui_repl_with_policy(
+            &config,
+            None,
+            TokenUsage::default(),
+            false,
+            cli.read_only,
+            &self_update,
+        )
+        .await?;
     }
 
     Ok(())
@@ -310,8 +329,17 @@ async fn run_tui_repl_post_restart(
     session: Session,
     config: &PikuConfig,
     read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
-    tui_repl::run_tui_repl_post_restart(config, Some(session), read_only).await
+    tui_repl::run_tui_repl_with_policy(
+        config,
+        Some(session),
+        TokenUsage::default(),
+        true,
+        read_only,
+        self_update,
+    )
+    .await
 }
 
 async fn run_resume(
@@ -320,6 +348,7 @@ async fn run_resume(
     config: &PikuConfig,
     print: bool,
     read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
@@ -347,6 +376,7 @@ async fn run_resume(
                     config,
                     print,
                     read_only,
+                    self_update,
                 )
                 .await;
             }
@@ -375,6 +405,7 @@ async fn run_resume(
         config,
         print,
         read_only,
+        self_update,
     )
     .await
 }
@@ -386,12 +417,14 @@ fn print_route_status(provider: &str, model: &str) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep launch persistence and update admission together.
 async fn run_single_shot(
     prompt: &str,
     existing_session: Option<Session>,
     config: &PikuConfig,
     print: bool,
     read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
     let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
     let model = config
@@ -437,7 +470,7 @@ async fn run_single_shot(
     let traces_dir = config.traces_dir();
     std::fs::create_dir_all(&traces_dir).ok();
     let trace = TraceWriter::open(&traces_dir, &session_id);
-    let mut sink = StdoutSink::new(trace);
+    let mut sink = StdoutSink::new(trace, self_update.clone());
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
     let mut turn_nonce = [0; 16];
@@ -484,7 +517,7 @@ async fn run_single_shot(
     let failed = result.stream_error.is_some();
     if let Some(new_binary) = result.replace_and_exec.filter(|_| !failed) {
         eprintln!("[piku] rebuilt — restarting with new binary...");
-        if let Err(e) = self_update::replace_and_exec(&new_binary) {
+        if let Err(e) = self_update.replace_and_exec(&new_binary, &[]) {
             eprintln!("[piku] self-update failed: {e}");
             eprintln!("[piku] continuing with old binary");
         }
@@ -499,7 +532,15 @@ async fn run_single_shot(
     }
 
     println!();
-    tui_repl::run_tui_repl_with_session(config, Some(session), result.usage).await
+    tui_repl::run_tui_repl_with_policy(
+        config,
+        Some(session),
+        result.usage,
+        false,
+        read_only,
+        self_update,
+    )
+    .await
 }
 
 fn report_launch_stream_error(error: Option<&str>, headless: bool) -> anyhow::Result<()> {
@@ -542,6 +583,7 @@ impl PermissionPrompter for ConfiguredAllowAll {
 }
 
 struct StdoutSink {
+    self_update: self_update::SelfUpdatePolicy,
     stdout: io::Stdout,
     trace: TraceWriter,
     md: piku::markdown::StreamingMarkdown,
@@ -549,10 +591,11 @@ struct StdoutSink {
 }
 
 impl StdoutSink {
-    fn new(trace: TraceWriter) -> Self {
+    fn new(trace: TraceWriter, self_update: self_update::SelfUpdatePolicy) -> Self {
         let stdout = io::stdout();
         let color = stdout.is_terminal() && env::var_os("NO_COLOR").is_none();
         Self {
+            self_update,
             stdout,
             trace,
             md: piku::markdown::StreamingMarkdown::new_stdout(),
@@ -623,9 +666,16 @@ impl OutputSink for StdoutSink {
         self.trace.tool_end(tool_name, tool_id, result, !is_error);
 
         if tool_name == "bash" {
-            if let Some(new_binary) = self_update::detect_self_build(result, !is_error) {
-                eprintln!("[piku] detected self-rebuild → {}", new_binary.display());
-                return PostToolAction::ReplaceAndExec(new_binary);
+            match self.self_update.detect_self_build(result, !is_error) {
+                Ok(Some(new_binary)) => {
+                    eprintln!(
+                        "[piku] detected approved self-rebuild → {}",
+                        new_binary.display()
+                    );
+                    return PostToolAction::ReplaceAndExec(new_binary);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("[piku] self-update check failed: {error}"),
             }
         }
 

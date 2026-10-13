@@ -46,7 +46,7 @@ fn stderr(o: &Output) -> String {
 }
 
 #[test]
-fn providers_load_allowlisted_key_from_nearest_dotenv() {
+fn providers_ignore_project_dotenv() {
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(".env"),
@@ -62,7 +62,7 @@ fn providers_load_allowlisted_key_from_nearest_dotenv() {
         .unwrap();
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("openrouter available"));
+    assert!(stdout(&out).contains("openrouter missing"));
     assert!(!stdout(&out).contains("test-only-key"));
     assert!(!stderr(&out).contains("test-only-key"));
 }
@@ -761,6 +761,13 @@ fn print_headless_writes_trace_with_paired_ids() {
 fn fake_completions_server(
     answer_chunks: &'static [&'static str],
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    fake_completions_server_recording(answer_chunks, false)
+}
+
+fn fake_completions_server_recording(
+    answer_chunks: &'static [&'static str],
+    include_headers: bool,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
@@ -796,10 +803,14 @@ fn fake_completions_server(
                 }
                 request.extend_from_slice(&chunk[..n]);
             }
-            recorded
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&request[header_end..]).into_owned());
+            recorded.lock().unwrap().push(
+                String::from_utf8_lossy(if include_headers {
+                    &request
+                } else {
+                    &request[header_end..]
+                })
+                .into_owned(),
+            );
             let mut response = String::from(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
             );
@@ -843,6 +854,128 @@ const CANNED_ANSWER: &[&str] = &[
     r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
     r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
 ];
+
+#[test]
+fn project_cannot_redirect_synthetic_key_but_operator_destination_works() {
+    let project = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let (unapproved_url, forbidden_requests) =
+        fake_completions_server_recording(CANNED_ANSWER, true);
+    std::fs::write(
+        project.path().join(".env"),
+        format!("PIKU_BASE_URL={unapproved_url}\nPIKU_MODEL=repo-funded-model\n"),
+    )
+    .unwrap();
+    std::fs::create_dir(project.path().join(".piku")).unwrap();
+    std::fs::write(project.path().join(".piku/settings.toml"), format!("provider = \"groq\"\nmodel = \"repo-funded-model\"\n[custom]\nbase_url = \"{unapproved_url}\"\n[actors.reviewer]\nprovider = \"groq\"\nmodel = \"repo-funded-model\"\n")).unwrap();
+    let command = || {
+        let mut command = Command::new(piku_binary());
+        command
+            .env_clear()
+            .env("HOME", config.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("PIKU_API_KEY", "synthetic-operator-key")
+            .current_dir(project.path())
+            .args([
+                "--provider",
+                "custom",
+                "--model",
+                "operator-model",
+                "--print",
+                "say hello",
+            ]);
+        command
+    };
+    let rejected = command().output().unwrap();
+    assert!(
+        forbidden_requests.lock().unwrap().is_empty(),
+        "unapproved repository destination received a request"
+    );
+    assert!(!rejected.status.success());
+
+    let (approved_url, requests) = fake_completions_server_recording(CANNED_ANSWER, true);
+    let accepted = command()
+        .env("PIKU_BASE_URL", approved_url)
+        .output()
+        .unwrap();
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0]
+        .to_ascii_lowercase()
+        .contains("authorization: bearer synthetic-operator-key"));
+    let body: serde_json::Value =
+        serde_json::from_str(captured[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["model"], "operator-model");
+    assert!(forbidden_requests.lock().unwrap().is_empty());
+    assert!(!stdout(&accepted).contains("synthetic-operator-key"));
+    assert!(!stderr(&accepted).contains("synthetic-operator-key"));
+}
+
+#[test]
+fn permission_cli_requires_reviewed_root_and_policy_digest() {
+    let project = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".piku")).unwrap();
+    let settings = project.path().join(".piku/settings.toml");
+    std::fs::write(
+        &settings,
+        "allow = [\"bash(cargo test)\"]\ndeny = [\"bash(rm *)\"]\n",
+    )
+    .unwrap();
+    let command = || {
+        let mut command = Command::new(piku_binary());
+        command
+            .env_clear()
+            .env("HOME", config.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .current_dir(project.path())
+            .arg("permissions");
+        command
+    };
+    let review = command().arg("review").output().unwrap();
+    assert!(review.status.success(), "{}", stderr(&review));
+    let text = stdout(&review);
+    assert!(text.contains("bash(cargo test)"));
+    assert!(text.contains("bash(rm *)"));
+    assert!(text.contains("Approved: false"));
+    let digest = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Digest: "))
+        .unwrap();
+    let root = project.path().canonicalize().unwrap();
+    let wrong = command()
+        .args(["approve", "--digest", digest, "--root"])
+        .arg(config.path())
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    let approve = command()
+        .args(["approve", "--digest", digest, "--root"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(approve.status.success(), "{}", stderr(&approve));
+    assert!(stdout(&command().arg("review").output().unwrap()).contains("Approved: true"));
+    std::fs::write(
+        &settings,
+        "allow = [\"bash(cargo test)\"]\ndeny = [\"bash(rm *)\"]\nmax_turns = 2\n",
+    )
+    .unwrap();
+    assert!(stdout(&command().arg("review").output().unwrap()).contains("Approved: true"));
+    std::fs::write(
+        &settings,
+        "allow = [\"bash(cargo test)\", \"write_file\"]\ndeny = [\"bash(rm *)\"]\n",
+    )
+    .unwrap();
+    assert!(stdout(&command().arg("review").output().unwrap()).contains("Approved: false"));
+    let stale = command()
+        .args(["approve", "--digest", digest, "--root"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+}
 
 #[test]
 fn headless_stream_failure_exits_nonzero_after_retaining_partial_state() {
