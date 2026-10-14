@@ -9,9 +9,12 @@ Use Playwright MCP browser tools for every interaction. Do not inspect source,
 run shell commands, or use curl. Do not start or stop the server. Your first
 action must be a Playwright call. The repository and host are out of bounds:
 do not start the terminal, request repository edits, or approve host actions.
-You MAY submit at most two model requests through the visible UI: one chat turn
-and one selected-page-source change. Those requests are required unless the UI
-or backend visibly blocks them.
+You MAY make at most two model-producing submissions through the visible UI:
+one chat turn and one selected-page-source change. Both are required unless the
+UI or backend visibly blocks them. Sends, reruns, page changes, and actor turns
+share this limit; a failed or cancelled submission still counts. Reserve one
+submission for each required action. This UI limit does not measure the
+evaluator's own requests or the backend provider calls within a submitted task.
 
 This distinction is essential:
 
@@ -73,10 +76,12 @@ the most useful usability evidence.
    into the chat card's optional context. Submit one chat turn asking the model
    to explain the authority boundaries. Observe queued/running/completed/error
    transitions, rendered Markdown, elapsed/progress information, and any
-   inspectable model/tool provenance. Edit that turn and use `run from here` or
-   the closest visible equivalent. Determine whether downstream output is
-   visibly invalidated and whether the rerun is attributable to the edited
-   input. Drag, resize, overlap, and raise cards; reload and verify content,
+   inspectable model/tool provenance. Edit that turn and inspect `run from here`
+   or the closest visible equivalent without submitting a rerun. Determine
+   whether downstream output is visibly invalidated and attributable to the
+   edited input. Record live recomputation as untested under this budget; the
+   deterministic preflight separately exercises rerun behavior. Drag, resize,
+   overlap, and raise cards; reload and verify content,
    geometry, and stacking. Capture `03-workspace-desktop.png`.
 
 5. TRUST — Through the change card, target selected page source and submit one
@@ -101,11 +106,12 @@ the most useful usability evidence.
    `05-final-desktop.png`. Verify narrow scroll state does not displace the
    desktop canvas.
 
-When the surface exposes an interleaved-agent room, also perform this bounded
-room probe without treating it as a background-task test: select two visible
-actors, send one short turn to each, and inspect the returned timeline. Verify
-that the two turns remain chronological and visibly attributable, and that a
-private actor history is not represented as ambient shared context. If the
+When the surface exposes an interleaved-agent room, inspect two visible actors
+and any existing timeline without sending another model-producing turn. Record
+new actor-turn execution as untested under the shared submission budget. Check
+whether existing turns are chronological and visibly attributable, and that
+private actor history is not represented as ambient shared context. This inspection
+is not a background-task test. If the
 surface does not expose actors, record that as an absent capability rather than
 inventing a hidden interaction. If a delegated task completion is visible,
 inspect whether it is a durable handoff/reference rather than an unsolicited
