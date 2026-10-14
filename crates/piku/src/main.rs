@@ -516,6 +516,7 @@ async fn run_single_shot(
     std::fs::create_dir_all(&traces_dir).ok();
     let trace = TraceWriter::open(&traces_dir, &session_id);
     let mut sink = StdoutSink::new(trace, self_update.clone());
+    sink.request_observation = request_log.map(RequestLog::request_observation);
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
     let mut turn_nonce = [0; 16];
@@ -640,6 +641,7 @@ impl PermissionPrompter for ConfiguredAllowAll {
 }
 
 struct StdoutSink {
+    request_observation: Option<piku_runtime::RequestObservation>,
     self_update: self_update::SelfUpdatePolicy,
     stdout: io::Stdout,
     trace: TraceWriter,
@@ -652,6 +654,7 @@ impl StdoutSink {
         let stdout = io::stdout();
         let color = stdout.is_terminal() && env::var_os("NO_COLOR").is_none();
         Self {
+            request_observation: None,
             self_update,
             stdout,
             trace,
@@ -675,6 +678,10 @@ impl StdoutSink {
 }
 
 impl OutputSink for StdoutSink {
+    fn request_observation(&self) -> Option<piku_runtime::RequestObservation> {
+        self.request_observation.clone()
+    }
+
     fn on_text(&mut self, text: &str) {
         let rendered = self.md.push(text);
         if !rendered.is_empty() {

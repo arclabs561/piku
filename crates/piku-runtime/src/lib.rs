@@ -16,6 +16,7 @@ pub mod memory;
 pub mod permission;
 pub mod prompt;
 pub mod provider;
+pub mod request_observation;
 pub mod run_audit;
 pub mod run_handle;
 pub mod run_record;
@@ -59,6 +60,9 @@ pub use prompt::build_system_prompt;
 pub use provider::{
     provider_availability, ProviderAvailability, ResolvedProvider, DEFAULT_MODEL_ANTHROPIC,
     DEFAULT_MODEL_GROQ, DEFAULT_MODEL_OLLAMA, DEFAULT_MODEL_OPENROUTER,
+};
+pub use request_observation::{
+    CausalBinding, CausalOrigin, RequestObservation, RequestObserverFactory, RequestPurpose,
 };
 pub use run_audit::{
     audit_run_record, AuditSeverity, ContentAudit, ContextAudit, RunAudit, RunAuditFinding,

@@ -965,6 +965,9 @@ mod review_workflow;
 #[path = "support/restart_recovery.rs"]
 mod restart_recovery;
 
+#[path = "support/request_correlation.rs"]
+mod request_correlation;
+
 /// Compose ambiguity, a genuinely unfinished stream, and fresh-process repair
 /// through the real terminal. Scripted answers establish application plumbing.
 #[test]
@@ -1253,6 +1256,7 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
         );
     }
     let final_record = std::fs::read_to_string(&record_path).unwrap();
+    request_correlation::assert_terminal_correlation(&logs, &final_record, session);
     assert!(
         final_record.starts_with(&prefix),
         "interrupted evidence was rewritten"

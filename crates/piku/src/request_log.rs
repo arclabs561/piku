@@ -45,7 +45,126 @@ struct State {
 
 struct Event {
     provider: String,
+    binding: Option<Value>,
     observation: InferenceObservation,
+}
+
+fn observer(
+    events: mpsc::SyncSender<Event>,
+    state: Arc<State>,
+    provider: String,
+    binding: Option<Value>,
+) -> Arc<InferenceObserver> {
+    Arc::new(move |observation| {
+        state.callbacks.fetch_add(1, Ordering::SeqCst);
+        if state.accepting.load(Ordering::SeqCst) {
+            match &observation {
+                InferenceObservation::Started { .. } => {
+                    state.active.fetch_add(1, Ordering::SeqCst);
+                }
+                InferenceObservation::Finished(_) => {
+                    state.active.fetch_sub(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            match events.try_send(Event {
+                provider: provider.clone(),
+                binding: binding.clone(),
+                observation,
+            }) {
+                Ok(()) => {
+                    state.enqueued.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    state.full.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    state.closed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        } else {
+            state.rejected.fetch_add(1, Ordering::SeqCst);
+        }
+        state.callbacks.fetch_sub(1, Ordering::SeqCst);
+    })
+}
+
+// Admit bounded opaque forms used by current constructors. Other imported text
+// remains unknown; matching this grammar does not verify an ID's authorship.
+fn decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u128>().is_ok()
+}
+
+fn hexadecimal(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && u128::from_str_radix(value, 16).is_ok()
+}
+
+fn task_identity(value: &str) -> bool {
+    let Some(parts) = value.strip_prefix("agent-") else {
+        return false;
+    };
+    let parts: Vec<_> = parts.split('-').collect();
+    parts.len() == 3 && decimal(parts[0]) && hexadecimal(parts[1]) && hexadecimal(parts[2])
+}
+
+fn run_identity(value: &str) -> bool {
+    if let Some(task) = value.strip_prefix("subagent-") {
+        return task_identity(task);
+    }
+    let Some(parts) = value.strip_prefix("session-") else {
+        return false;
+    };
+    let parts: Vec<_> = parts.split('-').collect();
+    parts.len() == 2 && decimal(parts[0]) && decimal(parts[1])
+}
+
+fn turn_identity(value: &str) -> bool {
+    let Some(turn) = value.strip_prefix("turn-") else {
+        return false;
+    };
+    if turn.len() == 32 && hexadecimal(turn) {
+        return true;
+    }
+    // The private child runner currently emits turn-<depth>-0.
+    let Some(depth) = turn.strip_suffix("-0") else {
+        return false;
+    };
+    decimal(depth)
+}
+
+fn safe_identity(value: Option<String>, validate: fn(&str) -> bool) -> Option<String> {
+    value.filter(|value| value.len() <= 128 && validate(value))
+}
+
+fn binding_value(binding: piku_runtime::CausalBinding) -> Value {
+    use piku_runtime::RequestPurpose;
+    let run_id = safe_identity(binding.run_id, run_identity);
+    let turn_id = safe_identity(binding.turn_id, turn_identity);
+    // A sequence without a known run and turn cannot identify a ContextBuilt.
+    let context_sequence = if run_id.is_some() && turn_id.is_some() {
+        binding.context_sequence
+    } else {
+        None
+    };
+    let parent_origin = binding.parent_origin.and_then(|parent| {
+        let run_id = safe_identity(parent.run_id, run_identity);
+        let turn_id = safe_identity(parent.turn_id, turn_identity);
+        (run_id.is_some() || turn_id.is_some()).then(|| json!({"run_id":run_id,"turn_id":turn_id}))
+    });
+    let purpose = match binding.purpose {
+        RequestPurpose::AgentTurn => "agent_turn",
+        RequestPurpose::PeriodicMemory => "periodic_memory",
+        RequestPurpose::ExitMemory => "exit_memory",
+        _ => "unknown",
+    };
+    json!({"run_id":run_id,"turn_id":turn_id,"context_sequence":context_sequence,
+        "task_id":safe_identity(binding.task_id, task_identity),"parent_origin":parent_origin,"purpose":purpose})
 }
 
 enum Control {
@@ -127,40 +246,34 @@ impl RequestLog {
     /// Capture this construction's name, including in old actor/background clones.
     #[must_use]
     pub fn observer(&self, provider: &str) -> Arc<InferenceObserver> {
-        let provider = provider.to_owned();
+        observer(
+            self.events.clone(),
+            Arc::clone(&self.state),
+            provider.to_owned(),
+            None,
+        )
+    }
+
+    /// Project the existing writer handles into an immutable per-request factory.
+    /// It copies only format-filtered opaque refs, never recorder or payload state.
+    #[must_use]
+    pub fn factory(&self) -> Arc<piku_runtime::RequestObserverFactory> {
         let events = self.events.clone();
         let state = Arc::clone(&self.state);
-        Arc::new(move |observation| {
-            state.callbacks.fetch_add(1, Ordering::SeqCst);
-            if state.accepting.load(Ordering::SeqCst) {
-                match &observation {
-                    InferenceObservation::Started { .. } => {
-                        state.active.fetch_add(1, Ordering::SeqCst);
-                    }
-                    InferenceObservation::Finished(_) => {
-                        state.active.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    _ => {}
-                }
-                match events.try_send(Event {
-                    provider: provider.clone(),
-                    observation,
-                }) {
-                    Ok(()) => {
-                        state.enqueued.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(mpsc::TrySendError::Full(_)) => {
-                        state.full.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        state.closed.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            } else {
-                state.rejected.fetch_add(1, Ordering::SeqCst);
-            }
-            state.callbacks.fetch_sub(1, Ordering::SeqCst);
+        Arc::new(move |provider, binding| {
+            observer(
+                events.clone(),
+                Arc::clone(&state),
+                provider.to_owned(),
+                Some(binding_value(binding)),
+            )
         })
+    }
+
+    /// Optional terminal-sink context; `RecordingSink` supplies acknowledged refs.
+    #[must_use]
+    pub fn request_observation(&self) -> piku_runtime::RequestObservation {
+        piku_runtime::RequestObservation::new(self.factory())
     }
 
     /// Refuse unsupported routes before inference, without selecting a fallback.
@@ -233,8 +346,7 @@ fn event_value(state: &State, event: Event) -> Value {
     use piku_api::observation::{
         InferenceAttemptFailure as Failure, InferenceAttemptOutcome as Outcome,
     };
-    let mut value =
-        json!({ "schema": 1, "namespace": state.namespace, "provider": event.provider });
+    let mut value = json!({ "schema": 1, "namespace": state.namespace, "provider": event.provider, "binding":event.binding });
     match event.observation {
         InferenceObservation::Started {
             attempt_id,
@@ -614,7 +726,37 @@ mod tests {
             let (url, server) = transport(body.into()).await;
             let provider = OpenAiCompatProvider::new("custom", url, piku_api::openai_compat::Auth::Bearer("private-auth-sentinel".into()), vec![]);
             let resolved = log.observe(piku_runtime::ResolvedProvider::compat(provider, "private-model-sentinel")).unwrap();
-            let clone = resolved.as_provider().boxed_clone();
+            let clone = if label == "unknown" {
+                // Keep the legacy provider-bound API explicitly unbound.
+                resolved.as_provider().boxed_clone()
+            } else {
+                let mut binding = piku_runtime::CausalBinding::default();
+                binding.run_id = Some("session-123456789-7".into());
+                binding.turn_id = Some("turn-abcdef0123456789abcdef0123456789".into());
+                binding.context_sequence = Some(37);
+                binding.task_id = Some("agent-7-abc-123def".into());
+                let mut parent = piku_runtime::CausalOrigin::default();
+                parent.run_id = Some("session-987654321-7".into());
+                parent.turn_id = Some("turn-1-0".into());
+                binding.parent_origin = Some(parent);
+                if label == "protocol" {
+                    binding.run_id = Some("private-run-sentinel".into());
+                    binding.turn_id = Some("private-turn-sentinel".into());
+                    binding.task_id = Some("private-task-sentinel".into());
+                    let mut parent = piku_runtime::CausalOrigin::default();
+                    parent.run_id = Some("private-parent-sentinel".into());
+                    parent.turn_id = Some("private-parent-turn-sentinel".into());
+                    binding.parent_origin = Some(parent);
+                }
+                let callback = (log.factory())(resolved.name(), binding.clone());
+                // Caller advances before polling; the callback already owns
+                // both receipt halves' safe metadata and route name.
+                binding.run_id = Some("private-later-run-sentinel".into());
+                binding.turn_id = Some("private-later-turn-sentinel".into());
+                assert_eq!(binding.run_id.as_deref(), Some("private-later-run-sentinel"));
+                assert_eq!(binding.turn_id.as_deref(), Some("private-later-turn-sentinel"));
+                resolved.as_provider().observed_clone(callback).unwrap()
+            };
             let request = MessageRequest {
                 model: "private-model-sentinel".into(), max_tokens: 10,
                 messages: vec![RequestMessage { role: "user".into(), content: vec![RequestContent::Text { text: "private-prompt-sentinel".into() }] }],
@@ -638,6 +780,18 @@ mod tests {
             assert_eq!(finished["event"], "finished");
             assert_eq!(started["attempt_id"], finished["attempt_id"]);
             assert_eq!(started["namespace"], finished["namespace"]);
+            assert_eq!(started["binding"], finished["binding"]);
+            if label == "unknown" {
+                assert!(started["binding"].is_null());
+            } else if label == "protocol" {
+                assert_eq!(started["binding"], json!({"run_id":null,"turn_id":null,
+                    "context_sequence":null,"task_id":null,"parent_origin":null,"purpose":"agent_turn"}));
+            } else {
+                assert_eq!(started["binding"], json!({"run_id":"session-123456789-7",
+                    "turn_id":"turn-abcdef0123456789abcdef0123456789","context_sequence":37,
+                    "task_id":"agent-7-abc-123def","parent_origin":{"run_id":"session-987654321-7",
+                    "turn_id":"turn-1-0"},"purpose":"agent_turn"}));
+            }
             assert_eq!(finished["provider"], "custom");
             assert!(started["attempt_id"].as_u64().unwrap() > 0);
             assert!(finished["finished_us"].as_u64().unwrap() >= finished["started_us"].as_u64().unwrap());

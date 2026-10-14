@@ -59,6 +59,11 @@ pub enum PostToolAction {
 
 /// Callbacks for streaming output so the caller (TUI or CLI) can render in real time.
 pub trait OutputSink: Send {
+    /// Optional caller-owned observer factory with immutable causal ownership.
+    /// Default sinks do not opt into request diagnostics.
+    fn request_observation(&self) -> Option<crate::RequestObservation> {
+        None
+    }
     fn on_text(&mut self, text: &str);
     fn on_tool_start(&mut self, tool_name: &str, tool_id: &str, input: &serde_json::Value);
     /// Called after a tool completes. Return `PostToolAction::ReplaceAndExec`
@@ -398,6 +403,9 @@ async fn run_turn_inner(
                             crate::embed_memory::build_extraction_transcript(new_messages);
                         if !transcript.trim().is_empty() {
                             let provider_clone = provider.boxed_clone();
+                            let observation = sink
+                                .request_observation()
+                                .map(|observation| observation.periodic_memory());
                             let model_owned = model.to_string();
                             let cwd = std::env::current_dir().unwrap_or_default();
                             let store_path = crate::embed_memory::default_store_path(&cwd);
@@ -405,18 +413,33 @@ async fn run_turn_inner(
                             let flag = extraction_in_flight.clone();
                             flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             tokio::spawn(async move {
-                                if let Err(error) = crate::embed_memory::extract_and_persist(
-                                    &transcript,
-                                    provider_clone.as_ref(),
-                                    &model_owned,
-                                    &store_path,
-                                    &embed_config,
-                                )
-                                .await
-                                {
-                                    eprintln!(
+                                let observed = observation
+                                    .map(|observation| {
+                                        observation.observed_clone(provider_clone.as_ref())
+                                    })
+                                    .transpose();
+                                match observed {
+                                    Ok(observed) => {
+                                        if let Err(error) =
+                                            crate::embed_memory::extract_and_persist(
+                                                &transcript,
+                                                observed
+                                                    .as_deref()
+                                                    .unwrap_or(provider_clone.as_ref()),
+                                                &model_owned,
+                                                &store_path,
+                                                &embed_config,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!(
                                         "[piku] memory extraction persistence failed: {error}"
                                     );
+                                        }
+                                    }
+                                    Err(error) => eprintln!(
+                                        "[piku] memory extraction observation refused: {error}"
+                                    ),
                                 }
                                 flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             });
@@ -946,6 +969,7 @@ async fn run_turn_inner(
                             &session.messages,
                             custom_agents,
                             hook_registry,
+                            sink.request_observation(),
                         );
                         if let Some(child_ref) = child_ref {
                             sink.on_run_event(&child_ref);
@@ -1160,7 +1184,26 @@ async fn stream_response(
             true,
         );
     }
-    let mut stream = provider.stream_message(request);
+    let observed = match sink
+        .request_observation()
+        .map(|observation| observation.observed_clone(provider))
+        .transpose()
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                TokenUsage::default(),
+                StopReason::EndTurn,
+                Some(error.to_string()),
+                false,
+            )
+        }
+    };
+    let mut stream = observed
+        .as_deref()
+        .unwrap_or(provider)
+        .stream_message(request);
 
     let mut text_buf = String::new();
     let mut replay = None;
@@ -1772,6 +1815,7 @@ fn execute_spawn_agent(
     parent_session_messages: &[crate::session::ConversationMessage],
     custom_agents: &[crate::agents::AgentDef],
     hook_registry: Option<&crate::hooks::HookRegistry>,
+    request_observation: Option<crate::RequestObservation>,
 ) -> (String, bool, Option<crate::run_record::RunEvent>) {
     if depth >= MAX_SPAWN_DEPTH {
         return (
@@ -2107,6 +2151,7 @@ fn execute_spawn_agent(
         custom_agents_owned,
         hooks_owned,
         child_policy,
+        request_observation,
     ));
 
     // Build a typed parent→child run pointer for the durable parent record.
@@ -2133,6 +2178,7 @@ async fn run_subagent_task(
     custom_agents: Vec<crate::agents::AgentDef>,
     hook_registry: Option<crate::hooks::HookRegistry>,
     child_policy: std::sync::Arc<dyn PermissionPrompter>,
+    request_observation: Option<crate::RequestObservation>,
 ) {
     let evidence = registry.evidence(&task_id);
     if evidence.is_some() {
@@ -2175,7 +2221,11 @@ async fn run_subagent_task(
         },
         None => None,
     };
-    let mut sink = crate::task::DevNullSink;
+    let mut sink = crate::request_observation::ObservationSink {
+        inner: crate::task::DevNullSink,
+        observation: request_observation
+            .map(|observation| observation.child(&session.id, &task_id.0)),
+    };
 
     // Worktree guard: Drop attempts to clean up the worktree and branch if
     // this future unwinds or returns before the explicit cleanup below. Defused
