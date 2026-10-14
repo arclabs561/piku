@@ -4,11 +4,16 @@
 /// `OpenAI` chat completions wire format (streaming).  Per-provider concerns
 /// (base URL, auth headers, extra headers) are supplied at construction time.
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 
 use crate::error::ApiError;
+use crate::observation::{
+    AttemptObservation, InferenceAttemptFailure, InferenceAttemptOutcome, InferenceObserver,
+    InferenceReportedUsage,
+};
 use crate::provider::Provider;
 use crate::sse::SseParser;
 use crate::types::{Event, MessageRequest, RequestContent, StopReason, TokenUsage, ToolDefinition};
@@ -47,6 +52,7 @@ pub struct OpenAiCompatProvider {
     pub auth: Auth,
     pub extra_headers: Vec<Header>,
     client: reqwest::Client,
+    observer: Option<Arc<InferenceObserver>>,
 }
 
 impl OpenAiCompatProvider {
@@ -63,7 +69,16 @@ impl OpenAiCompatProvider {
             auth,
             extra_headers,
             client: reqwest::Client::new(),
+            observer: None,
         }
+    }
+
+    /// Attach a trusted metadata-only observer to lazy POST attempts. Clones
+    /// share the callback; this does not alter routing or enforce a budget.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<InferenceObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 }
 
@@ -75,6 +90,13 @@ impl Provider for OpenAiCompatProvider {
     fn boxed_clone(&self) -> Box<dyn Provider + Send + Sync + 'static> {
         let cloned: OpenAiCompatProvider = OpenAiCompatProvider::clone(self);
         Box::new(cloned)
+    }
+
+    fn observed_clone(
+        &self,
+        observer: Arc<InferenceObserver>,
+    ) -> Result<Box<dyn Provider>, ApiError> {
+        Ok(Box::new(self.clone().with_observer(observer)))
     }
 
     fn stream_message(
@@ -106,12 +128,14 @@ impl Provider for OpenAiCompatProvider {
                 req = req.header(&h.name, &h.value);
             }
 
-            let resp = req.json(&body).send().await?;
+            let req = req.json(&body);
+            let mut attempt = AttemptObservation::start(self.observer.as_ref());
+            let resp = attempt.check(req.send().await.map_err(ApiError::from), InferenceAttemptFailure::Send)?;
 
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                Err(ApiError::Http { status, body })?;
+                attempt.check(Err::<(), _>(ApiError::Http { status, body }), InferenceAttemptFailure::Http)?;
                 return;
             }
 
@@ -122,7 +146,7 @@ impl Provider for OpenAiCompatProvider {
             let mut state = OaiStreamState::default();
 
             while let Some(chunk) = stream.next().await {
-                let bytes = chunk?;
+                let bytes = attempt.check(chunk.map_err(ApiError::from), InferenceAttemptFailure::Stream)?;
                 // Decoded across chunk boundaries: a character split by the
                 // transport must not become U+FFFD.
                 let text = decoder.push(&bytes);
@@ -130,7 +154,8 @@ impl Provider for OpenAiCompatProvider {
                 for ch in text.chars() {
                     if ch == '\n' {
                         if let Some(sse) = parser.feed_line(&line_buf) {
-                            let events = state.parse(&sse.data)?;
+                            let parsed = state.parse_observed(&sse.data, &mut attempt);
+                            let events = attempt.check(parsed, InferenceAttemptFailure::Protocol)?;
                             for event in events {
                                 yield event;
                             }
@@ -141,11 +166,13 @@ impl Provider for OpenAiCompatProvider {
                     }
                 }
             }
+            attempt.transport_complete();
 
             // Flush remaining line (no terminating newline).
             if !line_buf.is_empty() {
                 if let Some(sse) = parser.feed_line(&line_buf) {
-                    let events = state.parse(&sse.data)?;
+                    let parsed = state.parse_observed(&sse.data, &mut attempt);
+                    let events = attempt.check(parsed, InferenceAttemptFailure::Protocol)?;
                     for event in events {
                         yield event;
                     }
@@ -155,11 +182,19 @@ impl Provider for OpenAiCompatProvider {
             // Otherwise a stream that closes without a trailing blank line
             // silently drops its final event (often `[DONE]`).
             if let Some(sse) = parser.finish() {
-                let events = state.parse(&sse.data)?;
+                let parsed = state.parse_observed(&sse.data, &mut attempt);
+                let events = attempt.check(parsed, InferenceAttemptFailure::Protocol)?;
                 for event in events {
                     yield event;
                 }
             }
+            // EOF alone does not establish an actual terminal decision. Keep
+            // this observation separate from the legacy task event behavior.
+            attempt.finish(if state.terminal.is_some() {
+                InferenceAttemptOutcome::Completed
+            } else {
+                InferenceAttemptOutcome::Failed(InferenceAttemptFailure::Protocol)
+            });
         })
     }
 }
@@ -515,6 +550,18 @@ struct OaiStreamState {
 }
 
 impl OaiStreamState {
+    fn parse_observed(
+        &mut self,
+        data: &str,
+        attempt: &mut AttemptObservation<'_>,
+    ) -> Result<Vec<Event>, ApiError> {
+        let events = self.parse(data)?;
+        if attempt.enabled() {
+            attempt.usage(reported_usage(data));
+        }
+        Ok(events)
+    }
+
     fn parse(&mut self, data: &str) -> Result<Vec<Event>, ApiError> {
         if data == "[DONE]" {
             return Ok(vec![]);
@@ -561,6 +608,41 @@ impl OaiStreamState {
         }
         Ok(openai_chunk_events(&chunk))
     }
+}
+
+/// Raw reported samples remain independent of zero-filled legacy `UsageDelta`.
+/// Invalid observation-only detail must not reject an otherwise accepted chunk.
+fn reported_usage(data: &str) -> Option<InferenceReportedUsage> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let usage = value.get("usage")?;
+    let count = |name| u32::try_from(usage.get(name)?.as_u64()?).ok();
+    let input_tokens = count("prompt_tokens")?;
+    let output_tokens = count("completion_tokens")?;
+    let total = input_tokens.checked_add(output_tokens)?;
+    if usage
+        .get("total_tokens")
+        .is_some_and(|value| value.as_u64() != Some(u64::from(total)))
+    {
+        return None;
+    }
+    let detail = |pointer: &str, total: u32| -> Option<Option<u32>> {
+        match usage.pointer(pointer) {
+            None => Some(None),
+            Some(value) => {
+                let count = u32::try_from(value.as_u64()?).ok()?;
+                (count <= total).then_some(Some(count))
+            }
+        }
+    };
+    Some(InferenceReportedUsage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens: detail("/prompt_tokens_details/cached_tokens", input_tokens)?,
+        reasoning_output_tokens: detail(
+            "/completion_tokens_details/reasoning_tokens",
+            output_tokens,
+        )?,
+    })
 }
 
 fn delta_has_payload(delta: &OaiDelta) -> bool {
