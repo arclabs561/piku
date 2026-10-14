@@ -1044,6 +1044,7 @@ fn teardown_layout(rows: u16) {
 // ── Output sink that writes into the scroll zone ──────────────────────────────
 
 pub struct TuiSink {
+    request_observation: Option<piku_runtime::RequestObservation>,
     stdout: io::Stdout,
     request_model: Option<String>,
     request_context: Option<(String, f32)>,
@@ -1080,6 +1081,7 @@ impl TuiSink {
         trace: crate::trace::TraceWriter,
     ) -> Self {
         Self {
+            request_observation: None,
             stdout: io::stdout(),
             request_model: None,
             request_context: None,
@@ -1123,6 +1125,10 @@ impl TuiSink {
 }
 
 impl OutputSink for TuiSink {
+    fn request_observation(&self) -> Option<piku_runtime::RequestObservation> {
+        self.request_observation.clone()
+    }
+
     fn on_text(&mut self, text: &str) {
         self.trace.text_chunk(text);
         self.clear_thinking_indicator();
@@ -2382,6 +2388,8 @@ async fn run_tui_repl_core(
                     self_update.clone(),
                     crate::trace::TraceWriter::open(&config.traces_dir(), &session_id),
                 );
+                sink.request_observation =
+                    request_log.map(crate::request_log::RequestLog::request_observation);
                 // The harness rotates models between runs, so a trace that
                 // does not name what answered it cannot be compared with the
                 // next one.
@@ -2701,12 +2709,22 @@ async fn run_tui_repl_core(
     if !read_only && run.session().messages.len() > 2 {
         let transcript = piku_runtime::build_extraction_transcript(&run.session().messages);
         if !transcript.trim().is_empty() {
+            let exit_provider = request_log
+                .map(|log| {
+                    let mut observation = piku_runtime::RequestObservation::new(log.factory());
+                    observation.binding.run_id = Some(run.id().to_owned());
+                    observation.binding.purpose = piku_runtime::RequestPurpose::ExitMemory;
+                    observation.observed_clone(resolved.as_provider())
+                })
+                .transpose()?;
             let store_path = piku_runtime::default_store_path(&cwd);
             let embed_config = piku_runtime::embed_memory::EmbedConfig::from_env();
             // Use a short timeout — don't make the user wait forever on exit
             let extraction_future = piku_runtime::embed_memory::extract_and_persist(
                 &transcript,
-                resolved.as_provider(),
+                exit_provider
+                    .as_deref()
+                    .unwrap_or_else(|| resolved.as_provider()),
                 &model,
                 &store_path,
                 &embed_config,
