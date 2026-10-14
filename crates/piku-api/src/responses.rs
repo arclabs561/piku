@@ -1,8 +1,9 @@
 //! Account-bound, stateless Responses transport for `ChatGPT` plan usage.
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -14,6 +15,137 @@ use crate::{ApiError, Event, MessageRequest, Provider, RequestContent, StopReaso
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Trusted synchronous observation callback. It must not block or panic.
+/// Receipts contain no request, credential, account, model or response content.
+pub type ResponsesObserver = dyn Fn(ResponsesObservation) + Send + Sync;
+
+/// One local POST send and its eventual transport/protocol disposition.
+/// IDs and monotonic timestamps are meaningful only within this process.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ResponsesObservation {
+    Started {
+        attempt_id: u64,
+        started_at: Instant,
+    },
+    Finished(ResponsesAttemptReceipt),
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ResponsesAttemptReceipt {
+    pub attempt_id: u64,
+    pub started_at: Instant,
+    pub finished_at: Instant,
+    pub outcome: ResponsesAttemptOutcome,
+    /// Valid terminal counters, independent of replay/output acceptance.
+    /// Missing or malformed usage is unknown. On incomplete transport these
+    /// counters are only available reported evidence, not a complete total.
+    pub reported_usage: Option<ResponsesReportedUsage>,
+    /// Whether the successful HTTP response body reached clean EOF.
+    pub transport_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResponsesAttemptOutcome {
+    /// Clean transport and accepted protocol output; not task success.
+    Completed,
+    Failed(ResponsesAttemptFailure),
+    /// Includes consumer drop, timeout and cancellation, without inferring which.
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResponsesAttemptFailure {
+    Send,
+    Http,
+    Stream,
+    Protocol,
+}
+
+/// Counters actually present in valid terminal usage. Absent detail stays unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResponsesReportedUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_input_tokens: Option<u32>,
+    pub reasoning_output_tokens: Option<u32>,
+}
+
+struct AttemptObservation<'a> {
+    observer: Option<&'a Arc<ResponsesObserver>>,
+    receipt: Option<ResponsesAttemptReceipt>,
+}
+
+impl<'a> AttemptObservation<'a> {
+    fn start(observer: Option<&'a Arc<ResponsesObserver>>) -> Self {
+        let receipt = observer.map(|observer| {
+            let attempt_id = NEXT_ATTEMPT_ID
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("Responses attempt IDs exhausted");
+            let started_at = Instant::now();
+            observer(ResponsesObservation::Started {
+                attempt_id,
+                started_at,
+            });
+            ResponsesAttemptReceipt {
+                attempt_id,
+                started_at,
+                finished_at: started_at,
+                outcome: ResponsesAttemptOutcome::Dropped,
+                reported_usage: None,
+                transport_complete: false,
+            }
+        });
+        Self { observer, receipt }
+    }
+
+    fn finish(&mut self, outcome: ResponsesAttemptOutcome) {
+        if let Some(mut receipt) = self.receipt.take() {
+            receipt.finished_at = Instant::now();
+            receipt.outcome = outcome;
+            if let Some(observer) = self.observer {
+                observer(ResponsesObservation::Finished(receipt));
+            }
+        }
+    }
+
+    fn check<T>(
+        &mut self,
+        result: Result<T, ApiError>,
+        failure: ResponsesAttemptFailure,
+    ) -> Result<T, ApiError> {
+        if result.is_err() {
+            self.finish(ResponsesAttemptOutcome::Failed(failure));
+        }
+        result
+    }
+
+    fn usage(&mut self, event: &Value) {
+        if let Some(receipt) = self.receipt.as_mut() {
+            if receipt.reported_usage.is_none() {
+                receipt.reported_usage = reported_usage(event.pointer("/response/usage"));
+            }
+        }
+    }
+
+    fn transport_complete(&mut self) {
+        if let Some(receipt) = self.receipt.as_mut() {
+            receipt.transport_complete = true;
+        }
+    }
+}
+
+impl Drop for AttemptObservation<'_> {
+    fn drop(&mut self) {
+        self.finish(ResponsesAttemptOutcome::Dropped);
+    }
+}
 
 #[derive(Clone)]
 pub struct ResponsesProvider {
@@ -21,6 +153,7 @@ pub struct ResponsesProvider {
     registration: String,
     client: reqwest::Client,
     endpoint: String,
+    observer: Option<Arc<ResponsesObserver>>,
 }
 
 /// A model visible to the selected `ChatGPT` registration, in server order.
@@ -31,6 +164,15 @@ pub struct ChatgptModel {
 }
 
 impl ResponsesProvider {
+    /// Observe lazy POST attempts. Clones retain the same callback. Catalog and
+    /// credential access are excluded; unpolled or rejected requests emit nothing.
+    /// The observer reports transport evidence and does not enforce a budget.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<ResponsesObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Fetch the selected registration's catalog; never infer a model from a
     /// plan name or use the generic API's unrelated data-array response shape.
     pub async fn models(&self) -> Result<Vec<ChatgptModel>, ApiError> {
@@ -105,6 +247,7 @@ impl ResponsesProvider {
             source,
             client,
             endpoint: ENDPOINT.to_owned(),
+            observer: None,
         })
     }
 }
@@ -126,13 +269,15 @@ impl Provider for ResponsesProvider {
                 Err(protocol("credential registration changed"))?;
             }
             let token = self.source.token().await?;
-            let response = self.client.post(&self.endpoint)
-                .bearer_auth(token.expose_secret()).json(&body).send().await
-                .map_err(|_| protocol("Responses transport request failed"))?;
+            let post = self.client.post(&self.endpoint)
+                .bearer_auth(token.expose_secret()).json(&body);
+            let mut attempt = AttemptObservation::start(self.observer.as_ref());
+            let response = attempt.check(post.send().await
+                .map_err(|_| protocol("Responses transport request failed")), ResponsesAttemptFailure::Send)?;
             let request_id = response.headers().get("x-request-id")
                 .and_then(|value| value.to_str().ok())
                 .map(|value| redacted_identifier(value, token.expose_secret())).unwrap_or_default();
-            let response = check_response(response, token.expose_secret(), &request_id).await?;
+            let response = attempt.check(check_response(response, token.expose_secret(), &request_id).await, ResponsesAttemptFailure::Http)?;
             let advertised = tool_names(&request);
             let mut state = ResponseState::default();
             let mut decoder = Utf8Stream::new();
@@ -141,35 +286,39 @@ impl Provider for ResponsesProvider {
             let mut event_bytes = 0usize;
             let mut chunks = response.bytes_stream();
             while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.map_err(|_| protocol("Responses stream interrupted"))?;
+                let chunk = attempt.check(chunk.map_err(|_| protocol("Responses stream interrupted")), ResponsesAttemptFailure::Stream)?;
                 pending.push_str(&decoder.push(&chunk));
-                if pending.len() > MAX_EVENT_BYTES { Err(protocol("Responses event exceeds limit"))?; }
+                if pending.len() > MAX_EVENT_BYTES { attempt.check(Err::<(), _>(protocol("Responses event exceeds limit")), ResponsesAttemptFailure::Protocol)?; }
                 while let Some(end) = pending.find('\n') {
                     let line: String = pending.drain(..=end).collect();
                     event_bytes += line.len();
-                    if event_bytes > MAX_EVENT_BYTES { Err(protocol("Responses event exceeds limit"))?; }
+                    if event_bytes > MAX_EVENT_BYTES { attempt.check(Err::<(), _>(protocol("Responses event exceeds limit")), ResponsesAttemptFailure::Protocol)?; }
                     if let Some(event) = parser.feed_line(line.trim_end_matches('\n')) {
                         event_bytes = 0;
-                        if let Some(text) = state.accept(&event.data, &request_id, token.expose_secret())? {
+                        let accepted = state.accept(&event.data, &request_id, token.expose_secret(), &mut attempt);
+                        if let Some(text) = attempt.check(accepted, ResponsesAttemptFailure::Protocol)? {
                             yield Event::TextDelta { text };
                         }
                     }
                 }
             }
+            attempt.transport_complete();
             if !pending.is_empty() { parser.feed_line(&pending); }
             if let Some(event) = parser.finish() {
-                if let Some(text) = state.accept(&event.data, &request_id, token.expose_secret())? {
+                let accepted = state.accept(&event.data, &request_id, token.expose_secret(), &mut attempt);
+                if let Some(text) = attempt.check(accepted, ResponsesAttemptFailure::Protocol)? {
                     yield Event::TextDelta { text };
                 }
             }
             // Wait through EOF: trailing errors or duplicate terminal events
             // must not authorize tools from an earlier completed frame.
-            let completed = state.completed.take().ok_or(ApiError::UnexpectedStreamEnd)?;
-            let output: Vec<ResponsesOutputItem> = serde_json::from_value(state.items.reconcile(completed.get("output"))?)
-                .map_err(|_| protocol("unsupported or malformed Responses output"))?;
+            let completed = attempt.check(state.completed.take().ok_or(ApiError::UnexpectedStreamEnd), ResponsesAttemptFailure::Protocol)?;
+            let output_value = attempt.check(state.items.reconcile(completed.get("output")), ResponsesAttemptFailure::Protocol)?;
+            let output: Vec<ResponsesOutputItem> = attempt.check(serde_json::from_value(output_value)
+                .map_err(|_| protocol("unsupported or malformed Responses output")), ResponsesAttemptFailure::Protocol)?;
             let envelope = ReplayEnvelope { version: 1, route: ReplayRoute::ChatgptResponses, registration: self.registration.clone(), model: request.model.clone(), output };
-            validate_replay(&envelope, &self.registration, &request.model, Some(&advertised))?;
-            let usage = normalize_usage(completed.get("usage"))?;
+            attempt.check(validate_replay(&envelope, &self.registration, &request.model, Some(&advertised)), ResponsesAttemptFailure::Protocol)?;
+            let usage = attempt.check(normalize_usage(completed.get("usage")), ResponsesAttemptFailure::Protocol)?;
             let final_text: String = envelope.output.iter().filter_map(|item| {
                 if let ResponsesOutputItem::Message { content, .. } = item { Some(content) } else { None }
             }).flatten().map(|content| match content {
@@ -177,8 +326,9 @@ impl Provider for ResponsesProvider {
                 ResponseContent::Refusal { refusal, .. } => refusal.as_str(),
             }).collect();
             if state.text_seen && state.streamed_text != final_text {
-                Err(protocol("streamed text disagrees with completed Responses output"))?;
+                attempt.check(Err::<(), _>(protocol("streamed text disagrees with completed Responses output")), ResponsesAttemptFailure::Protocol)?;
             }
+            attempt.finish(ResponsesAttemptOutcome::Completed);
             if !state.text_seen && !final_text.is_empty() {
                 yield Event::TextDelta { text: final_text };
             }
@@ -390,6 +540,7 @@ impl ResponseState {
         data: &str,
         request_id: &str,
         secret: &str,
+        attempt: &mut AttemptObservation<'_>,
     ) -> Result<Option<String>, ApiError> {
         let event: Value =
             serde_json::from_str(data).map_err(|_| protocol("malformed Responses event"))?;
@@ -397,6 +548,20 @@ impl ResponseState {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| protocol("Responses event lacks type"))?;
+        if self.completed.is_none() {
+            if let Some(status) = kind
+                .strip_prefix("response.")
+                .filter(|status| matches!(*status, "completed" | "failed" | "incomplete"))
+            {
+                let id = event.pointer("/response/id").and_then(Value::as_str);
+                if id.is_some_and(|id| {
+                    !id.is_empty() && self.response_id.as_deref().is_none_or(|known| known == id)
+                }) && event.pointer("/response/status").and_then(Value::as_str) == Some(status)
+                {
+                    attempt.usage(&event);
+                }
+            }
+        }
         if matches!(
             kind,
             "response.created" | "response.in_progress" | "response.queued" | "response.completed"
@@ -468,6 +633,28 @@ impl ResponseState {
             _ => Err(protocol("unsupported Responses stream event")),
         }
     }
+}
+fn reported_usage(value: Option<&Value>) -> Option<ResponsesReportedUsage> {
+    let value = value?;
+    let usage = normalize_usage(Some(value)).ok()?;
+    let detail = |pointer: &str, total: u32| -> Option<Option<u32>> {
+        match value.pointer(pointer) {
+            None => Some(None),
+            Some(value) => {
+                let count = u32::try_from(value.as_u64()?).ok()?;
+                (count <= total).then_some(Some(count))
+            }
+        }
+    };
+    Some(ResponsesReportedUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: detail("/input_tokens_details/cached_tokens", usage.input_tokens)?,
+        reasoning_output_tokens: detail(
+            "/output_tokens_details/reasoning_tokens",
+            usage.output_tokens,
+        )?,
+    })
 }
 fn normalize_usage(value: Option<&Value>) -> Result<TokenUsage, ApiError> {
     let value = value.ok_or_else(|| protocol("completed response lacks usage"))?;

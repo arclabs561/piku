@@ -3,6 +3,7 @@
 use super::*;
 use crate::{AccessToken, RequestMessage, SystemBlock, ToolDefinition};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SECRET: &str = "syntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredentialsyntheticbearercredential";
@@ -139,6 +140,70 @@ fn provider(url: String) -> (ResponsesProvider, Arc<Credentials>) {
     provider.endpoint = url;
     (provider, source)
 }
+type ObservationLog = Arc<Mutex<Vec<ResponsesObservation>>>;
+
+fn observed(provider: ResponsesProvider) -> (ResponsesProvider, ObservationLog) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let captured = log.clone();
+    (
+        provider.with_observer(Arc::new(move |event| captured.lock().unwrap().push(event))),
+        log,
+    )
+}
+
+fn receipts(log: &ObservationLog, count: usize) -> Vec<ResponsesAttemptReceipt> {
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), count * 2);
+    let mut starts = BTreeMap::new();
+    let mut receipts = Vec::new();
+    for event in log.iter() {
+        match event {
+            ResponsesObservation::Started {
+                attempt_id,
+                started_at,
+            } => {
+                assert!(starts.insert(*attempt_id, *started_at).is_none());
+            }
+            ResponsesObservation::Finished(receipt) => {
+                assert_eq!(starts.remove(&receipt.attempt_id), Some(receipt.started_at));
+                assert!(receipt.finished_at >= receipt.started_at);
+                receipts.push(receipt.clone());
+            }
+        }
+    }
+    assert!(starts.is_empty());
+    assert_eq!(receipts.len(), count);
+    let ids: BTreeSet<_> = receipts.iter().map(|receipt| receipt.attempt_id).collect();
+    assert_eq!(ids.len(), count);
+    let debug = format!("{log:?}");
+    for excluded in [
+        SECRET,
+        "fixture-model",
+        "registration-fixture",
+        "fixture input",
+        "req-fixture",
+    ] {
+        assert!(!debug.contains(excluded));
+    }
+    receipts
+}
+
+fn expected_reported_usage() -> ResponsesReportedUsage {
+    ResponsesReportedUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        cached_input_tokens: Some(40),
+        reasoning_output_tokens: Some(10),
+    }
+}
+
+fn assert_completed_receipts(log: &ObservationLog, count: usize) {
+    for receipt in receipts(log, count) {
+        assert_eq!(receipt.outcome, ResponsesAttemptOutcome::Completed);
+        assert!(receipt.transport_complete);
+        assert_eq!(receipt.reported_usage, Some(expected_reported_usage()));
+    }
+}
 async fn collect(
     provider: &ResponsesProvider,
     request: MessageRequest,
@@ -229,6 +294,7 @@ async fn real_http_interleaved_calls_replay_and_tool_results() {
     ])
     .await;
     let (provider, source) = provider(url);
+    let (provider, log) = observed(provider);
     let events: Vec<_> = collect(&provider, request())
         .await
         .into_iter()
@@ -284,7 +350,13 @@ async fn real_http_interleaved_calls_replay_and_tool_results() {
         1
     );
     let next = resumed_request(replay);
-    assert!(collect(&provider, next).await.iter().all(Result::is_ok));
+    assert!(provider
+        .boxed_clone()
+        .stream_message(next)
+        .collect::<Vec<_>>()
+        .await
+        .iter()
+        .all(Result::is_ok));
     let bodies = server.await.unwrap();
     assert_eq!(bodies.len(), 2);
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
@@ -298,6 +370,7 @@ async fn real_http_interleaved_calls_replay_and_tool_results() {
     assert_eq!(input[6]["call_id"], "call-write");
     assert_eq!(input[7]["content"], "continue");
     assert_eq!(input.len(), 8);
+    assert_completed_receipts(&log, 2);
 }
 
 #[tokio::test]
@@ -325,12 +398,16 @@ async fn failures_after_text_never_release_tools_or_completion() {
         )],
     ];
     for mut case in cases {
+        let has_usage = case
+            .iter()
+            .any(|event| event["type"] == "response.completed");
         case.insert(
             0,
             json!({"type":"response.output_text.delta","delta":"partial"}),
         );
         let (url, server) = server(vec![(200, frames(&case))]).await;
         let (provider, _) = provider(url);
+        let (provider, log) = observed(provider);
         let events = collect(&provider, request()).await;
         assert!(matches!(&events[0],Ok(Event::TextDelta{text}) if text=="partial"));
         assert!(events.iter().any(Result::is_err));
@@ -345,6 +422,15 @@ async fn failures_after_text_never_release_tools_or_completion() {
             assert!(!error.to_string().contains(SECRET));
         }
         server.await.unwrap();
+        let receipt = receipts(&log, 1).remove(0);
+        assert_eq!(
+            receipt.outcome,
+            ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Protocol)
+        );
+        assert_eq!(
+            receipt.reported_usage,
+            has_usage.then(expected_reported_usage)
+        );
     }
 }
 
@@ -352,6 +438,7 @@ async fn failures_after_text_never_release_tools_or_completion() {
 async fn http_error_is_bounded_redacted_and_keeps_request_id() {
     let (url,server)=server(vec![(429,json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","param":"model","message":SECRET}}).to_string())]).await;
     let (provider, _) = provider(url);
+    let (provider, log) = observed(provider);
     let events = collect(&provider, request()).await;
     assert_eq!(events.len(), 1);
     let error = events[0].as_ref().unwrap_err();
@@ -362,6 +449,13 @@ async fn http_error_is_bounded_redacted_and_keeps_request_id() {
     assert!(!text.contains(SECRET));
     assert!(text.len() < 512);
     server.await.unwrap();
+    let receipt = receipts(&log, 1).remove(0);
+    assert_eq!(
+        receipt.outcome,
+        ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Http)
+    );
+    assert_eq!(receipt.reported_usage, None);
+    assert!(!receipt.transport_complete);
     assert_eq!(
         format!("{:?}", AccessToken::new(SECRET.into())),
         "AccessToken([REDACTED])"
@@ -380,6 +474,7 @@ fn envelope() -> ReplayEnvelope {
 #[tokio::test]
 async fn mismatched_replay_and_caps_fail_before_credentials_or_http() {
     let (provider, source) = provider("http://127.0.0.1:9/v1/responses".into());
+    let (provider, log) = observed(provider);
     for field in ["registration", "model", "version", "role", "cap"] {
         let mut request = request();
         let mut replay = envelope();
@@ -399,6 +494,7 @@ async fn mismatched_replay_and_caps_fail_before_credentials_or_http() {
         assert!(events[0].is_err());
     }
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert!(log.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -463,6 +559,15 @@ async fn catalog_uses_selected_registration_and_official_shape() {
 
 #[tokio::test]
 async fn dropping_stream_cancels_pending_http_body() {
+    assert_dropped_body_receipt(false).await;
+}
+
+#[tokio::test]
+async fn timing_out_stream_records_drop_and_cancels_pending_http_body() {
+    assert_dropped_body_receipt(true).await;
+}
+
+async fn assert_dropped_body_receipt(timed_out: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -496,26 +601,41 @@ async fn dropping_stream_cancels_pending_http_body() {
             )
             .await
             .unwrap();
-        socket
-            .write_all(
-                frames(&[json!({"type":"response.output_text.delta","delta":"partial"})])
-                    .as_bytes(),
-            )
-            .await
-            .unwrap();
+        let mut rows = vec![json!({"type":"response.output_text.delta","delta":"partial"})];
+        if timed_out {
+            rows.push(completion(json!([message("partial")])));
+        }
+        socket.write_all(frames(&rows).as_bytes()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), socket.read(&mut bytes))
             .await
             .unwrap()
             .unwrap()
     });
     let (provider, source) = provider(url);
+    let (provider, log) = observed(provider);
     let mut stream = provider.stream_message(request());
     assert!(
         matches!(tokio::time::timeout(Duration::from_secs(2),stream.next()).await.unwrap(),Some(Ok(Event::TextDelta{text})) if text=="partial")
     );
-    drop(stream);
+    assert_eq!(log.lock().unwrap().len(), 1);
+    if timed_out {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.collect::<Vec<_>>())
+                .await
+                .is_err()
+        );
+    } else {
+        drop(stream);
+    }
     assert_eq!(server.await.unwrap(), 0);
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    let receipt = receipts(&log, 1).remove(0);
+    assert_eq!(receipt.outcome, ResponsesAttemptOutcome::Dropped);
+    assert_eq!(
+        receipt.reported_usage,
+        timed_out.then(expected_reported_usage)
+    );
+    assert!(!receipt.transport_complete);
 }
 
 #[tokio::test]
@@ -880,6 +1000,7 @@ async fn indexed_done_items_wait_for_clean_transport_eof() {
     let (url, server) =
         server_with_length_offset(vec![(200, frames(&rows))], "req-fixture", 1).await;
     let (provider, _) = provider(url);
+    let (provider, log) = observed(provider);
     let mut request = request();
     request.tools.as_mut().unwrap()[1].name = "edit_file".into();
     let events = collect(&provider, request).await;
@@ -889,6 +1010,13 @@ async fn indexed_done_items_wait_for_clean_transport_eof() {
         Ok(Event::ToolUseStart { .. } | Event::Replay { .. } | Event::MessageStop { .. })
     )));
     server.await.unwrap();
+    let receipt = receipts(&log, 1).remove(0);
+    assert_eq!(
+        receipt.outcome,
+        ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Stream)
+    );
+    assert!(!receipt.transport_complete);
+    assert_eq!(receipt.reported_usage, Some(expected_reported_usage()));
 }
 
 #[tokio::test]
@@ -984,4 +1112,157 @@ fn aggregate_limit_precedes_argument_append_and_done_copy() {
         .contains("aggregate output assembly exceeds limit"));
     assert_eq!(items.arguments[&0].len(), prefix.len());
     assert_eq!(items.retained_bytes, retained);
+}
+
+#[tokio::test]
+async fn unpolled_stream_never_creates_an_attempt() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (provider, source) = provider(format!(
+        "http://{}/v1/responses",
+        listener.local_addr().unwrap()
+    ));
+    let (provider, log) = observed(provider);
+    drop(provider.stream_message(request()));
+    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn refused_local_connection_records_one_failed_send() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    drop(listener);
+    let (provider, source) = provider(url);
+    let (provider, log) = observed(provider);
+    let events = collect(&provider, request()).await;
+    assert_eq!(events.len(), 1);
+    assert!(events[0].is_err());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    let receipt = receipts(&log, 1).remove(0);
+    assert_eq!(
+        receipt.outcome,
+        ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Send)
+    );
+    assert!(!receipt.transport_complete);
+    assert_eq!(receipt.reported_usage, None);
+}
+
+#[tokio::test]
+async fn concurrent_clones_share_observer_and_have_unique_send_ids() {
+    let (url, server) = server(vec![
+        (200, frames(&[completion(json!([message("done")]))])),
+        (200, frames(&[completion(json!([message("done")]))])),
+    ])
+    .await;
+    let (provider, _) = provider(url);
+    let (provider, log) = observed(provider);
+    let clone = provider.clone();
+    let (first, second) = tokio::join!(collect(&provider, request()), collect(&clone, request()));
+    assert!(first.iter().all(Result::is_ok));
+    assert!(second.iter().all(Result::is_ok));
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert_completed_receipts(&log, 2);
+}
+
+#[tokio::test]
+async fn terminal_usage_observation_keeps_missing_and_malformed_counters_unknown() {
+    for variant in ["missing", "malformed", "absent_details", "failed"] {
+        let mut terminal = completion(json!([message("done")]));
+        match variant {
+            "missing" => {
+                terminal["response"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("usage");
+            }
+            "malformed" => terminal["response"]["usage"]["input_tokens"] = json!(-1),
+            "absent_details" => {
+                terminal["response"]["usage"] =
+                    json!({"input_tokens":100,"output_tokens":20,"total_tokens":120});
+            }
+            _ => {
+                terminal["type"] = json!("response.failed");
+                terminal["response"]["status"] = json!("failed");
+            }
+        }
+        let (url, server) = server(vec![(200, frames(&[terminal]))]).await;
+        let (provider, _) = provider(url);
+        let (provider, log) = observed(provider);
+        let events = collect(&provider, request()).await;
+        let succeeds = variant == "absent_details";
+        assert_eq!(events.iter().all(Result::is_ok), succeeds);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Ok(Event::MessageStop { .. })))
+                .count(),
+            usize::from(succeeds)
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+        let receipt = receipts(&log, 1).remove(0);
+        let expected = match variant {
+            "absent_details" => Some(ResponsesReportedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cached_input_tokens: None,
+                reasoning_output_tokens: None,
+            }),
+            "failed" => Some(expected_reported_usage()),
+            _ => None,
+        };
+        assert_eq!(receipt.reported_usage, expected);
+        assert_eq!(
+            receipt.outcome,
+            if succeeds {
+                ResponsesAttemptOutcome::Completed
+            } else {
+                ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Protocol)
+            }
+        );
+        assert_eq!(receipt.transport_complete, variant != "failed");
+    }
+}
+
+#[tokio::test]
+async fn terminal_usage_requires_matching_identity_and_status() {
+    for variant in [
+        "wrong_id",
+        "empty_id",
+        "missing_id",
+        "wrong_status",
+        "failed_completed",
+    ] {
+        let mut terminal = completion(json!([message("done")]));
+        match variant {
+            "wrong_id" => terminal["response"]["id"] = json!("other-response"),
+            "empty_id" => terminal["response"]["id"] = json!(""),
+            "missing_id" => {
+                terminal["response"].as_object_mut().unwrap().remove("id");
+            }
+            "wrong_status" => terminal["response"]["status"] = json!("incomplete"),
+            _ => terminal["type"] = json!("response.failed"),
+        }
+        let created = json!({"type":"response.created","response":{"id":"resp-fixture"}});
+        let (url, server) = server(vec![(200, frames(&[created, terminal]))]).await;
+        let (provider, _) = provider(url);
+        let (provider, log) = observed(provider);
+        let events = collect(&provider, request()).await;
+        assert!(events.iter().any(Result::is_err));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(Event::ToolUseStart { .. } | Event::Replay { .. } | Event::MessageStop { .. })
+        )));
+        assert_eq!(server.await.unwrap().len(), 1);
+        let receipt = receipts(&log, 1).remove(0);
+        assert_eq!(
+            receipt.outcome,
+            ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Protocol)
+        );
+        assert_eq!(receipt.reported_usage, None);
+    }
 }
