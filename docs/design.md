@@ -86,6 +86,15 @@ active requests and unsettled producers remain explicit at cutoff. This output
 does not establish billing, task acceptance or resource admission, and cannot
 combine with self-update or other subcommands.
 
+Opted-in runtime requests can carry immutable ownership references. Known context
+references identify a successfully appended `ContextBuilt` event; children use
+their own run and turn, with immediate parent provenance. Periodic memory keeps its
+triggering owner, while exit memory has a session reference and no foreground
+turn or context reference. Imported identity forms outside the bounded output
+grammar and unavailable context references remain unknown. These references join
+existing heuristic manifests; they do not establish durable flush, complete usage
+or settled background work.
+
 ## Agent loop
 
 ```text
