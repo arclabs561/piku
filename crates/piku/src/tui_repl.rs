@@ -266,6 +266,8 @@ impl PermissionPrompter for TuiPrompter {
         print!("\x1b[2K");
         goto(rows, 1);
         print!("\x1b[2K\x1b[?25h");
+        // Agent output resumes after this decision, before the next readline.
+        goto(scroll_bot, 1);
         let _ = io::stdout().flush();
 
         outcome

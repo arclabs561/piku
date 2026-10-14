@@ -277,7 +277,7 @@ fn permission_control_fixture() {
     std::io::stdout().flush().unwrap();
     let mut release = String::new();
     std::io::stdin().read_line(&mut release).unwrap();
-    print!("\x1b[1;1Hneighbor intact");
+    print!("\x1b[1;{}r\x1b[1;1Hneighbor intact", TEST_ROWS - 2);
     std::io::stdout().flush().unwrap();
     // CP-G21: ESC clear/repaint, C0 carriage return/backspace/bell, and C1
     // CSI in model-controlled fields must not reach the terminal interpreter.
@@ -297,6 +297,14 @@ fn permission_control_fixture() {
     ));
     assert_eq!(params, original, "display must not rewrite tool arguments");
     println!("PERMISSION_FIXTURE_DONE");
+    // Match the real turn boundary: footer/input repaint must preserve the
+    // output emitted after the interactive permission decision.
+    print!(
+        "\x1b[{};1H\x1b[2Kfooter\x1b[{};1H\x1b[2Kinput",
+        TEST_ROWS - 1,
+        TEST_ROWS
+    );
+    std::io::stdout().flush().unwrap();
 }
 
 #[test]
@@ -352,6 +360,17 @@ fn permission_controls_cannot_repaint_prompt_or_receipt() {
         "decision did not finish"
     );
     assert!(pty.captured().contains("denied"));
+    pty.wait(Duration::from_millis(100));
+    let mut finished = vt100::Parser::new(TEST_ROWS, 160, 0);
+    finished.process(&pty.buf);
+    assert!(
+        finished
+            .screen()
+            .contents()
+            .contains("PERMISSION_FIXTURE_DONE"),
+        "post-decision output erased by footer/input repaint: {}",
+        finished.screen().contents()
+    );
     for control in ["\x1b[2J", "\x1b[1;1HX", "\x08", "\x07", "\u{009b}"] {
         assert!(
             !pty.captured().contains(control),
