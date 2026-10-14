@@ -360,7 +360,13 @@ fn permission_controls_cannot_repaint_prompt_or_receipt() {
         "decision did not finish"
     );
     assert!(pty.captured().contains("denied"));
-    pty.wait(Duration::from_millis(100));
+    assert!(
+        pty.wait_for(
+            &format!("footer\x1b[{TEST_ROWS};1H\x1b[2Kinput"),
+            Duration::from_secs(5)
+        ),
+        "fixture footer/input repaint did not finish"
+    );
     let mut finished = vt100::Parser::new(TEST_ROWS, 160, 0);
     finished.process(&pty.buf);
     assert!(

@@ -892,12 +892,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[serial_test::serial(piku_restart_env)]
     fn was_restarted_returns_false_when_unset() {
         std::env::remove_var("PIKU_RESTARTED");
         assert!(!was_restarted());
     }
 
     #[test]
+    #[serial_test::serial(piku_restart_env)]
     fn was_restarted_returns_true_and_clears_env_var() {
         std::env::set_var("PIKU_RESTARTED", "1");
         assert!(was_restarted());
