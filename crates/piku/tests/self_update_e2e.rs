@@ -1222,6 +1222,18 @@ mod developer_admission {
         );
         let marker = std::fs::read_to_string(&f.marker).unwrap();
         assert!(marker.starts_with("approved:session-"), "{marker}");
+        let session_id = marker.strip_prefix("approved:").unwrap().trim();
+        let saved = piku_runtime::Session::load(
+            &f.home
+                .join(".config/piku/sessions")
+                .join(format!("{session_id}.json")),
+        )
+        .unwrap();
+        assert_eq!(saved.id, session_id);
+        assert!(
+            saved.messages.is_empty(),
+            "startup must publish even an empty checkpoint"
+        );
     }
 
     #[test]
@@ -1271,14 +1283,23 @@ mod developer_admission {
 
     /// Canned OpenAI-compatible stream using the same protocol as `binary_tests`.
     /// One bash turn prints forged Cargo text; the next turn ends normally.
-    fn forged_cargo_server(expect_continuation: bool) -> (String, std::thread::JoinHandle<()>) {
+    fn forged_cargo_server(
+        expect_continuation: bool,
+        obstruct_session: Option<&Path>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::time::{Duration, Instant};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut command =
+            "printf 'Compiling piku v0.1.0\\nFinished release [optimized]\\n'".to_string();
+        if let Some(path) = obstruct_session {
+            let quoted = path.to_string_lossy().replace('\'', "'\\''");
+            command = format!("mv '{quoted}' '{quoted}.retained' && mkdir '{quoted}' && {command}");
+        }
         let handle = std::thread::spawn(move || {
-            let tool = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"forged-build","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":"printf 'Compiling piku v0.1.0\\nFinished release [optimized]\\n'"}).to_string()}}]},"finish_reason":null}]});
+            let tool = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"forged-build","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":command}).to_string()}}]},"finish_reason":null}]});
             let answer = serde_json::json!({"choices":[{"delta":{"content":"continued without update"},"finish_reason":null}]});
             for (delta, stop) in [(tool, "tool_calls"), (answer, "stop")]
                 .into_iter()
@@ -1339,7 +1360,7 @@ mod developer_admission {
     fn headless_forged_cargo_output_cannot_replace_unapproved_copy() {
         let f = Fixture::new();
         Fixture::candidate(&f.project.join("target"), "unapproved");
-        let (url, server) = forged_cargo_server(true);
+        let (url, server) = forged_cargo_server(true, None);
         let output = f
             .command()
             .args([
@@ -1382,7 +1403,7 @@ mod developer_admission {
     fn headless_operator_opt_in_restarts_copy_after_tool_output() {
         let f = Fixture::new();
         let candidate = Fixture::candidate(&f.approved, "approved");
-        let (url, server) = forged_cargo_server(false);
+        let (url, server) = forged_cargo_server(false, None);
         let output = f
             .command()
             .args([
@@ -1410,5 +1431,255 @@ mod developer_admission {
             std::fs::read(candidate).unwrap()
         );
         assert_eq!(std::fs::read_to_string(&f.marker).unwrap(), "approved:\n");
+    }
+
+    fn inference_probe() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<usize>,
+    ) {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut count = 0;
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count += 1;
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        let _ = stream.write_all(b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+            count
+        });
+        (url, stop, server)
+    }
+
+    #[test]
+    fn referenced_restart_rejects_broken_checkpoint_before_inference() {
+        for kind in ["missing", "unreadable", "mismatched"] {
+            let f = Fixture::new();
+            let sessions = f.home.join(".config/piku/sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("session-checkpoint.json");
+            match kind {
+                "unreadable" => std::fs::write(&path, b"not a session").unwrap(),
+                "mismatched" => piku_runtime::Session::new("different-session".into())
+                    .save(&path)
+                    .unwrap(),
+                _ => {}
+            }
+            let (url, stop, server) = inference_probe();
+            let output = f
+                .command()
+                .args([
+                    "--provider",
+                    "custom",
+                    "--model",
+                    "fixture",
+                    "original prompt",
+                ])
+                .env("PIKU_BASE_URL", url)
+                .env("PIKU_API_KEY", "test-key")
+                .env("PIKU_RESTARTED", "1")
+                .env("PIKU_SESSION_ID", "session-checkpoint")
+                .output()
+                .unwrap();
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let requests = server.join().unwrap();
+            assert_eq!(requests, 0, "{kind}: restart must not acquire inference");
+            assert!(!output.status.success(), "{kind}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("restart checkpoint"),
+                "{kind}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            f.assert_unchanged(&output);
+        }
+    }
+
+    #[test]
+    fn referenced_restart_precedes_original_resume_prompt() {
+        let f = Fixture::new();
+        let sessions = f.home.join(".config/piku/sessions");
+        let mut session = piku_runtime::Session::new("session-checkpoint".into());
+        session.record_provider("custom", "fixture");
+        session.push(piku_runtime::ConversationMessage::user(
+            "retained checkpoint",
+        ));
+        let path = sessions.join("session-checkpoint.json");
+        session.save(&path).unwrap();
+        let run_path = f.home.join(".config/piku/runs/session-checkpoint.jsonl");
+        piku_runtime::RunRecorder::open(&run_path, &session.id)
+            .unwrap()
+            .append_run(piku_runtime::RunEvent::UserDisposition {
+                disposition: piku_runtime::run_record::RunDisposition::NeedsWork,
+                note: piku_runtime::run_record::ContentRef::Inline {
+                    text: "retain for review".into(),
+                },
+            })
+            .unwrap();
+        let prefix = std::fs::read(&run_path).unwrap();
+        let (url, stop, server) = inference_probe();
+        let output = f
+            .command()
+            .args([
+                "--provider",
+                "custom",
+                "--model",
+                "fixture",
+                "--resume",
+                "session-checkpoint",
+                "do not resubmit this prompt",
+            ])
+            .env("PIKU_BASE_URL", url)
+            .env("PIKU_API_KEY", "test-key")
+            .env("PIKU_RESTARTED", "1")
+            .env("PIKU_SESSION_ID", "session-checkpoint")
+            .output()
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            server.join().unwrap(),
+            0,
+            "restart must enter recovered TUI without submitting original resume prompt"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("restarted with new binary"));
+        f.assert_unchanged(&output);
+        assert!(std::fs::read(&run_path).unwrap().starts_with(&prefix));
+        piku_runtime::read_run_record(&run_path).unwrap();
+        assert_eq!(
+            piku_runtime::Session::load(&path).unwrap().messages.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn marker_only_resume_keeps_existing_launch_behavior() {
+        let f = Fixture::new();
+        let path = f
+            .home
+            .join(".config/piku/sessions/session-marker-only.json");
+        piku_runtime::Session::new("session-marker-only".into())
+            .save(&path)
+            .unwrap();
+        let (url, stop, server) = inference_probe();
+        let output = f
+            .command()
+            .args([
+                "--provider",
+                "custom",
+                "--model",
+                "fixture",
+                "--resume",
+                "session-marker-only",
+                "original prompt",
+            ])
+            .env("PIKU_BASE_URL", url)
+            .env("PIKU_API_KEY", "test-key")
+            .env("PIKU_RESTARTED", "1")
+            .output()
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(server.join().unwrap(), 1);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("restarted after self-rebuild"));
+        f.assert_unchanged(&output);
+    }
+
+    #[test]
+    fn failed_checkpoint_prevents_launch_turn_replacement() {
+        let f = Fixture::new();
+        Fixture::candidate(&f.approved, "approved");
+        let path = f
+            .home
+            .join(".config/piku/sessions/session-save-failure.json");
+        piku_runtime::Session::new("session-save-failure".into())
+            .save(&path)
+            .unwrap();
+        let (url, server) = forged_cargo_server(false, Some(&path));
+        let output = f
+            .command()
+            .args([
+                "--print",
+                "--provider",
+                "custom",
+                "--model",
+                "fixture",
+                "--resume",
+                "session-save-failure",
+                "--self-update-root",
+            ])
+            .arg(&f.approved)
+            .env("PIKU_BASE_URL", url)
+            .env("PIKU_API_KEY", "test-key")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        f.assert_unchanged(&output);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("restart checkpoint"));
+        assert!(path.is_dir());
+        let retained = path.with_extension("json.retained");
+        assert_eq!(
+            piku_runtime::Session::load(&retained).unwrap().id,
+            "session-save-failure"
+        );
+        let staged = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+                    .then_some(path)
+            })
+            .unwrap();
+        let snapshot = piku_runtime::Session::load(&staged).unwrap();
+        assert!(snapshot.messages.iter().flat_map(|message| &message.blocks).any(|block| matches!(block, piku_runtime::ContentBlock::ToolResult { output, .. } if output.contains("Finished release"))));
+        piku_runtime::read_run_record(f.home.join(".config/piku/runs/session-save-failure.jsonl"))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_checkpoint_prevents_empty_tui_startup_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        Fixture::candidate(&f.approved, "approved");
+        let sessions = f.home.join(".config/piku/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = std::fs::File::create(sessions.join("must-not-write"));
+        let output = f
+            .command()
+            .args(["--provider", "ollama", "--self-update-root"])
+            .arg(&f.approved)
+            .output()
+            .unwrap();
+        // Restore fixture ownership before assertions or TempDir cleanup.
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            denied.is_err(),
+            "fixture must run with directory write permissions enforced"
+        );
+        f.assert_unchanged(&output);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("restart checkpoint"));
     }
 }

@@ -28,7 +28,9 @@ disables replacement, even when this flag is present.
    with an mtime newer than the running binary's launch baseline. Piku opens
    `release` and `piku` relative to the pinned root with `O_NOFOLLOW`, rejecting
    symlinks for either entry, including links within the approved root.
-4. Piku saves the current session before attempting replacement.
+4. Piku must successfully save the exact current session before attempting
+   replacement, including an empty startup session. A save error refuses the
+   update and leaves the current process available to recover.
 5. Admission opens and checks the approved source again, then copies that same
    open handle into a unique temporary snapshot beside the running executable.
    `self_replace::self_replace` installs that snapshot. Candidate path or
@@ -46,7 +48,10 @@ does not perform these restart checks.
 ## Session behavior by surface
 
 The interactive TUI passes `PIKU_SESSION_ID` into the replacement process. The
-new process loads that saved session and resumes the TUI. This preserves the
+new process loads that saved session before dispatching the original prompt or
+`--resume` arguments, then resumes the TUI. A referenced checkpoint that is
+missing, unreadable, or has a different session ID fails explicitly before
+inference, so recovery cannot silently become a fresh task. This preserves the
 conversation, tool results, terminal ownership, and process identity across the
 `exec`.
 
@@ -55,6 +60,11 @@ that would later enter the TUI, saves its session but restarts without
 `PIKU_SESSION_ID`. Replacement therefore restarts the same argument vector
 rather than restoring the saved session. Only updates detected inside an
 already-running TUI pass the session ID for seamless resume.
+
+`PIKU_RESTARTED` without a session reference keeps its existing marker-only
+behavior. Headless same-argument restart and task-registry reconstruction remain
+separate recovery contracts; this checkpoint barrier does not replay child work
+or acknowledge completion delivery.
 
 Invalid writable launch roots fail with an explicit startup error. Missing
 release builds are normal and do not restart. Candidate inspection, replacement,
@@ -104,6 +114,8 @@ without the Piku markers should not trigger tool-output replacement.
   directory for that launch. There is no additional per-build prompt.
 - There is no GitHub release updater, background network check, signature
   verifier, or built-in rollback.
+- `--request-log` cannot be combined with developer self-update. Restart
+  explicitly with a fresh diagnostic output path; existing output is preserved.
 - Source control can help an operator reconstruct an older build, but Piku does
   not prescribe a destructive Git command as rollback.
 - Developer approval controls application behavior; it provides no OS

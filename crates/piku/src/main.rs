@@ -125,6 +125,25 @@ async fn run_terminal(
     )?;
     let config = PikuConfig::load(cli.provider.as_deref(), cli.model.as_deref(), cwd);
 
+    // A referenced interactive successor resumes its checkpoint, not the
+    // original argv's prompt or --resume action. Marker-only/headless launches
+    // retain their existing behavior.
+    if !cli.print
+        && (!cli.read_only || cli.prompt.is_empty())
+        && std::env::var_os("PIKU_SESSION_ID").is_some()
+        && self_update::was_restarted()
+    {
+        let session = load_restart_session(&config)?;
+        return run_tui_repl_post_restart(
+            session,
+            &config,
+            cli.read_only,
+            &self_update,
+            request_log,
+        )
+        .await;
+    }
+
     let prompt_str = if cli.prompt.is_empty() {
         None
     } else {
@@ -143,17 +162,8 @@ async fn run_terminal(
         )
         .await?;
     } else if let Some(prompt) = prompt_str {
-        if !cli.print && !cli.read_only && self_update::was_restarted() {
-            if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(
-                    session,
-                    &config,
-                    cli.read_only,
-                    &self_update,
-                    request_log,
-                )
-                .await;
-            }
+        if !cli.print && !cli.read_only {
+            let _ = self_update::was_restarted();
         }
         run_single_shot(
             &prompt,
@@ -166,18 +176,7 @@ async fn run_terminal(
         )
         .await?;
     } else {
-        if self_update::was_restarted() {
-            if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(
-                    session,
-                    &config,
-                    cli.read_only,
-                    &self_update,
-                    request_log,
-                )
-                .await;
-            }
-        }
+        let _ = self_update::was_restarted();
         tui_repl::run_tui_repl_with_policy_observed(
             &config,
             None,
@@ -344,18 +343,25 @@ fn conclude_run(
     Ok(())
 }
 
-fn try_load_restart_session(config: &PikuConfig) -> Option<Session> {
-    let session_id = std::env::var("PIKU_SESSION_ID").ok()?;
+fn load_restart_session(config: &PikuConfig) -> anyhow::Result<Session> {
+    let session_id = std::env::var("PIKU_SESSION_ID")
+        .map_err(|error| anyhow::anyhow!("invalid restart checkpoint reference: {error}"))?;
     std::env::remove_var("PIKU_SESSION_ID");
     let sessions_dir = config.sessions_dir();
     let path = sessions_dir.join(format!("{session_id}.json"));
-    match Session::load(&path) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("[piku] could not reload session after restart: {e}");
-            None
-        }
+    let session = Session::load(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "could not load restart checkpoint {}: {error}; recover the saved session explicitly",
+            path.display()
+        )
+    })?;
+    if session.id != session_id {
+        anyhow::bail!(
+            "restart checkpoint session ID mismatch at {}; recover the saved session explicitly",
+            path.display()
+        );
     }
+    Ok(session)
 }
 
 async fn run_tui_repl_post_restart(
@@ -545,16 +551,24 @@ async fn run_single_shot(
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
     let session_path = sessions_dir.join(format!("{session_id}.json"));
-    if let Err(e) = session.save(&session_path) {
+    let checkpoint_saved = if let Err(e) = session.save(&session_path) {
         eprintln!("warning: could not save session: {e}");
+        false
     } else {
         eprintln!("[piku] session saved → {}", session_path.display());
-    }
+        true
+    };
 
     report_launch_stream_error(result.stream_error.as_deref(), print || read_only)?;
 
     let failed = result.stream_error.is_some();
-    if let Some(new_binary) = result.replace_and_exec.filter(|_| !failed) {
+    if result.replace_and_exec.is_some() && !failed && !checkpoint_saved {
+        eprintln!("[piku] self-update refused: restart checkpoint could not be saved; continuing with old binary");
+    }
+    if let Some(new_binary) = result
+        .replace_and_exec
+        .filter(|_| !failed && checkpoint_saved)
+    {
         eprintln!("[piku] rebuilt — restarting with new binary...");
         if let Some(log) = request_log {
             log.prepare_exec()?;

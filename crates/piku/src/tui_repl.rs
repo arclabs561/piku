@@ -1483,17 +1483,18 @@ async fn run_tui_repl_core(
     if !post_restart {
         match self_update.check_for_update() {
             Ok(Some(candidate)) => {
-                if !run.session().messages.is_empty() {
-                    let _ = run.session().save(&session_path);
-                }
-                eprintln!("[piku] approved newer binary detected — restarting...");
-                if let Some(log) = request_log {
-                    log.prepare_exec()?;
-                }
-                if let Err(error) =
-                    self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
-                {
-                    eprintln!("[piku] self-update failed: {error}");
+                if let Err(error) = run.session().save(&session_path) {
+                    eprintln!("[piku] self-update refused: restart checkpoint could not be saved: {error}");
+                } else {
+                    eprintln!("[piku] approved newer binary detected — restarting...");
+                    if let Some(log) = request_log {
+                        log.prepare_exec()?;
+                    }
+                    if let Err(error) = self_update
+                        .replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
+                    {
+                        eprintln!("[piku] self-update failed: {error}");
+                    }
                 }
             }
             Ok(None) => {}
@@ -1577,17 +1578,20 @@ async fn run_tui_repl_core(
         // External builds are checked only inside the approved developer root.
         match self_update.check_for_update() {
             Ok(Some(candidate)) => {
-                let _ = run.session().save(&session_path);
-                let (_, rows) = term_size();
-                goto(rows.saturating_sub(2), 1);
-                announce_self_update(&candidate);
-                if let Some(log) = request_log {
-                    log.prepare_exec()?;
-                }
-                if let Err(error) =
-                    self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
-                {
-                    eprintln!("[piku] self-update failed: {error}");
+                if let Err(error) = run.session().save(&session_path) {
+                    eprintln!("[piku] self-update refused: restart checkpoint could not be saved: {error}");
+                } else {
+                    let (_, rows) = term_size();
+                    goto(rows.saturating_sub(2), 1);
+                    announce_self_update(&candidate);
+                    if let Some(log) = request_log {
+                        log.prepare_exec()?;
+                    }
+                    if let Err(error) = self_update
+                        .replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
+                    {
+                        eprintln!("[piku] self-update failed: {error}");
+                    }
                 }
             }
             Ok(None) => {}
@@ -2577,15 +2581,21 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 // Persist session
-                if let Err(e) = run.session().save(&session_path) {
+                let checkpoint_saved = if let Err(e) = run.session().save(&session_path) {
                     eprintln!("\x1b[33m[warn]\x1b[0m could not save session: {e}");
-                }
+                    false
+                } else {
+                    true
+                };
 
                 // Self-update: show animation, then exec the new binary in-place.
                 // We do NOT call teardown_layout — the new process calls setup_layout
                 // which redraws the whole screen fresh. PIKU_SESSION_ID lets the
                 // restarted process resume the session seamlessly.
-                if let Some(new_binary) = result.replace_and_exec {
+                if result.replace_and_exec.is_some() && !checkpoint_saved {
+                    eprintln!("[piku] self-update refused: restart checkpoint could not be saved; continuing with old binary");
+                }
+                if let Some(new_binary) = result.replace_and_exec.filter(|_| checkpoint_saved) {
                     // Place animation in the scroll zone, below the turn output
                     let (_, rows) = term_size();
                     let scroll_bot = rows.saturating_sub(2);

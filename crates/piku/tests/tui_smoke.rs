@@ -962,6 +962,9 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
 #[allow(dead_code)]
 mod review_workflow;
 
+#[path = "support/restart_recovery.rs"]
+mod restart_recovery;
+
 /// Compose ambiguity, a genuinely unfinished stream, and fresh-process repair
 /// through the real terminal. Scripted answers establish application plumbing.
 #[test]
