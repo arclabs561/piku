@@ -35,6 +35,21 @@ pub struct ResolvedProvider {
 }
 
 impl ResolvedProvider {
+    /// Resolve the explicitly selected `ChatGPT` route with transport observations.
+    ///
+    /// Clones of this provider share the callback, including those passed to
+    /// child or memory calls. It observes Responses POST attempts, not catalog/auth
+    /// traffic or independent embedding providers. It does not enforce a resource budget;
+    /// callers must reconcile incomplete receipts and process-local identities.
+    pub fn resolve_chatgpt_with_observer(
+        observer: std::sync::Arc<piku_api::responses::ResponsesObserver>,
+    ) -> Result<Self, ApiError> {
+        Ok(Self {
+            provider: Box::new(chatgpt::ChatgptProvider::selected_with_observer(observer)?),
+            default_model: String::new(),
+        })
+    }
+
     pub fn resolve(provider_override: Option<&str>) -> Result<Self, ApiError> {
         match provider_override {
             Some(name) => Self::resolve_named(name),

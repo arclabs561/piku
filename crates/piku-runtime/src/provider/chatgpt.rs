@@ -34,6 +34,13 @@ impl ChatgptProvider {
             catalog: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
+    pub(super) fn selected_with_observer(
+        observer: Arc<piku_api::responses::ResponsesObserver>,
+    ) -> Result<Self, ApiError> {
+        let mut provider = Self::selected()?;
+        provider.inner = provider.inner.with_observer(observer);
+        Ok(provider)
+    }
     async fn validate_model(&self, model: &str) -> Result<(), ApiError> {
         if model.trim().is_empty() {
             return Err(ApiError::Provider("ChatGPT requires an explicit model; run `piku auth chatgpt models`, then pass `--provider chatgpt --model MODEL`".into()));
@@ -92,8 +99,14 @@ mod tests {
 
     #[tokio::test]
     async fn missing_and_unlisted_models_refuse_before_inference() {
+        let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&observations);
         let provider = ChatgptProvider {
-            inner: ResponsesProvider::new(Arc::new(NeverToken)).unwrap(),
+            inner: ResponsesProvider::new(Arc::new(NeverToken))
+                .unwrap()
+                .with_observer(Arc::new(move |_| {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })),
             catalog: Arc::new(tokio::sync::OnceCell::new()),
         };
         assert!(provider
@@ -129,6 +142,7 @@ mod tests {
             .to_string()
             .contains("not available"));
         assert!(stream.next().await.is_none());
+        assert_eq!(observations.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
     #[tokio::test]
     async fn replay_mismatch_refuses_before_catalog_credentials() {
