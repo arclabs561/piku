@@ -516,6 +516,244 @@ mod anthropic_sse_parsing {
         assert!(matches!(&events[0], Event::UsageDelta { usage } if usage.input_tokens == 100));
     }
 
+    #[tokio::test]
+    async fn official_anthropic_wire_preserves_cumulative_output_only_usage() {
+        use crate::TokenUsage;
+
+        // Official streaming.md basic stream: start (25,1), final output 15.
+        // message_delta usage is cumulative, so final totals must be (25,15).
+        // https://platform.claude.com/docs/en/build-with-claude/streaming
+        let wire = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"!\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = collect_anthropic_wire(&[wire]).await.remove(0);
+        let mut usage = TokenUsage::default();
+        let mut text = String::new();
+        let mut stops = Vec::new();
+        for event in events {
+            match event {
+                Event::UsageDelta { usage: reported } => usage.accumulate(&reported),
+                Event::TextDelta { text: delta } => text.push_str(&delta),
+                Event::MessageStop { stop_reason } => stops.push(stop_reason),
+                Event::ToolUseEnd { .. } => {}
+                other => panic!("unexpected official text-stream event: {other:?}"),
+            }
+        }
+        assert_eq!(text, "Hello!");
+        assert_eq!(stops, vec![StopReason::EndTurn]);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (25, 15));
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_cumulative_updates_emit_only_new_counts() {
+        use serde_json::json;
+        // Counter fields come from the Messages usage schema; monotone updates
+        // probe the official cumulative contract, not measured model usage.
+        let wire = usage_wire(
+            &json!({"input_tokens":25,"output_tokens":1,"cache_creation_input_tokens":4,"cache_read_input_tokens":3}),
+            &[
+                json!({"output_tokens":7}),
+                json!({"output_tokens":7}),
+                json!({"input_tokens":30,"output_tokens":15,"cache_creation_input_tokens":9,"cache_read_input_tokens":8}),
+                json!({"output_tokens":15}),
+            ],
+        );
+        let events = collect_anthropic_wire(&[&wire]).await.remove(0);
+        assert_eq!(
+            usage_samples(&events),
+            vec![
+                (25, 1, 4, 3),
+                (0, 6, 0, 0),
+                (0, 0, 0, 0),
+                (5, 8, 5, 5),
+                (0, 0, 0, 0)
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::MessageStop {
+                        stop_reason: StopReason::EndTurn
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_missing_malformed_and_regressive_usage_preserves_baseline() {
+        use serde_json::json;
+        let wire = usage_wire(
+            &json!({"input_tokens":25,"output_tokens":1}),
+            &[
+                json!(null),
+                json!([]),
+                json!({}),
+                json!({"output_tokens":null}),
+                json!({"output_tokens":"7"}),
+                json!({"output_tokens":-1}),
+                json!({"output_tokens":1.5}),
+                json!({"output_tokens":4_294_967_296_u64}),
+                json!({"input_tokens":"bad","output_tokens":9}),
+                json!({"output_tokens":7}),
+                json!({"input_tokens":100,"output_tokens":3}),
+                json!({"output_tokens":15}),
+            ],
+        );
+        let absent = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let mut streams = collect_anthropic_wire(&[&wire, absent]).await;
+        assert!(usage_samples(&streams.pop().unwrap()).is_empty());
+        assert_eq!(
+            usage_samples(&streams.pop().unwrap()),
+            vec![(25, 1, 0, 0), (0, 6, 0, 0), (0, 8, 0, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_usage_state_is_independent_across_requests_and_clones() {
+        use serde_json::json;
+        let wire = usage_wire(
+            &json!({"input_tokens":25,"output_tokens":1}),
+            &[json!({"output_tokens":15})],
+        );
+        let streams = collect_anthropic_wire(&[&wire, &wire, &wire]).await;
+        assert_eq!(streams.len(), 3);
+        for events in streams {
+            assert_eq!(usage_samples(&events), vec![(25, 1, 0, 0), (0, 14, 0, 0)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_valid_zero_usage_is_distinct_from_absent_or_malformed_usage() {
+        use serde_json::json;
+        let zero = usage_wire(&json!({"input_tokens":0,"output_tokens":0}), &[]);
+        let unknown = usage_wire(
+            &json!(null),
+            &[
+                json!({}),
+                json!({"unrecognized":0}),
+                json!({"output_tokens":null}),
+            ],
+        );
+        let streams = collect_anthropic_wire(&[&zero, &unknown]).await;
+        assert_eq!(usage_samples(&streams[0]), vec![(0, 0, 0, 0)]);
+        assert!(usage_samples(&streams[1]).is_empty());
+    }
+
+    fn usage_samples(events: &[Event]) -> Vec<(u32, u32, u32, u32)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::UsageDelta { usage } => Some((
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn usage_wire(start: &serde_json::Value, updates: &[serde_json::Value]) -> String {
+        use std::fmt::Write;
+
+        let mut rows = vec![serde_json::json!({"type":"message_start","message":{"usage":start}})];
+        rows.extend(
+            updates
+                .iter()
+                .map(|usage| serde_json::json!({"type":"message_delta","usage":usage})),
+        );
+        rows.push(serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}));
+        rows.into_iter().fold(String::new(), |mut wire, row| {
+            write!(
+                wire,
+                "event: {}\ndata: {row}\n\n",
+                row["type"].as_str().unwrap()
+            )
+            .unwrap();
+            wire
+        })
+    }
+
+    async fn collect_anthropic_wire(wires: &[&str]) -> Vec<Vec<Event>> {
+        use crate::{AnthropicProvider, MessageRequest, Provider};
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses: Vec<String> = wires.iter().map(|wire| (*wire).to_string()).collect();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                for wire in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 1024];
+                let (header_end, length) = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    assert!(bytes.len() <= 64 * 1024);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        assert!(headers.starts_with("post /v1/messages http/1.1"));
+                        let length = headers.lines().find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap().trim().parse::<usize>().unwrap();
+                        assert!(length < 64 * 1024);
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wire.len()).as_bytes()).await.unwrap();
+                for chunk in wire.as_bytes().chunks(7) {
+                    socket.write_all(chunk).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                socket.shutdown().await.unwrap();
+                }
+            }).await.unwrap();
+        });
+        let provider = AnthropicProvider::with_base_url("synthetic-test-key".into(), base_url);
+        let request = MessageRequest {
+            model: "fixture-model".into(),
+            max_tokens: 32,
+            stream: true,
+            system: None,
+            messages: vec![],
+            tools: None,
+        };
+        let mut collected = Vec::new();
+        let cloned = provider.clone();
+        for (index, _) in wires.iter().enumerate() {
+            let selected = if index % 2 == 0 { &provider } else { &cloned };
+            let events = tokio::time::timeout(
+                Duration::from_secs(5),
+                selected.stream_message(request.clone()).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            collected.push(events.into_iter().map(Result::unwrap).collect());
+        }
+        server.await.unwrap();
+        collected
+    }
+
     #[test]
     fn bad_json_returns_parse_error() {
         let result = parse(None, "not json {{ garbage");

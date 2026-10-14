@@ -409,6 +409,98 @@ async fn dropped_and_timed_out_bodies_record_actual_connection_cancellation() {
     }
 }
 
+async fn held_body_with_request_deadline(
+    deadline: Duration,
+) -> (
+    OpenAiCompatProvider,
+    tokio::task::JoinHandle<()>,
+    ObservationLog,
+) {
+    let rows = vec![
+        json!({"choices":[{"index":0,"delta":{"content":"private payload"},"finish_reason":null}]}),
+        terminal(),
+        usage(),
+    ];
+    let (callback, log) = observer();
+    let (mut provider, server) = wire_provider(rows, 200, true, 0).await;
+    // Private test-instance injection only: production clients/defaults stay
+    // unchanged. The actual provider send, parser and guard remain the subject.
+    provider.client = reqwest::Client::builder()
+        .timeout(deadline)
+        .build()
+        .unwrap();
+    (provider.with_observer(callback), server, log)
+}
+
+#[tokio::test]
+async fn request_deadline_on_held_body_is_failed_stream() {
+    let (provider, server, log) = held_body_with_request_deadline(Duration::from_millis(500)).await;
+    let mut stream = provider.stream_message(request());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap(),
+        Some(Ok(Event::TextDelta { .. }))
+    ));
+    // The server sends terminal+usage but holds HTTP EOF. A longer watchdog
+    // must receive the provider's own error, rather than cause consumer Drop.
+    let result = tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>()).await;
+    // Reap the real peer-close witness even when the client deadline is omitted.
+    tokio::time::timeout(Duration::from_secs(4), server)
+        .await
+        .unwrap()
+        .unwrap();
+    let events = result.expect("HTTP-client deadline must precede the caller watchdog");
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, Ok(Event::MessageStop { .. }))));
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.as_ref().err())
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(errors[0], ApiError::Request(error) if error.is_timeout()));
+    let receipt = receipt(&log);
+    assert_eq!(
+        receipt.outcome,
+        InferenceAttemptOutcome::Failed(InferenceAttemptFailure::Stream)
+    );
+    assert!(!receipt.transport_complete);
+    assert_eq!(receipt.reported_usage, Some(expected_usage()));
+}
+
+#[tokio::test]
+async fn caller_deadline_on_held_body_is_dropped() {
+    let (provider, server, log) = held_body_with_request_deadline(Duration::from_secs(30)).await;
+    let mut stream = provider.stream_message(request());
+    for expected in ["text", "terminal", "usage"] {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            (expected, event),
+            ("text", Event::TextDelta { .. })
+                | ("terminal", Event::MessageStop { .. })
+                | ("usage", Event::UsageDelta { .. })
+        ));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.collect::<Vec<_>>())
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(4), server)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt = receipt(&log);
+    assert_eq!(receipt.outcome, InferenceAttemptOutcome::Dropped);
+    assert!(!receipt.transport_complete);
+    assert_eq!(receipt.reported_usage, Some(expected_usage()));
+}
+
 #[tokio::test]
 async fn unpolled_and_replay_rejected_compat_requests_emit_no_send() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
