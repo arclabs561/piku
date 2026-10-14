@@ -568,6 +568,7 @@ pub struct RecordingSink<'a> {
     turn_id: String,
     record_error: Option<io::Error>,
     after_turn_started: Vec<RunEvent>,
+    context_sequence: Option<u64>,
 }
 
 impl<'a> RecordingSink<'a> {
@@ -582,6 +583,7 @@ impl<'a> RecordingSink<'a> {
             turn_id: turn_id.into(),
             record_error: None,
             after_turn_started: Vec::new(),
+            context_sequence: None,
         }
     }
 
@@ -615,6 +617,13 @@ impl<'a> RecordingSink<'a> {
 }
 
 impl OutputSink for RecordingSink<'_> {
+    fn request_observation(&self) -> Option<crate::RequestObservation> {
+        let mut observation = self.inner.request_observation()?;
+        observation.binding.run_id = Some(self.recorder.session_id.clone());
+        observation.binding.turn_id = Some(self.turn_id.clone());
+        observation.binding.context_sequence = self.context_sequence;
+        Some(observation)
+    }
     fn on_text(&mut self, text: &str) {
         self.inner.on_text(text);
     }
@@ -655,10 +664,22 @@ impl OutputSink for RecordingSink<'_> {
     }
 
     fn on_run_event(&mut self, event: &RunEvent) {
+        if matches!(
+            event,
+            RunEvent::TurnStarted { .. } | RunEvent::ContextBuilt { .. }
+        ) {
+            self.context_sequence = None;
+        }
         self.inner.on_run_event(event);
         if self.record_error.is_none() {
-            if let Err(error) = self.recorder.append(&self.turn_id, event.clone()) {
-                self.record_error = Some(error);
+            match self.recorder.append(&self.turn_id, event.clone()) {
+                Ok(sequence) if matches!(event, RunEvent::ContextBuilt { .. }) => {
+                    self.context_sequence = Some(sequence);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.record_error = Some(error);
+                }
             }
         }
         if matches!(event, RunEvent::TurnStarted { .. }) && self.record_error.is_none() {

@@ -90,6 +90,7 @@ async fn child_at_cap(
         vec![],
         None,
         std::sync::Arc::new(crate::permission::AllowAll),
+        None,
     )
     .await;
     let entry = registry.status(&id).unwrap();
@@ -172,6 +173,7 @@ async fn child_completion_overflow_reaches_parent_once_across_repeated_drains() 
             vec![],
             None,
             std::sync::Arc::new(crate::permission::AllowAll),
+            None,
         )
         .await;
         assert_eq!(registry.status(&id).unwrap().status, expected);
@@ -319,6 +321,7 @@ async fn exhausted_child_join_reports_retained_work_recovery() {
         vec![],
         None,
         std::sync::Arc::new(crate::permission::AllowAll),
+        None,
     )
     .await;
     assert_eq!(std::fs::read_to_string(path).unwrap(), "retained work");
@@ -416,6 +419,7 @@ async fn setup_failure_join_reports_retained_work_recovery() {
             vec![],
             None,
             std::sync::Arc::new(crate::permission::AllowAll),
+            None,
         )
         .await;
         assert_eq!(
@@ -532,6 +536,7 @@ async fn child_with_recording_fault(
         vec![],
         None,
         std::sync::Arc::new(crate::permission::AllowAll),
+        None,
     )
     .await;
     assert_eq!(
