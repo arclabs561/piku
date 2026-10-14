@@ -1019,8 +1019,11 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
     let prompt = "Make settings.json deployment-ready; preserve service and all other files.";
     let clarification = "Use port 9090 and debug false; preserve service fixture.";
     let correction = "The previous turn was interrupted. Apply port 9090 and debug false now, preserving service fixture and all other files.";
-    let mut first =
-        Pty::spawn_command_with_env(Command::new(piku_binary()), &retained, &environment);
+    let first_log = fixture_path.join("first-requests.jsonl");
+    let resumed_log = fixture_path.join("resumed-requests.jsonl");
+    let mut first_command = Command::new(piku_binary());
+    first_command.arg("--request-log").arg(&first_log);
+    let mut first = Pty::spawn_command_with_env(first_command, &retained, &environment);
     assert!(first.wait_for("❯", Duration::from_secs(5)));
     first.send(format!("{prompt}\r").as_bytes());
     assert!(first.wait_for("AMBIGUITY:", Duration::from_secs(10)));
@@ -1070,6 +1073,7 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
         original
     );
     let mut cmd = Command::new(piku_binary());
+    cmd.arg("--request-log").arg(&resumed_log);
     // --resume executes its supplied prompt before entering the interactive
     // loop; omitting it would acquire an unintended "Continue" turn.
     cmd.args(["--resume", session, correction]);
@@ -1117,6 +1121,113 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
     assert!(git(&repo, &["status", "--porcelain"]).is_empty());
     let captured = requests.lock().unwrap();
     assert_eq!(captured.len(), 6);
+    // The scripted server fixes the oracle independently of the observer:
+    // three acquisitions per launch, including each normal-exit extraction.
+    let logs: Vec<String> = [&first_log, &resumed_log]
+        .into_iter()
+        .map(|path| {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::read_to_string(path).unwrap()
+        })
+        .collect();
+    let mut namespaces = std::collections::HashSet::new();
+    for (launch, log) in logs.iter().enumerate() {
+        let rows: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.first().unwrap()["event"], "launch");
+        let namespace = rows[0]["namespace"].as_str().unwrap();
+        assert!(
+            namespaces.insert(namespace.to_owned()),
+            "resume reused launch namespace"
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row["schema"] == 1 && row["namespace"] == namespace));
+        let started: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row["event"] == "started")
+            .collect();
+        let finished: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row["event"] == "finished")
+            .collect();
+        assert_eq!(started.len(), 3, "launch {launch}: {log}");
+        assert_eq!(finished.len(), 3, "launch {launch}: {log}");
+        let ids: std::collections::HashSet<_> = started
+            .iter()
+            .map(|row| row["attempt_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        for start in started {
+            assert_eq!(start["provider"], "custom");
+            let matching: Vec<_> = finished
+                .iter()
+                .filter(|row| row["attempt_id"] == start["attempt_id"])
+                .collect();
+            assert_eq!(matching.len(), 1, "attempt must finish exactly once");
+            let end = matching[0];
+            assert_eq!(end["provider"], start["provider"]);
+            assert_eq!(end["started_us"], start["started_us"]);
+            assert!(end["finished_us"].as_u64().unwrap() >= start["started_us"].as_u64().unwrap());
+            assert!(
+                end["reported_usage"].is_null(),
+                "absent usage must remain unknown"
+            );
+            assert!(end["failure"].is_null());
+            if end["outcome"] == "dropped" {
+                assert_eq!(end["transport_complete"], false);
+            } else {
+                assert_eq!(end["outcome"], "completed");
+                assert_eq!(end["transport_complete"], true);
+            }
+        }
+        assert_eq!(
+            finished
+                .iter()
+                .filter(|row| row["outcome"] == "dropped")
+                .count(),
+            usize::from(launch == 0)
+        );
+        let cutoff = rows.last().unwrap();
+        assert_eq!(cutoff["event"], "cutoff");
+        for field in [
+            "active_at_cutoff",
+            "callbacks_at_cutoff",
+            "queue_full",
+            "queue_closed",
+            "rejected_after_cutoff",
+            "queued_at_cutoff",
+        ] {
+            assert_eq!(cutoff[field], 0, "{field}: {log}");
+        }
+        assert_eq!(cutoff["writer_failed"], false);
+        // Even a drained fixture does not certify detached production lifetimes.
+        assert_eq!(cutoff["producers_unsettled"], true);
+        for private in [
+            prompt,
+            clarification,
+            correction,
+            "AMBIGUITY:",
+            "canned-model",
+            "recovery-write",
+            "write_file",
+            "sk-or-fake-smoke-test",
+            "Authorization",
+            "Bearer",
+            url.as_str(),
+        ] {
+            assert!(
+                !log.contains(private),
+                "request log disclosed payload or route"
+            );
+        }
+    }
     assert_eq!(
         captured[2]["tools"]
             .as_array()
@@ -1172,6 +1283,8 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
             ("first-pty.txt", first_transcript.as_bytes()),
             ("resumed-pty.txt", resumed_transcript.as_bytes()),
             ("run.jsonl", final_record.as_bytes()),
+            ("first-requests.jsonl", logs[0].as_bytes()),
+            ("resumed-requests.jsonl", logs[1].as_bytes()),
             (
                 "requests.json",
                 serde_json::to_vec_pretty(&*captured).unwrap().as_slice(),

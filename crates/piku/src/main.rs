@@ -4,6 +4,7 @@ use clap::Parser;
 
 use piku::cli::{Cli, Commands, InspectFormat};
 use piku::config::PikuConfig;
+use piku::request_log::RequestLog;
 use piku::self_update;
 use piku::trace::TraceWriter;
 use piku::tui_repl;
@@ -15,7 +16,7 @@ use piku_runtime::{
     build_system_prompt, run_turn, OutputSink, PermissionOutcome, PermissionPrompter,
     PermissionRequest, RunHandle, RunRecorder, Session, TurnResult,
 };
-use piku_runtime::{provider_availability, PostToolAction, ResolvedProvider, TokenUsage};
+use piku_runtime::{provider_availability, PostToolAction, TokenUsage};
 use piku_tools::all_tool_definitions;
 
 #[allow(clippy::too_many_lines)] // Command dispatch stays beside its subcommand wiring.
@@ -27,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     piku::telemetry::init();
     let cwd = env::current_dir().ok();
     let cli = Cli::parse();
+    cli.validate_request_log()?;
 
     match &cli.command {
         Some(Commands::Permissions { command }) => {
@@ -97,15 +99,31 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    let request_log = cli
+        .request_log
+        .as_deref()
+        .map(RequestLog::create)
+        .transpose()?;
+    let result = run_terminal(&cli, cwd.as_deref(), request_log.as_ref()).await;
+    let recording = request_log.map(RequestLog::finish).transpose();
+    if let Err(error) = &recording {
+        eprintln!("[piku] request-log recording error: {error}");
+    }
+    result?;
+    recording?;
+    Ok(())
+}
+
+async fn run_terminal(
+    cli: &Cli,
+    cwd: Option<&std::path::Path>,
+    request_log: Option<&RequestLog>,
+) -> anyhow::Result<()> {
     let self_update = self_update::SelfUpdatePolicy::from_operator_root(
         cli.self_update_root.as_deref(),
         cli.read_only,
     )?;
-    let config = PikuConfig::load(
-        cli.provider.as_deref(),
-        cli.model.as_deref(),
-        cwd.as_deref(),
-    );
+    let config = PikuConfig::load(cli.provider.as_deref(), cli.model.as_deref(), cwd);
 
     let prompt_str = if cli.prompt.is_empty() {
         None
@@ -121,13 +139,20 @@ async fn main() -> anyhow::Result<()> {
             cli.print,
             cli.read_only,
             &self_update,
+            request_log,
         )
         .await?;
     } else if let Some(prompt) = prompt_str {
         if !cli.print && !cli.read_only && self_update::was_restarted() {
             if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(session, &config, cli.read_only, &self_update)
-                    .await;
+                return run_tui_repl_post_restart(
+                    session,
+                    &config,
+                    cli.read_only,
+                    &self_update,
+                    request_log,
+                )
+                .await;
             }
         }
         run_single_shot(
@@ -137,22 +162,30 @@ async fn main() -> anyhow::Result<()> {
             cli.print,
             cli.read_only,
             &self_update,
+            request_log,
         )
         .await?;
     } else {
         if self_update::was_restarted() {
             if let Some(session) = try_load_restart_session(&config) {
-                return run_tui_repl_post_restart(session, &config, cli.read_only, &self_update)
-                    .await;
+                return run_tui_repl_post_restart(
+                    session,
+                    &config,
+                    cli.read_only,
+                    &self_update,
+                    request_log,
+                )
+                .await;
             }
         }
-        tui_repl::run_tui_repl_with_policy(
+        tui_repl::run_tui_repl_with_policy_observed(
             &config,
             None,
             TokenUsage::default(),
             false,
             cli.read_only,
             &self_update,
+            request_log,
         )
         .await?;
     }
@@ -330,14 +363,16 @@ async fn run_tui_repl_post_restart(
     config: &PikuConfig,
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&RequestLog>,
 ) -> anyhow::Result<()> {
-    tui_repl::run_tui_repl_with_policy(
+    tui_repl::run_tui_repl_with_policy_observed(
         config,
         Some(session),
         TokenUsage::default(),
         true,
         read_only,
         self_update,
+        request_log,
     )
     .await
 }
@@ -349,6 +384,7 @@ async fn run_resume(
     print: bool,
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&RequestLog>,
 ) -> anyhow::Result<()> {
     let sessions_dir = config.sessions_dir();
     std::fs::create_dir_all(&sessions_dir)?;
@@ -377,6 +413,7 @@ async fn run_resume(
                     print,
                     read_only,
                     self_update,
+                    request_log,
                 )
                 .await;
             }
@@ -406,6 +443,7 @@ async fn run_resume(
         print,
         read_only,
         self_update,
+        request_log,
     )
     .await
 }
@@ -425,8 +463,9 @@ async fn run_single_shot(
     print: bool,
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&RequestLog>,
 ) -> anyhow::Result<()> {
-    let resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
+    let resolved = piku::request_log::resolve(config.provider.as_deref(), request_log)?;
     let model = config
         .model
         .as_deref()
@@ -517,6 +556,9 @@ async fn run_single_shot(
     let failed = result.stream_error.is_some();
     if let Some(new_binary) = result.replace_and_exec.filter(|_| !failed) {
         eprintln!("[piku] rebuilt — restarting with new binary...");
+        if let Some(log) = request_log {
+            log.prepare_exec()?;
+        }
         if let Err(e) = self_update.replace_and_exec(&new_binary, &[]) {
             eprintln!("[piku] self-update failed: {e}");
             eprintln!("[piku] continuing with old binary");
@@ -532,13 +574,14 @@ async fn run_single_shot(
     }
 
     println!();
-    tui_repl::run_tui_repl_with_policy(
+    tui_repl::run_tui_repl_with_policy_observed(
         config,
         Some(session),
         result.usage,
         false,
         read_only,
         self_update,
+        request_log,
     )
     .await
 }

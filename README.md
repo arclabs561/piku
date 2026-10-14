@@ -38,6 +38,15 @@ continues there. `-p` prints one result and exits; `--read-only` runs one turn
 with inspection tools and exits. Provider and model overrides are available as
 `--provider` and `--model`.
 
+For terminal, print, or resume diagnostics, add `--request-log new.jsonl`.
+Piku creates a fresh private JSONL file containing request timing, transport
+outcomes, and available reported token counters. Prompts, responses, tools,
+credentials, and endpoint addresses are excluded. Missing usage stays unknown;
+the cutoff records loss and unfinished work rather than certifying billing or
+background completion. ChatGPT and OpenAI-compatible routes support this option;
+other selected routes fail before inference. Use a new path for each launch.
+This option cannot combine with `--self-update-root` or subcommands.
+
 Piku can use ChatGPT plan access, OpenRouter, Anthropic, Groq, Ollama, or a custom
 OpenAI-compatible server. Provider selection comes from the launch environment,
 user configuration and explicit flags. Repository `.env` files and project

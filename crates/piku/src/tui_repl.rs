@@ -27,8 +27,7 @@ use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use piku_runtime::{
     build_system_prompt, run_turn_with_registry, OutputSink, PermissionOutcome, PermissionPrompter,
-    PermissionRequest, PostToolAction, ResolvedProvider, Session, TaskRegistry, TaskStatus,
-    TokenUsage, TurnResult,
+    PermissionRequest, PostToolAction, Session, TaskRegistry, TaskStatus, TokenUsage, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
 
@@ -1321,6 +1320,28 @@ pub async fn run_tui_repl_with_policy(
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
 ) -> anyhow::Result<()> {
+    run_tui_repl_with_policy_observed(
+        config,
+        existing_session,
+        initial_usage,
+        post_restart,
+        read_only,
+        self_update,
+        None,
+    )
+    .await
+}
+
+/// The explicit terminal launch shares its recorder across all reconstructed providers.
+pub async fn run_tui_repl_with_policy_observed(
+    config: &crate::config::PikuConfig,
+    existing_session: Option<Session>,
+    initial_usage: TokenUsage,
+    post_restart: bool,
+    read_only: bool,
+    self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&crate::request_log::RequestLog>,
+) -> anyhow::Result<()> {
     let policy = if read_only {
         self_update::SelfUpdatePolicy::default()
     } else {
@@ -1333,6 +1354,7 @@ pub async fn run_tui_repl_with_policy(
         post_restart,
         read_only,
         &policy,
+        request_log,
     )
     .await
 }
@@ -1344,6 +1366,7 @@ async fn run_tui_repl_inner(
     post_restart: bool,
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&crate::request_log::RequestLog>,
 ) -> anyhow::Result<()> {
     // Wrap the entire REPL in a LocalSet so `tokio::task::spawn_local` works
     // for background subagents. Without this, spawn_local panics at runtime
@@ -1357,6 +1380,7 @@ async fn run_tui_repl_inner(
             post_restart,
             read_only,
             self_update,
+            request_log,
         ))
         .await
 }
@@ -1368,8 +1392,9 @@ async fn run_tui_repl_core(
     post_restart: bool,
     read_only: bool,
     self_update: &self_update::SelfUpdatePolicy,
+    request_log: Option<&crate::request_log::RequestLog>,
 ) -> anyhow::Result<()> {
-    let mut resolved = ResolvedProvider::resolve(config.provider.as_deref())?;
+    let mut resolved = crate::request_log::resolve(config.provider.as_deref(), request_log)?;
     let mut model = config
         .model
         .as_deref()
@@ -1462,6 +1487,9 @@ async fn run_tui_repl_core(
                     let _ = run.session().save(&session_path);
                 }
                 eprintln!("[piku] approved newer binary detected — restarting...");
+                if let Some(log) = request_log {
+                    log.prepare_exec()?;
+                }
                 if let Err(error) =
                     self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
                 {
@@ -1553,6 +1581,9 @@ async fn run_tui_repl_core(
                 let (_, rows) = term_size();
                 goto(rows.saturating_sub(2), 1);
                 announce_self_update(&candidate);
+                if let Some(log) = request_log {
+                    log.prepare_exec()?;
+                }
                 if let Err(error) =
                     self_update.replace_and_exec(&candidate, &[("PIKU_SESSION_ID", &session_id)])
                 {
@@ -1805,7 +1836,7 @@ async fn run_tui_repl_core(
                             let provider_name = profile
                                 .and_then(|profile| profile.provider.as_deref())
                                 .or(config.provider.as_deref());
-                            match ResolvedProvider::resolve(provider_name) {
+                            match crate::request_log::resolve(provider_name, request_log) {
                                 Ok(next_provider) => {
                                     let next_model = profile
                                         .and_then(|profile| profile.model.as_deref())
@@ -2560,6 +2591,9 @@ async fn run_tui_repl_core(
                     let scroll_bot = rows.saturating_sub(2);
                     goto(scroll_bot, 1);
                     announce_self_update(&new_binary);
+                    if let Some(log) = request_log {
+                        log.prepare_exec()?;
+                    }
                     if let Err(e) = self_update
                         .replace_and_exec(&new_binary, &[("PIKU_SESSION_ID", &session_id)])
                     {
