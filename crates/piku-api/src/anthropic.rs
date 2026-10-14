@@ -83,6 +83,7 @@ impl Provider for AnthropicProvider {
 
             let mut stream = resp.bytes_stream();
             let mut parser = SseParser::new();
+            let mut usage = AnthropicUsage::default();
             let mut decoder = crate::sse::Utf8Stream::new();
             let mut line_buf = String::new();
 
@@ -95,7 +96,7 @@ impl Provider for AnthropicProvider {
                 for ch in text.chars() {
                     if ch == '\n' {
                         if let Some(sse) = parser.feed_line(&line_buf) {
-                            let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data)?;
+                            let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data, &mut usage)?;
                             for event in events {
                                 yield event;
                             }
@@ -110,7 +111,7 @@ impl Provider for AnthropicProvider {
             // flush any remaining line (no trailing newline)
             if !line_buf.is_empty() {
                 if let Some(sse) = parser.feed_line(&line_buf) {
-                    let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data)?;
+                    let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data, &mut usage)?;
                     for event in events {
                         yield event;
                     }
@@ -118,7 +119,7 @@ impl Provider for AnthropicProvider {
             }
             // Flush any buffered data pending blank-line dispatch.
             if let Some(sse) = parser.finish() {
-                let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data)?;
+                let events = parse_anthropic_sse(sse.event_type.as_deref(), &sse.data, &mut usage)?;
                 for event in events {
                     yield event;
                 }
@@ -139,16 +140,67 @@ struct RawStreamEvent {
     rest: HashMap<String, serde_json::Value>,
 }
 
+/// Anthropic reports cumulative counters, while runtime usage events add.
+/// State belongs to one response stream, never the provider or its clones.
+#[derive(Default)]
+struct AnthropicUsage {
+    counters: [u32; 4],
+}
+
+impl AnthropicUsage {
+    fn observe(&mut self, value: &serde_json::Value) -> Option<TokenUsage> {
+        let object = value.as_object()?;
+        let mut next = self.counters;
+        let mut supplied_counter = false;
+        for (index, field) in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Absent counters provide no new evidence. Reject an entire
+            // malformed/regressive snapshot without advancing the baseline,
+            // rather than inventing a reset, a negative delta or extra usage.
+            if let Some(value) = object.get(field) {
+                let count = u32::try_from(value.as_u64()?).ok()?;
+                if count < self.counters[index] {
+                    return None;
+                }
+                next[index] = count;
+                supplied_counter = true;
+            }
+        }
+        let delta = std::array::from_fn::<_, 4, _>(|index| next[index] - self.counters[index]);
+        self.counters = next;
+        if !supplied_counter {
+            return None;
+        }
+        Some(TokenUsage {
+            input_tokens: delta[0],
+            output_tokens: delta[1],
+            cache_creation_input_tokens: delta[2],
+            cache_read_input_tokens: delta[3],
+        })
+    }
+}
+
 /// Public re-export for tests only.
 #[cfg(test)]
 pub fn parse_anthropic_sse_pub(
     event_type: Option<&str>,
     data: &str,
 ) -> Result<Vec<Event>, ApiError> {
-    parse_anthropic_sse(event_type, data)
+    parse_anthropic_sse(event_type, data, &mut AnthropicUsage::default())
 }
 
-fn parse_anthropic_sse(event_type: Option<&str>, data: &str) -> Result<Vec<Event>, ApiError> {
+fn parse_anthropic_sse(
+    event_type: Option<&str>,
+    data: &str,
+    usage: &mut AnthropicUsage,
+) -> Result<Vec<Event>, ApiError> {
     if data == "[DONE]" {
         return Ok(vec![]);
     }
@@ -164,8 +216,8 @@ fn parse_anthropic_sse(event_type: Option<&str>, data: &str) -> Result<Vec<Event
         "content_block_stop" => Ok(vec![Event::ToolUseEnd {
             id: anthropic_index_id(&raw),
         }]),
-        "message_delta" => Ok(anthropic_message_delta(&raw)),
-        "message_start" => Ok(anthropic_message_start(&raw)),
+        "message_delta" => Ok(anthropic_message_delta(&raw, usage)),
+        "message_start" => Ok(anthropic_message_start(&raw, usage)),
         _ => Ok(vec![]),
     }
 }
@@ -229,7 +281,7 @@ fn anthropic_input_json_delta(raw: &RawStreamEvent, delta: &serde_json::Value) -
     vec![Event::ToolUseDelta { id, partial_json }]
 }
 
-fn anthropic_message_delta(raw: &RawStreamEvent) -> Vec<Event> {
+fn anthropic_message_delta(raw: &RawStreamEvent, usage: &mut AnthropicUsage) -> Vec<Event> {
     let mut events = Vec::new();
     if let Some(reason) = raw
         .rest
@@ -244,7 +296,7 @@ fn anthropic_message_delta(raw: &RawStreamEvent) -> Vec<Event> {
 
     // usage may also be in message_delta
     if let Some(usage_val) = raw.rest.get("usage") {
-        if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
+        if let Some(usage) = usage.observe(usage_val) {
             events.push(Event::UsageDelta { usage });
         }
     }
@@ -252,11 +304,11 @@ fn anthropic_message_delta(raw: &RawStreamEvent) -> Vec<Event> {
     events
 }
 
-fn anthropic_message_start(raw: &RawStreamEvent) -> Vec<Event> {
+fn anthropic_message_start(raw: &RawStreamEvent, usage: &mut AnthropicUsage) -> Vec<Event> {
     // usage is in message.usage
     if let Some(msg) = raw.rest.get("message") {
         if let Some(usage_val) = msg.get("usage") {
-            if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
+            if let Some(usage) = usage.observe(usage_val) {
                 return vec![Event::UsageDelta { usage }];
             }
         }
