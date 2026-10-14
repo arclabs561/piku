@@ -63,18 +63,28 @@ provider-neutral tool definitions.
 
 ## Provider boundary
 
-`piku-api` exposes one object-safe streaming `Provider` trait. Native Anthropic
-and OpenAI-compatible clients translate provider responses into the same `Event`
+`piku-api` exposes one object-safe streaming `Provider` trait. Native Anthropic,
+account-bound Responses and OpenAI-compatible clients use the same `Event`
 enum before the runtime sees them. Runtime provider resolution currently supports:
 
 - OpenRouter
+- ChatGPT plan access, selected explicitly with an account-catalog model
 - Anthropic
 - Groq
 - Ollama
 - a custom OpenAI-compatible endpoint
 
-Provider selection is opportunistic unless `--provider` is supplied. Credentials
-come from environment variables; project settings do not store provider keys.
+Provider selection uses launch environment, user configuration and explicit
+flags. ChatGPT uses its managed account source; API routes use their configured
+credentials. Repository dotenv/settings cannot choose credential destinations
+or override provider/model selection.
+
+Terminal, print and resume launches can opt into `--request-log PATH`. A fresh
+private metadata log records transport timing, outcomes and available reported
+usage for ChatGPT and compatible routes. Missing usage stays unknown; loss,
+active requests and unsettled producers remain explicit at cutoff. This output
+does not establish billing, task acceptance or resource admission, and cannot
+combine with self-update or other subcommands.
 
 ## Agent loop
 
@@ -194,7 +204,8 @@ independent proof that the task succeeded.
 Sessions are JSON files under `$XDG_CONFIG_HOME/piku/sessions/`, falling back to
 `~/.config/piku/sessions/`. Provider/model attribution is session-level startup
 metadata: it is overwritten on resume and can become stale after `/model`.
-Per-turn attribution and pricing are not implemented.
+Semantic run records carry per-turn provider/model fields and context manifests;
+per-turn pricing is not implemented.
 
 Memory has three distinct surfaces:
 
