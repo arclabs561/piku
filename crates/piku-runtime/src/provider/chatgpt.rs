@@ -59,6 +59,14 @@ impl Provider for ChatgptProvider {
     fn boxed_clone(&self) -> Box<dyn Provider + Send + Sync + 'static> {
         Box::new(self.clone())
     }
+    fn observed_clone(
+        &self,
+        observer: Arc<piku_api::InferenceObserver>,
+    ) -> Result<Box<dyn Provider>, ApiError> {
+        let mut cloned = self.clone();
+        cloned.inner = cloned.inner.with_observer(observer);
+        Ok(Box::new(cloned))
+    }
     fn stream_message(
         &self,
         request: MessageRequest,

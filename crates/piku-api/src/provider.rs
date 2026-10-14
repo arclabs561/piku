@@ -1,8 +1,10 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_util::Stream;
 
 use crate::error::ApiError;
+use crate::observation::InferenceObserver;
 use crate::types::{Event, MessageRequest};
 
 /// A provider that can stream messages from an LLM API.
@@ -22,6 +24,17 @@ pub trait Provider: Send + Sync {
     /// The default implementation panics — only real providers need to implement this.
     fn boxed_clone(&self) -> Box<dyn Provider + Send + Sync + 'static> {
         unimplemented!("boxed_clone not implemented for this provider")
+    }
+
+    /// Clone the existing route with an opt-in inference observer. Unsupported
+    /// providers refuse before inference; this never selects a fallback route.
+    fn observed_clone(
+        &self,
+        _observer: Arc<InferenceObserver>,
+    ) -> Result<Box<dyn Provider>, ApiError> {
+        Err(ApiError::Provider(
+            "request observation is unsupported by selected provider".into(),
+        ))
     }
 }
 
@@ -53,4 +66,30 @@ pub trait AccessTokenSource: Send + Sync {
         &self,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<AccessToken, ApiError>> + Send + '_>>;
     fn binding(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unsupported;
+    impl Provider for Unsupported {
+        fn name(&self) -> &'static str {
+            "unsupported"
+        }
+        fn stream_message(
+            &self,
+            _: MessageRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + '_>> {
+            panic!("unsupported observation must refuse before inference")
+        }
+    }
+
+    #[test]
+    fn observation_defaults_to_refusal_without_cloning_or_inference() {
+        let provider: &dyn Provider = &Unsupported;
+        assert!(
+            matches!(provider.observed_clone(Arc::new(|_| panic!("unexpected receipt"))), Err(ApiError::Provider(message)) if message.contains("unsupported"))
+        );
+    }
 }

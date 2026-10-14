@@ -1,13 +1,20 @@
 //! Account-bound, stateless Responses transport for `ChatGPT` plan usage.
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
+use crate::observation::AttemptObservation;
+pub use crate::observation::{
+    InferenceAttemptFailure as ResponsesAttemptFailure,
+    InferenceAttemptOutcome as ResponsesAttemptOutcome,
+    InferenceAttemptReceipt as ResponsesAttemptReceipt,
+    InferenceObservation as ResponsesObservation, InferenceObserver as ResponsesObserver,
+    InferenceReportedUsage as ResponsesReportedUsage,
+};
 use crate::provider::AccessTokenSource;
 use crate::replay::{ReplayEnvelope, ReplayRoute, ResponseContent, ResponsesOutputItem};
 use crate::sse::{SseParser, Utf8Stream};
@@ -15,137 +22,6 @@ use crate::{ApiError, Event, MessageRequest, Provider, RequestContent, StopReaso
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
-static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Trusted synchronous observation callback. It must not block or panic.
-/// Receipts contain no request, credential, account, model or response content.
-pub type ResponsesObserver = dyn Fn(ResponsesObservation) + Send + Sync;
-
-/// One local POST send and its eventual transport/protocol disposition.
-/// IDs and monotonic timestamps are meaningful only within this process.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum ResponsesObservation {
-    Started {
-        attempt_id: u64,
-        started_at: Instant,
-    },
-    Finished(ResponsesAttemptReceipt),
-}
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ResponsesAttemptReceipt {
-    pub attempt_id: u64,
-    pub started_at: Instant,
-    pub finished_at: Instant,
-    pub outcome: ResponsesAttemptOutcome,
-    /// Valid terminal counters, independent of replay/output acceptance.
-    /// Missing or malformed usage is unknown. On incomplete transport these
-    /// counters are only available reported evidence, not a complete total.
-    pub reported_usage: Option<ResponsesReportedUsage>,
-    /// Whether the successful HTTP response body reached clean EOF.
-    pub transport_complete: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ResponsesAttemptOutcome {
-    /// Clean transport and accepted protocol output; not task success.
-    Completed,
-    Failed(ResponsesAttemptFailure),
-    /// Includes consumer drop, timeout and cancellation, without inferring which.
-    Dropped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ResponsesAttemptFailure {
-    Send,
-    Http,
-    Stream,
-    Protocol,
-}
-
-/// Counters actually present in valid terminal usage. Absent detail stays unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ResponsesReportedUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cached_input_tokens: Option<u32>,
-    pub reasoning_output_tokens: Option<u32>,
-}
-
-struct AttemptObservation<'a> {
-    observer: Option<&'a Arc<ResponsesObserver>>,
-    receipt: Option<ResponsesAttemptReceipt>,
-}
-
-impl<'a> AttemptObservation<'a> {
-    fn start(observer: Option<&'a Arc<ResponsesObserver>>) -> Self {
-        let receipt = observer.map(|observer| {
-            let attempt_id = NEXT_ATTEMPT_ID
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .expect("Responses attempt IDs exhausted");
-            let started_at = Instant::now();
-            observer(ResponsesObservation::Started {
-                attempt_id,
-                started_at,
-            });
-            ResponsesAttemptReceipt {
-                attempt_id,
-                started_at,
-                finished_at: started_at,
-                outcome: ResponsesAttemptOutcome::Dropped,
-                reported_usage: None,
-                transport_complete: false,
-            }
-        });
-        Self { observer, receipt }
-    }
-
-    fn finish(&mut self, outcome: ResponsesAttemptOutcome) {
-        if let Some(mut receipt) = self.receipt.take() {
-            receipt.finished_at = Instant::now();
-            receipt.outcome = outcome;
-            if let Some(observer) = self.observer {
-                observer(ResponsesObservation::Finished(receipt));
-            }
-        }
-    }
-
-    fn check<T>(
-        &mut self,
-        result: Result<T, ApiError>,
-        failure: ResponsesAttemptFailure,
-    ) -> Result<T, ApiError> {
-        if result.is_err() {
-            self.finish(ResponsesAttemptOutcome::Failed(failure));
-        }
-        result
-    }
-
-    fn usage(&mut self, event: &Value) {
-        if let Some(receipt) = self.receipt.as_mut() {
-            if receipt.reported_usage.is_none() {
-                receipt.reported_usage = reported_usage(event.pointer("/response/usage"));
-            }
-        }
-    }
-
-    fn transport_complete(&mut self) {
-        if let Some(receipt) = self.receipt.as_mut() {
-            receipt.transport_complete = true;
-        }
-    }
-}
-
-impl Drop for AttemptObservation<'_> {
-    fn drop(&mut self) {
-        self.finish(ResponsesAttemptOutcome::Dropped);
-    }
-}
 
 #[derive(Clone)]
 pub struct ResponsesProvider {
@@ -258,6 +134,12 @@ impl Provider for ResponsesProvider {
     }
     fn boxed_clone(&self) -> Box<dyn Provider + Send + Sync + 'static> {
         Box::new(self.clone())
+    }
+    fn observed_clone(
+        &self,
+        observer: Arc<ResponsesObserver>,
+    ) -> Result<Box<dyn Provider>, ApiError> {
+        Ok(Box::new(self.clone().with_observer(observer)))
     }
     fn stream_message(
         &self,
@@ -548,7 +430,7 @@ impl ResponseState {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| protocol("Responses event lacks type"))?;
-        if self.completed.is_none() {
+        if self.completed.is_none() && attempt.enabled() {
             if let Some(status) = kind
                 .strip_prefix("response.")
                 .filter(|status| matches!(*status, "completed" | "failed" | "incomplete"))
@@ -558,7 +440,7 @@ impl ResponseState {
                     !id.is_empty() && self.response_id.as_deref().is_none_or(|known| known == id)
                 }) && event.pointer("/response/status").and_then(Value::as_str) == Some(status)
                 {
-                    attempt.usage(&event);
+                    attempt.usage(reported_usage(event.pointer("/response/usage")));
                 }
             }
         }

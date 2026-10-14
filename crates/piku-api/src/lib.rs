@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod custom;
 pub mod error;
 pub mod groq;
+pub mod observation;
 pub mod ollama;
 pub mod openai_compat;
 pub mod openrouter;
@@ -15,6 +16,10 @@ pub mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use error::ApiError;
+pub use observation::{
+    InferenceAttemptFailure, InferenceAttemptOutcome, InferenceAttemptReceipt,
+    InferenceObservation, InferenceObserver, InferenceReportedUsage,
+};
 pub use openai_compat::OpenAiCompatProvider;
 pub use provider::{AccessToken, AccessTokenSource, Provider};
 pub use replay::{ReplayEnvelope, ReplayRoute, ResponsesOutputItem};

@@ -27,6 +27,14 @@ pub struct Cli {
     )]
     pub provider: Option<String>,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Create a fresh private request metadata JSONL log for terminal, print, or resume launches"
+    )]
+    pub request_log: Option<std::path::PathBuf>,
+
     #[arg(long, help = "Run with file-inspection tools only, then exit")]
     pub read_only: bool,
 
@@ -49,6 +57,19 @@ pub struct Cli {
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub prompt: Vec<String>,
+}
+
+impl Cli {
+    /// Validate before subcommand dispatch, authentication, or provider resolution.
+    pub fn validate_request_log(&self) -> anyhow::Result<()> {
+        if self.request_log.is_some() && self.command.is_some() {
+            anyhow::bail!("--request-log supports terminal, --print, and --resume launches only; see piku --help");
+        }
+        if self.request_log.is_some() && self.self_update_root.is_some() {
+            anyhow::bail!("--request-log cannot combine with --self-update-root: restart explicitly with a fresh request-log path; see piku --help");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -171,6 +192,69 @@ pub enum AuthCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_log_is_explicit_and_terminal_only() {
+        let default = Cli::try_parse_from(["piku", "-p", "hello"]).unwrap();
+        assert!(default.request_log.is_none());
+        for args in [
+            vec!["piku", "--request-log", "new.jsonl", "-p", "hello"],
+            vec![
+                "piku",
+                "--resume",
+                "session-id",
+                "--request-log",
+                "new.jsonl",
+            ],
+            vec!["piku", "--request-log", "new.jsonl"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(
+                cli.request_log.as_deref(),
+                Some(std::path::Path::new("new.jsonl"))
+            );
+            cli.validate_request_log().unwrap();
+        }
+        let restart = Cli::try_parse_from([
+            "piku",
+            "--request-log",
+            "new.jsonl",
+            "--self-update-root",
+            "/build-root",
+        ])
+        .unwrap();
+        assert!(restart
+            .validate_request_log()
+            .unwrap_err()
+            .to_string()
+            .contains("fresh request-log path"));
+        for args in [
+            vec!["piku", "--request-log", "new.jsonl", "providers"],
+            vec!["piku", "web", "--request-log", "new.jsonl"],
+            vec![
+                "piku",
+                "auth",
+                "chatgpt",
+                "models",
+                "--request-log",
+                "new.jsonl",
+            ],
+            vec![
+                "piku",
+                "inspect",
+                "session-id",
+                "--request-log",
+                "new.jsonl",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli
+                .validate_request_log()
+                .unwrap_err()
+                .to_string()
+                .contains("piku --help"));
+        }
+    }
 
     #[test]
     fn subscription_auth_requires_explicit_provider_and_action() {
