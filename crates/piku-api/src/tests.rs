@@ -91,6 +91,29 @@ mod sse_parser {
         let ev2 = p.feed_line("").unwrap();
         assert!(ev2.event_type.is_none());
     }
+
+    #[test]
+    fn event_only_frame_resets_type_before_next_data_frame() {
+        // WHATWG 9.2.6 also requires non-browser dispatch to reset the type
+        // buffer before returning, even when the frame has no data.
+        let observed: Vec<_> = [false, true]
+            .into_iter()
+            .map(|finish| {
+                let mut parser = SseParser::new();
+                assert!(parser.feed_line("event: ping").is_none());
+                assert!(parser.feed_line("").is_none());
+                assert!(parser.feed_line("data: bare").is_none());
+                let event = if finish {
+                    parser.finish()
+                } else {
+                    parser.feed_line("")
+                }
+                .unwrap();
+                (event.event_type, event.data)
+            })
+            .collect();
+        assert_eq!(observed, vec![(None, "bare".to_owned()); 2]);
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +572,38 @@ mod anthropic_sse_parsing {
         assert_eq!(text, "Hello!");
         assert_eq!(stops, vec![StopReason::EndTurn]);
         assert_eq!((usage.input_tokens, usage.output_tokens), (25, 15));
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_event_only_frames_do_not_override_next_json_type() {
+        // JSON shapes and cumulative counters follow the official basic stream
+        // above; data-less ping frames probe the WHATWG blank-line reset.
+        let wire = concat!(
+            "event: ping\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            "event: ping\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello!\"}}\n\n",
+            "event: ping\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}\n\n",
+        );
+        let events = collect_anthropic_wire(&[wire]).await.remove(0);
+        assert_eq!(usage_samples(&events), vec![(25, 1, 0, 0), (0, 14, 0, 0)]);
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello!");
+        let stops: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::MessageStop { stop_reason } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec![StopReason::EndTurn]);
     }
 
     #[tokio::test]

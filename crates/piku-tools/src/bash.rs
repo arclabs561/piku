@@ -175,27 +175,42 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
         }
     };
     let process_group = child.id();
+    let mut output = CapturedOutput::default();
     let fut = async {
-        let output = capture_output(child).await?;
+        let status = capture_output(child, &mut output).await?;
         let stdout = bound_stream(&output.stdout, output.stdout_total, "stdout");
         let stderr = bound_stream(&output.stderr, output.stderr_total, "stderr");
         // Decoding is bounded by the retained prefixes. Yield before returning
         // so the deadline also covers this last synchronous work.
         tokio::task::yield_now().await;
-        Ok::<_, std::io::Error>((output.status, stdout, stderr))
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     };
 
     match timeout(timeout_duration, fut).await {
         Err(_) => {
             #[cfg(unix)]
             kill_process_group(process_group);
+            let mut message = format!(
+                "bash: command timed out after {}ms: {}",
+                p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+                p.command
+            );
+            // Only bytes already observed by the cancelled drain are retained;
+            // these counts are not complete process-output totals.
+            for (label, bytes, total) in [
+                ("stdout", &output.stdout, output.stdout_total),
+                ("stderr", &output.stderr, output.stderr_total),
+            ] {
+                if !bytes.is_empty() {
+                    let partial = bound_stream(bytes, total, label);
+                    let _ = write!(
+                        message,
+                        "\npartial {label} (observed {total} bytes):\n{partial}"
+                    );
+                }
+            }
             attach_verification(
-                ToolResult::error(format!(
-                    "bash: command timed out after {}ms: {}",
-                    p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-                    p.command
-                ))
-                .with_effect(ToolEffect::ShellCommand {
+                ToolResult::error(message).with_effect(ToolEffect::ShellCommand {
                     command: p.command.clone(),
                     exit_code: None,
                 }),
@@ -297,45 +312,46 @@ fn attach_verification(
     }
 }
 
+#[derive(Default)]
 struct CapturedOutput {
-    status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     stdout_total: usize,
     stderr_total: usize,
 }
 
-async fn capture_output(mut child: tokio::process::Child) -> std::io::Result<CapturedOutput> {
+async fn capture_output(
+    mut child: tokio::process::Child,
+    output: &mut CapturedOutput,
+) -> std::io::Result<std::process::ExitStatus> {
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let ((stdout, stdout_total), (stderr, stderr_total), status) =
-        tokio::try_join!(capture_stream(stdout), capture_stream(stderr), child.wait())?;
-    Ok(CapturedOutput {
-        status,
-        stdout,
-        stderr,
-        stdout_total,
-        stderr_total,
-    })
+    let ((), (), status) = tokio::try_join!(
+        capture_stream(stdout, &mut output.stdout, &mut output.stdout_total),
+        capture_stream(stderr, &mut output.stderr, &mut output.stderr_total),
+        child.wait(),
+    )?;
+    Ok(status)
 }
 
 async fn capture_stream(
     mut stream: impl tokio::io::AsyncRead + Unpin,
-) -> std::io::Result<(Vec<u8>, usize)> {
+    prefix: &mut Vec<u8>,
+    total: &mut usize,
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
 
     // One lookahead byte lets bound_stream preserve its UTF-8 cut behavior.
     // Continue draining excess: noisy commands retain their normal exit status.
     let limit = MAX_STREAM_BYTES + 1;
-    let mut prefix = Vec::with_capacity(limit);
-    let mut total = 0_usize;
+    prefix.reserve_exact(limit);
     let mut buffer = Box::new([0_u8; 8192]);
     loop {
         let count = stream.read(&mut buffer[..]).await?;
         if count == 0 {
-            return Ok((prefix, total));
+            return Ok(());
         }
-        total = total
+        *total = total
             .checked_add(count)
             .ok_or_else(|| std::io::Error::other("shell output byte count overflow"))?;
         let keep = count.min(limit - prefix.len());
@@ -353,8 +369,9 @@ mod capture_tests {
             .arg("-c")
             .arg("dd if=/dev/zero bs=65536 count=32 2>/dev/null; dd if=/dev/zero bs=65536 count=32 >&2 2>/dev/null")
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let output = capture_output(child).await.unwrap();
-        assert!(output.status.success());
+        let mut output = CapturedOutput::default();
+        let status = capture_output(child, &mut output).await.unwrap();
+        assert!(status.success());
         assert_eq!(output.stdout_total, 2 * 1024 * 1024);
         assert_eq!(output.stderr_total, 2 * 1024 * 1024);
         assert!(
@@ -399,6 +416,82 @@ mod capture_tests {
         .await;
         assert!(result.is_error && result.output.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_preserves_emitted_diagnostics_and_classification() {
+        // Encoded printf arguments prevent the echoed timeout command from
+        // masquerading as retained output. The late marker must never appear.
+        let prints = r"printf '\117\125\124\055\104\111\101\107'; printf '\105\122\122\055\104\111\101\107' >&2";
+        let positive =
+            execute(serde_json::json!({"command": prints, "purpose":"verification"})).await;
+        assert_eq!(positive.output, "OUT-DIAG\nstderr:\nERR-DIAG");
+        assert!(!positive.is_error);
+        assert_eq!(
+            positive.verification.unwrap().status,
+            VerificationStatus::Passed
+        );
+        let marker =
+            std::env::temp_dir().join(format!("piku-shell-diagnostics-{}", std::process::id()));
+        assert!(!marker.exists());
+        let command = format!(
+            r"{prints}; printf ready > '{}'; sleep 2; printf '\114\101\124\105'",
+            marker.display()
+        );
+        let start = std::time::Instant::now();
+        let result = execute(
+            serde_json::json!({"command":command,"timeout_ms":300,"purpose":"verification"}),
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ready");
+        std::fs::remove_file(&marker).unwrap();
+        assert!(result.is_error && result.output.contains("timed out after 300ms"));
+        assert!(result
+            .output
+            .contains("partial stdout (observed 8 bytes):\nOUT-DIAG"));
+        assert!(result
+            .output
+            .contains("partial stderr (observed 8 bytes):\nERR-DIAG"));
+        assert!(!result.output.contains("LATE"));
+        assert_eq!(
+            result.verification.unwrap().status,
+            VerificationStatus::Indeterminate {
+                reason: VerificationIndeterminate::TimedOut
+            }
+        );
+        assert!(
+            matches!(result.effects.as_slice(), [ToolEffect::ShellCommand { command: actual, exit_code: None }] if actual == &command)
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_noisy_partial_streams_remain_bounded() {
+        let marker =
+            std::env::temp_dir().join(format!("piku-shell-noisy-timeout-{}", std::process::id()));
+        assert!(!marker.exists());
+        let result = execute(serde_json::json!({
+            "command":format!("dd if=/dev/zero bs=65536 count=8 2>/dev/null; dd if=/dev/zero bs=65536 count=8 >&2 2>/dev/null; printf ready > '{}'; sleep 2", marker.display()),
+            "timeout_ms":300,"purpose":"verification",
+        })).await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ready");
+        std::fs::remove_file(&marker).unwrap();
+        assert!(result.is_error);
+        for stream in ["stdout", "stderr"] {
+            assert!(result
+                .output
+                .contains(&format!("partial {stream} (observed 524288 bytes):")));
+            assert!(result.output.contains(&format!(
+                "[{stream} truncated: 262144 of 524288 bytes shown]"
+            )));
+        }
+        assert!(result.output.len() < 2 * MAX_STREAM_BYTES + 1000);
+        assert_eq!(
+            result.verification.unwrap().status,
+            VerificationStatus::Indeterminate {
+                reason: VerificationIndeterminate::TimedOut
+            }
+        );
     }
 
     #[test]
