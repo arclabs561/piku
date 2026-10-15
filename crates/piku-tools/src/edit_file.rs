@@ -128,8 +128,17 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         };
     }
 
-    // require exactly one match
-    let count = content.matches(old_string_normalized.as_str()).count();
+    // Require exactly one start position, including overlapping occurrences.
+    // Only distinguish zero, one, and multiple; replace_all keeps its separate
+    // non-overlapping replacement/count semantics above.
+    let count = content.find(&old_string_normalized).map_or(0, |start| {
+        let first_char = old_string_normalized
+            .chars()
+            .next()
+            .expect("nonempty match");
+        let next = start + first_char.len_utf8();
+        1 + usize::from(content[next..].contains(&old_string_normalized))
+    });
     match count {
         0 => ToolResult::error(format!(
             "edit_file: old_string not found in {} — read {} with read_file first to get exact whitespace. Your old_string was: {:?}",
@@ -153,8 +162,8 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
                 Err(e) => ToolResult::error(format!("edit_file: write {}: {e}", p.path)),
             }
         }
-        n => ToolResult::error(format!(
-            "edit_file: ambiguous — old_string matched {n} times in {}. Use replace_all=true or provide more context.",
+        _ => ToolResult::error(format!(
+            "edit_file: ambiguous — old_string matched more than once in {}. Use replace_all=true or provide more context.",
             p.path
         )),
     }
