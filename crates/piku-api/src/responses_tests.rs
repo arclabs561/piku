@@ -567,50 +567,93 @@ async fn timing_out_stream_records_drop_and_cancels_pending_http_body() {
     assert_dropped_body_receipt(true).await;
 }
 
-async fn assert_dropped_body_receipt(timed_out: bool) {
+#[tokio::test]
+async fn request_deadline_on_held_body_is_failed_stream() {
+    let (url, server) = held_body_server(true).await;
+    let (mut provider, source) = provider(url);
+    // Only this owned test instance gets a short request deadline. Production
+    // connect/request defaults and the real send/parser/guard stay unchanged.
+    provider.client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let (provider, log) = observed(provider);
+    let mut stream = provider.stream_message(request());
+    assert!(
+        matches!(tokio::time::timeout(Duration::from_secs(2),stream.next()).await.unwrap(),Some(Ok(Event::TextDelta{text})) if text=="partial")
+    );
+    assert_eq!(log.lock().unwrap().len(), 1);
+    let result = tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>()).await;
+    // Even an omitted-client-timeout mutant must close/reap the actual peer
+    // before failing at the longer caller watchdog.
+    assert_eq!(server.await.unwrap(), 0);
+    let events = result.expect("HTTP-client deadline must precede the caller watchdog");
+    // Native transport errors are sanitized; typed reqwest timeout information
+    // is intentionally unavailable. No terminal projection is accepted before EOF.
+    assert!(
+        matches!(events.as_slice(), [Err(ApiError::Provider(message))] if message == "Responses stream interrupted")
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    let receipt = receipts(&log, 1).remove(0);
+    assert_eq!(
+        receipt.outcome,
+        ResponsesAttemptOutcome::Failed(ResponsesAttemptFailure::Stream)
+    );
+    assert!(!receipt.transport_complete);
+    assert_eq!(receipt.reported_usage, Some(expected_reported_usage()));
+}
+
+async fn held_body_server(with_completion: bool) -> (String, tokio::task::JoinHandle<usize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut bytes = [0u8; 4096];
-        let (end, length) = loop {
-            let n = socket.read(&mut bytes).await.unwrap();
-            assert_ne!(n, 0);
-            request.extend_from_slice(&bytes[..n]);
-            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                let header = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-                let length = header
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .unwrap()
-                    .trim()
-                    .parse::<usize>()
-                    .unwrap();
-                break (end + 4, length);
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 4096];
+            let (end, length) = loop {
+                let n = socket.read(&mut bytes).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&bytes[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < end + length {
+                let n = socket.read(&mut bytes).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&bytes[..n]);
             }
-        };
-        while request.len() < end + length {
-            let n = socket.read(&mut bytes).await.unwrap();
-            assert_ne!(n, 0);
-            request.extend_from_slice(&bytes[..n]);
-        }
-        socket
+            socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
-        let mut rows = vec![json!({"type":"response.output_text.delta","delta":"partial"})];
-        if timed_out {
-            rows.push(completion(json!([message("partial")])));
-        }
-        socket.write_all(frames(&rows).as_bytes()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), socket.read(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap()
+            let mut rows = vec![json!({"type":"response.output_text.delta","delta":"partial"})];
+            if with_completion {
+                rows.push(completion(json!([message("partial")])));
+            }
+            socket.write_all(frames(&rows).as_bytes()).await.unwrap();
+            socket.read(&mut bytes).await.unwrap()
+        })
+        .await
+        .expect("held-body peer must close within the fixture watchdog")
     });
+    (url, server)
+}
+
+async fn assert_dropped_body_receipt(timed_out: bool) {
+    let (url, server) = held_body_server(timed_out).await;
     let (provider, source) = provider(url);
     let (provider, log) = observed(provider);
     let mut stream = provider.stream_message(request());
@@ -619,6 +662,8 @@ async fn assert_dropped_body_receipt(timed_out: bool) {
     );
     assert_eq!(log.lock().unwrap().len(), 1);
     if timed_out {
+        // The production native client's 300s deadline is far longer than this
+        // controlled caller timeout, which drops the pending body collection.
         assert!(
             tokio::time::timeout(Duration::from_millis(50), stream.collect::<Vec<_>>())
                 .await

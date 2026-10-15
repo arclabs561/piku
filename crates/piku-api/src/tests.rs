@@ -650,6 +650,88 @@ mod anthropic_sse_parsing {
         assert!(usage_samples(&streams[1]).is_empty());
     }
 
+    #[tokio::test]
+    async fn anthropic_wire_final_usage_without_trailing_newline() {
+        assert_final_usage_flush("").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_final_usage_with_single_trailing_newline() {
+        assert_final_usage_flush("\n").await;
+    }
+
+    async fn assert_final_usage_flush(terminator: &str) {
+        use serde_json::json;
+
+        // Same cumulative/output-only schema as the official streaming example;
+        // terminate the final usage row at EOF instead of blank-line dispatch.
+        let mut wire = usage_wire(
+            &json!({"input_tokens":25,"output_tokens":1}),
+            &[json!({"output_tokens":7})],
+        );
+        let terminal = wire.rfind("event: message_delta").unwrap();
+        wire.truncate(terminal);
+        wire.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}");
+        wire.push_str(terminator);
+        let events = collect_anthropic_wire(&[&wire]).await.remove(0);
+        assert_eq!(
+            usage_samples(&events),
+            vec![(25, 1, 0, 0), (0, 6, 0, 0), (0, 8, 0, 0)]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::MessageStop {
+                        stop_reason: StopReason::EndTurn
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_wire_overlapping_streams_keep_independent_usage() {
+        use serde_json::json;
+
+        let first = usage_wire(
+            &json!({"input_tokens":25,"output_tokens":1}),
+            &[json!({"output_tokens":15})],
+        );
+        let second = usage_wire(
+            &json!({"input_tokens":71,"output_tokens":3}),
+            &[json!({"output_tokens":9})],
+        );
+        // Four-party barrier: both servers have sent initial usage, and both
+        // clients have consumed it, before either server may send its tail.
+        let streams = collect_anthropic_wire_mode(&[&first, &second], true).await;
+        assert_eq!(streams.len(), 2);
+        assert_eq!(
+            usage_samples(&streams[0]),
+            vec![(25, 1, 0, 0), (0, 14, 0, 0)]
+        );
+        assert_eq!(
+            usage_samples(&streams[1]),
+            vec![(71, 3, 0, 0), (0, 6, 0, 0)]
+        );
+        for events in streams {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        Event::MessageStop {
+                            stop_reason: StopReason::EndTurn
+                        }
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
     fn usage_samples(events: &[Event]) -> Vec<(u32, u32, u32, u32)> {
         events
             .iter()
@@ -686,19 +768,57 @@ mod anthropic_sse_parsing {
         })
     }
 
-    async fn collect_anthropic_wire(wires: &[&str]) -> Vec<Vec<Event>> {
-        use crate::{AnthropicProvider, MessageRequest, Provider};
+    async fn collect_anthropic_request(
+        selected: &crate::AnthropicProvider,
+        request: crate::MessageRequest,
+        barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    ) -> Vec<Event> {
+        use crate::Provider;
         use futures_util::StreamExt;
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut stream = selected.stream_message(request);
+            let mut events = Vec::new();
+            if let Some(barrier) = barrier {
+                let first = stream.next().await.unwrap().unwrap();
+                assert!(matches!(first, Event::UsageDelta { .. }));
+                events.push(first);
+                barrier.wait().await;
+            }
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            events
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn collect_anthropic_wire(wires: &[&str]) -> Vec<Vec<Event>> {
+        collect_anthropic_wire_mode(wires, false).await
+    }
+
+    async fn collect_anthropic_wire_mode(wires: &[&str], overlap: bool) -> Vec<Vec<Event>> {
+        use crate::{AnthropicProvider, MessageRequest};
+        use std::sync::Arc;
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let responses: Vec<String> = wires.iter().map(|wire| (*wire).to_string()).collect();
+        let responses: Arc<Vec<String>> =
+            Arc::new(wires.iter().map(|wire| (*wire).to_string()).collect());
+        let barrier = overlap.then(|| Arc::new(tokio::sync::Barrier::new(wires.len() * 2)));
+        let server_barrier = barrier.clone();
         let server = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), async move {
-                for wire in responses {
+                let mut handlers = tokio::task::JoinSet::new();
+                for _ in 0..responses.len() {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let barrier = server_barrier.clone();
+                let responses = Arc::clone(&responses);
+                handlers.spawn(async move {
                 let mut bytes = Vec::new();
                 let mut buffer = [0u8; 1024];
                 let (header_end, length) = loop {
@@ -720,13 +840,24 @@ mod anthropic_sse_parsing {
                     assert_ne!(n, 0);
                     bytes.extend_from_slice(&buffer[..n]);
                 }
+                let request: serde_json::Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let index = request["model"].as_str().unwrap().strip_prefix("fixture-model-").unwrap().parse::<usize>().unwrap();
+                let wire = &responses[index];
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wire.len()).as_bytes()).await.unwrap();
-                for chunk in wire.as_bytes().chunks(7) {
+                let prefix = if let Some(barrier) = barrier {
+                    let end = wire.find("\n\n").unwrap() + 2;
+                    socket.write_all(&wire.as_bytes()[..end]).await.unwrap();
+                    barrier.wait().await;
+                    end
+                } else { 0 };
+                for chunk in wire.as_bytes()[prefix..].chunks(7) {
                     socket.write_all(chunk).await.unwrap();
                     tokio::task::yield_now().await;
                 }
                 socket.shutdown().await.unwrap();
+                });
                 }
+                while let Some(result) = handlers.join_next().await { result.unwrap(); }
             }).await.unwrap();
         });
         let provider = AnthropicProvider::with_base_url("synthetic-test-key".into(), base_url);
@@ -738,18 +869,27 @@ mod anthropic_sse_parsing {
             messages: vec![],
             tools: None,
         };
-        let mut collected = Vec::new();
         let cloned = provider.clone();
-        for (index, _) in wires.iter().enumerate() {
-            let selected = if index % 2 == 0 { &provider } else { &cloned };
-            let events = tokio::time::timeout(
-                Duration::from_secs(5),
-                selected.stream_message(request.clone()).collect::<Vec<_>>(),
-            )
-            .await
-            .unwrap();
-            collected.push(events.into_iter().map(Result::unwrap).collect());
-        }
+        let collect = |index: usize| {
+            let selected = if index.is_multiple_of(2) {
+                &provider
+            } else {
+                &cloned
+            };
+            let mut request = request.clone();
+            request.model = format!("fixture-model-{index}");
+            let barrier = barrier.clone();
+            collect_anthropic_request(selected, request, barrier)
+        };
+        let collected = if overlap {
+            futures_util::future::join_all((0..wires.len()).map(collect)).await
+        } else {
+            let mut streams = Vec::new();
+            for index in 0..wires.len() {
+                streams.push(collect(index).await);
+            }
+            streams
+        };
         server.await.unwrap();
         collected
     }
