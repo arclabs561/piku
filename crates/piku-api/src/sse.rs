@@ -80,6 +80,7 @@ impl SseParser {
         if line.is_empty() {
             // blank line = dispatch
             if self.data_buf.is_empty() {
+                self.event_type = None;
                 return None;
             }
             let data = std::mem::take(&mut self.data_buf);
