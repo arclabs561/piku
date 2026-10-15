@@ -178,6 +178,95 @@ mod edit_file {
     use super::tempdir;
     use crate::{edit_file, ContentChange, ToolEffect};
 
+    async fn assert_dispatcher_refuses_overlap(original: &str, old_string: &str) {
+        let dir = tempdir();
+        let path = dir.join("overlap.txt");
+        std::fs::write(&path, original).unwrap();
+        let result = crate::execute_tool(
+            "edit_file",
+            serde_json::json!({
+                "path": path,
+                "old_string": old_string,
+                "new_string": "replacement",
+            }),
+        )
+        .await
+        .unwrap();
+        // Read back before asserting the response: refusal must have no effect.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after, original.as_bytes(), "{}", result.output);
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("ambiguous"), "{}", result.output);
+        assert!(result.effects.is_empty(), "{:?}", result.effects);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_refuses_ascii_overlap_without_writing() {
+        assert_dispatcher_refuses_overlap("}\n}\n}\n", "}\n}").await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_refuses_unicode_overlap_without_writing() {
+        assert_dispatcher_refuses_overlap("ééé", "éé").await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_refuses_crlf_overlap_without_writing() {
+        assert_dispatcher_refuses_overlap("}\r\n}\r\n}\r\n", "}\n}").await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preserves_unique_context_and_replace_all_semantics() {
+        let dir = tempdir();
+        for (name, original, old_string, replace_all, expected) in [
+            (
+                "unique.txt",
+                "prefix éé suffix",
+                "éé",
+                false,
+                "prefix X suffix",
+            ),
+            (
+                "context.txt",
+                "left aaa right",
+                "aaa right",
+                false,
+                "left X",
+            ),
+            ("all.txt", "aaa", "aa", true, "Xa"),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, original).unwrap();
+            let result = crate::execute_tool(
+                "edit_file",
+                serde_json::json!({
+                    "path": path,
+                    "old_string": old_string,
+                    "new_string": "X",
+                    "replace_all": replace_all,
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{name}: {}", result.output);
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes(), "{name}");
+            assert!(matches!(
+                result.effects.as_slice(),
+                [ToolEffect::FileWrite {
+                    content_change: ContentChange::Modified,
+                    ..
+                }]
+            ));
+            if replace_all {
+                assert!(
+                    result.output.contains("replaced 1 occurrences"),
+                    "{}",
+                    result.output
+                );
+            }
+        }
+    }
+
     #[test]
     fn replaces_exact_match() {
         let dir = tempdir();
