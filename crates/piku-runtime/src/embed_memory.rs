@@ -604,12 +604,10 @@ impl MemoryStore {
     /// Trace from an attempt back to the root. Returns entries from leaf to root.
     #[must_use]
     pub fn path_to_root(&self, id: u64) -> Vec<&MemoryEntry> {
-        let mut path = Vec::new();
+        let mut path: Vec<&MemoryEntry> = Vec::new();
         let mut current_id = Some(id);
-        // Guard against cycles (max 50 depth).
-        let mut depth = 0;
         while let Some(cid) = current_id {
-            if depth > 50 {
+            if path.iter().any(|entry| entry.id == cid) {
                 break;
             }
             if let Some(entry) = self.entries.iter().find(|e| e.id == cid) {
@@ -618,7 +616,6 @@ impl MemoryStore {
             } else {
                 break;
             }
-            depth += 1;
         }
         path
     }
@@ -668,17 +665,19 @@ impl MemoryStore {
         let mut trees = Vec::new();
 
         for (_, entry) in &scored {
-            let root_id = self
-                .path_to_root(entry.id)
+            let path = self.path_to_root(entry.id);
+            let Some(root) = path
                 .last()
-                .map_or(entry.id, |r| r.id);
+                .filter(|root| root.parent.is_none() && root.entry_type == EntryType::Attempt)
+            else {
+                continue;
+            };
+            let root_id = root.id;
             if seen_roots.contains(&root_id) {
                 continue;
             }
             seen_roots.push(root_id);
-            if let Some(root) = self.entries.iter().find(|e| e.id == root_id) {
-                trees.push(self.build_attempt_tree(root));
-            }
+            trees.push(self.build_attempt_tree(root));
             if trees.len() >= max_roots {
                 break;
             }
@@ -1279,15 +1278,19 @@ impl MemoryStore {
     /// successful descendant). Unresolved trees (all failures, still searching)
     /// should be retained longer.
     fn tree_is_resolved(&self, id: u64) -> bool {
-        // Check direct children for success
-        for child in &self.entries {
-            if child.parent == Some(id) && child.is_valid {
-                if child.outcome == Some(Outcome::Success) {
-                    return true;
-                }
-                // Recurse into child subtrees
-                if self.tree_is_resolved(child.id) {
-                    return true;
+        let mut pending = vec![id];
+        let mut visited = Vec::new();
+        while let Some(current) = pending.pop() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.push(current);
+            for child in &self.entries {
+                if child.parent == Some(current) && child.is_valid {
+                    if child.outcome == Some(Outcome::Success) {
+                        return true;
+                    }
+                    pending.push(child.id);
                 }
             }
         }
@@ -2339,6 +2342,100 @@ pub mod tests {
         let path = store.path_to_root(root);
         assert_eq!(path.len(), 1);
         assert_eq!(path[0].content, "root");
+    }
+
+    #[test]
+    fn attempt_recall_rejects_missing_and_fact_roots() {
+        let mut store = MemoryStore::default();
+        let fact = store.insert("fact".into(), vec![], vec![1.0], 6).unwrap();
+        store.record_attempt("goal".into(), "fact child".into(), Some(fact), vec![1.0], 6);
+        store.record_attempt(
+            "goal".into(),
+            "missing parent".into(),
+            Some(999),
+            vec![1.0],
+            6,
+        );
+        assert!(store.find_attempt_trees(&[1.0], "", 5).is_empty());
+    }
+
+    #[test]
+    fn attempt_recall_reaches_root_when_only_deep_leaf_scores() {
+        let mut store = MemoryStore::default();
+        let mut parent = None;
+        for index in 0..64 {
+            let id = store.record_attempt(
+                "ancestry".into(),
+                format!("node {index}"),
+                parent,
+                vec![0.0, 1.0],
+                3,
+            );
+            parent = Some(id);
+        }
+        for entry in &mut store.entries {
+            entry.created_at = 0;
+            entry.last_accessed = 0;
+            assert!(composite_score(0.0, entry, now_unix()) < MIN_SIMILARITY);
+        }
+        let leaf = store.record_attempt(
+            "leaf".into(),
+            "matching leaf".into(),
+            parent,
+            vec![1.0, 0.0],
+            6,
+        );
+        let path = store.path_to_root(leaf);
+        assert_eq!(path.len(), 65);
+        assert_eq!(
+            path.iter().map(|e| e.id).collect::<Vec<_>>(),
+            (0..=leaf).rev().collect::<Vec<_>>()
+        );
+        let trees = store.find_attempt_trees(&[1.0, 0.0], "", 1);
+        assert_eq!(trees.len(), 1);
+        let mut node = &trees[0];
+        for id in 0..leaf {
+            assert_eq!(node.id, id);
+            assert_eq!(node.children.len(), 1);
+            node = &node.children[0];
+        }
+        assert_eq!(node.id, leaf);
+        assert!(node.children.is_empty());
+    }
+
+    #[test]
+    fn attempt_resolution_requires_a_valid_successful_descendant() {
+        let mut store = MemoryStore::default();
+        let root = store.record_attempt("goal".into(), "root".into(), None, vec![1.0], 3);
+        store.record_outcome(root, Outcome::Success, None);
+        assert!(
+            !store.tree_is_resolved(root),
+            "root's own Success does not resolve it"
+        );
+        let failed = store.record_attempt("goal".into(), "failed".into(), Some(root), vec![1.0], 3);
+        store.record_outcome(failed, Outcome::Failure, None);
+        let success =
+            store.record_attempt("goal".into(), "success".into(), Some(failed), vec![1.0], 3);
+        store.record_outcome(success, Outcome::Success, None);
+        assert!(store.tree_is_resolved(root));
+        store
+            .entries
+            .iter_mut()
+            .find(|e| e.id == success)
+            .unwrap()
+            .is_valid = false;
+        assert!(
+            !store.tree_is_resolved(root),
+            "invalid success must not count"
+        );
+        // The existing resolution predicate includes valid children of any type.
+        let fact = store
+            .insert("fact descendant".into(), vec![], vec![1.0], 3)
+            .unwrap();
+        let entry = store.entries.iter_mut().find(|e| e.id == fact).unwrap();
+        entry.parent = Some(root);
+        entry.outcome = Some(Outcome::Success);
+        assert!(store.tree_is_resolved(root));
     }
 
     #[test]

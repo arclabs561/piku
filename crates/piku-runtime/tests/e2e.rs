@@ -3237,3 +3237,182 @@ async fn memory_interleaving_in_isolated_process() {
     assert_eq!(stored.next_id, 3);
     server.abort();
 }
+
+// Cyclic retained stores used to overflow the stack during recall/eviction.
+// Keep those fixtures in directly owned processes, including on a regression.
+#[cfg(unix)]
+mod attempt_graph_regressions {
+    use piku_runtime::{MemoryStore, Outcome};
+
+    fn run_isolated(case: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "ulimit -c 0; exec \"$@\"", "piku-attempt-fixture"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "attempt_graph_regressions::isolated_fixture",
+                "--nocapture",
+            ])
+            .env("PIKU_ATTEMPT_GRAPH_FIXTURE", case)
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "{case} child failed: {status}");
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{case} child wait failed: {error}");
+                }
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(5) {
+                let killed = child.kill();
+                let reaped = child.wait();
+                panic!("{case} exceeded 5s: kill={killed:?}, wait={reaped:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cyclic_recall_after_reopen() {
+        run_isolated("cycle-recall");
+    }
+
+    #[test]
+    fn self_cyclic_recall_after_reopen() {
+        run_isolated("self-recall");
+    }
+
+    #[test]
+    fn cyclic_leaf_weak_eviction_after_reopen() {
+        run_isolated("weak");
+    }
+
+    #[test]
+    fn cyclic_leaf_stale_eviction_after_reopen() {
+        run_isolated("stale");
+    }
+
+    fn reopen_unchanged(store: &MemoryStore, check: impl FnOnce(&mut MemoryStore)) {
+        let path = std::env::current_dir().unwrap().join("memories.json");
+        store.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut reopened = MemoryStore::try_load(&path).unwrap();
+        assert_eq!(reopened.next_id, store.next_id);
+        assert_eq!(
+            serde_json::to_value(&reopened).unwrap(),
+            serde_json::to_value(store).unwrap()
+        );
+        eprintln!(
+            "reopened {} attempt fixture entries",
+            reopened.entries.len()
+        );
+        check(&mut reopened);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            serde_json::to_value(&reopened).unwrap(),
+            serde_json::to_value(store).unwrap(),
+            "unresolved fixture must remain unchanged in memory too"
+        );
+    }
+
+    #[test]
+    fn isolated_fixture() {
+        let Ok(case) = std::env::var("PIKU_ATTEMPT_GRAPH_FIXTURE") else {
+            return;
+        };
+        let mut store = MemoryStore::default();
+        let self_cycle = case == "self-recall";
+        let first = store.record_attempt(
+            "fixture".into(),
+            "cycle A".into(),
+            Some(u64::from(!self_cycle)),
+            vec![1.0, 0.0],
+            10,
+        );
+        if !self_cycle {
+            store.record_attempt(
+                "fixture".into(),
+                "cycle B".into(),
+                Some(first),
+                vec![1.0, 0.0],
+                10,
+            );
+        }
+        if case.ends_with("recall") {
+            reopen_unchanged(&store, |reopened| {
+                assert!(reopened.find_attempt_trees(&[1.0, 0.0], "", 1).is_empty());
+                let path = reopened.path_to_root(first);
+                assert_eq!(path.len(), if self_cycle { 1 } else { 2 });
+                assert_eq!(path[0].id, first);
+            });
+            let root = store.record_attempt(
+                "valid goal".into(),
+                "valid root".into(),
+                None,
+                vec![0.8, 0.6],
+                3,
+            );
+            let child = store.record_attempt(
+                "valid goal".into(),
+                "valid child".into(),
+                Some(root),
+                vec![0.8, 0.6],
+                3,
+            );
+            store.record_outcome(child, Outcome::Success, None);
+            reopen_unchanged(&store, |reopened| {
+                let trees = reopened.find_attempt_trees(&[1.0, 0.0], "", 1);
+                assert_eq!(
+                    trees.len(),
+                    1,
+                    "skipping rootless hits must not consume limit"
+                );
+                assert_eq!(trees[0].id, root);
+                assert_eq!(trees[0].children.len(), 1);
+                assert_eq!(trees[0].children[0].id, child);
+                assert!(trees[0].children[0].children.is_empty());
+                assert_eq!(trees[0].children[0].outcome, Some(Outcome::Success));
+                assert!(trees[0].format(0).contains("[OK] valid child"));
+            });
+        } else {
+            assert!(matches!(case.as_str(), "weak" | "stale"));
+            let leaf = store.record_attempt(
+                "fixture".into(),
+                "unresolved leaf".into(),
+                Some(first),
+                vec![1.0, 0.0],
+                3,
+            );
+            for entry in &mut store.entries {
+                entry.importance = 3;
+                entry.created_at = 0;
+                entry.last_accessed = 0;
+            }
+            reopen_unchanged(&store, |reopened| {
+                let evicted = if case == "weak" {
+                    reopened.evict_weak(1.0)
+                } else {
+                    reopened.evict_stale(30)
+                };
+                assert_eq!(evicted, 0);
+                assert!(
+                    reopened
+                        .entries
+                        .iter()
+                        .find(|e| e.id == leaf)
+                        .unwrap()
+                        .is_valid
+                );
+            });
+        }
+    }
+}
