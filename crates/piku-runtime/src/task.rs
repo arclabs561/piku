@@ -433,16 +433,19 @@ struct SubagentPersistence {
     parent_run_path: Option<std::path::PathBuf>,
 }
 
+enum NotificationDestination {
+    Channel(mpsc::Sender<String>),
+    Session(String),
+}
+
 struct RegistryInner {
     tasks: HashMap<AgentTaskId, TaskEntry>,
     persistence: Option<SubagentPersistence>,
     /// Completions channel — callers waiting on join receive via oneshot.
     waiters: HashMap<AgentTaskId, Vec<oneshot::Sender<TaskEntry>>>,
-    /// If set, background task completions inject a notification message
-    /// into the parent agent's interjection channel.
-    notification_tx: Option<mpsc::Sender<String>>,
-    /// Bounded previews that have not entered the local channel. Successful
-    /// enqueue removes them; this is not provider or operator acknowledgement.
+    /// One completion destination; descendants continue bubbling to this root.
+    notification_destination: Option<NotificationDestination>,
+    /// Bounded previews awaiting legacy enqueue or configured session admission.
     pending_notifications: VecDeque<String>,
 }
 
@@ -460,7 +463,7 @@ impl TaskRegistry {
                 tasks: HashMap::new(),
                 persistence: None,
                 waiters: HashMap::new(),
-                notification_tx: None,
+                notification_destination: None,
                 pending_notifications: VecDeque::new(),
             })),
         }
@@ -579,12 +582,44 @@ impl TaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Register an interjection channel so background task completions
-    /// auto-inject a notification into the parent's agent loop.
+    /// Register a best-effort String channel for completion previews.
+    /// Successful enqueue removes a preview even if the receiver is later lost.
+    /// Replaces session admission; only still-pending previews change destination.
     pub fn set_notification_channel(&self, tx: mpsc::Sender<String>) {
         let mut inner = self.inner();
-        inner.notification_tx = Some(tx);
+        inner.notification_destination = Some(NotificationDestination::Channel(tx));
         Self::flush_notifications(&mut inner);
+    }
+
+    /// Retain future completion previews until this root session admits them.
+    /// Child loops sharing the registry cannot consume the root's previews.
+    /// Replaces channel delivery; already-enqueued legacy previews cannot be
+    /// recovered. Still-pending previews transfer to the new destination.
+    /// Admission is in memory, not durable save, provider receipt or human review.
+    pub fn bind_notification_session(&self, session_id: impl Into<String>) {
+        self.inner().notification_destination =
+            Some(NotificationDestination::Session(session_id.into()));
+    }
+
+    /// Append before removing, with no await or callbacks across that boundary.
+    /// Returned previews may be displayed after releasing the registry mutex.
+    pub(crate) fn admit_notifications(&self, session: &mut crate::session::Session) -> Vec<String> {
+        let mut inner = self.inner();
+        if !matches!(&inner.notification_destination,
+            Some(NotificationDestination::Session(id)) if id == &session.id)
+        {
+            return Vec::new();
+        }
+        let mut admitted = Vec::with_capacity(inner.pending_notifications.len());
+        while let Some(preview) = inner.pending_notifications.front() {
+            let preview = preview.clone();
+            session.push(crate::session::ConversationMessage::user(format!(
+                "<interjection>\n{preview}\n</interjection>"
+            )));
+            inner.pending_notifications.pop_front();
+            admitted.push(preview);
+        }
+        admitted
     }
 
     /// Retry previews that could not enter the channel, without replaying any
@@ -594,7 +629,7 @@ impl TaskRegistry {
     }
 
     fn flush_notifications(inner: &mut RegistryInner) {
-        let Some(tx) = &inner.notification_tx else {
+        let Some(NotificationDestination::Channel(tx)) = &inner.notification_destination else {
             return;
         };
         while let Some(preview) = inner.pending_notifications.pop_front() {
@@ -702,7 +737,7 @@ impl TaskRegistry {
             None
         };
         Self::notify_waiters(&mut inner, id);
-        if let Some(msg) = notification.filter(|_| inner.notification_tx.is_some()) {
+        if let Some(msg) = notification.filter(|_| inner.notification_destination.is_some()) {
             inner
                 .pending_notifications
                 .push_back(notification_preview(id, &msg));
@@ -729,7 +764,7 @@ impl TaskRegistry {
             None
         };
         Self::notify_waiters(&mut inner, id);
-        if let Some(msg) = notification.filter(|_| inner.notification_tx.is_some()) {
+        if let Some(msg) = notification.filter(|_| inner.notification_destination.is_some()) {
             inner
                 .pending_notifications
                 .push_back(notification_preview(id, &msg));
@@ -798,6 +833,59 @@ impl TaskRegistry {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn session_admission_preserves_terminal_occurrences_and_rejects_other_sessions() {
+        let registry = TaskRegistry::new();
+        registry.bind_notification_session("root");
+        let id = registry.register("child".into(), "check".into(), 1, None);
+        registry.complete(&id, "first", 1);
+        registry.complete(&id, "second", 2);
+        registry.fail(&id, "correction");
+        let mut other = crate::session::Session::new("other".into());
+        assert!(registry.admit_notifications(&mut other).is_empty());
+        assert!(other.messages.is_empty());
+        assert_eq!(registry.inner().pending_notifications.len(), 3);
+
+        let mut parent = crate::session::Session::new("root".into());
+        let previews = registry.admit_notifications(&mut parent);
+        assert_eq!(previews.len(), 3);
+        assert!(previews[0].contains("first"));
+        assert!(previews[1].contains("second"));
+        assert!(previews[2].contains("correction"));
+        assert_eq!(parent.messages.len(), 3);
+        registry.bind_notification_session("root");
+        assert!(registry.admit_notifications(&mut parent).is_empty());
+        assert_eq!(parent.messages.len(), 3);
+        assert!(registry.inner().pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn session_binding_transfers_pending_but_not_already_enqueued_legacy_previews() {
+        let registry = TaskRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.set_notification_channel(tx);
+        let delivered = registry.register("delivered".into(), "check".into(), 1, None);
+        registry.complete(&delivered, "legacy", 1);
+        let pending = registry.register("pending".into(), "check".into(), 1, None);
+        registry.complete(&pending, "retained", 1);
+        registry.bind_notification_session("root");
+        let mut parent = crate::session::Session::new("root".into());
+        let previews = registry.admit_notifications(&mut parent);
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].contains(&pending.to_string()));
+        assert!(!previews[0].contains(&delivered.to_string()));
+        assert!(rx.try_recv().unwrap().contains(&delivered.to_string()));
+        assert!(rx.is_empty());
+
+        let later = registry.register("later".into(), "check".into(), 1, None);
+        registry.complete(&later, "channel again", 1);
+        let (tx, mut replacement) = mpsc::channel(1);
+        registry.set_notification_channel(tx);
+        assert!(replacement.try_recv().unwrap().contains(&later.to_string()));
+        assert!(registry.admit_notifications(&mut parent).is_empty());
+        assert!(replacement.is_empty());
+    }
 
     #[test]
     fn closed_notification_channel_retries_only_unsent_previews_on_replacement() {

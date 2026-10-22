@@ -51,7 +51,7 @@ retain worktrees using actual Git state, bound hook IO and preserve allowed
 context, serialize cooperating memory writers, and distinguish capped children
 from final answers. These bounded repairs do not complete the phase gates.
 
-Task-required checks, parent acceptance, acknowledged delivery, and a complete
+Task-required checks, parent acceptance, durable delivery recovery, and a complete
 execution-containment boundary remain open. Collaboration topologies and agentic
 learning require primary-source grounding and matched-cost, held-out evaluation.
 
@@ -61,7 +61,7 @@ learning require primary-source grounding and matched-cost, held-out evaluation.
 | Deterministic evaluation is a real strength. | Scripted-provider integration tests, isolated PTY smoke tests, trace-backed dogfood, and one canonical `just check` path exist. | Use these boundaries as gates for authority, lifecycle, and attention changes. |
 | Capability behavior differs by surface. | Writable launch uses configured denials through `ConfiguredAllowAll`; TUI children inherit a policy snapshot. Prompting and registry wiring remain surface-specific. | Test each actual entrypoint before generalizing its authority or capabilities. |
 | Worktrees are not an enforcement boundary. | Cleanup inspects tracked, untracked, ignored, and child-commit state. This preserves work but does not contain arbitrary shell effects. | Keep work preservation and execution containment as separate guarantees. |
-| Child notification is partial, not absent. | The production TUI drains bounded previews before model requests; full results remain in the task registry. Delivery is still unacknowledged. | Finish lifecycle acceptance and acknowledgement using the existing registry. |
+| Child notification is partial, not absent. | The TUI binds the root session before children run. The registry retains bounded previews until that session appends them at either intake boundary; full results stay queryable. Legacy String channels remain enqueue-only. | In-memory admission is separate from durable save, provider receipt, restart reconstruction and human acceptance. Finish those lifecycle gates using the existing registry. |
 | Evidence precedence is narrower than the prose implied. | Scenario predicates do not cover every goal clause, and verifier infrastructure failures share the product-failure path. | Add pass, fail, and inconclusive states before relying on acceptance outcomes as roadmap authority. |
 | Tool discovery is not lazy. | `tool_search` searches metadata for schemas already included in the request. | Measure and implement actual schema disclosure only after tool-result semantics are dependable. |
 | Memory is implemented but weakly attributable. | Automatically extracted semantic entries lack source session, model, evidence, and authorization provenance. | Audit present memory before adding mutable skills or more automatic recall. |

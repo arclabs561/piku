@@ -38,10 +38,8 @@ fn terminal_turn_id() -> io::Result<String> {
     Ok(format!("turn-{:032x}", u128::from_ne_bytes(bytes)))
 }
 
-fn task_notifications(registry: &TaskRegistry) -> piku_runtime::agent_loop::InterjectionRx {
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
-    registry.set_notification_channel(tx);
-    rx
+fn task_notifications(registry: &TaskRegistry, session_id: &str) {
+    registry.bind_notification_session(session_id);
 }
 
 // ── Permission prompter ───────────────────────────────────────────────────────
@@ -1456,7 +1454,7 @@ async fn run_tui_repl_core(
         config.agent_links_dir(),
         Some(run_path.clone()),
     );
-    let mut task_notification_rx = task_notifications(&task_registry);
+    task_notifications(&task_registry, &session_id);
     let session_path = sessions_dir.join(format!("{session_id}.json"));
     // Announce the session at the start, not only on the way out. It is
     // rewritten after every turn, so a name known up front can be tailed live
@@ -2519,7 +2517,7 @@ async fn run_tui_repl_core(
                         &prompter,
                         recording_sink,
                         config.max_turns,
-                        Some(&mut task_notification_rx),
+                        None,
                         &task_registry,
                         0,
                         &custom_agents,
@@ -3405,7 +3403,7 @@ mod tests {
             }
         }
         let registry = TaskRegistry::new();
-        let mut rx = task_notifications(&registry);
+        task_notifications(&registry, "notification-parent");
         let id = registry.register("child".into(), "check".into(), 1, None);
         let output = "✓".repeat(4096);
         registry.complete(&id, &output, 1);
@@ -3420,7 +3418,7 @@ mod tests {
             &piku_runtime::AllowAll,
             &mut piku_runtime::task::DevNullSink,
             Some(1),
-            Some(&mut rx),
+            None,
             &registry,
             0,
             &[],
@@ -3439,7 +3437,8 @@ mod tests {
     #[test]
     fn task_notification_overflow_preserves_queryable_results() {
         let registry = TaskRegistry::new();
-        let rx = task_notifications(&registry);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        registry.set_notification_channel(tx);
         let mut ids = Vec::new();
         for _ in 0..33 {
             let id = registry.register("child".into(), "check".into(), 1, None);
