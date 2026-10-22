@@ -11,6 +11,106 @@ mod registry {
     }
 }
 
+#[cfg(unix)]
+mod memory_sections {
+    fn run_isolated(case: &str) {
+        let dir = super::tempdir();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::memory_sections::write_in_isolated_process",
+                "--nocapture",
+            ])
+            .current_dir(&dir)
+            .env("PIKU_MEMORY_SECTION_FIXTURE", case)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "{case} memory child failed: {status}");
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{case} memory child wait failed: {error}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let killed = child.kill();
+                let reaped = child.wait();
+                panic!("{case} memory child exceeded 5s: kill={killed:?}, wait={reaped:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn nested_alias_only_appends_a_new_level_two_section() {
+        run_isolated("nested-only");
+    }
+
+    #[test]
+    fn nested_alias_before_real_heading_preserves_unrelated_content() {
+        run_isolated("nested-before-real");
+    }
+
+    #[test]
+    fn ordinary_heading_and_plain_append_remain_compatible() {
+        run_isolated("controls");
+    }
+
+    #[tokio::test]
+    async fn write_in_isolated_process() {
+        let Ok(case) = std::env::var("PIKU_MEMORY_SECTION_FIXTURE") else {
+            return;
+        };
+        let fixtures: &[(&str, &str, &str)] = match case.as_str() {
+            "nested-only" => &[(
+                "## Build\nuse just\n### Notes\nkeep me\n## Other\nstay\n",
+                "## Notes\nnew note",
+                "## Build\nuse just\n### Notes\nkeep me\n## Other\nstay\n\n## Notes\nnew note",
+            )],
+            "nested-before-real" => &[(
+                "## Build\nuse just\n### Notes\nkeep me\n## Notes\nold note\n## Other\nstay\n",
+                "## Notes\nnew note",
+                "## Build\nuse just\n### Notes\nkeep me\n## Notes\nnew note\n## Other\nstay\n",
+            )],
+            "controls" => &[
+                (
+                    "## Notes\nold note\n## Other\nstay\n",
+                    "## Notes\nnew note",
+                    "## Notes\nnew note\n## Other\nstay\n",
+                ),
+                (
+                    "## Notes\nold note\n",
+                    "plain note",
+                    "## Notes\nold note\n\nplain note",
+                ),
+            ],
+            _ => panic!("unknown memory fixture: {case}"),
+        };
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(".piku/memory/MEMORY.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (before, entry, expected) in fixtures {
+            std::fs::write(&path, before).unwrap();
+            let result = crate::execute_tool(
+                "write_memory",
+                serde_json::json!({ "scope": "project", "entry": entry }),
+            )
+            .await
+            .expect("write_memory must be registered");
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes(), "{case}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod read_file {
     use super::tempdir;

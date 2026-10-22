@@ -147,7 +147,10 @@ pub fn execute_write_memory(params: serde_json::Value) -> ToolResult {
 fn replace_section(existing: &str, heading: &str, entry: &str) -> String {
     let mut search = heading.to_string();
     search.push('\n');
-    if let Some(start) = existing.find(&search) {
+    if let Some((start, _)) = existing
+        .match_indices(&search)
+        .find(|(start, _)| *start == 0 || existing.as_bytes()[*start - 1] == b'\n')
+    {
         let after = &existing[start + search.len()..];
         let end = after
             .find("\n## ")

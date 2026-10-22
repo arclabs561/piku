@@ -161,7 +161,10 @@ fn replace_or_append_section(existing: &str, heading: &str, entry: &str) -> Stri
         s.push('\n');
         s
     };
-    if let Some(start) = existing.find(&search) {
+    if let Some((start, _)) = existing
+        .match_indices(&search)
+        .find(|(start, _)| *start == 0 || existing.as_bytes()[*start - 1] == b'\n')
+    {
         // Find the next `## ` heading after start, or end of file
         let after = &existing[start + search.len()..];
         let end = after
@@ -322,6 +325,60 @@ mod tests {
         let content = read_memory(MemoryScope::Project, cwd).unwrap();
         assert!(content.contains("new content"));
         assert!(!content.contains("old content"));
+    }
+
+    #[test]
+    fn nested_alias_only_appends_for_project_and_agent_memory() {
+        let before = "## Build\nuse just\n### Notes\nkeep me\n## Other\nstay\n";
+        let expected =
+            "## Build\nuse just\n### Notes\nkeep me\n## Other\nstay\n\n## Notes\nnew note";
+        for agent in [false, true] {
+            let dir = tempdir();
+            let path = if agent {
+                agent_memory_dir(dir.path(), "reviewer").join(MEMORY_FILE)
+            } else {
+                MemoryScope::Project.memory_file(dir.path())
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, before).unwrap();
+            if agent {
+                write_agent_memory(dir.path(), "reviewer", "## Notes\nnew note").unwrap();
+            } else {
+                write_memory(MemoryScope::Project, dir.path(), "## Notes\nnew note").unwrap();
+            }
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "agent={agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_alias_before_real_heading_preserves_project_and_agent_memory() {
+        let before = "## Build\nuse just\n### Notes\nkeep me\n## Notes\nold note\n## Other\nstay\n";
+        let expected =
+            "## Build\nuse just\n### Notes\nkeep me\n## Notes\nnew note\n## Other\nstay\n";
+        for agent in [true, false] {
+            let dir = tempdir();
+            let path = if agent {
+                agent_memory_dir(dir.path(), "reviewer").join(MEMORY_FILE)
+            } else {
+                MemoryScope::Project.memory_file(dir.path())
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, before).unwrap();
+            if agent {
+                write_agent_memory(dir.path(), "reviewer", "## Notes\nnew note").unwrap();
+            } else {
+                write_memory(MemoryScope::Project, dir.path(), "## Notes\nnew note").unwrap();
+            }
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "agent={agent}"
+            );
+        }
     }
 
     #[test]
