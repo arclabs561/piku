@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::{Destructiveness, ToolResult};
+use crate::{ContentChange, Destructiveness, ToolEffect, ToolResult};
 
 // SYNC: Memory paths duplicated from piku-runtime::memory::MemoryScope::dir()
 // to avoid circular deps (piku-tools cannot depend on piku-runtime).
@@ -123,12 +123,17 @@ pub fn execute_write_memory(params: serde_json::Value) -> ToolResult {
         return ToolResult::error(format!("create_dir_all: {e}"));
     }
     let path = dir.join("MEMORY.md");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let previous = std::fs::read(&path);
+    let existing = previous
+        .as_deref()
+        .ok()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or_default();
 
     // Replace section if heading exists, otherwise append
     let heading = p.entry.lines().find(|l| l.starts_with("## "));
     let updated = if let Some(h) = heading {
-        replace_section(&existing, h, &p.entry)
+        replace_section(existing, h, &p.entry)
     } else if existing.trim().is_empty() {
         p.entry.clone()
     } else {
@@ -138,8 +143,20 @@ pub fn execute_write_memory(params: serde_json::Value) -> ToolResult {
         s
     };
 
+    let content_change = match previous {
+        Ok(previous) if previous == updated.as_bytes() => ContentChange::Unchanged,
+        Ok(_) => ContentChange::Modified,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ContentChange::Created,
+        Err(_) => ContentChange::Unknown,
+    };
+
     match std::fs::write(&path, updated) {
-        Ok(()) => ToolResult::ok(format!("memory written ({scope} scope)")),
+        Ok(()) => ToolResult::ok(format!("memory written ({scope} scope)")).with_effect(
+            ToolEffect::FileWrite {
+                path: path.canonicalize().unwrap_or(path),
+                content_change,
+            },
+        ),
         Err(e) => ToolResult::error(format!("write failed: {e}")),
     }
 }

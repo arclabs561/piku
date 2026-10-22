@@ -65,8 +65,8 @@ impl ToolResult {
 /// A side effect observed by the concrete tool implementation.
 ///
 /// This list is intentionally incomplete: arbitrary shell commands, partial
-/// failures, memory writes, and agent work may have effects Piku cannot yet
-/// describe structurally.
+/// failures, runtime-managed memory writes, and agent work may have effects Piku
+/// cannot yet describe structurally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolEffect {
     FileWrite {

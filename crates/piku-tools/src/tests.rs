@@ -22,6 +22,7 @@ mod memory_sections {
                 "--nocapture",
             ])
             .current_dir(&dir)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("PIKU_MEMORY_SECTION_FIXTURE", case)
             .spawn()
             .unwrap();
@@ -63,11 +64,106 @@ mod memory_sections {
         run_isolated("controls");
     }
 
+    #[test]
+    fn project_memory_reports_actual_file_changes() {
+        run_isolated("effects-project");
+    }
+
+    #[test]
+    fn local_memory_reports_actual_file_changes() {
+        run_isolated("effects-local");
+    }
+
+    #[test]
+    fn user_memory_reports_actual_file_changes_in_isolated_config() {
+        run_isolated("effects-user");
+    }
+
+    #[test]
+    fn failed_memory_write_reports_no_successful_effect() {
+        run_isolated("effects-failure");
+    }
+
+    async fn check_file_effects(scope: &str) {
+        use crate::{ContentChange, ToolEffect};
+
+        let cwd = std::env::current_dir().unwrap();
+        let path = match scope {
+            "local" => cwd.join(".piku/memory-local/MEMORY.md"),
+            "user" => cwd.join("config/piku/memory/MEMORY.md"),
+            _ => cwd.join(".piku/memory/MEMORY.md"),
+        };
+        // Pin existing merge/newline semantics while checking the effect's
+        // classification against independently read file bytes after dispatch.
+        for (entry, expected, change) in [
+            ("## Notes\nold", "## Notes\nold", ContentChange::Created),
+            ("## Notes\nnew", "## Notes\nnew\n", ContentChange::Modified),
+            ("## Notes\nnew", "## Notes\nnew\n", ContentChange::Unchanged),
+        ] {
+            let result = crate::execute_tool(
+                "write_memory",
+                serde_json::json!({ "scope": scope, "entry": entry }),
+            )
+            .await
+            .expect("write_memory must be registered");
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(result.output, format!("memory written ({scope} scope)"));
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+            assert_eq!(
+                result.effects,
+                vec![ToolEffect::FileWrite {
+                    path: path.canonicalize().unwrap(),
+                    content_change: change,
+                }]
+            );
+        }
+
+        // Invalid UTF-8 still has observable prewrite bytes. Preserve the
+        // existing text-read fallback, but report replacement as Modified.
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let result = crate::execute_tool(
+            "write_memory",
+            serde_json::json!({ "scope": scope, "entry": "plain note" }),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read(&path).unwrap(), b"plain note");
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::FileWrite {
+                path: path.canonicalize().unwrap(),
+                content_change: ContentChange::Modified,
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn write_in_isolated_process() {
         let Ok(case) = std::env::var("PIKU_MEMORY_SECTION_FIXTURE") else {
             return;
         };
+        if let Some(scope) = case.strip_prefix("effects-") {
+            if scope == "failure" {
+                let path = std::env::current_dir()
+                    .unwrap()
+                    .join(".piku/memory/MEMORY.md");
+                std::fs::create_dir_all(&path).unwrap();
+                let result = crate::execute_tool(
+                    "write_memory",
+                    serde_json::json!({ "scope": "project", "entry": "plain note" }),
+                )
+                .await
+                .unwrap();
+                assert!(result.is_error);
+                assert!(result.output.starts_with("write failed: "));
+                assert!(result.effects.is_empty());
+                assert!(path.is_dir());
+            } else {
+                check_file_effects(scope).await;
+            }
+            return;
+        }
         let fixtures: &[(&str, &str, &str)] = match case.as_str() {
             "nested-only" => &[(
                 "## Build\nuse just\n### Notes\nkeep me\n## Other\nstay\n",
