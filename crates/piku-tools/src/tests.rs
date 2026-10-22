@@ -615,6 +615,56 @@ mod grep_tool {
     use super::tempdir;
     use crate::grep;
 
+    #[tokio::test]
+    async fn dispatcher_errors_on_missing_search_root() {
+        let dir = tempdir();
+        let missing = dir.join("not-created");
+        assert!(!missing.exists());
+        let result = crate::execute_tool(
+            "grep",
+            serde_json::json!({ "pattern": "fixture_marker", "path": missing }),
+        )
+        .await
+        .expect("grep must be registered");
+        assert!(!missing.exists(), "grep must not create the missing root");
+        assert!(result.effects.is_empty(), "{:?}", result.effects);
+        assert!(result.is_error, "missing search root: {}", result.output);
+        assert!(
+            result.output.contains(missing.to_string_lossy().as_ref()),
+            "error must identify the requested root: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preserves_existing_file_no_hit_and_directory_hit() {
+        let dir = tempdir();
+        let file = dir.join("fixture.txt");
+        let original = b"fixture_marker\n";
+        std::fs::write(&file, original).unwrap();
+        let no_hit = crate::execute_tool(
+            "grep",
+            serde_json::json!({ "pattern": "definitely_absent_marker", "path": file }),
+        )
+        .await
+        .expect("grep must be registered");
+        assert!(!no_hit.is_error, "{}", no_hit.output);
+        assert_eq!(no_hit.output, "(no matches)");
+        assert!(no_hit.effects.is_empty(), "{:?}", no_hit.effects);
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+
+        let hit = crate::execute_tool(
+            "grep",
+            serde_json::json!({ "pattern": "fixture_marker", "path": dir }),
+        )
+        .await
+        .expect("grep must be registered");
+        assert!(!hit.is_error, "{}", hit.output);
+        assert_eq!(hit.output, format!("{}:1: fixture_marker", file.display()));
+        assert!(hit.effects.is_empty(), "{:?}", hit.effects);
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+    }
+
     #[test]
     fn finds_pattern_in_file() {
         let dir = tempdir();

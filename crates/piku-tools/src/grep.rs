@@ -57,9 +57,13 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     let mut total = 0usize;
 
     let root_path = std::path::Path::new(&root);
+    let root_metadata = match std::fs::metadata(root_path) {
+        Ok(metadata) => metadata,
+        Err(error) => return ToolResult::error(format!("grep: {root}: {error}")),
+    };
 
     // If root is a file, search just that file
-    if root_path.is_file() {
+    if root_metadata.is_file() {
         search_file(
             root_path,
             &re,
