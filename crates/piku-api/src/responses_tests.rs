@@ -115,7 +115,9 @@ async fn server_with_length_offset(
                 serde_json::from_slice(&bytes[end..end + length]).unwrap()
             });
             stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nx-request-id: {request_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()+length_offset).as_bytes()).await.unwrap();
-            let chunk_size = if response.len() > MAX_EVENT_BYTES / 2 {
+            // Keep small fixtures fragmented without making bulk-limit probes
+            // depend on tens of thousands of individual socket writes.
+            let chunk_size = if response.len() > 64 * 1024 {
                 16 * 1024
             } else {
                 7
