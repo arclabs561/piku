@@ -2471,14 +2471,14 @@ async fn run_tui_repl_core(
                         let _ = terminal::enable_raw_mode();
                     }
                     loop {
-                        // Poll with timeout so we don't block forever after the turn ends.
-                        // spawn_blocking (not block_in_place) because this task is
-                        // inside a LocalSet, where block_in_place panics.
-                        let poll_res = tokio::task::spawn_blocking(|| {
-                            cxevent::poll(std::time::Duration::from_millis(100))
-                        })
-                        .await;
-                        match poll_res.unwrap_or(Ok(false)) {
+                        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        // Crossterm requires poll/read on the same thread. Keep
+                        // them together without yielding: the permission prompter
+                        // can otherwise consume the ready key before this read,
+                        // blocking the LocalSet and the provider request.
+                        match cxevent::poll(std::time::Duration::ZERO) {
                             Ok(true) => {
                                 if let Ok(Event::Key(KeyEvent {
                                     code, modifiers, ..
@@ -2493,12 +2493,10 @@ async fn run_tui_repl_core(
                                         break;
                                     }
                                 }
+                                tokio::task::yield_now().await;
                             }
                             Ok(false) => {
-                                // Check if cancel was set externally (turn ended)
-                                if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break;
-                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                             Err(_) => break,
                         }

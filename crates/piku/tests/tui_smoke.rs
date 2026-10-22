@@ -968,6 +968,97 @@ mod restart_recovery;
 #[path = "support/request_correlation.rs"]
 mod request_correlation;
 
+/// A single denial key must let the turn acquire its next provider response.
+#[test]
+#[serial]
+#[ignore = "PTY regression: run isolated via scripts/ci.sh pty"]
+fn permission_denial_without_enter_continues_turn() {
+    use serde_json::{json, Value};
+
+    let fixture = smoke_tempdir();
+    let repo = fixture.path().join("repo");
+    let config = fixture.path().join("config");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    let original = "# Keep this README unchanged\n";
+    std::fs::write(repo.join("README.md"), original).unwrap();
+    let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"denied-readme","type":"function","function":{"name":"write_file","arguments":json!({"path":"README.md","content":"unauthorized replacement\n"}).to_string()}}]},"finish_reason":null}]});
+    let text =
+        |content: &str| json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
+    let (url, requests, server) = review_workflow::scripted_response_server(vec![
+        (tool, "tool_calls"),
+        (text("DENIAL_CONTINUED"), "stop"),
+        (text("[]"), "stop"),
+    ]);
+    let config_text = config.to_str().unwrap();
+    let environment = [
+        ("XDG_CONFIG_HOME", config_text),
+        ("HOME", config_text),
+        ("PIKU_NO_DOTENV", "1"),
+        ("PIKU_MODEL", "canned-model"),
+        ("PIKU_BASE_URL", url.as_str()),
+    ];
+    let mut pty = Pty::spawn_command_with_env(Command::new(piku_binary()), &repo, &environment);
+    assert!(pty.wait_for("❯", Duration::from_secs(5)));
+    pty.send(b"Replace README.md\r");
+    assert!(
+        pty.wait_for("y/n/a?", Duration::from_secs(10)),
+        "permission prompt missing: {}",
+        pty.captured()
+    );
+    pty.send(b"n");
+    let continued = pty.wait_for("DENIAL_CONTINUED", Duration::from_secs(5));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        original
+    );
+    assert!(
+        continued,
+        "denial stalled before next response ({} provider requests): {}",
+        requests.lock().unwrap().len(),
+        pty.captured()
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let captured_requests = requests.lock().unwrap();
+    let messages = captured_requests[1]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("denied"))
+    }));
+    drop(captured_requests);
+    pty.wait(Duration::from_millis(300));
+    pty.exit_cleanly();
+    assert!(pty.eof, "terminal did not exit after completed denial turn");
+    server.join().unwrap();
+    let record = std::fs::read_dir(config.join("piku/runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+    let events = piku_runtime::read_run_record(&record).unwrap();
+    assert!(piku_runtime::audit_run_record(&events).is_structurally_complete());
+    let recorded: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(recorded
+        .iter()
+        .any(|event| event["event"] == "tool_completed" && event["is_error"] == true));
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| event["event"] == "turn_completed")
+            .count(),
+        1
+    );
+}
+
 /// Compose ambiguity, a genuinely unfinished stream, and fresh-process repair
 /// through the real terminal. Scripted answers establish application plumbing.
 #[test]
