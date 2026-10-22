@@ -138,6 +138,271 @@ async fn provider_token_limit_is_incomplete() {
     assert!(events.iter().any(|e| matches!(&e.event, crate::run_record::RunEvent::TurnCompleted { stop_reason: Some(reason), .. } if reason == "max_tokens")));
 }
 
+struct CapturingCompletionProvider {
+    provider: ChildProvider,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<MessageRequest>>>,
+}
+
+impl CapturingCompletionProvider {
+    fn new() -> Self {
+        Self {
+            provider: ChildProvider {
+                tool: false,
+                stop: StopReason::EndTurn,
+                write_path: None,
+            },
+            requests: std::sync::Arc::default(),
+        }
+    }
+}
+
+impl Provider for CapturingCompletionProvider {
+    fn name(&self) -> &'static str {
+        "completion-admission-request-capture"
+    }
+
+    fn stream_message(
+        &self,
+        request: MessageRequest,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Event, piku_api::ApiError>> + Send + '_>,
+    > {
+        self.requests.lock().unwrap().push(request.clone());
+        self.provider.stream_message(request)
+    }
+}
+
+fn request_child_previews(request: &MessageRequest, id: &crate::task::AgentTaskId) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, RequestContent::Text { text } if text.starts_with("<interjection>") && text.contains(&id.to_string())))
+        .count()
+}
+
+async fn complete_admission_child(
+    registry: &TaskRegistry,
+    provider: CapturingCompletionProvider,
+) -> crate::task::AgentTaskId {
+    let id = registry.register("child".into(), "summarize evidence".into(), 1, None);
+    run_subagent_task(
+        id.clone(),
+        "summarize evidence".into(),
+        Box::new(provider),
+        "scripted".into(),
+        vec![],
+        vec![],
+        1,
+        registry.clone(),
+        1,
+        None,
+        None,
+        vec![],
+        None,
+        std::sync::Arc::new(crate::permission::AllowAll),
+        None,
+    )
+    .await;
+    assert_eq!(
+        registry.status(&id).unwrap().status,
+        crate::task::TaskStatus::Done
+    );
+    id
+}
+
+async fn request_with_admission(
+    session: &mut Session,
+    provider: &dyn Provider,
+    registry: &TaskRegistry,
+    interjections: Option<&mut InterjectionRx>,
+    max_turns: u32,
+) {
+    let result = run_turn_with_registry(
+        "review child completion",
+        session,
+        provider,
+        "scripted",
+        &[],
+        vec![],
+        &crate::permission::AllowAll,
+        &mut crate::task::DevNullSink,
+        Some(max_turns),
+        interjections,
+        registry,
+        0,
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert!(result.stream_error.is_none());
+}
+
+#[tokio::test]
+async fn child_completion_survives_unread_receiver_replacement_in_parent_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = Session::new("receiver-replacement-parent".into());
+    let registry = TaskRegistry::with_persistence(
+        &parent.id,
+        dir.path().join("sessions"),
+        dir.path().join("runs"),
+        dir.path().join("links"),
+    );
+    registry.bind_notification_session(&parent.id);
+    let (old_tx, old_rx) = tokio::sync::mpsc::channel::<String>(1);
+    old_tx.try_send("obsolete steering".into()).unwrap();
+    let id = complete_admission_child(&registry, CapturingCompletionProvider::new()).await;
+    drop(old_rx);
+    let (replacement_tx, mut replacement_rx) = tokio::sync::mpsc::channel::<String>(1);
+    replacement_tx
+        .try_send("replacement steering".into())
+        .unwrap();
+
+    let (joined, is_error) = execute_agent_join(
+        &serde_json::json!({"task_id": id.to_string(), "timeout_secs": 1}),
+        &registry,
+    )
+    .await;
+    assert!(!is_error);
+    assert_eq!(
+        registry.status(&id).unwrap().output.as_deref(),
+        Some("finished")
+    );
+    assert!(joined.contains("finished"), "{joined}");
+    let evidence = registry.evidence(&id).unwrap();
+    assert!(joined.contains(&evidence.session_path.display().to_string()));
+    assert!(joined.contains(&evidence.run_record_path.display().to_string()));
+
+    let other_provider = CapturingCompletionProvider::new();
+    let mut other = Session::new("unrelated-parent".into());
+    request_with_admission(&mut other, &other_provider, &registry, None, 1).await;
+    assert_eq!(
+        request_child_previews(&other_provider.requests.lock().unwrap()[0], &id),
+        0
+    );
+
+    // A second actual child starts while the first completion is pending.
+    // Sharing the registry must not let that child's loop admit the root notice.
+    let child_provider = CapturingCompletionProvider::new();
+    let child_requests = child_provider.requests.clone();
+    let second_id = complete_admission_child(&registry, child_provider).await;
+    assert_eq!(
+        request_child_previews(&child_requests.lock().unwrap()[0], &id),
+        0
+    );
+
+    let provider = CapturingCompletionProvider::new();
+    request_with_admission(&mut parent, &provider, &registry, None, 1).await;
+    assert_eq!(
+        replacement_rx.len(),
+        1,
+        "ordinary steering remains independently queued"
+    );
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(request_child_previews(&requests[0], &id), 1);
+        assert_eq!(request_child_previews(&requests[0], &second_id), 1);
+    }
+
+    registry.bind_notification_session(&parent.id);
+    request_with_admission(
+        &mut parent,
+        &provider,
+        &registry,
+        Some(&mut replacement_rx),
+        1,
+    )
+    .await;
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(request_child_previews(request, &id), 1);
+        assert_eq!(request_child_previews(request, &second_id), 1);
+    }
+    for child_id in [&id, &second_id] {
+        assert_eq!(parent.messages.iter().flat_map(|message| &message.blocks).filter(|block| matches!(block, ContentBlock::Text { text } if text.starts_with("<interjection>") && text.contains(&child_id.to_string()))).count(), 1);
+    }
+    assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, RequestContent::Text { text } if text == "<interjection>\nreplacement steering\n</interjection>")));
+    assert!(replacement_rx.is_empty());
+}
+
+#[tokio::test]
+async fn session_bound_child_notices_after_stream_force_next_request_and_keep_string_steering() {
+    struct CompletingParent {
+        capture: CapturingCompletionProvider,
+        registry: TaskRegistry,
+        ids: Vec<crate::task::AgentTaskId>,
+        completed: std::sync::atomic::AtomicBool,
+        steering: Option<InterjectionTx>,
+    }
+    impl Provider for CompletingParent {
+        fn name(&self) -> &'static str {
+            "post-stream-admission"
+        }
+        fn stream_message(
+            &self,
+            request: MessageRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<Event, piku_api::ApiError>> + Send + '_>,
+        > {
+            if !self
+                .completed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Actual child execution is covered above; these completions
+                // select the independent post-stream admission boundary.
+                for id in &self.ids {
+                    self.registry.complete(id, "finished", 1);
+                }
+                if let Some(steering) = &self.steering {
+                    steering.try_send("keep the reply brief".into()).unwrap();
+                }
+            }
+            self.capture.stream_message(request)
+        }
+    }
+
+    for with_steering in [false, true] {
+        let registry = TaskRegistry::new();
+        let mut parent = Session::new("post-stream-parent".into());
+        registry.bind_notification_session(&parent.id);
+        let ids: Vec<_> = (0..3)
+            .map(|_| registry.register("child".into(), "check".into(), 1, None))
+            .collect();
+        let (steering, mut rx) = if with_steering {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let provider = CompletingParent {
+            capture: CapturingCompletionProvider::new(),
+            registry: registry.clone(),
+            ids: ids.clone(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+            steering,
+        };
+        request_with_admission(&mut parent, &provider, &registry, rx.as_mut(), 2).await;
+        let requests = provider.capture.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "post-stream admission must force continuation after EndTurn; steering={with_steering}"
+        );
+        for id in &ids {
+            assert_eq!(request_child_previews(&requests[0], id), 0);
+            assert_eq!(request_child_previews(&requests[1], id), 1);
+        }
+        assert_eq!(requests[0].messages.iter().flat_map(|message| &message.content).filter(|block| matches!(block, RequestContent::Text { text } if text == "<interjection>\nkeep the reply brief\n</interjection>")).count(), 0);
+        assert_eq!(requests[1].messages.iter().flat_map(|message| &message.content).filter(|block| matches!(block, RequestContent::Text { text } if text == "<interjection>\nkeep the reply brief\n</interjection>")).count(), usize::from(with_steering));
+        if let Some(rx) = rx {
+            assert!(rx.is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn child_completion_overflow_reaches_parent_once_across_repeated_drains() {
     let registry = TaskRegistry::new();

@@ -41,6 +41,21 @@ mod tool_response_tests;
 pub type InterjectionRx = mpsc::Receiver<String>;
 pub type InterjectionTx = mpsc::Sender<String>;
 
+fn admit_task_notifications(
+    session: &mut Session,
+    registry: Option<&TaskRegistry>,
+    sink: &mut dyn OutputSink,
+) -> bool {
+    let Some(registry) = registry else {
+        return false;
+    };
+    let admitted = registry.admit_notifications(session);
+    for preview in &admitted {
+        sink.on_interjection(preview);
+    }
+    !admitted.is_empty()
+}
+
 /// Shared cancellation flag. Set to `true` to abort the current turn.
 pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
@@ -309,8 +324,10 @@ async fn run_turn_inner(
         }
         iterations += 1;
 
-        // Deliver completions queued while the parent was idle before building
-        // its next provider request. The channel is also drained after tools.
+        // Admit retained completions only to the configured root session, even
+        // without a String receiver. Child loops share the registry, not its inbox.
+        admit_task_notifications(session, task_registry, sink);
+        // Deliver ordinary steering and legacy channel notifications too.
         if let Some(rx) = interjections.as_deref_mut() {
             loop {
                 if let Some(registry) = task_registry {
@@ -1053,8 +1070,8 @@ async fn run_turn_inner(
         // Drain any queued interjections and inject them as user messages.
         // This lets the model see "steer me" signals without breaking the
         // tool-use alternation protocol.
+        let mut injected = admit_task_notifications(session, task_registry, sink);
         if let Some(rx) = interjections.as_deref_mut() {
-            let mut injected = false;
             loop {
                 if let Some(registry) = task_registry {
                     registry.retry_notifications();
@@ -1066,10 +1083,10 @@ async fn run_turn_inner(
                 )));
                 injected = true;
             }
-            if injected {
-                // Force another iteration so the model can respond to the interjection.
-                stop_reason = StopReason::ToolUse;
-            }
+        }
+        if injected {
+            // Force another iteration so the model can respond to the interjection.
+            stop_reason = StopReason::ToolUse;
         }
 
         // only loop if stop_reason was tool_use

@@ -198,9 +198,13 @@ Gate:
 
 ### 6. Complete background-agent lifecycle
 
-The TUI already injects completion through a bounded notification channel. Before
-adding more concurrent writers, make delivery reliable and bounded, then define
-acknowledgement, cancellation, inherited authority, file ownership,
+The TUI retains bounded completion previews in its registry until the configured
+root session admits them. This avoids loss through an unread channel receiver;
+the legacy String-channel API still acknowledges only enqueue. Pending storage
+scales with terminal events, without an aggregate hard cap. Admission is not
+durable save, provider receipt, restart recovery or human acceptance. Before
+adding more concurrent writers, define those remaining delivery guarantees,
+cancellation, inherited authority, file ownership,
 changed-worktree disposition, and parent verification. The launch-turn surface must
 either provide a task registry or stop advertising agent tools. `background:
 false` must block or cease claiming that it does. Semantic memory injected into
