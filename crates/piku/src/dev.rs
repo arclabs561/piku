@@ -151,6 +151,11 @@ fn state_dir() -> PathBuf {
 /// failures keep the previous child running and are recorded instead.
 pub fn run(release: bool, web: bool) -> anyhow::Result<()> {
     let root = workspace_root()?;
+    anyhow::ensure!(
+        root.join("crates/piku").is_dir(),
+        "piku dev needs a source checkout; {} does not contain crates/piku",
+        root.display()
+    );
     let watch_root = watch_root(&root);
     let binary = target_binary(&root, release);
     let state = state_dir();
@@ -184,6 +189,8 @@ pub fn run(release: bool, web: bool) -> anyhow::Result<()> {
     let mut active = binary.clone();
 
     let outcome = loop {
+        // A restart must not inherit the previous child's "reloading" label.
+        write_status(&state, "ready");
         let mut child = match spawn_child(&active) {
             Ok(child) => child,
             Err(error) => break Err(error.into()),
@@ -215,7 +222,13 @@ pub fn run(release: bool, web: bool) -> anyhow::Result<()> {
                                 let _ = old.kill();
                                 let _ = old.wait();
                             }
-                            web_child = spawn_web(&binary, &state).ok();
+                            web_child = match spawn_web(&binary, &state) {
+                                Ok(child) => Some(child),
+                                Err(error) => {
+                                    record(&state, "web-failed", &error.to_string());
+                                    None
+                                }
+                            };
                         }
                         request_reload(&child);
                     }
