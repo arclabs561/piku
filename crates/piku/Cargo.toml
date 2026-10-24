@@ -50,7 +50,7 @@ rexpect = "0.7"
 serial_test = "3"
 vt100 = "0.16"
 reqwest = { workspace = true, features = ["blocking"] }
-surfacekit = "0.5.1"
+surfacekit = "0.6.0"
 
 [lints]
 workspace = true
