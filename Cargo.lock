@@ -3016,9 +3016,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surfacekit"
-version = "0.3.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bd26eaeef61dac7bedd2d1c133d4c3b0f18a83ba99e6262e5cebfcceddd8d99"
+checksum = "f8154832d1039997c78d7e9d520b75e20fce7622c26a4e74a0828ac8a7980ec8"
 dependencies = [
  "crossterm",
  "libc",
