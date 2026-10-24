@@ -1,11 +1,22 @@
 # piku
 
 Piku runs a local coding agent in a terminal or browser workspace. It is
-experimental and currently built from source.
+pre-1.0 and built from source.
 
-For a mature terminal agent, use Claude Code, Codex CLI, aider, or opencode;
-piku pairs a provider-agnostic Rust agent with a browser canvas that holds
+Piku pairs a provider-agnostic Rust agent with a browser canvas that holds
 chat, terminal, file, and preview cards side by side.
+
+## Status
+
+The repository gate (`just check`) covers formatting, strict Clippy,
+deterministic workspace tests, isolated PTY smoke tests, web bundle freshness,
+and a release build. The known gaps are tracked in
+[docs/design.md](docs/design.md#known-implementation-gaps); the largest are
+MCP and LSP integration, an OS sandbox, and permission prompts that begin only
+inside the TUI.
+
+For development, `piku dev` watches sources and settings, rebuilds, and
+restarts the TUI at a turn boundary with the session and prompt draft intact.
 
 ## Run
 
