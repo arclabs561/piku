@@ -472,10 +472,17 @@ impl InputBuffer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
+    /// A dev reload arrived while the prompt was idle. The payload is the
+    /// in-progress draft, which the caller persists before restarting.
+    Reload(String),
     Cancel,
     Inspect,
     Exit,
 }
+
+/// How often the idle prompt checks for a pending dev reload. Short enough to
+/// feel immediate, long enough that an idle prompt costs nothing.
+const RELOAD_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 // ── Line editor ─────────────────────────────────────────────────────────────
 
@@ -507,6 +514,74 @@ pub struct LineEditor {
     /// Storage for large pastes collapsed to pills.
     /// Key: pill ID, Value: full pasted text.
     pasted_contents: Vec<String>,
+    /// Text restored after a dev reload, applied to the next prompt.
+    pending_input: Option<String>,
+    /// Optional dev-reload probe, checked once per poll tick while idle.
+    reload_check: Option<fn() -> bool>,
+    /// Latest raw dev status label from the supervisor.
+    dev_status_label: Option<String>,
+    /// Rendered dev status, with state color and elapsed time.
+    dev_status_line: Option<String>,
+    /// When the current status label first appeared.
+    status_since: std::time::Instant,
+    /// Optional dev status probe, polled while the prompt is idle.
+    status_source: Option<fn() -> Option<String>>,
+}
+
+/// Encode one history entry as a single line.
+///
+/// Multiline prompts are ordinary input (Shift+Enter). A raw newline would
+/// split one entry into several on the next load, so backslash, newline, and
+/// carriage return are escaped. This is the one-line escaping fish and zsh use
+/// for multiline history. Entries without backslashes read unchanged, so files
+/// written by older versions still load.
+fn encode_history_entry(entry: &str) -> String {
+    let mut encoded = String::with_capacity(entry.len());
+    for ch in entry.chars() {
+        match ch {
+            '\\' => encoded.push_str("\\\\"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// Decode a line written by [`encode_history_entry`]. Unknown escapes keep
+/// their backslash so a future format stays readable instead of silently
+/// dropping text.
+fn decode_history_entry(line: &str) -> String {
+    let mut decoded = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+/// Collapse whitespace and bound one history entry to a single display line.
+fn one_line(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut short: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+    short.push('\u{2026}');
+    short
 }
 
 impl LineEditor {
@@ -522,9 +597,33 @@ impl LineEditor {
             preferred_col: None,
             stash: None,
             pasted_contents: Vec::new(),
+            pending_input: None,
+            reload_check: None,
+            dev_status_label: None,
+            dev_status_line: None,
+            status_since: std::time::Instant::now(),
+            status_source: None,
             search_query: None,
             search_match_idx: None,
         }
+    }
+
+    /// Prefill the next prompt. Used when a dev reload preserved a draft.
+    pub fn set_initial_input(&mut self, text: impl Into<String>) {
+        self.pending_input = Some(text.into());
+    }
+
+    /// Arm the dev-reload probe. The prompt polls it while idle and returns
+    /// [`ReadOutcome::Reload`] instead of waiting for a key.
+    pub fn set_reload_check(&mut self, check: fn() -> bool) {
+        self.reload_check = Some(check);
+    }
+
+    /// Arm the dev status probe. Status is rendered on the prompt row only
+    /// while the input is empty, so it cannot disturb a typed draft or the
+    /// cursor position inside one.
+    pub fn set_status_source(&mut self, source: fn() -> Option<String>) {
+        self.status_source = Some(source);
     }
 
     /// Expand any paste pills in the text, replacing `[Pasted text #N ...]`
@@ -570,9 +669,11 @@ impl LineEditor {
     pub fn load_history_file(&mut self, path: &std::path::Path) {
         if let Ok(contents) = std::fs::read_to_string(path) {
             for line in contents.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    self.history.push(trimmed.to_string());
+                let entry = decode_history_entry(line);
+                // Whitespace-only lines carry no prompt; everything else is
+                // kept verbatim so indented code and trailing spaces survive.
+                if !entry.trim().is_empty() {
+                    self.history.push(entry);
                 }
             }
         }
@@ -581,7 +682,12 @@ impl LineEditor {
     pub fn save_history_file(&self, path: &std::path::Path) {
         // Keep last 500 entries
         let start = self.history.len().saturating_sub(500);
-        let contents = self.history[start..].join("\n") + "\n";
+        let contents = self.history[start..]
+            .iter()
+            .map(|entry| encode_history_entry(entry))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         let _ = std::fs::write(path, contents);
     }
 
@@ -633,10 +739,30 @@ impl LineEditor {
         );
 
         let mut input = InputBuffer::new();
+        if let Some(text) = self.pending_input.take() {
+            input.replace(text);
+        }
         let mut rendered_lines = 1usize;
         self.redraw(&mut stdout, &input, rendered_lines)?;
 
         let outcome = loop {
+            if self.reload_check.is_some_and(|check| check()) {
+                break ReadOutcome::Reload(input.as_str().to_owned());
+            }
+            match event::poll(RELOAD_POLL) {
+                Ok(false) => {
+                    self.refresh_status(&mut stdout, &input, &mut rendered_lines)?;
+                    continue;
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+                    if !was_raw {
+                        let _ = terminal::disable_raw_mode();
+                    }
+                    return Err(e);
+                }
+            }
             match event::read() {
                 Ok(Event::Key(key)) => match self.handle_key(key, &mut input) {
                     Action::Continue => {
@@ -1206,6 +1332,20 @@ impl LineEditor {
     }
 
     /// Find the next match (further back in history from current).
+    /// Newest-first matches for the picker. Bounded so the overlay cannot
+    /// outgrow the scroll region.
+    fn search_matches(&self, query: &str) -> Vec<usize> {
+        let needle = query.to_lowercase();
+        self.history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, entry)| needle.is_empty() || entry.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .take(6)
+            .collect()
+    }
+
     fn search_next_match(&mut self, input: &mut InputBuffer) {
         let Some(ref query) = self.search_query else {
             return;
@@ -1244,23 +1384,36 @@ impl LineEditor {
     // ── Rendering ───────────────────────────────────────────────────────
 
     fn render(&self, input: &InputBuffer) -> Rendered {
-        // In search mode, show a single-line search prompt
+        // In search mode, show the query plus a newest-first picker. Selection
+        // wins over age dimming so the current match is always readable.
         if let Some(ref query) = self.search_query {
-            let match_indicator = if self.search_match_idx.is_some() {
-                ""
-            } else if !query.is_empty() {
+            let matches = self.search_matches(query);
+            let mut lines = Vec::new();
+            let no_match = if matches.is_empty() {
                 " \x1b[31m(no match)\x1b[0m"
             } else {
                 ""
             };
-            let line = format!("\x1b[2m(reverse-search):\x1b[0m {query}{match_indicator}");
+            lines.push(format!("\x1b[2m(reverse-search):\x1b[0m {query}{no_match}"));
+            for (position, index) in matches.iter().enumerate() {
+                let text = one_line(&self.history[*index], 88);
+                let line = if self.search_match_idx == Some(*index) {
+                    format!("  \x1b[7m {text} \x1b[0m")
+                } else if position >= 5 {
+                    format!("  \x1b[2m{text}\x1b[0m")
+                } else {
+                    format!("  {text}")
+                };
+                lines.push(line);
+            }
             #[allow(clippy::cast_possible_truncation)]
             let cursor_col = (19 + query.len()) as u16;
+            let line_count = lines.len();
             return Rendered {
-                lines: vec![line],
+                lines,
                 cursor_row: 0,
                 cursor_col,
-                line_count: 1,
+                line_count,
             };
         }
 
@@ -1282,8 +1435,15 @@ impl LineEditor {
         // Build display lines
         let mut lines = Vec::new();
         if text.is_empty() {
-            // Show placeholder hint
-            lines.push(format!("{}\x1b[2m{}\x1b[0m", self.prompt, self.placeholder));
+            // Show placeholder hint, plus the dev status when the prompt is
+            // idle. Both are dim and live on the prompt row, so a build in
+            // flight is visible without touching the transcript.
+            let mut line = format!("{}\x1b[2m{}\x1b[0m", self.prompt, self.placeholder);
+            if let Some(status) = &self.dev_status_line {
+                line.push_str("  ");
+                line.push_str(status);
+            }
+            lines.push(line);
         } else {
             for (i, line) in text.split('\n').enumerate() {
                 let prefix = if i == 0 {
@@ -1312,6 +1472,52 @@ impl LineEditor {
             cursor_col: sat_u16(cursor_col),
             line_count: text.split('\n').count().max(1),
         }
+    }
+
+    /// Refresh the dev status on an idle tick, redrawing only when it changed.
+    fn refresh_status(
+        &mut self,
+        out: &mut impl Write,
+        input: &InputBuffer,
+        rendered_lines: &mut usize,
+    ) -> io::Result<()> {
+        let now = std::time::Instant::now();
+        let label = self.status_source.and_then(|source| source());
+        if label != self.dev_status_label {
+            self.dev_status_label = label;
+            self.status_since = now;
+        }
+        let line = self.status_line(now);
+        if line != self.dev_status_line {
+            self.dev_status_line = line;
+            *rendered_lines = self.redraw(out, input, *rendered_lines)?;
+        }
+        Ok(())
+    }
+
+    /// Render the current dev status as a colored token. `ready` fades after
+    /// a few seconds so the prompt returns to its resting shape; `building`
+    /// carries elapsed seconds so a slow compile is visible, not silent.
+    fn status_line(&self, now: std::time::Instant) -> Option<String> {
+        let (color, text) = match self.dev_status_label.as_deref()? {
+            "building" => (
+                33,
+                format!(
+                    "building {}s",
+                    now.duration_since(self.status_since).as_secs()
+                ),
+            ),
+            "ready" => {
+                if now.duration_since(self.status_since) >= std::time::Duration::from_secs(4) {
+                    return None;
+                }
+                (32, String::from("ready"))
+            }
+            "build failed" => (31, String::from("build failed")),
+            "reloading" => (36, String::from("reloading")),
+            other => (2, other.to_string()),
+        };
+        Some(format!("\x1b[{color}m● {text}\x1b[0m"))
     }
 
     fn redraw(
@@ -1834,6 +2040,120 @@ mod tests {
         editor.push_history("different");
         editor.push_history("different");
         assert_eq!(editor.history.len(), 2);
+    }
+
+    #[test]
+    fn history_file_round_trips_multiline_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        let mut editor = LineEditor::new("> ");
+        editor.push_history("single line");
+        editor.push_history("first\nsecond\n  indented");
+        editor.push_history("literal \\n and a back\\slash");
+        editor.save_history_file(&path);
+
+        let mut loaded = LineEditor::new("> ");
+        loaded.load_history_file(&path);
+        assert_eq!(loaded.history.len(), 3);
+        assert_eq!(loaded.history[0], "single line");
+        assert_eq!(loaded.history[1], "first\nsecond\n  indented");
+        assert_eq!(loaded.history[2], "literal \\n and a back\\slash");
+    }
+
+    // The Option is required by the `fn() -> Option<String>` probe type.
+    #[allow(clippy::unnecessary_wraps)]
+    fn sample_dev_status() -> Option<String> {
+        Some("building".to_string())
+    }
+
+    #[test]
+    fn dev_status_renders_only_on_an_empty_prompt() {
+        let mut editor = LineEditor::new("> ");
+        editor.dev_status_label = Some("building".to_string());
+        editor.status_since = std::time::Instant::now();
+        let line = editor.status_line(std::time::Instant::now());
+        editor.dev_status_line = line;
+        let empty = editor.render(&InputBuffer::new());
+        assert!(empty.lines[0].contains("building"), "{}", empty.lines[0]);
+        assert!(empty.lines[0].contains("\x1b[33m"), "{}", empty.lines[0]);
+
+        let mut typed = InputBuffer::new();
+        typed.replace("half typed");
+        let rendered = editor.render(&typed);
+        assert!(
+            !rendered.lines[0].contains("[dev:"),
+            "status must not move the cursor of a draft: {}",
+            rendered.lines[0]
+        );
+    }
+
+    #[test]
+    fn reverse_search_renders_a_picker() {
+        let mut editor = LineEditor::new("> ");
+        for text in ["alpha one", "beta", "alpha two"] {
+            editor.push_history(text);
+        }
+        editor.search_query = Some("alpha".to_string());
+        editor.search_match_idx = Some(2);
+
+        let rendered = editor.render(&InputBuffer::new());
+        assert_eq!(rendered.line_count, 3);
+        assert!(rendered.lines[0].contains("alpha"));
+        assert!(
+            rendered.lines[1].contains("\x1b[7m"),
+            "selection must be visible: {}",
+            rendered.lines[1]
+        );
+        assert!(rendered.lines[2].contains("alpha one"));
+    }
+
+    #[test]
+    fn reverse_search_dims_older_matches() {
+        let mut editor = LineEditor::new("> ");
+        for index in 0..8 {
+            editor.push_history(format!("entry {index}"));
+        }
+        editor.search_query = Some(String::new());
+
+        let rendered = editor.render(&InputBuffer::new());
+        // Query line plus six bounded matches; the sixth match is older than
+        // the newest five and is dimmed.
+        assert_eq!(rendered.line_count, 7);
+        assert!(
+            rendered.lines[6].contains("\x1b[2m"),
+            "older matches must dim: {}",
+            rendered.lines[6]
+        );
+    }
+
+    #[test]
+    fn idle_tick_picks_up_a_changed_dev_status() {
+        let mut editor = LineEditor::new("> ");
+        editor.set_status_source(sample_dev_status);
+        let mut out = Vec::new();
+        let mut lines = 1usize;
+        editor
+            .refresh_status(&mut out, &InputBuffer::new(), &mut lines)
+            .unwrap();
+        assert!(
+            editor
+                .dev_status_line
+                .as_deref()
+                .is_some_and(|line| line.contains("building")),
+            "{:?}",
+            editor.dev_status_line
+        );
+    }
+
+    #[test]
+    fn history_file_reads_legacy_unescaped_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(&path, "first\nsecond\n\n").unwrap();
+
+        let mut loaded = LineEditor::new("> ");
+        loaded.load_history_file(&path);
+        assert_eq!(loaded.history, vec!["first", "second"]);
     }
 
     // ── Undo ────────────────────────────────────────────────────────

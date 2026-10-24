@@ -2038,6 +2038,7 @@ dependencies = [
  "serial_test",
  "sha2",
  "signal-hook-registry",
+ "surfacekit",
  "syntect",
  "tempfile",
  "thiserror 1.0.69",
@@ -3012,6 +3013,22 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "surfacekit"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f450f693e8217f444c5ec5f764862e0f4355c71800148ebdb38e2f7304bb13b3"
+dependencies = [
+ "crossterm",
+ "libc",
+ "nix 0.31.2",
+ "rexpect",
+ "serde",
+ "serde_json",
+ "sha2",
+ "vt100",
+]
 
 [[package]]
 name = "syn"

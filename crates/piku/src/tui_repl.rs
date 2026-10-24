@@ -26,10 +26,18 @@ use crate::self_update;
 use crossterm::event::{self as cxevent, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use piku_runtime::{
-    build_system_prompt, run_turn_with_registry, OutputSink, PermissionOutcome, PermissionPrompter,
-    PermissionRequest, PostToolAction, Session, TaskRegistry, TaskStatus, TokenUsage, TurnResult,
+    build_system_prompt, run_turn_with_registry, ContentBlock, ConversationMessage, MessageRole,
+    OutputSink, PermissionOutcome, PermissionPrompter, PermissionRequest, PostToolAction, Session,
+    TaskRegistry, TaskStatus, TokenUsage, TurnResult,
 };
 use piku_tools::{all_tool_definitions, Destructiveness};
+
+/// Prompt history is per session, so a tab or resumed session recalls only the
+/// prompts submitted in it. Sessions already live in the same directory as
+/// `<session-id>.json`, so their history sits beside them.
+fn repl_history_path(sessions_dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    sessions_dir.join(format!("{session_id}.history"))
+}
 
 fn terminal_turn_id() -> io::Result<String> {
     let mut bytes = [0; 16];
@@ -1573,9 +1581,19 @@ async fn run_tui_repl_core(
     }
 
     // ── Line editor ──────────────────────────────────────────────────────────
-    let history_path = sessions_dir.join(".repl_history");
+    let history_path = repl_history_path(&sessions_dir, &session_id);
     let mut editor = LineEditor::new("\x1b[34m❯\x1b[0m ");
     editor.load_history_file(&history_path);
+    // Dev reload: the supervisor signals a completed build, and the prompt
+    // exits at the next idle tick or turn boundary. The draft and the session
+    // carry across the restart; nothing else in memory does.
+    if crate::dev::install_reload_handler() {
+        editor.set_reload_check(crate::dev::reload_requested);
+        editor.set_status_source(crate::dev::status);
+        if let Some(draft) = crate::dev::take_draft(&session_id) {
+            editor.set_initial_input(draft);
+        }
+    }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -2592,6 +2610,16 @@ async fn run_tui_repl_core(
                     true
                 };
 
+                // Dev reload: a supervisor rebuild is ready and the turn is
+                // complete. Save the checkpoint, then hand the restart to the
+                // supervisor so no in-flight work is interrupted.
+                if checkpoint_saved && crate::dev::reload_requested() {
+                    let _ = crate::dev::write_draft(&session_id, "");
+                    let (_, rows) = term_size();
+                    teardown_layout(rows);
+                    std::process::exit(crate::dev::RELOAD_EXIT_CODE);
+                }
+
                 // Self-update: show animation, then exec the new binary in-place.
                 // We do NOT call teardown_layout — the new process calls setup_layout
                 // which redraws the whole screen fresh. PIKU_SESSION_ID lets the
@@ -2643,6 +2671,21 @@ async fn run_tui_repl_core(
                         context_pct: request_context_pct(request_context.as_ref(), &model),
                     },
                 );
+            }
+
+            Ok(ReadOutcome::Reload(draft)) => {
+                // The prompt was idle when the build finished. Keep the typed
+                // draft and the session, then let the supervisor restart us.
+                if let Err(error) = crate::dev::write_draft(&session_id, &draft) {
+                    eprintln!("\x1b[33m[dev]\x1b[0m could not persist draft: {error}");
+                }
+                if let Err(error) = run.session().save(&session_path) {
+                    eprintln!("\x1b[33m[dev]\x1b[0m could not save session: {error}");
+                    std::process::exit(1);
+                }
+                let (_, rows) = term_size();
+                teardown_layout(rows);
+                std::process::exit(crate::dev::RELOAD_EXIT_CODE);
             }
 
             Ok(ReadOutcome::Cancel) => {
@@ -2852,6 +2895,150 @@ struct SlashCommandResult {
 ///
 /// The caller records the returned text as one interaction receipt after this
 /// function has released its mutable session borrow.
+/// One bounded line for the recap. Whitespace is collapsed so a wrapped
+/// paragraph cannot turn one thread item into ten.
+fn recap_line(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut short: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+    short.push('\u{2026}');
+    short
+}
+
+fn recap_message_text(message: &ConversationMessage) -> String {
+    let mut parts = Vec::new();
+    for block in &message.blocks {
+        if let ContentBlock::Text { text } = block {
+            parts.push(text.as_str());
+        }
+    }
+    parts.join(" ")
+}
+
+fn recap_tool_path(input: &serde_json::Value) -> Option<String> {
+    ["path", "file_path", "target"]
+        .iter()
+        .find_map(|key| input.get(key).and_then(|value| value.as_str()))
+        .map(str::to_string)
+}
+
+fn recap_push(bucket: &mut Vec<String>, value: String) {
+    if bucket.len() < 5 && !bucket.contains(&value) {
+        bucket.push(value);
+    }
+}
+
+/// Local, deterministic session digest in the shape of the recap skill:
+/// thread, changes, unfinished, open. No model call and no writes.
+fn build_recap(session: &Session) -> String {
+    const MAX: usize = 90;
+    let mut thread: Vec<(usize, String, String)> = Vec::new();
+    let mut changes = std::collections::BTreeMap::new();
+    let mut unfinished: Vec<String> = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+
+    for message in &session.messages {
+        let text = recap_message_text(message);
+        match message.role {
+            MessageRole::User => {
+                if let Some(question) = pending.take() {
+                    thread.push((
+                        thread.len() + 1,
+                        question,
+                        String::from("(no reply recorded)"),
+                    ));
+                }
+                let question = recap_line(&text, MAX);
+                if !question.is_empty() {
+                    pending = Some(question);
+                }
+            }
+            MessageRole::Assistant => {
+                for block in &message.blocks {
+                    if let ContentBlock::ToolUse { name, input, .. } = block {
+                        if let Some(path) = recap_tool_path(input) {
+                            changes.insert(path, name.clone());
+                        }
+                    }
+                }
+                let outcome = recap_line(&text, MAX);
+                if let Some(question) = pending.take() {
+                    thread.push((thread.len() + 1, question, outcome));
+                }
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let lower = trimmed.to_lowercase();
+                    if [
+                        "todo",
+                        "deferred",
+                        "not implemented",
+                        "follow-up",
+                        "follow up",
+                    ]
+                    .iter()
+                    .any(|marker| lower.contains(marker))
+                    {
+                        recap_push(&mut unfinished, recap_line(trimmed, MAX));
+                    }
+                    if trimmed.ends_with('?') {
+                        recap_push(&mut open, recap_line(trimmed, MAX));
+                    }
+                }
+            }
+            MessageRole::Tool | MessageRole::System => {}
+        }
+    }
+    if let Some(question) = pending.take() {
+        thread.push((
+            thread.len() + 1,
+            question,
+            String::from("(no reply recorded)"),
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str("\x1b[1mRecap\x1b[0m \x1b[2m(local digest, no model call)\x1b[0m\n");
+    out.push_str("\x1b[1mThread\x1b[0m\n");
+    if thread.is_empty() {
+        out.push_str("  none recorded\n");
+    }
+    for (index, question, outcome) in &thread {
+        out.push_str(&format!(
+            "  {index}. asked: {question}\n     \u{2192} {outcome}\n"
+        ));
+    }
+    out.push_str("\x1b[1mChanges\x1b[0m\n");
+    if changes.is_empty() {
+        out.push_str("  none recorded\n");
+    }
+    for (path, tool) in &changes {
+        out.push_str(&format!("  {path} \x1b[2m({tool})\x1b[0m\n"));
+    }
+    out.push_str("\x1b[1mUnfinished\x1b[0m\n");
+    if unfinished.is_empty() {
+        out.push_str("  none recorded\n");
+    }
+    for item in &unfinished {
+        out.push_str(&format!("  - {item}\n"));
+    }
+    out.push_str("\x1b[1mOpen\x1b[0m\n");
+    if open.is_empty() {
+        out.push_str("  none recorded\n");
+    }
+    for item in &open {
+        out.push_str(&format!("  - {item}\n"));
+    }
+    out.push_str("\x1b[1mNext\x1b[0m\n");
+    out.push_str("  - /status for counts, /activity for receipts, /cells for retained output\n");
+    out
+}
+
 fn handle_slash_cmd(
     input: &str,
     session: &mut Session,
@@ -2912,6 +3099,7 @@ fn handle_slash_cmd(
                 "\x1b[1mCommands:\x1b[0m\r
   /help          This message\r
 {shell_help}
+  /recap         Local session digest (thread, changes, open)\r
   /status        Session info\r
   /cost          Token usage\r
   /model [name]  Show or switch model\r
@@ -2941,6 +3129,11 @@ fn handle_slash_cmd(
   Right          Accept history suggestion\r
   Esc            Clear input\r{read_only_note}"
             );
+        }
+        "recap" => {
+            for line in build_recap(session).lines() {
+                slash_line!("{line}");
+            }
         }
         "status" => {
             if provider_name == "chatgpt" {
@@ -3335,6 +3528,46 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::*;
+
+    #[test]
+    fn recap_digests_the_thread_changes_and_open_questions() {
+        let mut session = Session::new("session-recap".to_string());
+        session
+            .messages
+            .push(ConversationMessage::user("add per-session history"));
+        session.messages.push(ConversationMessage::assistant(
+            vec![
+                ContentBlock::Text {
+                    text: "Implemented. Deferred the web child. Is the picker enough?".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "crates/piku/src/dev.rs"}),
+                },
+            ],
+            None,
+        ));
+
+        let recap = build_recap(&session);
+        assert!(recap.contains("asked: add per-session history"), "{recap}");
+        assert!(recap.contains("crates/piku/src/dev.rs"), "{recap}");
+        assert!(recap.contains("Deferred the web child"), "{recap}");
+        assert!(recap.contains("Is the picker enough?"), "{recap}");
+    }
+
+    #[test]
+    fn prompt_history_is_scoped_to_one_session() {
+        let dir = std::path::Path::new("/tmp/piku-sessions");
+        assert_eq!(
+            repl_history_path(dir, "session-a"),
+            dir.join("session-a.history")
+        );
+        assert_ne!(
+            repl_history_path(dir, "session-a"),
+            repl_history_path(dir, "session-b")
+        );
+    }
 
     #[test]
     fn tool_output_self_update_requires_operator_policy() {

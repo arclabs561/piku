@@ -40,9 +40,7 @@ mod test_helpers;
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
 // into the grid a human would see. Same observer the agentic judge loop uses,
 // so these smoke tests and the judge assert on one definition of "the screen".
-#[path = "agentic/screen.rs"]
-mod screen;
-use screen::{ScreenObserver, ScreenSnapshot};
+use surfacekit::term::screen::{self, ScreenObserver, ScreenSnapshot};
 
 /// The fixed grid these PTY tests render into. The observer and the PTY winsize
 /// are both built from this one constant, so the parsed grid can never disagree
@@ -225,6 +223,24 @@ impl Pty {
                     break;
                 }
             }
+        }
+    }
+
+    fn read_available(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.reader.read(buf) {
+            Ok(n) => {
+                if n > 0 {
+                    self.buf.extend_from_slice(&buf[..n]);
+                    self.observer.process(&buf[..n]);
+                }
+                Ok(n)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                self.eof = true;
+                Ok(0)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -460,6 +476,72 @@ fn submit_does_not_panic_on_turn_start() {
     assert!(
         !out.contains("can call blocking only when running on the multi-threaded runtime"),
         "block_in_place panic regressed:\n{out}"
+    );
+}
+
+/// A dev reload must save the session, persist the draft, restore the
+/// terminal, and exit with the supervisor's restart code.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn dev_reload_signal_saves_the_session_and_exits_for_restart() {
+    let state = smoke_tempdir();
+    let cmd = Command::new(piku_binary());
+    let mut pty = Pty::spawn_command_with_env(
+        cmd,
+        smoke_temp_root().as_path(),
+        &[
+            ("PIKU_DEV", "1"),
+            ("XDG_STATE_HOME", state.path().to_str().expect("state path")),
+        ],
+    );
+
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    let before = pty.buf.len();
+    pty._proc
+        .signal(nix::sys::signal::Signal::SIGUSR1)
+        .expect("signal SIGUSR1");
+
+    let start = Instant::now();
+    while !pty.eof && start.elapsed() < Duration::from_secs(3) {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        pty.eof,
+        "piku did not exit for a dev restart within 3s:\n{}",
+        pty.captured()
+    );
+
+    let after = String::from_utf8_lossy(&pty.buf[before..]);
+    // `teardown_layout` resets the scroll region, parks the cursor, then shows
+    // it, so the two halves are not adjacent in one escape sequence.
+    assert!(
+        after.contains("\x1b[r"),
+        "reload must reset the scroll region:\n{after}"
+    );
+    assert!(
+        after.contains("\x1b[?25h"),
+        "reload must restore cursor visibility:\n{after}"
+    );
+
+    let status = pty._proc.exit().expect("exit status");
+    assert!(
+        matches!(status, nix::sys::wait::WaitStatus::Exited(_, 75)),
+        "reload must use the supervisor exit code, got {status:?}"
+    );
+
+    let sessions = isolated_config_home().join("piku/sessions");
+    let saved = std::fs::read_dir(&sessions)
+        .expect("sessions dir")
+        .filter_map(std::result::Result::ok)
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"));
+    assert!(saved, "reload must save the session");
+    assert!(
+        state.path().join("piku/dev/draft.json").exists(),
+        "reload must persist the prompt draft"
     );
 }
 
@@ -1416,6 +1498,26 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
 /// `LINES`/`COLUMNS` environment, so this is what makes the render deterministic.
 /// Called once at spawn from the same `(TEST_ROWS, TEST_COLS)` the observer is
 /// built with, so the grid piku draws and the grid the parser models agree.
+impl surfacekit::term::SessionIo for Pty {
+    fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.send(bytes);
+        Ok(())
+    }
+
+    fn read_available(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_available(buf)
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        set_winsize(&self.writer, rows, cols);
+        Ok(())
+    }
+
+    fn is_dead(&self) -> bool {
+        self.eof
+    }
+}
+
 #[allow(unsafe_code)]
 fn set_winsize(file: &std::fs::File, rows: u16, cols: u16) {
     use std::os::unix::io::AsRawFd;
@@ -1694,4 +1796,103 @@ fn recording_failure_restores_terminal_modes() {
     );
     // rexpect deliberately disables echo before exec, so ECHO is not a
     // restoration oracle for this harness. Canonical mode is.
+}
+
+/// The actor loop, driven against piku's real TUI rather than a shell fixture.
+/// Records a timeline, promotes it to a case, and replays it on a fresh session.
+#[test]
+#[serial]
+#[ignore = "PTY acceptance: run isolated via scripts/ci.sh pty"]
+fn actor_drives_the_tui_and_promotes_a_replayable_case() {
+    use serde_json::json;
+    use surfacekit::contract::TerminalProfile;
+    use surfacekit::scenario::replay::replay_case;
+    use surfacekit::scenario::{
+        run_actor, ActionPlan, Case, CheckSpec, Event, ExpectActor, ExpectStep, LoopConfig,
+        Resolution, Step, VerificationProvenance,
+    };
+    use surfacekit::term::{TerminalEmulator, Vt100Emulator};
+
+    let fixture = smoke_tempdir();
+    let repo = fixture.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let config_dir = fixture.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let replay_config_dir = fixture.path().join("config-replay");
+    std::fs::create_dir_all(&replay_config_dir).unwrap();
+
+    let text =
+        |content: &str| json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
+    let profile = TerminalProfile::vt100(TEST_ROWS, TEST_COLS);
+    let loop_config = LoopConfig {
+        timeout: Duration::from_secs(20),
+        poll: Duration::from_millis(25),
+        max_steps: 4,
+    };
+
+    let (url, _requests, server) =
+        review_workflow::scripted_response_server(vec![(text("ACTOR_OK"), "stop")]);
+    let environment = [
+        ("XDG_CONFIG_HOME", config_dir.to_str().unwrap()),
+        ("HOME", config_dir.to_str().unwrap()),
+        ("PIKU_NO_DOTENV", "1"),
+        ("PIKU_MODEL", "canned-model"),
+        ("PIKU_BASE_URL", url.as_str()),
+    ];
+    let mut pty = Pty::spawn_command_with_env(Command::new(piku_binary()), &repo, &environment);
+    let mut emulator = Vt100Emulator::new(profile.clone());
+    let mut actor = ExpectActor::new(vec![
+        ExpectStep::act_on(
+            "❯",
+            ActionPlan::new(
+                Resolution::Line,
+                vec![Step::Line {
+                    text: "Say ACTOR_OK".into(),
+                    submit: true,
+                }],
+            ),
+        ),
+        ExpectStep::wait_for("ACTOR_OK"),
+    ]);
+    let report = run_actor(&mut actor, &mut pty, &mut emulator, &profile, &loop_config);
+    assert!(!report.timed_out, "{:?}", report.timeline);
+    assert!(
+        emulator.screen_text().contains("ACTOR_OK"),
+        "screen: {}",
+        emulator.screen_text()
+    );
+    assert!(report
+        .timeline
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::Action { .. })));
+    pty.exit_cleanly();
+    server.join().unwrap();
+
+    let mut case = Case::from_timeline(
+        "piku-tui-actor",
+        &report.timeline,
+        vec![CheckSpec {
+            name: "response visible".into(),
+            contains: "ACTOR_OK".into(),
+            provenance: VerificationProvenance::Program,
+        }],
+    );
+    case.ready_when = Some("❯".into());
+
+    let (url2, _requests2, server2) =
+        review_workflow::scripted_response_server(vec![(text("ACTOR_OK"), "stop")]);
+    let environment2 = [
+        ("XDG_CONFIG_HOME", replay_config_dir.to_str().unwrap()),
+        ("HOME", replay_config_dir.to_str().unwrap()),
+        ("PIKU_NO_DOTENV", "1"),
+        ("PIKU_MODEL", "canned-model"),
+        ("PIKU_BASE_URL", url2.as_str()),
+    ];
+    let mut pty2 = Pty::spawn_command_with_env(Command::new(piku_binary()), &repo, &environment2);
+    let mut emulator2 = Vt100Emulator::new(profile.clone());
+    let replay = replay_case(&case, &mut pty2, &mut emulator2, &profile, &loop_config);
+    assert!(replay.passed(), "{replay:?}");
+    pty2.exit_cleanly();
+    server2.join().unwrap();
 }

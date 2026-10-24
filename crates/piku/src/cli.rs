@@ -131,6 +131,15 @@ pub enum Commands {
         #[arg(long, required = true, help = "Reason for the disposition")]
         note: String,
     },
+    #[command(
+        about = "Watch sources and settings, rebuild, and restart the TUI at a turn boundary"
+    )]
+    Dev {
+        #[arg(long, help = "Build the release profile instead of debug")]
+        release: bool,
+        #[arg(long, help = "Run and restart the web surface beside the TUI")]
+        web: bool,
+    },
     #[command(about = "Start the run surface web server")]
     Web {
         #[arg(long, default_value = "8080", help = "Port to listen on")]
