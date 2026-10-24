@@ -4,9 +4,6 @@
 //! measure comprehension, preference, or usability, and they are deliberately
 //! not collapsed into a single score.
 
-#[path = "agentic/surface_contract.rs"]
-mod surface_contract;
-
 use piku::cell_view::{cells, raw_output, render_text as render_cells_text, select};
 use piku::run_view::{
     build_search_index_with_artifacts, render_html_with_artifacts, render_text, RunSearchEntry,
@@ -18,7 +15,7 @@ use piku_runtime::{
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use surface_contract::{Surface, SurfacePacket};
+use surfacekit::contract::{Surface, SurfacePacket};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RetrievalMetric {

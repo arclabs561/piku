@@ -40,9 +40,7 @@ mod test_helpers;
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
 // into the grid a human would see. Same observer the agentic judge loop uses,
 // so these smoke tests and the judge assert on one definition of "the screen".
-#[path = "agentic/screen.rs"]
-mod screen;
-use screen::{ScreenObserver, ScreenSnapshot};
+use surfacekit::term::screen::{self, ScreenObserver, ScreenSnapshot};
 
 /// The fixed grid these PTY tests render into. The observer and the PTY winsize
 /// are both built from this one constant, so the parsed grid can never disagree
