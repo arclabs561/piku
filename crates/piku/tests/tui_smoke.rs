@@ -463,6 +463,72 @@ fn submit_does_not_panic_on_turn_start() {
     );
 }
 
+/// A dev reload must save the session, persist the draft, restore the
+/// terminal, and exit with the supervisor's restart code.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: slow/fragile under concurrent-binary load; run isolated via `scripts/ci.sh pty`"]
+fn dev_reload_signal_saves_the_session_and_exits_for_restart() {
+    let state = smoke_tempdir();
+    let cmd = Command::new(piku_binary());
+    let mut pty = Pty::spawn_command_with_env(
+        cmd,
+        smoke_temp_root().as_path(),
+        &[
+            ("PIKU_DEV", "1"),
+            ("XDG_STATE_HOME", state.path().to_str().expect("state path")),
+        ],
+    );
+
+    let ready = pty.wait_for("❯", Duration::from_secs(5));
+    assert!(ready, "prompt not reached:\n{}", pty.captured());
+
+    let before = pty.buf.len();
+    pty._proc
+        .signal(nix::sys::signal::Signal::SIGUSR1)
+        .expect("signal SIGUSR1");
+
+    let start = Instant::now();
+    while !pty.eof && start.elapsed() < Duration::from_secs(3) {
+        pty.drain();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        pty.eof,
+        "piku did not exit for a dev restart within 3s:\n{}",
+        pty.captured()
+    );
+
+    let after = String::from_utf8_lossy(&pty.buf[before..]);
+    // `teardown_layout` resets the scroll region, parks the cursor, then shows
+    // it, so the two halves are not adjacent in one escape sequence.
+    assert!(
+        after.contains("\x1b[r"),
+        "reload must reset the scroll region:\n{after}"
+    );
+    assert!(
+        after.contains("\x1b[?25h"),
+        "reload must restore cursor visibility:\n{after}"
+    );
+
+    let status = pty._proc.exit().expect("exit status");
+    assert!(
+        matches!(status, nix::sys::wait::WaitStatus::Exited(_, 75)),
+        "reload must use the supervisor exit code, got {status:?}"
+    );
+
+    let sessions = isolated_config_home().join("piku/sessions");
+    let saved = std::fs::read_dir(&sessions)
+        .expect("sessions dir")
+        .filter_map(std::result::Result::ok)
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"));
+    assert!(saved, "reload must save the session");
+    assert!(
+        state.path().join("piku/dev/draft.json").exists(),
+        "reload must persist the prompt draft"
+    );
+}
+
 /// Ctrl-D on an empty prompt should exit cleanly — no panic, no hang.
 /// Startup/shutdown sanity.
 #[test]
