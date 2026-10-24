@@ -1821,9 +1821,8 @@ fn actor_drives_the_tui_and_promotes_a_replayable_case() {
     let replay_config_dir = fixture.path().join("config-replay");
     std::fs::create_dir_all(&replay_config_dir).unwrap();
 
-    let text = |content: &str| {
-        json!({"choices":[{"delta":{"content":content},"finish_reason":null}]})
-    };
+    let text =
+        |content: &str| json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
     let profile = TerminalProfile::vt100(TEST_ROWS, TEST_COLS);
     let loop_config = LoopConfig {
         timeout: Duration::from_secs(20),
@@ -1855,13 +1854,7 @@ fn actor_drives_the_tui_and_promotes_a_replayable_case() {
         ),
         ExpectStep::wait_for("ACTOR_OK"),
     ]);
-    let report = run_actor(
-        &mut actor,
-        &mut pty,
-        &mut emulator,
-        &profile,
-        &loop_config,
-    );
+    let report = run_actor(&mut actor, &mut pty, &mut emulator, &profile, &loop_config);
     assert!(!report.timed_out, "{:?}", report.timeline);
     assert!(
         emulator.screen_text().contains("ACTOR_OK"),
