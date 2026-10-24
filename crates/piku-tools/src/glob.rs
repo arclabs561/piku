@@ -2,6 +2,10 @@ use serde::Deserialize;
 
 use crate::{Destructiveness, ToolResult};
 
+/// Upper bound on returned paths. A broad pattern such as `**/*` in a large
+/// tree would otherwise return an unbounded result list.
+const MAX_RESULTS: usize = 1000;
+
 #[derive(Debug, Deserialize)]
 pub struct GlobParams {
     pub pattern: String,
@@ -92,11 +96,19 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
     };
 
     let mut results: Vec<String> = Vec::new();
+    let mut truncated = false;
     for entry in entries {
+        if results.len() >= MAX_RESULTS {
+            truncated = true;
+            break;
+        }
         match entry {
             Ok(path) => results.push(path.to_string_lossy().into_owned()),
             Err(e) => results.push(format!("(error: {e})")),
         }
+    }
+    if truncated {
+        results.push(format!("(truncated at {MAX_RESULTS} results)"));
     }
 
     if results.is_empty() {

@@ -80,6 +80,10 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
         for entry in WalkDir::new(root_path)
             .follow_links(false)
             .into_iter()
+            // Skip VCS metadata during directory search: `.git` internals are
+            // never working-tree content and would otherwise consume the result
+            // budget. An explicit `.git` root is still searched (depth 0).
+            .filter_entry(|e| e.depth() == 0 || e.file_name() != ".git")
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_type().is_file())
         {

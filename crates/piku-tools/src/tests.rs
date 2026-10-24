@@ -804,6 +804,27 @@ mod glob_tool {
         let d = glob::destructiveness(&serde_json::json!({}));
         assert_eq!(d, crate::Destructiveness::Safe);
     }
+
+    #[test]
+    fn caps_results_and_announces_truncation() {
+        let dir = tempdir();
+        for i in 0..1005 {
+            std::fs::write(dir.join(format!("f{i:04}.txt")), "").unwrap();
+        }
+        let result = glob::execute(serde_json::json!({
+            "pattern": "*.txt",
+            "path": dir,
+        }));
+        assert!(!result.is_error, "{}", result.output);
+        let lines: Vec<&str> = result.output.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1001,
+            "expected 1000 results plus a truncation note, got {}",
+            lines.len()
+        );
+        assert_eq!(lines.last().copied(), Some("(truncated at 1000 results)"));
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +880,53 @@ mod grep_tool {
         assert_eq!(hit.output, format!("{}:1: fixture_marker", file.display()));
         assert!(hit.effects.is_empty(), "{:?}", hit.effects);
         assert_eq!(std::fs::read(&file).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_skips_vcs_metadata_directories() {
+        let dir = tempdir();
+        let git_dir = dir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("config"), "fixture_marker\n").unwrap();
+        std::fs::write(dir.join("real.txt"), "fixture_marker\n").unwrap();
+        let hit = crate::execute_tool(
+            "grep",
+            serde_json::json!({ "pattern": "fixture_marker", "path": dir }),
+        )
+        .await
+        .expect("grep must be registered");
+        assert!(!hit.is_error, "{}", hit.output);
+        assert!(
+            !hit.output.contains(".git"),
+            "grep must not search VCS metadata: {}",
+            hit.output
+        );
+        assert!(
+            hit.output.contains("real.txt"),
+            "grep must still search working files: {}",
+            hit.output
+        );
+        assert!(hit.effects.is_empty(), "{:?}", hit.effects);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_honors_explicit_vcs_metadata_root() {
+        let dir = tempdir();
+        let git_dir = dir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("config"), "fixture_marker\n").unwrap();
+        let hit = crate::execute_tool(
+            "grep",
+            serde_json::json!({ "pattern": "fixture_marker", "path": &git_dir }),
+        )
+        .await
+        .expect("grep must be registered");
+        assert!(!hit.is_error, "{}", hit.output);
+        assert!(
+            hit.output.contains("config"),
+            "an explicit .git root must still be searched: {}",
+            hit.output
+        );
     }
 
     #[test]
