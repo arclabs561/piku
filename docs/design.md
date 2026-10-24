@@ -179,9 +179,8 @@ is routing guidance rather than an enforced workspace boundary.
 `spawn_agent` starts a fresh-session agent as a background Tokio task. The parent
 can poll or join it through `TaskRegistry`. In the TUI, a bounded notification
 channel also injects completed child output as a user-role interjection. The
-launch-turn path has no task registry, so agent tools advertised there fail as
-unavailable even when that turn will later enter the TUI. The implementation
-provides:
+launch-turn path has no task registry, so it does not advertise agent tools,
+even when that turn will later enter the TUI. The implementation provides:
 
 - a hard recursion depth of four;
 - per-agent turn budgets;
@@ -330,9 +329,9 @@ inconclusive states, an acceptance result is not automatically a product verdict
 
 - Writable launch turns allow advertised calls not blocked by configured deny
   rules without interactive confirmation; TUI prompts begin after that turn.
-- Launch turns advertise agent tools without providing the task
-  registry required to execute them. Memory, attempt-tree, and `tool_search`
-  operations use shared runtime paths and remain available there.
+- Launch turns have no task registry and therefore no agent lifecycle; they omit
+  agent tools rather than offering one there. Memory, attempt-tree, and
+  `tool_search` operations use shared runtime paths and remain available.
 - Read-only paths are not workspace-confined, project/user memory can enter the
   provider context, and Piku still writes its own runtime state.
 - The `Likely` versus `Definite` distinction does not change the decision path;

@@ -254,6 +254,24 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Return tools advertised to a writable launch turn.
+///
+/// A launch turn has no task registry, so agent tools would resolve to
+/// unavailable stubs. They are omitted rather than advertised. The TUI builds
+/// its own catalog once the registry exists.
+#[must_use]
+pub fn launch_tool_definitions() -> Vec<ToolDefinition> {
+    all_tool_definitions()
+        .into_iter()
+        .filter(|t| {
+            !matches!(
+                t.name.as_str(),
+                "spawn_agent" | "agent_status" | "agent_join"
+            )
+        })
+        .collect()
+}
+
 /// Return file-inspection tools for read-only agent runs.
 #[must_use]
 pub fn read_only_tool_definitions() -> Vec<ToolDefinition> {

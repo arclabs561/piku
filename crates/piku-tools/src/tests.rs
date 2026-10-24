@@ -1,6 +1,22 @@
 #[cfg(test)]
 mod registry {
     #[test]
+    fn launch_tool_definitions_omit_agent_tools() {
+        let names: Vec<String> = crate::launch_tool_definitions()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+
+        for agent_tool in ["spawn_agent", "agent_status", "agent_join"] {
+            assert!(
+                !names.iter().any(|name| name == agent_tool),
+                "launch turns cannot execute {agent_tool}; it must not be advertised"
+            );
+        }
+        assert!(names.iter().any(|name| name == "bash"));
+    }
+
+    #[test]
     fn read_only_tool_definitions_only_include_file_inspection_tools() {
         let names: Vec<String> = crate::read_only_tool_definitions()
             .into_iter()

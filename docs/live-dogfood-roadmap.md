@@ -205,9 +205,9 @@ scales with terminal events, without an aggregate hard cap. Admission is not
 durable save, provider receipt, restart recovery or human acceptance. Before
 adding more concurrent writers, define those remaining delivery guarantees,
 cancellation, inherited authority, file ownership,
-changed-worktree disposition, and parent verification. The launch-turn surface must
-either provide a task registry or stop advertising agent tools. `background:
-false` must block or cease claiming that it does. Semantic memory injected into
+changed-worktree disposition, and parent verification. The launch-turn surface now
+omits agent tools because it has no task registry. `background: false` must
+block or cease claiming that it does. Semantic memory injected into
 a child must first gain source and policy provenance or be disabled for that
 verified path.
 

@@ -1481,6 +1481,31 @@ fn headless_output_to_a_pipe_has_no_escape_sequences_and_reports_usage() {
 }
 
 #[test]
+fn headless_launch_request_omits_agent_tools() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let (out, _) = run_headless_turn(config.path(), &base_url);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let bodies = bodies.lock().unwrap();
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let tools: Vec<&str> = request["tools"]
+        .as_array()
+        .expect("headless request must advertise a tool catalog")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+
+    assert!(tools.contains(&"bash"), "bash missing: {tools:?}");
+    for agent_tool in ["spawn_agent", "agent_status", "agent_join"] {
+        assert!(
+            !tools.contains(&agent_tool),
+            "{agent_tool} has no task registry in a launch turn but was advertised: {tools:?}"
+        );
+    }
+}
+
+#[test]
 fn inspect_selectors_imply_their_listing_and_raw_is_the_final_answer() {
     let config = tempfile::tempdir().unwrap();
     let (base_url, _) = fake_completions_server(CANNED_ANSWER);

@@ -109,8 +109,9 @@ The TUI, headless CLI, and any future client should share these semantics. A new
 surface is not a reason to fork the loop.
 
 The current implementation does not yet satisfy that narrow waist uniformly.
-Writable launch turns advertise background-agent tools without the task registry
-used by the TUI. Child worktree selection is conveyed through prompt text rather
+Writable launch turns previously advertised background-agent tools without the
+task registry used by the TUI; the launch catalog now omits them. Child worktree
+selection is conveyed through prompt text rather
 than an executor working directory, `background: false` does not block, and
 completion delivery is a bounded best-effort TUI channel without
 acknowledgement. These are alignment defects, not evidence for adding a broader
