@@ -32,9 +32,9 @@ tool implementations in `piku-tools`, and presentation/configuration in `piku`.
   write trace state.
 - Writable launch turns permit tool calls after configured deny rules, including
   a prompt that later enters the TUI. They have no interactive confirmation or
-  sandbox and advertise agent tools without a task registry, so those calls
-  return unavailable stubs. Permission prompts and agent lifecycle support begin
-  only inside the TUI loop.
+  sandbox and do not advertise agent tools because no task registry exists on
+  that path. Permission prompts and agent lifecycle support begin only inside
+  the TUI loop.
 - Configured deny rules precede `Safe` classification and per-turn allow-all.
   New unprotected files and agent-memory writes are among the mutations
   classified `Safe` after restrictions have been checked.

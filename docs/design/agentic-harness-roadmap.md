@@ -127,7 +127,7 @@ Work:
 - bind every authoritative goal clause to a direct predicate or mark it
   unverified;
 - make writable launch turns omit agent tools until they have a task registry, or wire
-  the registry deliberately;
+  the registry deliberately (done 2026-10-23: launch turns omit them);
 - make `background: false` block or remove the false synchronous claim;
 - document hooks as TUI-only and disabled in read-only mode;
 - disable automatic semantic-memory injection into child prompts until each
@@ -357,6 +357,9 @@ Gate:
   evaluation, and rollback.
 - Full workspace rewind waits until arbitrary shell effects participate in a
   mutation ledger.
+- A full shell or `$SHELL` replacement is outside Piku's product scope and
+  owned by the separate `wish` project. Piku keeps the executor shell and a
+  composable CLI; see [shell surfaces research](shell-surfaces-research.md).
 
 ## Roadmap review triggers
 
@@ -383,6 +386,9 @@ evidence.
 - [Child task review](task-review-contract.md) compares the existing human
   conclusion workflow with an enforced acceptance contract, keeping execution,
   observed verification, and acceptance distinct.
+- [Delegation as job control](delegation-job-model.md) compares subagent
+  lifecycle with shell job control and lists the constraints the current
+  registry imposes.
 - [Collaboration and experience-memory experiment](agent-learning-collaboration-experiment.md)
   defines single-agent/delegation and frozen held-out memory baselines. It is an
   opt-in experiment proposal, not an implemented capability or measured gain.

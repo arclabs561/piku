@@ -17,7 +17,7 @@ use piku_runtime::{
     PermissionRequest, RunHandle, RunRecorder, Session, TurnResult,
 };
 use piku_runtime::{provider_availability, PostToolAction, TokenUsage};
-use piku_tools::all_tool_definitions;
+use piku_tools::launch_tool_definitions;
 
 #[allow(clippy::too_many_lines)] // Command dispatch stays beside its subcommand wiring.
 #[tokio::main]
@@ -513,7 +513,7 @@ async fn run_single_shot(
             "[piku] tool calls run without prompting; {} deny rule(s) from settings.toml apply",
             config.deny.len()
         );
-        all_tool_definitions()
+        launch_tool_definitions()
     };
     let prompter = ConfiguredAllowAll::new(&config.deny);
     let traces_dir = config.traces_dir();
