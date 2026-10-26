@@ -4,7 +4,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -30,6 +30,7 @@ mod codex;
 mod codex_attestation;
 mod launch_auth;
 mod page_broker;
+mod preview;
 mod pty;
 mod workspace_inventory;
 mod write_lease;
@@ -342,6 +343,7 @@ pub(super) struct AppState {
     workspace_write_attestation: Option<Arc<codex_attestation::VerifiedWriteAttestation>>,
     terminal_enabled: bool,
     launch_auth: Arc<launch_auth::LaunchAuth>,
+    previews: Arc<preview::PreviewStore>,
     preauth_slots: Arc<Semaphore>,
     evaluation_fixtures: bool,
     fixture_cancellation_acks: Arc<RwLock<HashMap<String, Instant>>>,
@@ -587,6 +589,7 @@ pub async fn serve(config: &PikuConfig, port: u16, terminal_enabled: bool) -> an
         workspace_write_attestation,
         terminal_enabled,
         launch_auth,
+        previews: Arc::new(preview::PreviewStore::default()),
         preauth_slots: Arc::new(Semaphore::new(8)),
         evaluation_fixtures: std::env::var_os("PIKU_WEB_EVALUATION_FIXTURES")
             .is_some_and(|value| value == "1"),
@@ -627,6 +630,12 @@ pub async fn serve(config: &PikuConfig, port: u16, terminal_enabled: bool) -> an
 fn app_router(state: Arc<AppState>) -> Router {
     let mut app = Router::new()
         .route("/", get(home))
+        .route("/app.js", get(app_bundle))
+        .route(
+            "/api/previews",
+            post(create_preview).layer(DefaultBodyLimit::max(preview::MAX_PREVIEW_BYTES)),
+        )
+        .route("/preview/{ticket}", get(serve_preview))
         .route("/api/surfaces", get(list_surfaces_api).post(create_surface))
         .route(
             "/api/surfaces/{name}",
@@ -760,9 +769,15 @@ async fn local_request_guard(
     };
     let malformed_authorization = headers.contains_key(header::AUTHORIZATION)
         && launch_auth::single_header(headers, header::AUTHORIZATION).is_none();
+    let path = request.uri().path();
     let public_shell =
-        request.uri().path() == "/" && matches!(*request.method(), Method::GET | Method::HEAD);
+        matches!(path, "/" | "/app.js") && matches!(*request.method(), Method::GET | Method::HEAD);
+    // Iframe navigations cannot carry the bearer header. `/preview/<ticket>` is
+    // admitted for GET only; its handler redeems the single-use ticket, which
+    // grants nothing on any other route.
+    let preview_navigation = path.starts_with("/preview/") && request.method() == Method::GET;
     let admitted = public_shell
+        || preview_navigation
         || websocket
         || launch_auth::single_header(headers, header::AUTHORIZATION)
             .and_then(|value| value.strip_prefix("Bearer "))
@@ -788,8 +803,9 @@ fn security_headers(mut response: Response) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
-        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    // A handler that sets its own policy (only the preview route) keeps it.
+    headers.entry(header::CONTENT_SECURITY_POLICY).or_insert(HeaderValue::from_static(
+        "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     ));
     response
 }
@@ -800,6 +816,37 @@ fn security_headers(mut response: Response) -> Response {
 
 async fn home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Html(render_home("", "", &[], state.terminal_enabled))
+}
+
+async fn app_bundle() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/javascript; charset=utf-8"),
+        )],
+        include_str!("web/app.js"),
+    )
+}
+
+async fn create_preview(State(state): State<Arc<AppState>>, html: String) -> Response {
+    match state.previews.insert(html, Instant::now()) {
+        Ok(ticket) => {
+            Json(serde_json::json!({ "url": format!("/preview/{ticket}") })).into_response()
+        }
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+async fn serve_preview(State(state): State<Arc<AppState>>, Path(ticket): Path<String>) -> Response {
+    let Some(html) = state.previews.take(&ticket, Instant::now()) else {
+        return (StatusCode::NOT_FOUND, "preview unavailable").into_response();
+    };
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(preview::PREVIEW_CSP),
+    );
+    response
 }
 
 fn render_home(
@@ -827,11 +874,10 @@ fn render_home(
 <main id="canvas"><div id="reflow-notice" role="status">narrow reflow · edit here, arrange on desktop</div><div id="canvas-overlay"></div></main>
 <section id="chat"><div id="messages"></div><form id="chat-form"><input id="input" type="text" placeholder="chat without changing the canvas…" autocomplete="off" autofocus><button type="submit">send</button></form></section>
 </div>
-<script>window.PIKU_BOOTSTRAP={bootstrap};
-{}</script>
+<script id="piku-bootstrap" type="application/json">{bootstrap}</script>
+<script src="/app.js"></script>
 </body></html>"#,
         include_str!("web/app.css"),
-        include_str!("web/app.js"),
     )
 }
 
@@ -4407,6 +4453,7 @@ mod tests {
             workspace_write_attestation: None,
             terminal_enabled,
             launch_auth: Arc::new(launch_auth::LaunchAuth::new(port).unwrap()),
+            previews: Arc::new(preview::PreviewStore::default()),
             preauth_slots: Arc::new(Semaphore::new(8)),
             evaluation_fixtures: false,
             fixture_cancellation_acks: Arc::new(RwLock::new(HashMap::new())),
@@ -4523,6 +4570,147 @@ mod tests {
             state.model_slots.available_permits(),
             super::MODEL_REQUEST_SLOTS
         );
+        task.abort();
+        fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
+    }
+
+    fn csp_directive(policy: &str, name: &str) -> String {
+        policy
+            .split(';')
+            .map(str::trim)
+            .find(|directive| directive.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("{name} missing from {policy}"))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn home_page_scripts_run_only_from_same_origin_files() {
+        let (state, url, task) = boundary_fixture(false).await;
+        let client = reqwest::Client::new();
+        let home = client.get(format!("{url}/")).send().await.unwrap();
+        assert_eq!(home.status(), 200);
+        let policy = home.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let scripts = csp_directive(&policy, "script-src");
+        assert!(!scripts.contains("'unsafe-inline'"), "{scripts}");
+        assert!(!scripts.contains("'unsafe-eval'"), "{scripts}");
+        let page = home.text().await.unwrap();
+        // Every executable script is an external same-origin file; the only
+        // inline script element is an inert JSON data block.
+        assert_eq!(page.matches("<script").count(), 2, "{page}");
+        assert!(page.contains(r#"<script id="piku-bootstrap" type="application/json">"#));
+        assert!(page.contains(r#"<script src="/app.js"></script>"#));
+
+        // The public bundle is the same static code the shell used to inline.
+        let bundle = client.get(format!("{url}/app.js")).send().await.unwrap();
+        assert_eq!(bundle.status(), 200);
+        assert!(bundle.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+        assert_eq!(bundle.text().await.unwrap(), include_str!("web/app.js"));
+        task.abort();
+        fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_tickets_are_single_use_and_admit_only_the_preview_route() {
+        let (state, url, task) = boundary_fixture(false).await;
+        let client = reqwest::Client::new();
+        let authorization = state.launch_auth.bearer();
+        let html = "<main>preview marker</main><script>document.title='ran'</script>";
+
+        let anonymous = client
+            .post(format!("{url}/api/previews"))
+            .body(html)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), 401);
+
+        let created = client
+            .post(format!("{url}/api/previews"))
+            .header("Authorization", &authorization)
+            .header("Content-Type", "text/html")
+            .body(html)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 200);
+        let created: serde_json::Value = created.json().await.unwrap();
+        let preview_path = created["url"].as_str().unwrap().to_string();
+        let ticket = preview_path.strip_prefix("/preview/").unwrap().to_string();
+        assert_eq!(ticket.len(), 64);
+        assert!(ticket.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        // A ticket is not a bearer credential and is not accepted elsewhere.
+        for path in ["/api/surfaces", "/api/executors", "/run/unknown"] {
+            let response = client
+                .get(format!("{url}{path}"))
+                .header("Authorization", format!("Bearer {ticket}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401, "{path}");
+            let response = client
+                .get(format!("{url}{path}?ticket={ticket}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401, "{path}");
+        }
+        // Only GET navigations may redeem it, so a POST cannot burn or read it.
+        let response = client
+            .post(format!("{url}{preview_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+
+        let missing = client.get(format!("{url}/preview/")).send().await.unwrap();
+        assert_ne!(missing.status(), 200);
+        let unknown = client
+            .get(format!("{url}/preview/{}", "0".repeat(64)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 404);
+        assert!(!unknown.text().await.unwrap().contains("preview marker"));
+
+        let served = client
+            .get(format!("{url}{preview_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(served.status(), 200);
+        let policy = served.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(csp_directive(&policy, "sandbox"), "sandbox allow-scripts");
+        assert_eq!(
+            csp_directive(&policy, "script-src"),
+            "script-src 'unsafe-inline'"
+        );
+        assert_eq!(csp_directive(&policy, "connect-src"), "connect-src 'none'");
+        assert_eq!(csp_directive(&policy, "default-src"), "default-src 'none'");
+        assert_eq!(
+            csp_directive(&policy, "frame-ancestors"),
+            "frame-ancestors 'self'"
+        );
+        assert_eq!(served.headers()["cache-control"], "no-store");
+        assert_eq!(served.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(served.text().await.unwrap(), html);
+
+        let reused = client
+            .get(format!("{url}{preview_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), 404);
+        assert!(!reused.text().await.unwrap().contains("preview marker"));
         task.abort();
         fs::remove_dir_all(state.surfaces.read().await.root.clone()).unwrap();
     }
@@ -4805,18 +4993,18 @@ mod tests {
 
     #[test]
     fn home_quotes_active_surface_and_enables_canvas_input() {
-        let page = render_home("scratch's surface", "", &[], true);
+        // The shell and its external bundle together form the served page.
+        let page = render_home("scratch's surface", "", &[], true) + include_str!("web/app.js");
 
         assert!(page.contains(r#""active":"scratch's surface""#));
         assert!(page.contains("canvas.addEventListener"));
         assert!(page.contains("openCreationMenu"));
         assert!(page.contains(".sandbox = \"allow-scripts\""));
-        assert!(page.contains("form-action 'none'"));
+        assert!(page.contains("/api/previews"));
         assert!(page.contains("function renderPage(html"));
         assert!(page.contains("sandboxed"));
         assert!(page.contains("page preview"));
         assert!(page.contains("page-preview-body"));
-        assert!(page.contains("connect-src 'none'"));
         assert!(page.contains("data-kind=\"chat\""));
         assert!(page.contains("data-kind=\"workspace_task\""));
         assert!(page.contains("data-kind=\"page_task\""));
@@ -4836,7 +5024,7 @@ mod tests {
         assert!(page.contains("/api/terminal/pty"));
         assert!(page.contains("Interactive terminal"));
 
-        let restricted = render_home("scratch", "", &[], false);
+        let restricted = render_home("scratch", "", &[], false) + include_str!("web/app.js");
         assert!(restricted.contains(r#""terminalEnabled":false"#));
         assert!(restricted.contains("Terminal access is unavailable in this capability profile"));
     }
@@ -5388,18 +5576,15 @@ mod tests {
             true,
         );
 
-        assert_eq!(page.matches("</script>").count(), 1);
+        // One inert bootstrap data block plus the external bundle tag.
+        assert_eq!(page.matches("</script>").count(), 2);
+        assert!(!page.contains("<script>alert"));
         assert!(page.contains(r"\u003c/script\u003e"));
     }
 
     #[test]
     fn browser_program_parses_when_node_is_available() {
-        let page = render_home("scratch", "<main>hello</main>", &[], true);
-        let script = page
-            .split_once("<script>")
-            .and_then(|(_, rest)| rest.split_once("</script>"))
-            .map(|(script, _)| script)
-            .expect("home page has one host script");
+        let script = include_str!("web/app.js");
         let mut child = match Command::new("node")
             .args(["--check", "-"])
             .stdin(Stdio::piped())

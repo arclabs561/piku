@@ -10,6 +10,9 @@ import "./style.css";
 // The launch capability belongs only to this origin and browser tab. Scrub it
 // before any request, DOM rendering, or preview can observe the launch URL.
 const launchStorageKey = "piku.launchToken";
+// The shell's CSP forbids inline script, so server data arrives as an inert
+// JSON block rather than an inline assignment.
+const bootstrap = JSON.parse(document.getElementById("piku-bootstrap").textContent);
 const launchFragment = new URLSearchParams(location.hash.slice(1));
 let launchToken = launchFragment.get("token") || "";
 let admissionGeneration = 0;
@@ -128,13 +131,13 @@ const surfacesEl = document.getElementById("surfaces"),
   delBtn = document.getElementById("del-btn"),
   terminalBtn = document.getElementById("terminal-btn");
 const MAX_WORKSPACE_OBJECT_HEIGHT = 1800;
-let active = window.PIKU_BOOTSTRAP.active;
+let active = bootstrap.active;
 let creationMenu = null,
   zCounter = 20,
   activitySequence = 0,
   renderingWorkspace = false,
   saveTimer = null,
-  currentPageHtml = window.PIKU_BOOTSTRAP.canvasHtml || "",
+  currentPageHtml = bootstrap.canvasHtml || "",
   selectedPageId = null;
 let executorCatalog = {
   default: "codex",
@@ -156,7 +159,7 @@ async function refreshExecutorCatalog() {
 }
 const executorCatalogReady = Promise.resolve().then(refreshExecutorCatalog);
 
-const terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled === true;
+const terminalEnabled = bootstrap.terminalEnabled === true;
 if (!terminalEnabled) terminalBtn.hidden = true;
 
 function viewportKey(surface) {
@@ -207,11 +210,19 @@ async function switchSurface(name) {
   requestAnimationFrame(() => restoreViewport(name));
   refreshList();
 }
-function sandboxHtml(html) {
-  const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; media-src data: blob:; frame-src 'none'; form-action 'none'; base-uri 'none';">`,
-    parsed = new DOMParser().parseFromString(html, "text/html");
-  parsed.head.insertAdjacentHTML("afterbegin", policy);
-  return "<!doctype html>" + parsed.documentElement.outerHTML;
+// srcdoc previews would inherit this page's strict CSP, so preview HTML goes to
+// the server, which returns a single-use ticket URL served with its own
+// sandboxed policy. Frames keep sandbox="allow-scripts" for an opaque origin.
+async function previewUrl(html) {
+  const response = await authenticatedFetch("/api/previews", {
+    method: "POST",
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+    body: html,
+  });
+  if (!response.ok) throw new Error("preview unavailable");
+  const { url } = await response.json();
+  if (!/^\/preview\/[a-f0-9]{64}$/.test(url)) throw new Error("preview unavailable");
+  return url;
 }
 async function showRunRecord(url) {
   const response = await authenticatedFetch(url);
@@ -224,7 +235,7 @@ async function showRunRecord(url) {
   const frame = document.createElement("iframe");
   frame.title = "Full session record";
   frame.sandbox = "allow-scripts";
-  frame.srcdoc = sandboxHtml(await response.text());
+  frame.src = await previewUrl(await response.text());
   dialog.append(close, frame);
   dialog.addEventListener("close", () => dialog.remove());
   document.body.append(dialog);
@@ -249,8 +260,10 @@ function renderPage(html, targetId = null) {
   frame.className = "canvas-frame";
   frame.title = "Sandboxed page preview";
   frame.sandbox = "allow-scripts";
-  frame.srcdoc = sandboxHtml(html);
   body.append(frame);
+  previewUrl(html)
+    .then((url) => { if (frame.isConnected) frame.src = url; })
+    .catch(() => setSaveStatus("preview unavailable", true));
 }
 function renderSurface(name, html, msgs, objects, running) {
   closeCreationMenu();
@@ -2344,7 +2357,7 @@ function renderChatTurns(object, state) {
         if (!response.ok) return;
         const frame = evidence.querySelector("iframe");
         frame.sandbox = "allow-scripts";
-        frame.srcdoc = sandboxHtml(await response.text());
+        frame.src = await previewUrl(await response.text());
         frame.title = `Saved session evidence for ${turn.runId || turn.id}`;
         recordLoaded = true;
       }
