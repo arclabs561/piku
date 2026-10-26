@@ -198549,9 +198549,7 @@ ${checks.join("\n")}`;
     console.info("[piku]", terminalSafe(text4));
   }
   function esc(s16) {
-    const d3 = document.createElement("div");
-    d3.textContent = s16;
-    return d3.innerHTML;
+    return String(s16 ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
   async function initializeWorkspace() {
     const response = await authenticatedFetch("/api/surfaces");
