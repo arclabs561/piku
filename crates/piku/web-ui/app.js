@@ -2919,10 +2919,16 @@ function visibleNarration(text) {
 function terminalWrite(text) {
   console.info("[piku]", terminalSafe(text));
 }
+// Safe in element text and in quoted attribute values. Serializing a text node
+// leaves quotes alone, so a title containing `"` could break out of an
+// attribute that callers build into innerHTML.
 function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 async function initializeWorkspace() {
   const response = await authenticatedFetch("/api/surfaces");

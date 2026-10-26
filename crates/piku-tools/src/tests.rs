@@ -368,14 +368,6 @@ mod write_file {
     }
 
     #[test]
-    fn new_file_is_safe_destructiveness() {
-        let dir = tempdir();
-        let path = dir.join("brand_new.txt");
-        let d = write_file::destructiveness(&serde_json::json!({ "path": path }));
-        assert_eq!(d, crate::Destructiveness::Safe);
-    }
-
-    #[test]
     fn overwrite_is_likely_destructiveness() {
         let dir = tempdir();
         let path = dir.join("exists.txt");
@@ -1096,6 +1088,38 @@ mod sandbox {
     /// Set CWD to a throwaway dir. `#[serial]` because CWD is process-global.
     fn cd(dir: &std::path::Path) {
         std::env::set_current_dir(dir).unwrap();
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn new_file_inside_working_dir_is_safe() {
+        let td = tempdir();
+        cd(&td);
+        let d = crate::write_file::destructiveness(&serde_json::json!({ "path": "brand_new.txt" }));
+        assert_eq!(d, crate::Destructiveness::Safe);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn new_file_outside_working_dir_needs_approval() {
+        let work = tempdir();
+        let elsewhere = tempdir();
+        cd(&work);
+        let path = elsewhere.join("brand_new.txt");
+        let d = crate::write_file::destructiveness(&serde_json::json!({ "path": path }));
+        assert_eq!(d, crate::Destructiveness::Definite);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn new_piku_global_hooks_file_needs_approval_even_from_home() {
+        // Running from $HOME puts ~/.config/piku inside the working directory.
+        let home = tempdir();
+        cd(&home);
+        let d = crate::write_file::destructiveness(
+            &serde_json::json!({ "path": ".config/piku/hooks.json" }),
+        );
+        assert_eq!(d, crate::Destructiveness::Definite);
     }
 
     #[test]
