@@ -3416,3 +3416,75 @@ mod attempt_graph_regressions {
         }
     }
 }
+
+/// Replays the arguments a gpt-6.1 session sent four times in a row: every
+/// optional integer filled with 0 on an empty attempt store. The call must
+/// create an attempt, not fail with "attempt 0 not found".
+#[test]
+fn record_attempt_with_provider_filled_zero_ids_creates_an_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "record_attempt_zero_ids_in_isolated_process",
+            "--nocapture",
+        ])
+        .current_dir(dir.path())
+        .env("PIKU_RECORD_ATTEMPT_ZERO_IDS_HELPER", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated record_attempt replay failed: {status}"
+    );
+}
+
+#[tokio::test]
+async fn record_attempt_zero_ids_in_isolated_process() {
+    if std::env::var_os("PIKU_RECORD_ATTEMPT_ZERO_IDS_HELPER").is_none() {
+        return;
+    }
+    let (url, server) = memory_embedding_server().await;
+    std::env::set_var("PIKU_EMBED_URL", &url);
+    std::env::set_var("PIKU_EMBED_BACKEND", "ollama");
+    let provider = SequenceProvider::new(vec![
+        tool_call_events(
+            "zero-ids",
+            "record_attempt",
+            r#"{"approach":"Reproduce footer loss in a PTY","attempt_id":0,"goal":"Fix footer after Enter","importance":6,"outcome":"pending","outcome_detail":"","parent_id":0}"#,
+        ),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("zero-ids".into());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "record the attempt",
+        &mut session,
+        &provider,
+        "scripted",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(sink.tool_ends.len(), 1);
+    let (_, _, output, is_error) = &sink.tool_ends[0];
+    assert!(
+        !is_error,
+        "provider-filled zero ids must not fail: {output}"
+    );
+    assert!(output.starts_with("attempt recorded (id="), "{output}");
+    let stored = piku_runtime::MemoryStore::try_load(&piku_runtime::default_store_path(
+        &std::env::current_dir().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(stored.entries.len(), 1);
+    assert_eq!(
+        stored.entries[0].parent, None,
+        "a parent that does not exist is dropped"
+    );
+    server.abort();
+}

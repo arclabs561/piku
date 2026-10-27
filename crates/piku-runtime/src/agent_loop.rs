@@ -176,6 +176,27 @@ impl TurnExit {
 /// If `task_registry` is Some, `spawn_agent` / `agent_status` / `agent_join`
 /// calls are handled natively — subagents run as background tokio tasks and
 /// report back through the registry.
+/// Count a failing call and, from its second identical occurrence, append a
+/// note telling the model that repeating it will not help.
+fn note_repeated_failure(
+    failed_calls: &mut std::collections::HashMap<String, u32>,
+    tool_name: &str,
+    params: &serde_json::Value,
+    output: String,
+) -> String {
+    let count = failed_calls
+        .entry(format!("{tool_name}\u{1f}{params}"))
+        .or_insert(0);
+    *count += 1;
+    if *count < 2 {
+        return output;
+    }
+    format!(
+        "{output}\n\n[piku] This exact {tool_name} call has now failed {count} times with these \
+arguments. Repeating it will fail the same way: change the arguments or take a different approach."
+    )
+}
+
 pub async fn run_turn(
     input: &str,
     session: &mut Session,
@@ -283,6 +304,8 @@ async fn run_turn_inner(
     let turn_start = std::time::Instant::now();
     let mut tracker = UsageTracker::default();
     let mut iterations = 0u32;
+    // Failing calls seen this turn, keyed by tool name and exact arguments.
+    let mut failed_calls: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut request_pressure = 0.0;
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
@@ -1019,6 +1042,15 @@ async fn run_turn_inner(
                     Some(r) => unpack_tool_result(r, &mut tool_effects, &mut verification),
                     None => (format!("unknown tool: {tool_name}"), true),
                 }
+            };
+
+            // A model that repeats an identical failing call will keep getting
+            // the same error; say so instead of letting it loop (a session sent
+            // record_attempt with attempt_id 0 four times in a row).
+            let output = if is_error {
+                note_repeated_failure(&mut failed_calls, tool_name, params, output)
+            } else {
+                output
             };
 
             // Append hook-injected context to the tool output so the model sees it.
@@ -2967,5 +2999,28 @@ mod curation_tests {
             has_use, has_result,
             "tool_use and tool_result must be included or dropped together (use={has_use} result={has_result})"
         );
+    }
+}
+
+#[cfg(test)]
+mod repeated_failure_tests {
+    use super::note_repeated_failure;
+
+    #[test]
+    fn second_identical_failure_gets_a_note_and_different_arguments_do_not() {
+        let mut seen = std::collections::HashMap::new();
+        let args = serde_json::json!({"attempt_id": 0});
+        let first = note_repeated_failure(&mut seen, "record_attempt", &args, "not found".into());
+        assert_eq!(first, "not found");
+        let second = note_repeated_failure(&mut seen, "record_attempt", &args, "not found".into());
+        assert!(
+            second.starts_with(
+                "not found\n\n[piku] This exact record_attempt call has now failed 2 times"
+            ),
+            "{second}"
+        );
+        let other = serde_json::json!({"attempt_id": 1});
+        let fresh = note_repeated_failure(&mut seen, "record_attempt", &other, "not found".into());
+        assert_eq!(fresh, "not found");
     }
 }
