@@ -10,7 +10,7 @@
 
 use std::io::{self, IsTerminal, Write};
 
-use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
+use crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -528,6 +528,30 @@ pub struct LineEditor {
     status_since: std::time::Instant,
     /// Optional dev status probe, polled while the prompt is idle.
     status_source: Option<fn() -> Option<String>>,
+    /// Bottom-anchored layout owned by a full-screen caller; see [`EditorFrame`].
+    frame: Option<EditorFrame>,
+    /// Rows the input block occupied at the last framed redraw.
+    frame_rows: u16,
+    /// Terminal size at the last framed redraw, to relayout after a resize.
+    frame_size: (u16, u16),
+}
+
+/// Lets a full-screen caller keep its frame while the editor draws.
+///
+/// Without a frame the editor draws relative to the cursor and lets the
+/// terminal wrap and scroll, which in a pinned layout scrolls the header and
+/// footer away as soon as input needs a second row. With a frame, the input
+/// block is drawn at absolute rows at the bottom of the screen, split into
+/// rows that never reach the last column, and `relayout` is called whenever
+/// the block needs a different number of rows (or the terminal resized) so
+/// the caller can move its footer and scroll region above it.
+pub struct EditorFrame {
+    /// `relayout(old_rows, new_rows)`: lay out the frame for `new_rows` input
+    /// rows at the bottom of the screen.
+    pub relayout: Box<dyn FnMut(u16, u16)>,
+    /// Most rows the block may take; longer input shows a window around the
+    /// caret.
+    pub max_rows: u16,
 }
 
 /// Encode one history entry as a single line.
@@ -607,7 +631,23 @@ impl LineEditor {
             status_source: None,
             search_query: None,
             search_match_idx: None,
+            frame: None,
+            frame_rows: 1,
+            frame_size: (0, 0),
         }
+    }
+
+    /// Draw input as a bottom-anchored block inside a caller-owned frame.
+    pub fn set_frame(&mut self, frame: Option<EditorFrame>) {
+        self.frame = frame;
+        self.frame_rows = 1;
+        self.frame_size = (0, 0);
+    }
+
+    /// Rows the framed input block occupies now (1 when idle or unframed).
+    #[must_use]
+    pub fn frame_rows(&self) -> u16 {
+        self.frame_rows
     }
 
     /// Prefill the next prompt. Used when a dev reload preserved a draft.
@@ -1531,12 +1571,15 @@ impl LineEditor {
     }
 
     fn redraw(
-        &self,
+        &mut self,
         out: &mut impl Write,
         input: &InputBuffer,
         prev_lines: usize,
     ) -> io::Result<usize> {
         let rendered = self.render(input);
+        if self.frame.is_some() {
+            return self.redraw_framed(out, &rendered);
+        }
 
         // Move up to the first line of previous render
         if prev_lines > 1 {
@@ -1578,6 +1621,118 @@ pub enum Action {
     Inspect,
     Repaint,
     Exit,
+}
+
+impl LineEditor {
+    /// Framed redraw: absolute rows at the bottom, no terminal wrapping or
+    /// scrolling, and a relayout call when the block changes height.
+    fn redraw_framed(&mut self, out: &mut impl Write, rendered: &Rendered) -> io::Result<usize> {
+        let (cols, rows) = term_size();
+        let layout = frame_layout(
+            rendered,
+            cols,
+            self.frame.as_ref().map_or(1, |f| f.max_rows),
+        );
+        let block = sat_u16(layout.rows.len()).max(1);
+        if block != self.frame_rows || (cols, rows) != self.frame_size {
+            if let Some(frame) = self.frame.as_mut() {
+                (frame.relayout)(self.frame_rows, block);
+            }
+            self.frame_rows = block;
+            self.frame_size = (cols, rows);
+        }
+        let top = rows.saturating_sub(block) + 1;
+        for (offset, row) in layout.rows.iter().enumerate() {
+            queue!(
+                out,
+                MoveTo(0, top - 1 + sat_u16(offset)),
+                Clear(ClearType::CurrentLine)
+            )?;
+            write!(out, "{row}\x1b[0m")?;
+        }
+        queue!(out, MoveTo(layout.cursor_col, top - 1 + layout.cursor_row))?;
+        write!(out, "\x1b[?25h")?;
+        out.flush()?;
+        Ok(rendered.line_count)
+    }
+}
+
+/// Rendered lines split into screen rows for a framed redraw.
+struct FrameLayout {
+    rows: Vec<String>,
+    /// Caret position within `rows` (0-based row, 0-based column).
+    cursor_row: u16,
+    cursor_col: u16,
+}
+
+/// Split each rendered line into rows of at most `cols - 1` cells (the last
+/// column stays empty so a full row never leaves the terminal in its
+/// wrap-pending state), place the caret, and keep at most `max_rows` rows
+/// around it.
+fn frame_layout(rendered: &Rendered, cols: u16, max_rows: u16) -> FrameLayout {
+    let width = usize::from(cols.saturating_sub(1)).max(1);
+    let mut rows = Vec::new();
+    let mut caret = (0usize, 0usize);
+    for (index, line) in rendered.lines.iter().enumerate() {
+        let first = rows.len();
+        rows.extend(split_by_width(line, width));
+        if index == usize::from(rendered.cursor_row) {
+            let col = usize::from(rendered.cursor_col);
+            caret = (first + col / width, col % width);
+            // A caret just past a full row sits at the start of the next one.
+            while rows.len() <= caret.0 {
+                rows.push(String::new());
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let max_rows = usize::from(max_rows).max(1);
+    let start = if rows.len() > max_rows {
+        (caret.0 + 1)
+            .saturating_sub(max_rows)
+            .min(rows.len() - max_rows)
+    } else {
+        0
+    };
+    let end = (start + max_rows).min(rows.len());
+    FrameLayout {
+        rows: rows[start..end].to_vec(),
+        cursor_row: sat_u16(caret.0 - start),
+        cursor_col: sat_u16(caret.1),
+    }
+}
+
+/// Split `s` into pieces of at most `width` display cells, passing ANSI escape
+/// sequences through untouched. Styles are re-opened per piece only as far as
+/// the escape sequences themselves carry them.
+fn split_by_width(s: &str, width: usize) -> Vec<String> {
+    let mut pieces = vec![String::new()];
+    let mut used = 0;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            pieces.last_mut().unwrap().push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            in_escape = true;
+            pieces.last_mut().unwrap().push(ch);
+            continue;
+        }
+        let w = UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4]) as &str);
+        if used + w > width && used > 0 {
+            pieces.push(String::new());
+            used = 0;
+        }
+        pieces.last_mut().unwrap().push(ch);
+        used += w;
+    }
+    pieces
 }
 
 struct Rendered {
@@ -1708,6 +1863,17 @@ pub fn visible_width(s: &str) -> usize {
         }
     }
     width
+}
+
+/// Terminal `(cols, rows)`. Some PTY setups (freshly spawned pty slaves, CI
+/// runners) report (0, 0) through a successful ioctl rather than failing; an
+/// `unwrap_or` on `Err` would miss that and draw into a zero-sized grid. A
+/// degenerate size resolves to 80x24.
+pub(crate) fn term_size() -> (u16, u16) {
+    match terminal::size() {
+        Ok((cols, rows)) if cols > 0 && rows > 0 => (cols, rows),
+        _ => (80, 24),
+    }
 }
 
 fn sat_u16(v: usize) -> u16 {

@@ -531,15 +531,7 @@ fn record_operator_receipt(
 }
 
 fn term_size() -> (u16, u16) {
-    // Fall back to a sane default when the terminal reports no size. Some PTY
-    // setups (e.g. freshly spawned pty slaves, CI runners) report (0, 0) via a
-    // successful ioctl rather than failing; an unwrap_or on Err would miss that
-    // and leave piku drawing into a zero-sized grid (no header, no scroll
-    // region). A degenerate size must still resolve to a usable layout.
-    match terminal::size() {
-        Ok((r, c)) if r > 0 && c > 0 => (r, c),
-        _ => (80, 24),
-    }
+    crate::input_helper::term_size()
 }
 
 /// Escape terminal controls and bound a permission description without splitting UTF-8.
@@ -693,6 +685,66 @@ fn draw_type_ahead_row(row: u16, ahead: &TypeAhead, suffix: &str) {
     let _ = out.write_all(format!("\x1b[2K{line}{suffix}").as_bytes());
     let _ = out.write_all(b"\x1b[u");
     let _ = out.flush();
+}
+
+// ── Input block layout ────────────────────────────────────────────────────────
+
+/// Footer values owned by the editor's relayout callback, which outlives the
+/// borrows a [`FooterState`] holds.
+struct OwnedFooter {
+    provider: String,
+    model: String,
+    actor: String,
+    session_id: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    running_agents: usize,
+    context_pct: Option<u8>,
+}
+
+/// Most rows the input block may take: leave the header and a few rows of
+/// conversation visible.
+fn input_block_max_rows(rows: u16) -> u16 {
+    rows.saturating_sub(HEADER_ROWS + 4).clamp(1, 10)
+}
+
+/// The frame below the conversation is the footer row plus `block` input rows.
+/// When the block grows, scroll the conversation up by the difference first so
+/// nothing is drawn over; then shrink the region and redraw the footer above
+/// the block.
+fn input_block_relayout(footer: OwnedFooter) -> impl FnMut(u16, u16) {
+    move |old: u16, new: u16| {
+        let (cols, rows) = term_size();
+        if new > old {
+            let old_bottom = rows.saturating_sub(1 + old);
+            set_scroll_region(scroll_top(), old_bottom);
+            goto(old_bottom, 1);
+            for _ in 0..(new - old) {
+                println!();
+            }
+        }
+        set_scroll_region(scroll_top(), rows.saturating_sub(1 + new));
+        for row in rows.saturating_sub(old.max(new))..=rows {
+            goto(row, 1);
+            print!("\x1b[2K");
+        }
+        draw_footer(
+            rows.saturating_sub(new),
+            cols,
+            &FooterState {
+                provider: &footer.provider,
+                model: &footer.model,
+                actor: &footer.actor,
+                session_id: &footer.session_id,
+                input_tokens: footer.input_tokens,
+                output_tokens: footer.output_tokens,
+                turns: 0,
+                running_agents: footer.running_agents,
+                context_pct: footer.context_pct,
+            },
+        );
+        let _ = io::stdout().flush();
+    }
 }
 
 // ── Repaint ───────────────────────────────────────────────────────────────────
@@ -1748,14 +1800,24 @@ async fn run_tui_repl_core(
         // the caret reports only whether input is accepted right now.
         editor.set_prompt(READY_PROMPT);
 
-        // Use read_line_raw so the editor doesn't emit post-submit
-        // cursor movement that conflicts with the DECSTBM layout.
-        // We temporarily reset the scroll region so MoveUp/MoveDown
-        // in the editor's redraw work without scroll-region clipping.
-        // Park on the input row: leaving the region homes the cursor, and the
-        // editor's first redraw erases from wherever the cursor is down to the
-        // bottom. Homed, that erase eats the header, transcript, and footer.
-        leave_scroll_region(input_row);
+        // The editor draws a bottom-anchored input block at absolute rows and
+        // asks for a relayout when the block changes height, so multiline or
+        // wrapped input pushes the footer up instead of scrolling the header
+        // and footer off screen.
+        let _ = input_row;
+        editor.set_frame(Some(crate::input_helper::EditorFrame {
+            relayout: Box::new(input_block_relayout(OwnedFooter {
+                provider: resolved.name().to_string(),
+                model: model.clone(),
+                actor: active_actor.clone(),
+                session_id: session_id.clone(),
+                input_tokens: total_usage.input_tokens,
+                output_tokens: total_usage.output_tokens,
+                running_agents: task_registry.running().len(),
+                context_pct: request_context_pct(request_context.as_ref(), &model),
+            })),
+            max_rows: input_block_max_rows(term_size().1),
+        }));
         let queued = {
             let mut ahead = lock_type_ahead(&type_ahead);
             if ahead.interrupted {
@@ -1776,14 +1838,18 @@ async fn run_tui_repl_core(
             Some(line) => Ok(ReadOutcome::Submit(line)),
             None => editor.read_line_raw(),
         };
-        // Restore the region and park in the scroll zone so turn output lands
+        // Back to a one-row input: clear the block and the footer above it,
+        // restore the region, and park in the scroll zone so turn output lands
         // below the transcript rather than on top of the header.
+        let block_rows = editor.frame_rows();
+        editor.set_frame(None);
         let (cols, rows) = term_size();
+        for row in rows.saturating_sub(block_rows)..=rows {
+            goto(row, 1);
+            print!("\x1b[2K");
+        }
         let scroll_bot = rows.saturating_sub(2);
         enter_scroll_region(rows, scroll_bot);
-        // The editor ran with the whole screen as its region, so a multiline
-        // or wrapped redraw can scroll or erase the footer. Repaint it now
-        // rather than after the turn, which may be slow, then re-park.
         draw_footer(
             rows.saturating_sub(1),
             cols,

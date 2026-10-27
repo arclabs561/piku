@@ -2184,3 +2184,161 @@ fn piku_shell_runs_a_line_and_exits() {
         "ledger: {ledger}"
     );
 }
+
+/// The frame every interactive state must keep: pinned header, a footer that
+/// names the model, and an input row. The header does not repeat the model
+/// (it used to); transcript rows such as /status output may name it.
+fn assert_frame(snap: &ScreenSnapshot, model: &str, step: &str) {
+    let footer = &snap.rows[usize::from(TEST_ROWS - 2)];
+    let problems: Vec<&str> = [
+        (!snap.rows[0].starts_with("piku v"), "header row lost"),
+        (!footer.contains(model), "footer lost its model"),
+        (!footer.contains("/help"), "footer lost its /help hint"),
+        (
+            snap.rows[..2].iter().any(|row| row.contains(model)),
+            "header repeats the model the footer shows",
+        ),
+        (
+            !snap.input_row().trim_start().starts_with('❯'),
+            "input row has no prompt",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(bad, what)| bad.then_some(what))
+    .collect();
+    assert!(
+        problems.is_empty(),
+        "after {step}: {problems:?}\n{}",
+        snap.summary(24)
+    );
+}
+
+/// While the input block is taller than one row the footer sits directly
+/// above it, not on the second-to-last row.
+fn assert_frame_above_input(snap: &ScreenSnapshot, model: &str, step: &str) {
+    let footer = snap
+        .rows
+        .iter()
+        .rposition(|row| row.contains("/help") && row.contains(model));
+    // Earlier rows starting with the prompt glyph are transcript echoes; the
+    // input block starts on the row right after the footer and runs to the end.
+    let block_starts_after_footer = footer.is_some_and(|row| {
+        snap.rows
+            .get(row + 1)
+            .is_some_and(|text| text.trim_start().starts_with('❯'))
+            && row + 2 < snap.rows.len()
+    });
+    assert!(
+        snap.rows[0].starts_with("piku v") && block_starts_after_footer,
+        "after {step}: header kept, footer directly above the input block\n{}",
+        snap.summary(24)
+    );
+}
+
+/// One operator session through the states that each broke once: a multiline
+/// submit, typing while a slow turn runs, the queued turn, Ctrl-L, a slash
+/// command, and exit. The whole frame is checked after every step, so a
+/// regression in any one of them names the step that caused it.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn operator_journey_keeps_the_frame_through_every_step() {
+    const MODEL: &str = "journey-model";
+    let (base_url, bodies) = slow_completions_server(Duration::from_millis(1500));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let state = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("XDG_STATE_HOME", state.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", MODEL),
+        ],
+    );
+    let snap = wait_ready(&mut pty);
+    assert_frame(&snap, MODEL, "launch");
+
+    // Multiline submit: the editor scrolls the whole screen while typing.
+    pty.send(b"\x1b[200~first line\nsecond line\x1b[201~");
+    pty.wait(Duration::from_millis(150));
+    pty.send(b"\r");
+    let (pending, snap) = pty.wait_until(
+        |s| s.input_row().contains("thinking"),
+        Duration::from_secs(5),
+    );
+    assert!(pending, "turn never started:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "multiline submit");
+
+    // Type and queue a follow-up while the first turn is still running.
+    pty.send(b"follow up\r");
+    let (queued, snap) = pty.wait_until(
+        |s| s.input_row().contains("1 queued"),
+        Duration::from_secs(2),
+    );
+    assert!(queued, "queue not shown:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "typing during a turn");
+
+    // Both turns finish and the queued one was its own request.
+    let (done, snap) = pty.wait_until(
+        |s| s.is_ready() && bodies.lock().unwrap().len() >= 2,
+        Duration::from_secs(15),
+    );
+    assert!(done, "queued turn did not run:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "queued turn");
+    assert!(bodies.lock().unwrap()[1].contains("follow up"));
+
+    pty.send(b"\x0c");
+    let (repainted, snap) = pty.wait_until(
+        |s| s.is_ready() && s.rows.iter().any(|row| row.contains("prior conversation")),
+        Duration::from_secs(5),
+    );
+    assert!(repainted, "Ctrl-L did nothing:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "Ctrl-L");
+
+    // A long line wraps inside the input block; the frame moves up for it
+    // and comes back once the line is cleared.
+    pty.send(&[b'z'; 200]);
+    let (wrapped, snap) = pty.wait_until(
+        |s| s.rows.iter().filter(|row| row.contains("zzzz")).count() >= 3,
+        Duration::from_secs(5),
+    );
+    assert!(wrapped, "long input did not wrap:\n{}", snap.summary(24));
+    assert_frame_above_input(&snap, MODEL, "long wrapped input");
+    pty.send(b"\x15");
+    let (cleared, snap) = pty.wait_until(ScreenSnapshot::is_ready, Duration::from_secs(5));
+    assert!(cleared, "Ctrl-U did not clear:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "clearing long input");
+
+    pty.send(b"/status\r");
+    pty.wait(Duration::from_millis(400));
+    let (ready, snap) = pty.wait_until(ScreenSnapshot::is_ready, Duration::from_secs(5));
+    assert!(ready, "not ready after /status:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "/status");
+
+    // Exit announces its waits and their outcome instead of hanging silently.
+    let started = Instant::now();
+    pty.send(b"\x04");
+    while !pty.eof && started.elapsed() < Duration::from_secs(25) {
+        pty.wait(Duration::from_millis(100));
+    }
+    assert!(pty.eof, "piku did not exit:\n{}", pty.captured());
+    let log = pty.captured();
+    assert!(
+        log.contains("[extracting memories"),
+        "exit wait not announced:\n{log}"
+    );
+    assert!(
+        [
+            "[no new memories",
+            "memories saved to",
+            "memory extraction failed",
+            "timed out after"
+        ]
+        .iter()
+        .any(|outcome| log.contains(outcome)),
+        "exit wait outcome not reported:\n{log}"
+    );
+}
