@@ -102,6 +102,14 @@ fn write_draft_at(dir: &Path, session_id: &str, text: &str) -> std::io::Result<(
     std::fs::rename(temporary, path)
 }
 
+/// The session named by the draft a reloading child left, without consuming
+/// the draft: the resumed child takes it.
+fn reload_session_at(dir: &Path) -> Option<String> {
+    let body = std::fs::read(dir.join("draft.json")).ok()?;
+    let draft: Draft = serde_json::from_slice(&body).ok()?;
+    Some(draft.session_id)
+}
+
 /// Read and remove the draft for `session_id`. A draft written for another
 /// session is left alone.
 pub(crate) fn take_draft(session_id: &str) -> Option<String> {
@@ -187,11 +195,13 @@ pub fn run(release: bool, web: bool) -> anyhow::Result<()> {
     let mut guard = CrashGuard::new(CRASH_LIMIT, CRASH_WINDOW);
     let mut limiter = ReloadLimiter::new(RATE_WINDOW, MAX_RELOADS);
     let mut active = binary.clone();
+    // The session a reloading child saved; the next child resumes it.
+    let mut resume: Option<String> = None;
 
     let outcome = loop {
         // A restart must not inherit the previous child's "reloading" label.
         write_status(&state, "ready");
-        let mut child = match spawn_child(&active) {
+        let mut child = match spawn_child(&active, resume.take().as_deref()) {
             Ok(child) => child,
             Err(error) => break Err(error.into()),
         };
@@ -260,6 +270,9 @@ pub fn run(release: bool, web: bool) -> anyhow::Result<()> {
             break Ok(());
         }
         if code == Some(RELOAD_EXIT_CODE) {
+            // The child saved its session and wrote a draft naming it before
+            // exiting; without passing it on, the rebuild started a new session.
+            resume = reload_session_at(&state);
             continue;
         }
         if guard.record(started.elapsed(), code) == Verdict::Revert {
@@ -325,8 +338,15 @@ fn target_binary_in(target: &Path, release: bool) -> PathBuf {
     target.join(profile).join("piku")
 }
 
-fn spawn_child(binary: &Path) -> std::io::Result<Child> {
+fn spawn_child(binary: &Path, resume: Option<&str>) -> std::io::Result<Child> {
     let mut command = Command::new(binary);
+    if let Some(session_id) = resume {
+        // The same handoff self-update uses: resume this saved session and
+        // replay its tail instead of starting fresh.
+        command
+            .env("PIKU_SESSION_ID", session_id)
+            .env("PIKU_RESTARTED", "1");
+    }
     command
         .env(DEV_ENV, "1")
         .stdin(Stdio::inherit())
@@ -613,6 +633,19 @@ fn restore_terminal(_saved: Option<&()>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_session_names_the_saved_session_and_leaves_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(reload_session_at(dir.path()), None);
+        write_draft_at(dir.path(), "session-a", "half typed").unwrap();
+        assert_eq!(reload_session_at(dir.path()).as_deref(), Some("session-a"));
+        assert_eq!(
+            take_draft_at(dir.path(), "session-a").as_deref(),
+            Some("half typed"),
+            "the resumed child still restores the draft"
+        );
+    }
 
     #[test]
     fn draft_round_trips_and_is_session_bound() {
