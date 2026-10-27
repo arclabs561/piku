@@ -110,9 +110,6 @@ pub struct BuiltinResult {
     pub exit: Option<i32>,
     /// Already formatted for `piku shell: {error}`.
     pub error: Option<String>,
-    /// The builtin already explained this status (a stopped `fg`, say), so the
-    /// executor should not add a `piku shell: exit N` line.
-    pub reported: bool,
 }
 
 impl BuiltinResult {
@@ -121,7 +118,6 @@ impl BuiltinResult {
             status: 0,
             exit: None,
             error: None,
-            reported: false,
         }
     }
 
@@ -130,7 +126,6 @@ impl BuiltinResult {
             status: 1,
             exit: None,
             error: Some(error),
-            reported: false,
         }
     }
 
@@ -139,7 +134,6 @@ impl BuiltinResult {
             status: code,
             exit: Some(code),
             error: None,
-            reported: false,
         }
     }
 }
@@ -320,7 +314,6 @@ fn exit(args: &[String], shell: &mut Shell) -> BuiltinResult {
             status: 2,
             exit: Some(2),
             error: Some(format!("exit: {argument}: numeric argument required")),
-            reported: false,
         },
     }
 }
@@ -382,7 +375,6 @@ fn foreground(args: &[String], shell: &mut Shell, out: &mut dyn Write) -> Builti
                 status,
                 exit: None,
                 error: None,
-                reported: false,
             }
         }
         Waited::Signaled(signal) => {
@@ -391,7 +383,6 @@ fn foreground(args: &[String], shell: &mut Shell, out: &mut dyn Write) -> Builti
                 status: 128 + signal,
                 exit: None,
                 error: None,
-                reported: false,
             }
         }
         Waited::Stopped(status) => {
@@ -405,7 +396,6 @@ fn foreground(args: &[String], shell: &mut Shell, out: &mut dyn Write) -> Builti
                 status,
                 exit: None,
                 error: None,
-                reported: true,
             }
         }
         // An interrupt leaves the job alone: it is still running or stopped
@@ -414,13 +404,11 @@ fn foreground(args: &[String], shell: &mut Shell, out: &mut dyn Write) -> Builti
             status: code,
             exit: None,
             error: None,
-            reported: true,
         },
         Waited::Terminated(code) => BuiltinResult {
             status: code,
             exit: Some(code),
             error: None,
-            reported: false,
         },
     }
 }
@@ -458,7 +446,6 @@ fn wait(args: &[String], shell: &mut Shell) -> BuiltinResult {
         None => shell.jobs.ids(),
     };
     let mut status = 0;
-    let mut interrupted = false;
     for id in targets {
         match shell.jobs.wait(id) {
             Waited::Exited(code) => {
@@ -477,7 +464,6 @@ fn wait(args: &[String], shell: &mut Shell) -> BuiltinResult {
                 // Ctrl-C aborts the wait, not the job: keep the entry so the
                 // operator can `fg`, `wait` again, or `kill` it.
                 status = code;
-                interrupted = true;
                 break;
             }
             Waited::Terminated(code) => {
@@ -485,7 +471,6 @@ fn wait(args: &[String], shell: &mut Shell) -> BuiltinResult {
                     status: code,
                     exit: Some(code),
                     error: None,
-                    reported: false,
                 };
             }
         }
@@ -494,7 +479,6 @@ fn wait(args: &[String], shell: &mut Shell) -> BuiltinResult {
         status,
         exit: None,
         error: None,
-        reported: interrupted,
     }
 }
 
@@ -546,7 +530,6 @@ fn kill(args: &[String], shell: &mut Shell) -> BuiltinResult {
         status,
         exit: None,
         error: failure,
-        reported: false,
     }
 }
 

@@ -1920,6 +1920,21 @@ fn piku_shell_runs_a_line_and_exits() {
         pty.captured()
     );
 
+    // A nonzero status with nothing to say stays silent, the way every other
+    // shell behaves; `test` with no arguments is a plain false.
+    pty.send(b"test\r");
+    pty.send(b"echo status=$?\r");
+    assert!(
+        pty.wait_for("status=1\r\n", Duration::from_secs(10)),
+        "a failed builtin did not set $?: {:?}",
+        pty.captured()
+    );
+    assert!(
+        !pty.captured().contains("piku shell: exit"),
+        "a bare nonzero status must not print a line: {:?}",
+        pty.captured()
+    );
+
     // The self-exec upgrade belongs to the wish prototype; under piku it must
     // refuse rather than replace the installed binary.
     pty.send(b":upgrade\r");

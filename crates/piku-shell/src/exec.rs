@@ -32,8 +32,6 @@ struct Outcome {
     status: i32,
     /// Set when the shell must exit with this code.
     exit: Option<i32>,
-    /// A `piku shell: ...` message already described this failure.
-    reported: bool,
 }
 
 impl Outcome {
@@ -41,24 +39,11 @@ impl Outcome {
         Self {
             status: 0,
             exit: None,
-            reported: false,
         }
     }
 
     fn failure(status: i32) -> Self {
-        Self {
-            status,
-            exit: None,
-            reported: false,
-        }
-    }
-
-    fn reported(status: i32) -> Self {
-        Self {
-            status,
-            exit: None,
-            reported: true,
-        }
+        Self { status, exit: None }
     }
 }
 
@@ -83,11 +68,8 @@ pub fn execute(line: &str, shell: &mut Shell, terminal: &mut Terminal) -> Result
     let outcome = run_program(&program, shell);
 
     terminal.enter_raw().map_err(terminal_error)?;
-    // A requested exit is the shell's own status, not a command failure.
-    if outcome.exit.is_none() && outcome.status != 0 && !outcome.reported {
-        let message = format!("piku shell: exit {}\r\n", outcome.status);
-        term::write(message.as_bytes()).map_err(terminal_error)?;
-    }
+    // A nonzero status stays in `$?` and prints nothing, matching every other
+    // shell; only failures with something to say print a line.
     Ok(match outcome.exit {
         Some(code) => Flow::Exit(code),
         None => Flow::Continue,
@@ -235,14 +217,12 @@ fn run_builtin(argv: &[String], redirects: &[Redirection], shell: &mut Shell) ->
     let _ = out.flush();
     drop(interrupt);
 
-    let reported = result.error.is_some() || result.reported;
     if let Some(error) = result.error {
         eprintln!("piku shell: {error}");
     }
     Outcome {
         status: result.exit.unwrap_or(result.status),
         exit: result.exit,
-        reported,
     }
 }
 
@@ -569,7 +549,7 @@ fn wait_foreground(shell: &mut Shell, id: usize, pgid: Pid) -> Outcome {
         Waited::Signaled(signal) => {
             shell.jobs.remove(id);
             eprintln!("piku shell: terminated by signal {signal}");
-            Outcome::reported(128 + signal)
+            Outcome::failure(128 + signal)
         }
         Waited::Stopped(status) => {
             shell.jobs.mark_stopped(id);
@@ -577,15 +557,14 @@ fn wait_foreground(shell: &mut Shell, id: usize, pgid: Pid) -> Outcome {
                 let line = format!("{}\r\n", notice.render());
                 let _ = term::write(line.as_bytes());
             }
-            Outcome::reported(status)
+            Outcome::failure(status)
         }
         // Not reachable through `IgnoredSignals`, but the job is untouched by
         // an interrupt and must stay in the table if it ever is.
-        Waited::Interrupted(code) => Outcome::reported(code),
+        Waited::Interrupted(code) => Outcome::failure(code),
         Waited::Terminated(code) => Outcome {
             status: code,
             exit: Some(code),
-            reported: true,
         },
     }
 }
@@ -612,9 +591,7 @@ fn finish(status: i32) -> Outcome {
 
 fn report(message: &str, status: i32) -> Outcome {
     eprintln!("piku shell: {message}");
-    // Not `reported`: a failed external command or redirection should still
-    // end the line with the same `piku shell: exit N` line as before, so the
-    // operator sees the status the shell recorded.
+    // The message carries the failure; the status still reaches `$?`.
     Outcome::failure(status)
 }
 
