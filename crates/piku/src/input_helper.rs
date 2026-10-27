@@ -477,6 +477,8 @@ pub enum ReadOutcome {
     Reload(String),
     Cancel,
     Inspect,
+    /// Ctrl-L: repaint the screen. The payload is the draft to restore.
+    Repaint(String),
     Exit,
 }
 
@@ -777,6 +779,9 @@ impl LineEditor {
                     Action::Inspect => {
                         break ReadOutcome::Inspect;
                     }
+                    Action::Repaint => {
+                        break ReadOutcome::Repaint(input.as_str().to_owned());
+                    }
                     Action::Exit => {
                         break ReadOutcome::Exit;
                     }
@@ -859,6 +864,11 @@ impl LineEditor {
                 modifiers,
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() => Action::Inspect,
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => Action::Repaint,
             KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers,
@@ -1566,6 +1576,7 @@ pub enum Action {
     Submit,
     Cancel,
     Inspect,
+    Repaint,
     Exit,
 }
 
@@ -1891,6 +1902,7 @@ mod tests {
         let mut editor = LineEditor::new("> ");
         let mut empty = InputBuffer::new();
         assert_eq!(editor.handle_key(ctrl('o'), &mut empty), Action::Inspect);
+        assert_eq!(editor.handle_key(ctrl('l'), &mut empty), Action::Repaint);
 
         let mut filled = InputBuffer::new();
         filled.insert('o');

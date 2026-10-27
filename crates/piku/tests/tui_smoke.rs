@@ -1600,7 +1600,7 @@ fn header_is_pinned_and_shows_version_on_launch() {
     );
     assert!(
         snap.shows("custom"),
-        "provider should be visible in the header; screen:\n{}",
+        "provider should be visible (footer); screen:\n{}",
         snap.summary(24)
     );
     pty.exit_cleanly();
@@ -1740,6 +1740,207 @@ fn submit_does_not_blank_the_screen() {
         "header should survive a submit; screen:\n{}",
         snap.summary(24)
     );
+    pty.exit_cleanly();
+}
+
+/// The footer must be restored as soon as the editor returns, not only once
+/// a provider finishes. Multiline editing can scroll it off its reserved row.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn submit_restores_footer_while_provider_is_pending() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let config_home = config.path().to_str().unwrap();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config_home),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "footer-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    // First use a single-line control, then exercise a multiline editor redraw.
+    for input in ["hello", "first line\nsecond line"] {
+        pty.send(b"\x1b[200~");
+        pty.send(input.as_bytes());
+        pty.send(b"\x1b[201~");
+        pty.wait(Duration::from_millis(150));
+        pty.send(b"\r");
+        let (pending, snap) = pty.wait_until(
+            |s| s.input_row().contains("thinking"),
+            Duration::from_secs(5),
+        );
+        assert!(pending, "turn never started:\n{}", snap.summary(24));
+        let footer = &snap.rows[usize::from(TEST_ROWS - 2)];
+        assert!(
+            footer.contains("footer-model") && footer.contains("/help"),
+            "footer missing while provider is pending after {input:?}:\n{}",
+            snap.summary(24)
+        );
+        pty.send(b"\x03");
+        wait_ready(&mut pty);
+    }
+    pty.exit_cleanly();
+}
+
+/// OpenAI-style completions server that answers every request after `delay`
+/// and records each request body.
+fn slow_completions_server(
+    delay: Duration,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = bodies.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request[end + 4..]).into_owned());
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
+            let _ = stream.write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (base_url, bodies)
+}
+
+/// A line typed and submitted while a turn runs is queued, shown on the input
+/// row, and sent as the next turn once the current one finishes.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn type_ahead_line_is_sent_after_the_running_turn() {
+    let (base_url, bodies) = slow_completions_server(Duration::from_secs(2));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "queue-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"first turn\r");
+    let (pending, snap) = pty.wait_until(
+        |s| s.input_row().contains("thinking"),
+        Duration::from_secs(5),
+    );
+    assert!(pending, "turn never started:\n{}", snap.summary(24));
+    pty.send(b"queued follow-up\r");
+    let (shown, snap) = pty.wait_until(
+        |s| s.input_row().contains("1 queued"),
+        Duration::from_secs(2),
+    );
+    assert!(shown, "queue not shown on input row:\n{}", snap.summary(24));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while bodies.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        pty.wait(Duration::from_millis(100));
+    }
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "expected two requests: {bodies:?}");
+    assert!(
+        bodies[1].contains("queued follow-up") && !bodies[0].contains("queued follow-up"),
+        "queued line must be the second turn: {bodies:?}"
+    );
+    pty.send(b"\x03");
+    wait_ready(&mut pty);
+    pty.exit_cleanly();
+}
+
+/// Ctrl-L rebuilds the frame from the session: the conversation tail, the
+/// footer, and the prompt with the unsent draft kept.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn ctrl_l_repaints_transcript_footer_and_keeps_the_draft() {
+    let (base_url, _bodies) = slow_completions_server(Duration::from_millis(10));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "repaint-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"remember this question\r");
+    let (answered, snap) = pty.wait_until(
+        |s| s.is_ready() && s.rows.iter().any(|row| row.trim() == "ok"),
+        Duration::from_secs(10),
+    );
+    assert!(answered, "turn did not finish:\n{}", snap.summary(24));
+    assert!(
+        !snap
+            .rows
+            .iter()
+            .any(|row| row.contains("prior conversation")),
+        "replay marker already on screen before Ctrl-L:\n{}",
+        snap.summary(24)
+    );
+    pty.send(b"draft");
+    pty.send(b"\x0c");
+    let (repainted, snap) = pty.wait_until(
+        |s| {
+            let footer = &s.rows[usize::from(TEST_ROWS - 2)];
+            s.rows[0].contains("piku")
+                && s.rows.iter().any(|row| row.contains("prior conversation"))
+                && s.rows
+                    .iter()
+                    .any(|row| row.contains("❯ remember this question"))
+                && footer.contains("repaint-model")
+                && s.input_row().contains("draft")
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        repainted,
+        "Ctrl-L did not rebuild the frame:\n{}",
+        snap.summary(24)
+    );
+    pty.send(b"\x03");
+    pty.send(b"\x03");
     pty.exit_cleanly();
 }
 

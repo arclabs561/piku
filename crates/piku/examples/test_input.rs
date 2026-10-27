@@ -26,6 +26,9 @@ fn main() {
             Ok(ReadOutcome::Inspect) => {
                 println!("\x1b[2mInspect requested\x1b[0m\n");
             }
+            Ok(ReadOutcome::Repaint(_)) => {
+                println!("\x1b[2mRepaint requested\x1b[0m\n");
+            }
             Ok(ReadOutcome::Reload(_)) => {
                 // No supervisor owns this standalone editor, so a reload
                 // request has nowhere to go.
