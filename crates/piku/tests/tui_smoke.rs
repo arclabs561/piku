@@ -411,24 +411,25 @@ impl Drop for Pty {
         use nix::sys::signal::Signal;
         use nix::sys::wait::WaitStatus;
 
+        //
+        // Keep reading the PTY while waiting: a child whose terminal output
+        // buffer is full cannot finish exiting (the kernel drains tty output
+        // on close), not even after SIGKILL, so an unread master turned one
+        // failed assertion into a suite that never ended.
         let _ = self._proc.signal(Signal::SIGTERM);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            match self._proc.status() {
-                Some(WaitStatus::StillAlive) => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Some(_) | None => return,
+        for (signal, bound) in [(None, 1), (Some(Signal::SIGKILL), 5)] {
+            if let Some(signal) = signal {
+                let _ = self._proc.signal(signal);
             }
-        }
-        let _ = self._proc.signal(Signal::SIGKILL);
-        let kill_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < kill_deadline {
-            match self._proc.status() {
-                Some(WaitStatus::StillAlive) => {
-                    std::thread::sleep(Duration::from_millis(20));
+            let deadline = Instant::now() + Duration::from_secs(bound);
+            while Instant::now() < deadline {
+                self.drain();
+                match self._proc.status() {
+                    Some(WaitStatus::StillAlive) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Some(_) | None => return,
                 }
-                Some(_) | None => return,
             }
         }
     }
