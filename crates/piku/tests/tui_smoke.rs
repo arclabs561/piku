@@ -1794,6 +1794,14 @@ fn submit_restores_footer_while_provider_is_pending() {
 fn slow_completions_server(
     delay: Duration,
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    completions_server(delay, "ok")
+}
+
+/// Like [`slow_completions_server`], answering every request with `reply`.
+fn completions_server(
+    delay: Duration,
+    reply: &'static str,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1827,12 +1835,13 @@ fn slow_completions_server(
                 }
             }
             std::thread::sleep(delay);
+            let content = serde_json::to_string(reply).unwrap();
             let _ = stream.write_all(
-                concat!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: [DONE]\n\n"
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}},\"finish_reason\":null}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: [DONE]\n\n"
                 )
                 .as_bytes(),
             );
@@ -2341,4 +2350,59 @@ fn operator_journey_keeps_the_frame_through_every_step() {
         .any(|outcome| log.contains(outcome)),
         "exit wait outcome not reported:\n{log}"
     );
+}
+
+/// After a typing pause the prompt shows the continuation the suggestion
+/// samples agree on; Right accepts it and it is sent as typed text.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn model_ghost_text_appears_after_a_pause_and_right_accepts_it() {
+    let (base_url, bodies) = completions_server(Duration::from_millis(10), " the parser tests");
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "chat-model"),
+            ("PIKU_GHOST_MODEL", "ghost-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"please run");
+    let (shown, snap) = pty.wait_until(
+        |s| s.input_row().contains("please run the parser tests"),
+        Duration::from_secs(5),
+    );
+    assert!(shown, "ghost text never appeared:\n{}", snap.summary(24));
+    {
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "three suggestion samples: {bodies:?}");
+        assert!(
+            bodies.iter().all(|body| body.contains("\"ghost-model\"")),
+            "{bodies:?}"
+        );
+        assert!(bodies.iter().all(|body| body.contains("please run")));
+    }
+    pty.send(b"\x1b[C");
+    pty.wait(Duration::from_millis(200));
+    pty.send(b"\r");
+    let (sent, snap) = pty.wait_until(
+        |s| s.is_ready() && bodies.lock().unwrap().len() >= 4,
+        Duration::from_secs(10),
+    );
+    assert!(
+        sent,
+        "accepted text was not submitted:\n{}",
+        snap.summary(24)
+    );
+    let turn = bodies.lock().unwrap()[3].clone();
+    assert!(
+        turn.contains("\"chat-model\"") && turn.contains("please run the parser tests"),
+        "{turn}"
+    );
+    pty.exit_cleanly();
 }

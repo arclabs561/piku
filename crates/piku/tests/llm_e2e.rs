@@ -595,3 +595,40 @@ fn piku_runs_a_subproject_command_from_the_parent_directory() {
         "answer should name the package: {stdout}"
     );
 }
+
+/// Ghost text against the real default suggestion model: it answers inside
+/// the editor's budget, and whatever it shows continues the draft rather than
+/// repeating it. Disagreement (no suggestion) is an allowed outcome.
+#[test]
+#[ignore = "live LLM e2e; run with `cargo test --test llm_e2e -- --ignored` and OPENROUTER_API_KEY"]
+fn ghost_suggestions_from_the_default_model_continue_the_draft() {
+    use piku::input_helper::GhostSource as _;
+    assert!(has_key("OPENROUTER_API_KEY"), "needs OPENROUTER_API_KEY");
+    let resolved = piku_runtime::ResolvedProvider::resolve_named("openrouter").unwrap();
+    let mut ghost = piku::ghost::ModelGhost::new(
+        resolved.as_provider().boxed_clone(),
+        piku::ghost::DEFAULT_OPENROUTER_MODEL.to_string(),
+    );
+    let mut shown = 0;
+    for draft in [
+        "run cargo test and fix the ",
+        "explain what this function ",
+        "add a unit test for ",
+    ] {
+        let started = std::time::Instant::now();
+        let answer = ghost
+            .request(draft)
+            .recv_timeout(std::time::Duration::from_secs(6))
+            .expect("suggestion thread answers");
+        eprintln!("{draft:?} -> {answer:?} in {:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        if let Some(text) = answer {
+            shown += 1;
+            assert!(
+                !text.trim().is_empty() && !text.contains(draft.trim()),
+                "{text:?}"
+            );
+        }
+    }
+    eprintln!("{shown}/3 drafts got a suggestion");
+}

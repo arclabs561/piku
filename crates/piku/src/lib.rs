@@ -14,6 +14,7 @@ pub mod cell_view;
 pub mod cli;
 pub mod config;
 pub mod dev;
+pub mod ghost;
 pub mod input_helper;
 pub mod markdown;
 pub mod project_permissions;

@@ -534,7 +534,26 @@ pub struct LineEditor {
     frame_rows: u16,
     /// Terminal size at the last framed redraw, to relayout after a resize.
     frame_size: (u16, u16),
+    /// Model-backed ghost text, when configured.
+    ghost_source: Option<Box<dyn GhostSource>>,
+    /// The draft a request is in flight for, and where its answer arrives.
+    ghost_pending: Option<(String, std::sync::mpsc::Receiver<Option<String>>)>,
+    /// The last draft a suggestion was requested for, so it is asked once.
+    ghost_asked: Option<String>,
+    /// A suggestion and the exact draft it continues.
+    model_ghost: Option<(String, String)>,
+    /// When the input last changed, to wait for a typing pause.
+    last_edit: std::time::Instant,
 }
+
+/// Supplies model-backed ghost text. `request` must not block: it starts the
+/// work and hands back a receiver the editor polls on idle ticks.
+pub trait GhostSource {
+    fn request(&mut self, draft: &str) -> std::sync::mpsc::Receiver<Option<String>>;
+}
+
+/// Pause after the last keystroke before asking for a suggestion.
+const GHOST_PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Lets a full-screen caller keep its frame while the editor draws.
 ///
@@ -634,7 +653,66 @@ impl LineEditor {
             frame: None,
             frame_rows: 1,
             frame_size: (0, 0),
+            ghost_source: None,
+            ghost_pending: None,
+            ghost_asked: None,
+            model_ghost: None,
+            last_edit: std::time::Instant::now(),
         }
+    }
+
+    /// Offer model-backed ghost text after typing pauses.
+    pub fn set_ghost_source(&mut self, source: Option<Box<dyn GhostSource>>) {
+        self.ghost_source = source;
+    }
+
+    /// History match first (free and instant), then a model suggestion made
+    /// for exactly this draft.
+    fn ghost_hint(&self, text: &str) -> Option<String> {
+        self.history_ghost(text).or_else(|| {
+            self.model_ghost
+                .as_ref()
+                .filter(|(draft, _)| draft == text)
+                .map(|(_, hint)| hint.clone())
+        })
+    }
+
+    /// On an idle tick: collect a finished suggestion, or ask for one once the
+    /// operator has paused on a single-line draft with nothing else to show.
+    /// Returns true when the shown hint changed.
+    fn tick_ghost(&mut self, input: &InputBuffer) -> bool {
+        let text = input.as_str();
+        if let Some((draft, receiver)) = &self.ghost_pending {
+            match receiver.try_recv() {
+                Ok(answer) => {
+                    let draft = draft.clone();
+                    self.ghost_pending = None;
+                    if let Some(hint) = answer.filter(|_| draft == text) {
+                        self.model_ghost = Some((draft, hint));
+                        return true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ghost_pending = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            return false;
+        }
+        let eligible = self.ghost_source.is_some()
+            && text.chars().count() >= 3
+            && !text.contains('\n')
+            && !text.starts_with('/')
+            && input.cursor == text.len()
+            && self.search_query.is_none()
+            && self.history_ghost(text).is_none()
+            && self.ghost_asked.as_deref() != Some(text)
+            && self.last_edit.elapsed() >= GHOST_PAUSE;
+        if eligible {
+            if let Some(source) = self.ghost_source.as_mut() {
+                self.ghost_pending = Some((text.to_string(), source.request(text)));
+                self.ghost_asked = Some(text.to_string());
+            }
+        }
+        false
     }
 
     /// Draw input as a bottom-anchored block inside a caller-owned frame.
@@ -794,6 +872,9 @@ impl LineEditor {
             match event::poll(RELOAD_POLL) {
                 Ok(false) => {
                     self.refresh_status(&mut stdout, &input, &mut rendered_lines)?;
+                    if self.tick_ghost(&input) {
+                        rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                    }
                     continue;
                 }
                 Ok(true) => {}
@@ -806,27 +887,32 @@ impl LineEditor {
                 }
             }
             match event::read() {
-                Ok(Event::Key(key)) => match self.handle_key(key, &mut input) {
-                    Action::Continue => {
-                        rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                Ok(Event::Key(key)) => {
+                    self.last_edit = std::time::Instant::now();
+                    let action = self.handle_key(key, &mut input);
+                    match action {
+                        Action::Continue => {
+                            rendered_lines = self.redraw(&mut stdout, &input, rendered_lines)?;
+                        }
+                        Action::Submit => {
+                            break ReadOutcome::Submit(input.as_str().to_owned());
+                        }
+                        Action::Cancel => {
+                            break ReadOutcome::Cancel;
+                        }
+                        Action::Inspect => {
+                            break ReadOutcome::Inspect;
+                        }
+                        Action::Repaint => {
+                            break ReadOutcome::Repaint(input.as_str().to_owned());
+                        }
+                        Action::Exit => {
+                            break ReadOutcome::Exit;
+                        }
                     }
-                    Action::Submit => {
-                        break ReadOutcome::Submit(input.as_str().to_owned());
-                    }
-                    Action::Cancel => {
-                        break ReadOutcome::Cancel;
-                    }
-                    Action::Inspect => {
-                        break ReadOutcome::Inspect;
-                    }
-                    Action::Repaint => {
-                        break ReadOutcome::Repaint(input.as_str().to_owned());
-                    }
-                    Action::Exit => {
-                        break ReadOutcome::Exit;
-                    }
-                },
+                }
                 Ok(Event::Paste(text)) => {
+                    self.last_edit = std::time::Instant::now();
                     // Bracketed paste: normalize, then either insert inline
                     // or collapse to a pill for large pastes.
                     let cleaned = strip_ansi_from_paste(&text);
@@ -1164,7 +1250,7 @@ impl LineEditor {
             } => {
                 // At end of input: accept ghost text hint if available
                 if input.cursor >= input.as_str().len() {
-                    if let Some(ghost) = self.history_ghost(input.as_str()) {
+                    if let Some(ghost) = self.ghost_hint(input.as_str()) {
                         input.replace(format!("{}{ghost}", input.as_str()));
                         self.history_index = None;
                         self.draft = None;
@@ -1508,7 +1594,7 @@ impl LineEditor {
             // Ghost text: show dim hint from matching history entry (single-line only).
             // Only when cursor is at end and input has no newlines.
             if !text.contains('\n') && input.cursor == text.len() && text.len() >= 2 {
-                if let Some(hint) = self.history_ghost(text) {
+                if let Some(hint) = self.ghost_hint(text) {
                     if let Some(first) = lines.first_mut() {
                         first.push_str(&format!("\x1b[2m{hint}\x1b[0m"));
                     }

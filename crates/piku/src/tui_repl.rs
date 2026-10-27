@@ -1745,6 +1745,12 @@ async fn run_tui_repl_core(
     // ── Line editor ──────────────────────────────────────────────────────────
     let history_path = repl_history_path(&sessions_dir, &session_id);
     let mut editor = LineEditor::new("\x1b[34m❯\x1b[0m ");
+    if let Some(ghost_model) = crate::ghost::configured_model(resolved.name()) {
+        editor.set_ghost_source(Some(Box::new(crate::ghost::ModelGhost::new(
+            resolved.as_provider().boxed_clone(),
+            ghost_model,
+        ))));
+    }
     editor.load_history_file(&history_path);
     // Dev reload: the supervisor signals a completed build, and the prompt
     // exits at the next idle tick or turn boundary. The draft and the session
