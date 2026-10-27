@@ -157,10 +157,15 @@ async fn run_terminal(
         .await;
     }
 
+    let shell_context = cli.shell_context.or_else(|| {
+        std::env::var("PIKU_SHELL_CONTEXT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    });
     let prompt_str = if cli.prompt.is_empty() {
         None
     } else {
-        Some(cli.prompt.join(" "))
+        Some(with_shell_context(cli.prompt.join(" "), shell_context))
     };
 
     if let Some(session_id) = &cli.resume {
@@ -471,6 +476,36 @@ fn print_route_status(provider: &str, model: &str) {
     eprintln!("[piku] provider={provider} model={model}");
     if provider == "chatgpt" {
         eprintln!("[piku] ChatGPT subscription funding; allowance and credits unknown; no hard output-token cap for foreground, children, or memory calls");
+    }
+}
+
+/// Prepend recent shell ledger records when the operator asked for them, and
+/// say on stderr exactly what was attached (ADR 0012).
+fn with_shell_context(prompt: String, limit: Option<usize>) -> String {
+    let Some(limit) = limit.filter(|&limit| limit > 0) else {
+        return prompt;
+    };
+    let Some(path) = piku_shell::ledger::ledger_path() else {
+        eprintln!("[piku] shell context: no HOME or XDG_STATE_HOME; nothing attached");
+        return prompt;
+    };
+    match piku_shell::ledger::recent(&path, limit) {
+        Ok(entries) if entries.is_empty() => {
+            eprintln!("[piku] shell context: no commands in {}", path.display());
+            prompt
+        }
+        Ok(entries) => {
+            eprintln!(
+                "\x1b[2m[attached {} shell command(s) from {}]\x1b[0m",
+                entries.len(),
+                path.display()
+            );
+            format!("{}\n{prompt}", piku_shell::ledger::render(&entries))
+        }
+        Err(error) => {
+            eprintln!("[piku] shell context not attached: {error}");
+            prompt
+        }
     }
 }
 

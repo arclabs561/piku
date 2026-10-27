@@ -1596,3 +1596,67 @@ fn inspect_html_resolves_cross_directory_record_alias_artifacts() {
         .file_type()
         .is_symlink());
 }
+
+/// ADR 0012: shell ledger records reach the model only when asked for, and
+/// the operator is told what was attached.
+#[test]
+fn shell_context_attaches_only_requested_ledger_tail_and_says_so() {
+    let config = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let ledger = state.path().join("piku/shell-ledger.jsonl");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let records: String = ["make build", "cargo test -p alpha", "git status"]
+        .iter()
+        .enumerate()
+        .map(|(n, command)| {
+            format!(
+                "{{\"at\":{n},\"cwd\":\"/work\",\"command\":\"{command}\",\"exit\":{n},\"source\":\"piku-shell\"}}\n"
+            )
+        })
+        .collect();
+    std::fs::write(&ledger, records).unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let run = |extra: &[&str]| {
+        let out = piku_clean_env()
+            .args(extra)
+            .args(["-p", "what failed?"])
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env_remove("PIKU_SHELL_CONTEXT")
+            .env("PIKU_BASE_URL", &base_url)
+            .env("PIKU_API_KEY", "test-key")
+            .env("PIKU_MODEL", "canned-model")
+            .current_dir(config.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+        stderr(&out)
+    };
+
+    let quiet = run(&[]);
+    assert!(!quiet.contains("attached"), "no flag, no notice: {quiet}");
+    let with_tail = run(&["--shell-context", "2"]);
+    assert!(
+        with_tail.contains("[attached 2 shell command(s) from"),
+        "notice missing: {with_tail}"
+    );
+
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(!bodies[0].contains("cargo test -p alpha"), "{}", bodies[0]);
+    assert!(
+        bodies[1].contains("[/work] $ cargo test -p alpha  (exit 1)"),
+        "{}",
+        bodies[1]
+    );
+    assert!(
+        bodies[1].contains("$ git status  (exit 2)"),
+        "{}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("make build"),
+        "only the last 2: {}",
+        bodies[1]
+    );
+}

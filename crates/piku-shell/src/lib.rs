@@ -19,6 +19,7 @@ mod highlight;
 mod history;
 mod input;
 mod jobs;
+pub mod ledger;
 mod signals;
 mod syntax;
 mod term;
@@ -270,7 +271,18 @@ fn repl(restore: Option<PathBuf>, allow_upgrade: bool) -> Result<i32, String> {
                 {
                     warn(&format!("history: {error}"));
                 }
-                match exec::execute(&line, &mut shell, &mut terminal) {
+                let started_in = std::env::current_dir().unwrap_or_default();
+                let flow = exec::execute(&line, &mut shell, &mut terminal);
+                if trimmed != "exit"
+                    && let (Some(path), Some(record)) = (
+                        ledger::ledger_path(),
+                        ledger::entry(&line, &started_in, shell.status(), "piku-shell"),
+                    )
+                    && let Err(error) = ledger::append(&path, &record)
+                {
+                    warn(&format!("shell ledger: {error}"));
+                }
+                match flow {
                     Ok(exec::Flow::Continue) => {}
                     Ok(exec::Flow::Exit(code)) => {
                         exit_code = code;

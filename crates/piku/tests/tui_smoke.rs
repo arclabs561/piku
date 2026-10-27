@@ -2105,7 +2105,15 @@ fn piku_shell_runs_a_line_and_exits() {
     // `piku shell` owns the terminal instead of the TUI: no provider, config,
     // or API key participates. The only proof that matters is that a typed
     // line executed and the process left a clean exit status.
-    let mut pty = Pty::spawn_with_args(&smoke_temp_root(), ["shell"]);
+    // Keep the shell ledger (ADR 0012) out of the operator's real state dir.
+    let state = smoke_tempdir();
+    let mut shell = Command::new(piku_binary());
+    shell.arg("shell");
+    let mut pty = Pty::spawn_command_with_env(
+        shell,
+        &smoke_temp_root(),
+        &[("XDG_STATE_HOME", state.path().to_str().unwrap())],
+    );
     assert!(
         pty.wait_for("% ", Duration::from_secs(10)),
         "piku shell did not draw a prompt: {:?}",
@@ -2147,4 +2155,31 @@ fn piku_shell_runs_a_line_and_exits() {
 
     pty.exit_cleanly();
     assert!(pty.eof, "piku shell did not exit: {:?}", pty.captured());
+
+    // Each command left one ledger record with its exit status. Meta commands
+    // (`:upgrade`) and `exit` are not shell commands and leave none.
+    let ledger =
+        std::fs::read_to_string(state.path().join("piku/shell-ledger.jsonl")).unwrap_or_default();
+    let records: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary: Vec<(String, i64)> = records
+        .iter()
+        .map(|r| {
+            (
+                r["command"].as_str().unwrap().to_string(),
+                r["exit"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("echo shell-smoke".to_string(), 0),
+            ("test".to_string(), 1),
+            ("echo status=$?".to_string(), 0),
+        ],
+        "ledger: {ledger}"
+    );
 }

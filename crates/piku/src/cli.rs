@@ -55,6 +55,15 @@ pub struct Cli {
     #[arg(long, help = "Resume a previous session by ID (partial match ok)")]
     pub resume: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "20",
+        help = "Attach the last N commands from the piku shell ledger to the prompt (default 20; or set PIKU_SHELL_CONTEXT)"
+    )]
+    pub shell_context: Option<usize>,
+
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub prompt: Vec<String>,
 }
