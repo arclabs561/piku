@@ -126,10 +126,7 @@ fn real_successor_recovers_same_session_without_replaying_resume_prompt() {
         "successor did not exit normally:\n{}",
         pty.captured()
     );
-    assert!(matches!(
-        pty._proc.status(),
-        Some(nix::sys::wait::WaitStatus::Exited(_, 0))
-    ));
+    assert_eq!(pty.io.exit_code(), Some(0), "successor exit status");
     std::fs::write(root.join("terminal.txt"), pty.captured()).unwrap();
     drop(pty);
     server.join().unwrap();

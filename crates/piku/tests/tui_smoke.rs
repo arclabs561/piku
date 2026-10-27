@@ -19,8 +19,7 @@
 
 // Pedantic lints that are noise in this PTY harness, not in production:
 // `use` lives inside test fns to keep platform glue local; `Winsize`/`ws_*`
-// mirror C `struct winsize`; `_proc` is rexpect's own field we read to get the
-// PTY fd. Production code stays under full pedantic-deny.
+// mirror C `struct winsize`. Production code stays under full pedantic-deny.
 #![allow(
     clippy::items_after_statements,
     clippy::struct_field_names,
@@ -39,7 +38,9 @@ mod test_helpers;
 
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
 // into the grid a human would see.
+use surfacekit::term::command_pty::CommandPty;
 use surfacekit::term::screen::{self, ScreenObserver, ScreenSnapshot};
+use surfacekit::term::SessionIo as _;
 
 /// The fixed grid these PTY tests render into. The observer and the PTY winsize
 /// are both built from this one constant, so the parsed grid can never disagree
@@ -74,9 +75,7 @@ fn piku_binary() -> PathBuf {
 }
 
 struct Pty {
-    _proc: rexpect::process::PtyProcess,
-    writer: std::fs::File,
-    reader: std::fs::File,
+    io: CommandPty,
     buf: Vec<u8>,
     eof: bool,
     /// Persistent renderer: every byte drained from the PTY is also fed here so
@@ -137,30 +136,15 @@ impl Pty {
             cmd.env(key, value);
         }
 
-        let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
-        proc.set_kill_timeout(Some(3_000));
+        Self::from_command(cmd)
+    }
 
-        let writer = proc.get_file_handle().expect("pty writer");
-        let reader = proc.get_file_handle().expect("pty reader");
-
-        // Fix the terminal size before piku's first `term_size()` so the layout
-        // it draws and the grid the observer parses are the same shape. piku
-        // reads its dimensions from the PTY ioctl (TIOCGWINSZ), not from
-        // LINES/COLUMNS, so this is the only knob that controls the render.
-        set_winsize(&writer, TEST_ROWS, TEST_COLS);
-
-        use nix::fcntl::{fcntl, FcntlArg, OFlag};
-        let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
-        fcntl(
-            &reader,
-            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
-        )
-        .unwrap();
-
+    /// Spawn `cmd` on a PTY sized like the observer, so the grid piku draws
+    /// and the grid the parser models are the same shape. surfacekit's
+    /// `CommandPty` owns the transport and bounds teardown.
+    fn from_command(cmd: Command) -> Self {
         Self {
-            _proc: proc,
-            writer,
-            reader,
+            io: CommandPty::spawn(cmd, TEST_ROWS, TEST_COLS).expect("spawn piku"),
             buf: Vec::new(),
             eof: false,
             observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
@@ -169,8 +153,7 @@ impl Pty {
 
     fn send(&mut self, bytes: &[u8]) {
         // Tolerant of closed PTY — writes after child exit return EIO.
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let _ = self.io.write_bytes(bytes);
     }
 
     /// Current rendered screen — what the user sees right now. Drains any
@@ -204,43 +187,28 @@ impl Pty {
 
     fn drain(&mut self) {
         let mut chunk = [0u8; 4096];
-        loop {
-            match self.reader.read(&mut chunk) {
-                Ok(0) => {
-                    self.eof = true;
-                    break;
-                }
-                Ok(n) => {
-                    self.buf.extend_from_slice(&chunk[..n]);
-                    self.observer.process(&chunk[..n]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::EIO) {
-                        self.eof = true;
-                    }
-                    break;
-                }
+        while let Ok(n) = self.read_available(&mut chunk) {
+            if n == 0 {
+                break;
             }
+        }
+        // A closed PTY reads as EIO on some platforms and as plain end of
+        // output on others; an exited child settles it either way.
+        if self.io.is_dead() || self.io.exit_code().is_some() {
+            self.eof = true;
         }
     }
 
     fn read_available(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.reader.read(buf) {
-            Ok(n) => {
-                if n > 0 {
-                    self.buf.extend_from_slice(&buf[..n]);
-                    self.observer.process(&buf[..n]);
-                }
-                Ok(n)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                self.eof = true;
-                Ok(0)
-            }
-            Err(e) => Err(e),
+        let n = self.io.read_available(buf)?;
+        if n > 0 {
+            self.buf.extend_from_slice(&buf[..n]);
+            self.observer.process(&buf[..n]);
         }
+        if self.io.is_dead() {
+            self.eof = true;
+        }
+        Ok(n)
     }
 
     fn captured(&self) -> String {
@@ -340,7 +308,7 @@ fn permission_controls_cannot_repaint_prompt_or_receipt() {
     );
     // The fixture waits for a release line so winsize is set before rendering.
     assert!(pty.wait_for("PERMISSION_FIXTURE_READY", Duration::from_secs(5)));
-    set_winsize(&pty.writer, TEST_ROWS, 160);
+    pty.io.resize(TEST_ROWS, 160).expect("resize");
     pty.send(b"start\n");
     assert!(
         pty.wait_for("y/n/a?", Duration::from_secs(5)),
@@ -397,40 +365,6 @@ fn permission_controls_cannot_repaint_prompt_or_receipt() {
             !pty.captured().contains(control),
             "model terminal control emitted in receipt: {control:?}"
         );
-    }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // Never delegate teardown to rexpect's blocking Drop loop. A test can
-        // finish while piku is still handling a turn, where Ctrl-D is input
-        // rather than an exit request. Signal and reap the child within a
-        // fixed bound so an earlier test stage cannot turn this suite into an
-        // unbounded gate.
-        use nix::sys::signal::Signal;
-        use nix::sys::wait::WaitStatus;
-
-        //
-        // Keep reading the PTY while waiting: a child whose terminal output
-        // buffer is full cannot finish exiting (the kernel drains tty output
-        // on close), not even after SIGKILL, so an unread master turned one
-        // failed assertion into a suite that never ended.
-        let _ = self._proc.signal(Signal::SIGTERM);
-        for (signal, bound) in [(None, 1), (Some(Signal::SIGKILL), 5)] {
-            if let Some(signal) = signal {
-                let _ = self._proc.signal(signal);
-            }
-            let deadline = Instant::now() + Duration::from_secs(bound);
-            while Instant::now() < deadline {
-                self.drain();
-                match self._proc.status() {
-                    Some(WaitStatus::StillAlive) => {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Some(_) | None => return,
-                }
-            }
-        }
     }
 }
 
@@ -500,9 +434,7 @@ fn dev_reload_signal_saves_the_session_and_exits_for_restart() {
     assert!(ready, "prompt not reached:\n{}", pty.captured());
 
     let before = pty.buf.len();
-    pty._proc
-        .signal(nix::sys::signal::Signal::SIGUSR1)
-        .expect("signal SIGUSR1");
+    pty.io.signal(libc::SIGUSR1).expect("signal SIGUSR1");
 
     let start = Instant::now();
     while !pty.eof && start.elapsed() < Duration::from_secs(3) {
@@ -527,10 +459,11 @@ fn dev_reload_signal_saves_the_session_and_exits_for_restart() {
         "reload must restore cursor visibility:\n{after}"
     );
 
-    let status = pty._proc.exit().expect("exit status");
-    assert!(
-        matches!(status, nix::sys::wait::WaitStatus::Exited(_, 75)),
-        "reload must use the supervisor exit code, got {status:?}"
+    let status = pty.io.wait_for_exit(Duration::from_secs(3));
+    assert_eq!(
+        status,
+        Some(75),
+        "reload must use the supervisor exit code"
     );
 
     let sessions = isolated_config_home().join("piku/sessions");
@@ -858,7 +791,7 @@ fn pty_resize_does_not_panic() {
     assert!(ready, "prompt not reached:\n{}", pty.captured());
 
     // Set initial size, then shrink, then grow. Each ioctl delivers SIGWINCH.
-    let fd = pty._proc.get_file_handle().expect("pty fd");
+    let fd = pty.io.master().expect("pty fd");
     set_pty_winsize(&fd, 30, 100);
     std::thread::sleep(Duration::from_millis(100));
     set_pty_winsize(&fd, 15, 50);
@@ -898,27 +831,7 @@ fn sigterm_restores_terminal_before_exit() {
         .env("PIKU_INSTALL_SIGNAL_HANDLERS", "1")
         .env("PIKU_RESTARTED", "1");
 
-    let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
-    proc.set_kill_timeout(Some(3_000));
-    let writer = proc.get_file_handle().expect("pty writer");
-    let reader = proc.get_file_handle().expect("pty reader");
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
-    fcntl(
-        &reader,
-        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
-    )
-    .unwrap();
-
-    set_winsize(&writer, TEST_ROWS, TEST_COLS);
-    let mut pty = Pty {
-        _proc: proc,
-        writer,
-        reader,
-        buf: Vec::new(),
-        eof: false,
-        observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
-    };
+    let mut pty = Pty::from_command(cmd);
 
     // Wait for piku to finish startup — prompt glyph is a reliable marker
     // that the signal handler has been installed (install fires before the
@@ -933,9 +846,7 @@ fn sigterm_restores_terminal_before_exit() {
     let before_signal = pty.buf.len();
 
     // Send SIGTERM to the child piku process.
-    pty._proc
-        .signal(nix::sys::signal::Signal::SIGTERM)
-        .expect("signal SIGTERM");
+    pty.io.signal(libc::SIGTERM).expect("signal SIGTERM");
 
     // Wait for exit.
     let start = Instant::now();
@@ -997,27 +908,7 @@ fn ctrl_c_mid_turn_cancels_cleanly() {
         .env("PIKU_NO_SIGNAL_HANDLERS", "1")
         .env("PIKU_RESTARTED", "1");
 
-    let mut proc = rexpect::process::PtyProcess::new(cmd).expect("spawn piku");
-    proc.set_kill_timeout(Some(3_000));
-    let writer = proc.get_file_handle().expect("pty writer");
-    let reader = proc.get_file_handle().expect("pty reader");
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    let flags = fcntl(&reader, FcntlArg::F_GETFL).unwrap();
-    fcntl(
-        &reader,
-        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
-    )
-    .unwrap();
-
-    set_winsize(&writer, TEST_ROWS, TEST_COLS);
-    let mut pty = Pty {
-        _proc: proc,
-        writer,
-        reader,
-        buf: Vec::new(),
-        eof: false,
-        observer: ScreenObserver::new(TEST_ROWS, TEST_COLS),
-    };
+    let mut pty = Pty::from_command(cmd);
 
     let ready = pty.wait_for("❯", Duration::from_secs(5));
     assert!(ready, "prompt not reached:\n{}", pty.captured());
@@ -1509,39 +1400,11 @@ impl surfacekit::term::SessionIo for Pty {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
-        set_winsize(&self.writer, rows, cols);
-        Ok(())
+        self.io.resize(rows, cols)
     }
 
     fn is_dead(&self) -> bool {
         self.eof
-    }
-}
-
-#[allow(unsafe_code)]
-fn set_winsize(file: &std::fs::File, rows: u16, cols: u16) {
-    use std::os::unix::io::AsRawFd;
-    #[cfg(target_os = "macos")]
-    const TIOCSWINSZ: libc::c_ulong = 0x8008_7467;
-    #[cfg(target_os = "linux")]
-    const TIOCSWINSZ: libc::c_ulong = 0x5414;
-
-    #[repr(C)]
-    struct Winsize {
-        ws_row: u16,
-        ws_col: u16,
-        ws_xpixel: u16,
-        ws_ypixel: u16,
-    }
-    let ws = Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCSWINSZ writes a fixed-layout `struct winsize` to a valid PTY fd.
-    unsafe {
-        libc::ioctl(file.as_raw_fd(), TIOCSWINSZ, &ws);
     }
 }
 
@@ -1976,7 +1839,8 @@ fn recording_failure_restores_terminal_modes() {
         pty.captured()
     );
     let deadline = Instant::now() + Duration::from_secs(2);
-    while tcgetattr(&pty.writer)
+    let master = pty.io.master().expect("pty master");
+    while tcgetattr(&master)
         .unwrap()
         .local_flags
         .contains(LocalFlags::ICANON)
@@ -1988,7 +1852,7 @@ fn recording_failure_restores_terminal_modes() {
     // smoke helper cannot silently truncate one large paste at WouldBlock.
     pty.send(b"\x1b[200~");
     for chunk in prompt.as_bytes().chunks(512) {
-        pty.writer.write_all(chunk).unwrap();
+        pty.io.write_bytes(chunk).unwrap();
         pty.wait(Duration::from_millis(25));
     }
     pty.send(b"\x1b[201~\r");
@@ -1997,7 +1861,7 @@ fn recording_failure_restores_terminal_modes() {
         "{}",
         pty.captured()
     );
-    let modes = tcgetattr(&pty.writer).unwrap();
+    let modes = tcgetattr(&master).unwrap();
     assert!(
         modes.local_flags.contains(LocalFlags::ICANON),
         "record failure left terminal noncanonical"
