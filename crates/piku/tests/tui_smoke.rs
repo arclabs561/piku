@@ -38,8 +38,7 @@ use serial_test::serial;
 mod test_helpers;
 
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
-// into the grid a human would see. Same observer the agentic judge loop uses,
-// so these smoke tests and the judge assert on one definition of "the screen".
+// into the grid a human would see.
 use surfacekit::term::screen::{self, ScreenObserver, ScreenSnapshot};
 
 /// The fixed grid these PTY tests render into. The observer and the PTY winsize
@@ -1550,16 +1549,14 @@ fn set_winsize(file: &std::fs::File, rows: u16, cols: u16) {
 // Rendered-screen TUI QA — assert on what a human SEES
 // ---------------------------------------------------------------------------
 // These tests drive the real piku binary over a PTY and assert on the rendered
-// grid (`pty.screen()`), not the raw byte log. The renderer is the same vt100
-// observer the agentic judge loop uses (`agentic/screen.rs`), so "the screen"
-// has one definition across the suite.
+// grid (`pty.screen()`), not the raw byte log. The renderer is surfacekit's
+// vt100 `ScreenObserver`.
 //
 // Why the rendered screen and not raw bytes: a user experiences the grid a
 // terminal paints, not the escape sequence. vt100 is faithful enough that it
 // *caught* the blank-screen bug these tests now guard against — DECSTBM homes
 // the cursor (`ESC [ r` -> xterm `CursorSet(screen, 0, 0, ...)`), so piku's
-// reset-region-then-erase wiped the whole frame on a real terminal too. See
-// `agentic/screen.rs` for the full rationale.
+// reset-region-then-erase wiped the whole frame on a real terminal too.
 //
 // A fake API key means no network call succeeds; we assert only on the
 // presentation that happens before / instead of the LLM response.
