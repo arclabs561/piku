@@ -114,6 +114,23 @@ impl Cli {
 pub enum Commands {
     #[command(about = "Run the interactive shell (agent launch options do not apply)")]
     Shell,
+    #[command(about = "Print shell integration; add `eval \"$(piku init zsh)\"` to ~/.zshrc")]
+    Init {
+        #[arg(value_parser = ["zsh"])]
+        shell: String,
+    },
+    #[command(
+        hide = true,
+        about = "Append one shell ledger record (called by the zsh hook)"
+    )]
+    LedgerAppend {
+        #[arg(long)]
+        exit: i32,
+        #[arg(long)]
+        cwd: std::path::PathBuf,
+        #[arg(allow_hyphen_values = true)]
+        command: String,
+    },
     #[command(about = "Review and approve this project's tool permission rules")]
     Permissions {
         #[command(subcommand)]

@@ -25,6 +25,24 @@ pub struct LedgerEntry {
     pub source: String,
 }
 
+/// zsh integration printed by `piku init zsh`. `preexec` keeps the line as
+/// typed (so a leading space still marks it private); `precmd` reads `$?`
+/// first, then appends in the background so the prompt never waits on piku.
+pub const ZSH_HOOK: &str = r#"# piku shell ledger: records command lines (never output) for
+# `piku --shell-context`. Lines typed with a leading space are skipped.
+typeset -g _piku_ledger_cmd="" _piku_ledger_cwd=""
+_piku_ledger_preexec() { _piku_ledger_cmd="$1"; _piku_ledger_cwd="$PWD"; }
+_piku_ledger_precmd() {
+  local piku_exit=$?
+  [[ -n "$_piku_ledger_cmd" ]] || return 0
+  command piku ledger-append --exit "$piku_exit" --cwd "$_piku_ledger_cwd" -- "$_piku_ledger_cmd" &!
+  _piku_ledger_cmd=""
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec _piku_ledger_preexec
+add-zsh-hook precmd _piku_ledger_precmd
+"#;
+
 /// Records read back for `--shell-context` stop at this many bytes from the
 /// end of the file, so an old, large ledger cannot slow a launch.
 const TAIL_BYTES: u64 = 256 * 1024;

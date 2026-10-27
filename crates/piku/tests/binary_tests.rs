@@ -1662,3 +1662,79 @@ fn shell_context_attaches_only_requested_ledger_tail_and_says_so() {
         bodies[1]
     );
 }
+
+/// `eval "$(piku init zsh)"` makes zsh append each command and its exit
+/// status to the same ledger `piku shell` writes, skipping space-prefixed
+/// lines. Skipped where zsh is not installed.
+#[test]
+fn zsh_init_hook_records_commands_and_exit_status() {
+    let Ok(zsh) = which_zsh() else {
+        eprintln!("zsh not installed; skipping");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(piku_binary(), bin.join("piku")).unwrap();
+    let mut child = Command::new(zsh)
+        .args(["-f", "-i"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("XDG_STATE_HOME", state.path())
+        .current_dir(home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(
+                b"eval \"$(piku init zsh)\"\necho one\n export SECRET_TOKEN=x\nfalse\nexit\n",
+            )
+            .unwrap();
+    }
+    child.wait().unwrap();
+    // The hook appends in the background; give it a moment to land.
+    let ledger = state.path().join("piku/shell-ledger.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&ledger).unwrap_or_default();
+        if text.lines().count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let records: Vec<(String, i64, String)> = text
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                value["command"].as_str().unwrap().to_string(),
+                value["exit"].as_i64().unwrap(),
+                value["source"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        records,
+        [
+            ("echo one".to_string(), 0, "zsh".to_string()),
+            ("false".to_string(), 1, "zsh".to_string()),
+        ],
+        "ledger: {text}"
+    );
+}
+
+fn which_zsh() -> Result<std::path::PathBuf, ()> {
+    ["/bin/zsh", "/usr/bin/zsh"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.exists())
+        .ok_or(())
+}

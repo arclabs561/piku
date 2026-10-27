@@ -40,6 +40,21 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|error| anyhow::anyhow!(error))?;
             std::process::exit(code);
         }
+        Some(Commands::Init { .. }) => {
+            print!("{}", piku_shell::ledger::ZSH_HOOK);
+            return Ok(());
+        }
+        Some(Commands::LedgerAppend { exit, cwd, command }) => {
+            // Called after every zsh command, so it stays silent and cheap:
+            // a ledger problem must never print into the operator's shell.
+            if let (Some(path), Some(record)) = (
+                piku_shell::ledger::ledger_path(),
+                piku_shell::ledger::entry(command, cwd, *exit, "zsh"),
+            ) {
+                let _ = piku_shell::ledger::append(&path, &record);
+            }
+            return Ok(());
+        }
         Some(Commands::Permissions { command }) => {
             piku::project_permissions::run(
                 command,
