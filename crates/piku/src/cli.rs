@@ -74,6 +74,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    #[command(about = "Run the interactive shell")]
+    Shell,
     #[command(about = "Review and approve this project's tool permission rules")]
     Permissions {
         #[command(subcommand)]

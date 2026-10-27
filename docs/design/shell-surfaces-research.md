@@ -17,6 +17,13 @@ Piku to the `wish` project, which owns the human shell. Piku keeps surface 1
 The dependency seam is one-way: wish may consume Piku's CLI contract; Piku does
 not depend on wish.
 
+Superseded, 2026-10-26: the two projects are combined. The human shell ships as
+`piku shell` from the `piku-shell` crate in this workspace, absorbed from the
+wish prototype. Surface 3 below now means "run this shell as a command, which
+the operator may map to `$SHELL`", not "piku installs itself as the login
+shell". Surfaces 1 and 2 are unchanged, and the shell still shares no state
+with the agent loop's executor.
+
 This document is input to a decision, not a decision. It does not authorize
 implementation ahead of the authority and tool-result phases in
 [the harness roadmap](agentic-harness-roadmap.md).
@@ -172,9 +179,11 @@ authority.
 
 ### Shell replacement
 
-Out of scope for Piku. The `wish` project owns this surface; its design
-direction is a full shell, and the surveyed prior art above is handed there
-rather than duplicated here.
+Shipped as `piku shell` (2026-10-26). The shell core is the absorbed wish
+prototype: `crates/piku-shell`, run in-process by the `piku` binary and also
+buildable as the standalone `piku-shell` binary. The self-exec live update that
+wish used for its own binary is refused under `piku shell`, because the
+installed binary belongs to piku.
 
 No surveyed harness ships this. Crush's embedded interpreter is the closest
 primitive, and OpenCode's PTY layer is the closest presentation surface. A

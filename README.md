@@ -93,6 +93,25 @@ separate route. Live account interoperability still needs validation.
 Sessions are stored under `$XDG_CONFIG_HOME/piku/sessions/`, or
 `~/.config/piku/sessions/` when `XDG_CONFIG_HOME` is unset.
 
+## Shell
+
+```bash
+piku shell
+```
+
+`piku shell` starts an interactive shell in the current terminal. It parses and
+expands command lines itself, runs pipelines, redirection, and builtins without
+delegating to `sh`, and keeps its own line editing, completion, highlighting,
+history, and job control. It is a separate crate in this workspace,
+`crates/piku-shell`, also buildable as the standalone `piku-shell` binary.
+
+It is a command, not a login shell: piku never installs itself as `$SHELL`, and
+the shell shares no state with the agent loop's executor. History lives at
+`${XDG_DATA_HOME:-$HOME/.local/share}/piku/history`; a pre-existing
+`wish/history` file in the same directory is read until the first new entry.
+`:upgrade` and `Ctrl-X Ctrl-U` are refused, because the installed binary
+belongs to piku.
+
 ## Browser workspace
 
 ```bash

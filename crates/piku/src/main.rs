@@ -31,6 +31,14 @@ async fn main() -> anyhow::Result<()> {
     cli.validate_request_log()?;
 
     match &cli.command {
+        Some(Commands::Shell) => {
+            // The shell owns the terminal and the exit status; nothing after it
+            // runs. Upgrade paths that would replace this binary are disabled
+            // inside the shell.
+            let code = piku_shell::run_as_subcommand(std::iter::empty())
+                .map_err(|error| anyhow::anyhow!(error))?;
+            std::process::exit(code);
+        }
         Some(Commands::Permissions { command }) => {
             piku::project_permissions::run(
                 command,

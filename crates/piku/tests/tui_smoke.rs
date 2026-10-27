@@ -1896,3 +1896,39 @@ fn actor_drives_the_tui_and_promotes_a_replayable_case() {
     pty2.exit_cleanly();
     server2.join().unwrap();
 }
+
+#[test]
+#[ignore = "isolated PTY smoke test"]
+#[serial]
+fn piku_shell_runs_a_line_and_exits() {
+    // `piku shell` owns the terminal instead of the TUI: no provider, config,
+    // or API key participates. The only proof that matters is that a typed
+    // line executed and the process left a clean exit status.
+    let mut pty = Pty::spawn_with_args(&smoke_temp_root(), ["shell"]);
+    assert!(
+        pty.wait_for("% ", Duration::from_secs(10)),
+        "piku shell did not draw a prompt: {:?}",
+        pty.captured()
+    );
+
+    pty.send(b"echo shell-smoke\r");
+    // The echoed prompt repaints the typed text per keystroke, so only the
+    // executed output ends a line with the bare marker.
+    assert!(
+        pty.wait_for("shell-smoke\r\n", Duration::from_secs(10)),
+        "piku shell did not run the line: {:?}",
+        pty.captured()
+    );
+
+    // The self-exec upgrade belongs to the wish prototype; under piku it must
+    // refuse rather than replace the installed binary.
+    pty.send(b":upgrade\r");
+    assert!(
+        pty.wait_for("upgrade is managed by piku", Duration::from_secs(10)),
+        "piku shell did not refuse :upgrade: {:?}",
+        pty.captured()
+    );
+
+    pty.exit_cleanly();
+    assert!(pty.eof, "piku shell did not exit: {:?}", pty.captured());
+}

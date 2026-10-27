@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { workspace = true }
+piku-shell = { path = "../piku-shell" }
 self-replace = "1"
 tempfile = "3"
 thiserror = { workspace = true }

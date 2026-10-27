@@ -357,9 +357,11 @@ Gate:
   evaluation, and rollback.
 - Full workspace rewind waits until arbitrary shell effects participate in a
   mutation ledger.
-- A full shell or `$SHELL` replacement is outside Piku's product scope and
-  owned by the separate `wish` project. Piku keeps the executor shell and a
-  composable CLI; see [shell surfaces research](shell-surfaces-research.md).
+- `$SHELL` replacement stays out of scope. Piku ships the interactive shell as
+  `piku shell` (crate `piku-shell`, absorbed from the standalone `wish`
+  prototype on 2026-10-26) but is never installed as a login shell, and the
+  agent loop keeps its own executor. See
+  [shell surfaces research](shell-surfaces-research.md).
 
 ## Roadmap review triggers
 
