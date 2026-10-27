@@ -107,10 +107,9 @@ history, and job control. It is a separate crate in this workspace,
 
 It is a command, not a login shell: piku never installs itself as `$SHELL`, and
 the shell shares no state with the agent loop's executor. History lives at
-`${XDG_DATA_HOME:-$HOME/.local/share}/piku/history`; a pre-existing
-`wish/history` file in the same directory is read until the first new entry.
-`:upgrade` and `Ctrl-X Ctrl-U` are refused, because the installed binary
-belongs to piku.
+`${XDG_DATA_HOME:-$HOME/.local/share}/piku/history`; a history file left by the
+standalone prototype it came from is read until the first new entry. `:upgrade`
+and `Ctrl-X Ctrl-U` are refused, because the installed binary belongs to piku.
 
 ## Browser workspace
 

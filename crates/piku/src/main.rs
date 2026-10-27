@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let cwd = env::current_dir().ok();
     let cli = Cli::parse();
     cli.validate_request_log()?;
+    cli.validate_shell_launch()?;
 
     match &cli.command {
         Some(Commands::Shell) => {

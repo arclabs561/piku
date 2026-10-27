@@ -612,8 +612,8 @@ mod tests {
 
     #[test]
     fn variables_are_stored_and_unset() {
-        let mut shell = shell_with(&[("NAME", "wish")]);
-        assert_eq!(shell.var("NAME"), Some("wish"));
+        let mut shell = shell_with(&[("NAME", "piku-shell")]);
+        assert_eq!(shell.var("NAME"), Some("piku-shell"));
         assert_eq!(shell.var("MISSING"), None);
 
         let mut out = Vec::new();

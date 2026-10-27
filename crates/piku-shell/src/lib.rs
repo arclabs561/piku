@@ -515,7 +515,7 @@ fn restore_session(path: &Path, editor: &mut LineEditor, shell: &mut Shell) {
     }
     // The replacement process must own the terminal before it reads a key.
     let _ = jobs::take_terminal();
-    if std::env::var_os("WISH_RESTORE_MARKER").is_some() {
+    if std::env::var_os("PIKU_SHELL_RESTORE_MARKER").is_some() {
         eprintln!("piku shell: restored");
     }
 }

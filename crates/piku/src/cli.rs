@@ -70,11 +70,40 @@ impl Cli {
         }
         Ok(())
     }
+
+    /// `shell` owns the terminal and runs no agent turn, so a launch option
+    /// that would silently do nothing is an error instead.
+    pub fn validate_shell_launch(&self) -> anyhow::Result<()> {
+        if !matches!(self.command, Some(Commands::Shell)) {
+            return Ok(());
+        }
+        let launch_only = [
+            (self.print, "--print"),
+            (self.read_only, "--read-only"),
+            (self.resume.is_some(), "--resume"),
+            (self.model.is_some(), "--model"),
+            (self.provider.is_some(), "--provider"),
+            (self.self_update_root.is_some(), "--self-update-root"),
+            (!self.prompt.is_empty(), "a prompt"),
+        ];
+        let used: Vec<&str> = launch_only
+            .iter()
+            .filter(|(present, _)| *present)
+            .map(|(_, flag)| *flag)
+            .collect();
+        if used.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "piku shell runs an interactive shell; {} cannot apply to it; see piku --help",
+            used.join(", ")
+        )
+    }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    #[command(about = "Run the interactive shell")]
+    #[command(about = "Run the interactive shell (agent launch options do not apply)")]
     Shell,
     #[command(about = "Review and approve this project's tool permission rules")]
     Permissions {
@@ -264,6 +293,34 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("piku --help"));
+        }
+    }
+
+    #[test]
+    fn shell_rejects_launch_options_that_would_do_nothing() {
+        Cli::try_parse_from(["piku", "shell"])
+            .unwrap()
+            .validate_shell_launch()
+            .unwrap();
+        // Launch options stay valid for the commands that use them.
+        Cli::try_parse_from(["piku", "--model", "m", "providers"])
+            .unwrap()
+            .validate_shell_launch()
+            .unwrap();
+        for args in [
+            vec!["piku", "-p", "shell"],
+            vec!["piku", "--model", "m", "shell"],
+            vec!["piku", "--provider", "openrouter", "shell"],
+            vec!["piku", "--resume", "session-id", "shell"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                cli.validate_shell_launch()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot apply"),
+                "a launch option on shell must be an error"
+            );
         }
     }
 

@@ -129,7 +129,7 @@ pub fn blob_path() -> PathBuf {
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    dir.join(format!("wish-state-{}.json", std::process::id()))
+    dir.join(format!("piku-shell-state-{}.json", std::process::id()))
 }
 
 /// Writes `state` atomically: temp file with mode 0600, fsync, rename.
@@ -140,7 +140,7 @@ pub fn write(path: &Path, state: &State) -> Result<(), String> {
         _ => Path::new("."),
     };
     let temporary = directory.join(format!(
-        ".wish-state-{}-{}.tmp",
+        ".piku-shell-state-{}-{}.tmp",
         std::process::id(),
         monotonic_nanos()
     ));
@@ -255,7 +255,7 @@ pub fn install_binary(candidate: &Path) -> Result<PathBuf, String> {
     fs::copy(&current, &backup).map_err(|error| format!("keep {}: {error}", backup.display()))?;
 
     let temporary = directory.join(format!(
-        ".wish-install-{}-{}.tmp",
+        ".piku-shell-install-{}-{}.tmp",
         std::process::id(),
         monotonic_nanos()
     ));
@@ -276,8 +276,8 @@ pub fn install_binary(candidate: &Path) -> Result<PathBuf, String> {
     Ok(current)
 }
 
-/// Appends `suffix` to the whole file name, so `wish` becomes `wish.old`
-/// rather than `wish.old` losing its extension.
+/// Appends `suffix` to the whole file name, so `piku-shell` becomes
+/// `piku-shell.old` rather than `piku.shell.old` losing its extension.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);

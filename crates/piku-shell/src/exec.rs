@@ -687,7 +687,7 @@ mod tests {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         for directory in [first.path(), second.path()] {
-            let tool = directory.join("wish-test-tool");
+            let tool = directory.join("piku-shell-test-tool");
             fs::write(&tool, b"#!/bin/sh\n").unwrap();
             let mut permissions = fs::metadata(&tool).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -695,8 +695,8 @@ mod tests {
         }
         let path = format!("{}:{}", first.path().display(), second.path().display());
         assert_eq!(
-            resolve("wish-test-tool", Some(&path)),
-            Some(first.path().join("wish-test-tool"))
+            resolve("piku-shell-test-tool", Some(&path)),
+            Some(first.path().join("piku-shell-test-tool"))
         );
         assert_eq!(resolve("not-there", Some(&path)), None);
         // A command with a slash is used as written.
