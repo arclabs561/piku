@@ -7,6 +7,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 /// Keep startup bounded even if the history file grew without limit.
@@ -101,6 +102,9 @@ impl History {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            // A command line can carry a token or a private path; new history
+            // files stay owner-only, like every other piku file.
+            .mode(0o600)
             .open(path)
             .map_err(|error| format!("open {}: {error}", path.display()))?;
         writeln!(file, "{line}").map_err(|error| format!("write {}: {error}", path.display()))
