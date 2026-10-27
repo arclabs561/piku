@@ -44,13 +44,22 @@ async fn main() -> anyhow::Result<()> {
             print!("{}", piku_shell::ledger::ZSH_HOOK);
             return Ok(());
         }
-        Some(Commands::LedgerAppend { exit, cwd, command }) => {
+        Some(Commands::LedgerAppend {
+            exit,
+            cwd,
+            started_us,
+            command,
+        }) => {
             // Called after every zsh command, so it stays silent and cheap:
             // a ledger problem must never print into the operator's shell.
-            if let (Some(path), Some(record)) = (
+            if let (Some(path), Some(mut record)) = (
                 piku_shell::ledger::ledger_path(),
                 piku_shell::ledger::entry(command, cwd, *exit, "zsh"),
             ) {
+                if let Some(started) = started_us {
+                    record.at_us = Some(*started);
+                    record.at = started / 1_000_000;
+                }
                 let _ = piku_shell::ledger::append(&path, &record);
             }
             return Ok(());

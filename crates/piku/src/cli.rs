@@ -128,6 +128,9 @@ pub enum Commands {
         exit: i32,
         #[arg(long)]
         cwd: std::path::PathBuf,
+        /// When the command started, from zsh's $EPOCHREALTIME.
+        #[arg(long)]
+        started_us: Option<u64>,
         #[arg(allow_hyphen_values = true)]
         command: String,
     },

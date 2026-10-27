@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 pub struct LedgerEntry {
     /// Seconds since the Unix epoch.
     pub at: u64,
+    /// When the command started, in microseconds. Background writers can
+    /// append out of order, so readers sort by this; older records lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_us: Option<u64>,
     pub cwd: String,
     pub command: String,
     pub exit: i32,
@@ -30,12 +34,19 @@ pub struct LedgerEntry {
 /// first, then appends in the background so the prompt never waits on piku.
 pub const ZSH_HOOK: &str = r#"# piku shell ledger: records command lines (never output) for
 # `piku --shell-context`. Lines typed with a leading space are skipped.
-typeset -g _piku_ledger_cmd="" _piku_ledger_cwd=""
-_piku_ledger_preexec() { _piku_ledger_cmd="$1"; _piku_ledger_cwd="$PWD"; }
+zmodload -F zsh/datetime p:EPOCHREALTIME 2>/dev/null
+typeset -g _piku_ledger_cmd="" _piku_ledger_cwd="" _piku_ledger_us=""
+_piku_ledger_preexec() {
+  _piku_ledger_cmd="$1"; _piku_ledger_cwd="$PWD"
+  _piku_ledger_us="${${EPOCHREALTIME/./}[1,16]}"
+}
 _piku_ledger_precmd() {
   local piku_exit=$?
   [[ -n "$_piku_ledger_cmd" ]] || return 0
-  command piku ledger-append --exit "$piku_exit" --cwd "$_piku_ledger_cwd" -- "$_piku_ledger_cmd" &!
+  local -a piku_started=()
+  [[ -n "$_piku_ledger_us" ]] && piku_started=(--started-us "$_piku_ledger_us")
+  command piku ledger-append --exit "$piku_exit" --cwd "$_piku_ledger_cwd" \
+    "${piku_started[@]}" -- "$_piku_ledger_cmd" &!
   _piku_ledger_cmd=""
 }
 autoload -Uz add-zsh-hook
@@ -66,11 +77,14 @@ pub fn entry(command: &str, cwd: &Path, exit: i32, source: &str) -> Option<Ledge
     if command.starts_with(' ') || command.trim().is_empty() {
         return None;
     }
-    let at = std::time::SystemTime::now()
+    let at_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        });
     Some(LedgerEntry {
-        at,
+        at: at_us / 1_000_000,
+        at_us: Some(at_us),
         cwd: cwd.to_string_lossy().into_owned(),
         command: redact(command.trim()),
         exit,
@@ -89,8 +103,13 @@ pub fn append(path: &Path, entry: &LedgerEntry) -> Result<(), String> {
         .mode(0o600)
         .open(path)
         .map_err(|error| format!("open {}: {error}", path.display()))?;
-    let line = serde_json::to_string(entry).map_err(|error| error.to_string())?;
-    writeln!(file, "{line}").map_err(|error| format!("write {}: {error}", path.display()))
+    // One write per record: with O_APPEND a single small write lands whole,
+    // while writeln! issues the record and the newline separately, and the zsh
+    // hook runs appenders concurrently in the background.
+    let mut line = serde_json::to_string(entry).map_err(|error| error.to_string())?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 /// The last `limit` records, oldest first. Unparseable lines are skipped.
@@ -118,6 +137,7 @@ pub fn recent(path: &Path, limit: usize) -> Result<Vec<LedgerEntry>, String> {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
+    entries.sort_by_key(|entry| entry.at_us.unwrap_or(entry.at.saturating_mul(1_000_000)));
     let skip = entries.len().saturating_sub(limit);
     Ok(entries.split_off(skip))
 }
@@ -198,6 +218,53 @@ mod tests {
             redact("cargo test --release FOO=1"),
             "cargo test --release FOO=1"
         );
+    }
+
+    #[test]
+    fn recent_orders_by_start_time_not_append_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell-ledger.jsonl");
+        for (command, ms) in [
+            ("second", 2_000_000),
+            ("first", 1_000_001),
+            ("third", 3_000_000),
+        ] {
+            let mut record = entry(command, Path::new("/w"), 0, "t").unwrap();
+            record.at_us = Some(ms);
+            append(&path, &record).unwrap();
+        }
+        let order: Vec<String> = recent(&path, 3)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.command)
+            .collect();
+        assert_eq!(order, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn concurrent_appends_never_share_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell-ledger.jsonl");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..50 {
+                        let record =
+                            entry(&format!("echo {t}-{n}"), Path::new("/w"), 0, "t").unwrap();
+                        append(&path, &record).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 400);
+        for line in text.lines() {
+            serde_json::from_str::<LedgerEntry>(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        }
     }
 
     #[test]

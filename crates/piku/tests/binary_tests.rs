@@ -1710,10 +1710,16 @@ fn zsh_init_hook_records_commands_and_exit_status() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let records: Vec<(String, i64, String)> = text
+    // Appends run in the background and may land out of order; readers
+    // order by the start time the hook records, and so does this check.
+    let mut values: Vec<serde_json::Value> = text
         .lines()
-        .map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    values.sort_by_key(|value| value["at_us"].as_u64().expect("hook records a start time"));
+    let records: Vec<(String, i64, String)> = values
+        .iter()
+        .map(|value| {
             (
                 value["command"].as_str().unwrap().to_string(),
                 value["exit"].as_i64().unwrap(),
