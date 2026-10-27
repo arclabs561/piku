@@ -344,7 +344,7 @@ static TOOLS: &[ToolEntry] = &[
     },
     ToolEntry {
         name: "bash",
-        description: "Execute a shell command using sh -c (non-login shell). Returns stdout and stderr, each capped at 256 KiB with a truncation marker. Use timeout_ms to limit execution time (default 30s). If you need login shell behaviour (e.g. PATH including ~/.cargo/bin), prefix: bash -lc 'your command'.",
+        description: "Execute a shell command using sh -c (non-login shell). Every call starts in piku's launch directory; a `cd` does not carry over to the next call, so prefix `cd <dir> &&` each time. Returns stdout and stderr, each capped at 256 KiB with a truncation marker. Use timeout_ms to limit execution time (default 30s). If you need login shell behaviour (e.g. PATH including ~/.cargo/bin), prefix: bash -lc 'your command'.",
         schema_fn: bash::schema,
         destructiveness_fn: bash::destructiveness,
     },
