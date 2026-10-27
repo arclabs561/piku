@@ -2736,9 +2736,20 @@ async fn run_tui_repl_core(
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
     }
 
+    // Save prompt history before anything that can wait: Ctrl-C during the
+    // waits below exits through the signal handler and would skip this.
+    editor.save_history_file(&history_path);
+
     // Wait for async hooks to finish writing (logs, etc) before the
     // process exits and truncates their output mid-write. Bounded so a
     // hung hook can't block shutdown — the user's exit should feel snappy.
+    // Every wait is announced first, so exit never looks like a hang.
+    let pending_hooks = hook_registry.pending_count();
+    if pending_hooks > 0 {
+        eprintln!(
+            "\x1b[2m[waiting up to 2s for {pending_hooks} async hook(s) · Ctrl-C to skip]\x1b[0m"
+        );
+    }
     let still_running = hook_registry.shutdown(std::time::Duration::from_secs(2));
     if still_running > 0 {
         eprintln!("\x1b[2m[{still_running} async hook(s) still running at exit — detached]\x1b[0m");
@@ -2759,6 +2770,11 @@ async fn run_tui_repl_core(
             let store_path = piku_runtime::default_store_path(&cwd);
             let embed_config = piku_runtime::embed_memory::EmbedConfig::from_env();
             // Use a short timeout — don't make the user wait forever on exit
+            const EXTRACTION_TIMEOUT_SECS: u64 = 15;
+            eprintln!(
+                "\x1b[2m[extracting memories from this session with {model} · up to {EXTRACTION_TIMEOUT_SECS}s · Ctrl-C to skip]\x1b[0m"
+            );
+            let started = std::time::Instant::now();
             let extraction_future = piku_runtime::embed_memory::extract_and_persist(
                 &transcript,
                 exit_provider
@@ -2768,18 +2784,25 @@ async fn run_tui_repl_core(
                 &store_path,
                 &embed_config,
             );
-            match tokio::time::timeout(std::time::Duration::from_secs(15), extraction_future).await
-            {
-                Ok(Ok(n)) if n > 0 => {
-                    eprintln!("\x1b[2m[{n} memories extracted from session]\x1b[0m");
-                }
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(EXTRACTION_TIMEOUT_SECS),
+                extraction_future,
+            )
+            .await;
+            let took = crate::fmt_duration(started.elapsed().as_secs());
+            match outcome {
+                Ok(Ok(0)) => eprintln!("\x1b[2m[no new memories · {took}]\x1b[0m"),
+                Ok(Ok(n)) => eprintln!(
+                    "\x1b[2m[{n} memories saved to {} · {took}]\x1b[0m",
+                    store_path.display()
+                ),
                 Ok(Err(error)) => eprintln!("[piku] memory extraction failed: {error}"),
-                _ => {} // timeout or no memories — exit silently
+                Err(_) => eprintln!(
+                    "\x1b[2m[memory extraction timed out after {EXTRACTION_TIMEOUT_SECS}s · skipped]\x1b[0m"
+                ),
             }
         }
     }
-
-    editor.save_history_file(&history_path);
 
     Ok(())
 }
