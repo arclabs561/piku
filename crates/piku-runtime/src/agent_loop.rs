@@ -798,7 +798,19 @@ async fn run_turn_inner(
                     .get("approach")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
+                // Some providers fill every optional integer with 0. An id that
+                // names no attempt, sent alongside goal and approach, is a
+                // create, not an update to retry forever.
+                let known = |id: u64| store.entries.iter().any(|e| e.id == id && e.is_valid);
+                let creating = !goal.trim().is_empty() && !approach.trim().is_empty();
+                let attempt_id = params
+                    .get("attempt_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&id| !creating || known(id));
+                let parent_id = params
+                    .get("parent_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&id| known(id));
 
                 if let Some(error) = load_error {
                     (
@@ -857,8 +869,6 @@ async fn run_turn_inner(
                     .await;
                     match embed_result {
                         Ok(Ok(embedding)) => {
-                            let parent_id =
-                                params.get("parent_id").and_then(serde_json::Value::as_u64);
                             #[allow(clippy::cast_possible_truncation)]
                             let importance = params
                                 .get("importance")
