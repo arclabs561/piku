@@ -1605,15 +1605,17 @@ fn shell_context_attaches_only_requested_ledger_tail_and_says_so() {
     let state = tempfile::tempdir().unwrap();
     let ledger = state.path().join("piku/shell-ledger.jsonl");
     std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-    let records: String = ["make build", "cargo test -p alpha", "git status"]
+    let mut records = String::new();
+    for (n, command) in ["make build", "cargo test -p alpha", "git status"]
         .iter()
         .enumerate()
-        .map(|(n, command)| {
-            format!(
-                "{{\"at\":{n},\"cwd\":\"/work\",\"command\":\"{command}\",\"exit\":{n},\"source\":\"piku-shell\"}}\n"
-            )
-        })
-        .collect();
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            records,
+            "{{\"at\":{n},\"cwd\":\"/work\",\"command\":\"{command}\",\"exit\":{n},\"source\":\"piku-shell\"}}"
+        );
+    }
     std::fs::write(&ledger, records).unwrap();
     let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
     let run = |extra: &[&str]| {
