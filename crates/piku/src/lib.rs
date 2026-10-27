@@ -62,6 +62,62 @@ pub fn read_only_system_prompt_section() -> String {
         .to_string()
 }
 
+/// Facts about the running piku that the agent cannot see from the
+/// workspace: its version, route, where its settings and records live, and how
+/// the operator drives it. Without this the agent searches the disk to answer
+/// questions about itself, such as where its default model is configured.
+pub struct SelfContext<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub actor: &'a str,
+    pub session_id: &'a str,
+    pub config_dir: &'a std::path::Path,
+    /// The run record (event log) for this process, when one is open.
+    pub run_record: Option<&'a std::path::Path>,
+    pub interactive: bool,
+}
+
+#[must_use]
+pub fn self_system_prompt_section(s: &SelfContext<'_>) -> String {
+    let binary =
+        env::current_exe().map_or_else(|_| "piku".to_string(), |p| p.display().to_string());
+    let dir = s.config_dir.display();
+    let mut text = format!(
+        "# About you (piku)\n\n\
+- You are piku {version} ({binary}), an open-source coding agent: https://github.com/arclabs561/piku\n\
+- Route: provider {provider}, model {model}, actor @{actor}.\n\
+- Settings: {dir}/settings.toml (user), then .piku/settings.toml in the project, merged on top. \
+The default provider and model are set there; PIKU_MODEL and PIKU_BASE_URL override them.\n\
+- This session: {session}. Transcript: {dir}/sessions/{session}.json.",
+        version = VERSION,
+        provider = s.provider,
+        model = s.model,
+        actor = s.actor,
+        session = s.session_id,
+    );
+    if let Some(record) = s.run_record {
+        text.push_str(&format!(
+            " Event record: {} (`piku inspect {}` renders it).",
+            record.display(),
+            s.session_id
+        ));
+    }
+    text.push_str(&format!(
+        "\n- Memory: {dir}/memory (user), .piku/memory (project), .piku/memory-local (local).\n\
+- Shell: the operator's recent commands are attached only when they pass --shell-context; \
+the ledger is ~/.local/state/piku/shell-ledger.jsonl.\n"
+    ));
+    if s.interactive {
+        text.push_str(
+            "- Interface: the operator can type while you work; Enter queues a message for after \
+this turn, Esc or Ctrl-C interrupts, Ctrl-L repaints, /help lists commands (/model, /actor, \
+/cells, /sessions, /status).\n",
+        );
+    }
+    text.push_str("- For questions about piku itself, use these facts and read the files above instead of guessing.");
+    text
+}
+
 pub fn sessions_dir() -> anyhow::Result<std::path::PathBuf> {
     let base = env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {

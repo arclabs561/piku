@@ -582,6 +582,15 @@ async fn run_single_shot(
     sink.request_observation = request_log.map(RequestLog::request_observation);
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    system_sections.push(piku::self_system_prompt_section(&piku::SelfContext {
+        provider: resolved.name(),
+        model: &model,
+        actor: "primary",
+        session_id: &session_id,
+        config_dir: &config.config_dir,
+        run_record: Some(&run_path),
+        interactive: false,
+    }));
     let mut turn_nonce = [0; 16];
     getrandom::fill(&mut turn_nonce).map_err(|error| anyhow::anyhow!("turn ID: {error}"))?;
     let turn_id = format!("turn-{:032x}", u128::from_ne_bytes(turn_nonce));

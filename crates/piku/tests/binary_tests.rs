@@ -1738,3 +1738,30 @@ fn which_zsh() -> Result<std::path::PathBuf, ()> {
         .find(|path| path.exists())
         .ok_or(())
 }
+
+/// The agent is told where its own settings and records live, so a question
+/// like "where is piku's default model configured?" does not need a search.
+#[test]
+fn system_prompt_tells_the_agent_about_itself() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let (_out, session_id) = run_headless_turn(config.path(), &base_url);
+    let bodies = bodies.lock().unwrap().clone();
+    let body = bodies.first().expect("one request");
+    let settings = config.path().join("piku/settings.toml");
+    let transcript = config
+        .path()
+        .join(format!("piku/sessions/{session_id}.json"));
+    for needle in [
+        "# About you (piku)".to_string(),
+        format!("piku {}", env!("CARGO_PKG_VERSION")),
+        "model canned-model".to_string(),
+        settings.display().to_string(),
+        transcript.display().to_string(),
+    ] {
+        assert!(
+            body.contains(&needle),
+            "missing {needle:?} in request: {body}"
+        );
+    }
+}

@@ -2531,6 +2531,15 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 let mut system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                system_sections.push(crate::self_system_prompt_section(&crate::SelfContext {
+                    provider: resolved.name(),
+                    model: &model,
+                    actor: &active_actor,
+                    session_id: &session_id,
+                    config_dir: &config.config_dir,
+                    run_record: Some(run.record_path()),
+                    interactive: true,
+                }));
                 if let Some(instructions) = config
                     .actor(&active_actor)
                     .and_then(|profile| profile.instructions.as_deref())
