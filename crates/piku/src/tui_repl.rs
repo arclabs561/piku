@@ -661,11 +661,9 @@ impl TypeAhead {
     }
 
     /// The input row while a turn runs: the draft drawn like a prompt with a
-    /// block cursor, then the queue count. Empty when there is nothing typed.
+    /// block cursor, then the queue count. The cursor shows even with nothing
+    /// typed, so Enter never leaves the operator without one.
     pub(crate) fn line(&self, max_chars: usize) -> String {
-        if self.draft.is_empty() && self.queued.is_empty() {
-            return String::new();
-        }
         let queued = if self.queued.is_empty() {
             String::new()
         } else {
@@ -684,20 +682,17 @@ fn lock_type_ahead(ahead: &Mutex<TypeAhead>) -> MutexGuard<'_, TypeAhead> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Draw the type-ahead line on `row` without moving the output cursor.
-/// Returns false when there is nothing typed, leaving the row alone.
-fn draw_type_ahead_row(row: u16, ahead: &TypeAhead, suffix: &str) -> bool {
+/// Draw the type-ahead line on `row` without moving the output cursor. The
+/// terminal cursor stays hidden during a turn (output streams at it); this
+/// line carries the visible one.
+fn draw_type_ahead_row(row: u16, ahead: &TypeAhead, suffix: &str) {
     let line = ahead.line(usize::from(term_size().0).saturating_sub(24));
-    if line.is_empty() {
-        return false;
-    }
     let mut out = io::stdout();
     let _ = out.write_all(b"\x1b[s");
     goto(row, 1);
     let _ = out.write_all(format!("\x1b[2K{line}{suffix}").as_bytes());
     let _ = out.write_all(b"\x1b[u");
     let _ = out.flush();
-    true
 }
 
 // ── Repaint ───────────────────────────────────────────────────────────────────
@@ -2592,7 +2587,7 @@ async fn run_tui_repl_core(
                 goto(rows, 1);
                 // The real cursor stays hidden for the turn: output streams at it while
                 // type-ahead draws its own block cursor on this row.
-                print!("\x1b[2K\x1b[2m❯ · thinking\x1b[0m\x1b[?25l");
+                print!("\x1b[2K\x1b[2m❯\x1b[0m \x1b[7m \x1b[0m  \x1b[2m· thinking\x1b[0m\x1b[?25l");
                 goto(rows, 3);
                 let _ = io::stdout().flush();
                 let indicator_row = rows;
@@ -2624,19 +2619,11 @@ async fn run_tui_repl_core(
                             "\x1b[2m".to_string()
                         };
                         let indicator = format!("{color}{frame} {label} ({time_str})\x1b[0m");
-                        if draw_type_ahead_row(
+                        draw_type_ahead_row(
                             indicator_row,
                             &lock_type_ahead(&indicator_ahead),
                             &format!("  {indicator}"),
-                        ) {
-                            continue;
-                        }
-                        let mut out = io::stdout();
-                        let _ = out.write_all(b"\x1b[s");
-                        goto(indicator_row, 1);
-                        let _ = out.write_all(format!("\x1b[2K{color}❯ {indicator}").as_bytes());
-                        let _ = out.write_all(b"\x1b[u");
-                        let _ = out.flush();
+                        );
                     }
                 });
 
@@ -4705,7 +4692,7 @@ mod tests {
     #[test]
     fn type_ahead_line_shows_draft_tail_with_cursor_and_queue_count() {
         let mut ahead = TypeAhead::default();
-        assert_eq!(ahead.line(80), "");
+        assert_eq!(crate::markdown::strip_ansi(&ahead.line(80)), "❯  ");
         type_keys(&mut ahead, "a\nb\n");
         type_keys(&mut ahead, &"x".repeat(100));
         let plain = crate::markdown::strip_ansi(&ahead.line(30));
