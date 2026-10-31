@@ -261,7 +261,7 @@ Piku should preserve the first list and carefully repair the second:
 
 This means Piku must resist two opposite mistakes: a sterile machine-event log
 that loses the feeling of working, and a full-screen faux terminal that takes
-control away. The aim is an enriched typescript—ordinary shell life, plus
+control away. The aim is an enriched typescript: ordinary shell life, plus
 addressable experiments, accurate state, and a path from fleeting output to
 chosen knowledge.
 
@@ -318,7 +318,7 @@ unsupported terminals may remove them.
 A full-screen renderer owns stdout exclusively. Background tasks, hooks,
 plugins, and debug logging must route through a renderer queue, dedicated log,
 or durable artifact; they must never write directly into an active TUI. This is
-both a correctness and trust condition—one stray ANSI writer can corrupt the
+both a correctness and trust condition: one stray ANSI writer can corrupt the
 screen and make the visible transcript unreliable.
 
 Command/output grouping also has a strict attribution boundary. It is reliable

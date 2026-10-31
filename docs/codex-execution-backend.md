@@ -237,4 +237,4 @@ telemetry as enforcement.
 - Which secret-reference mechanism should back provider settings on macOS.
 
 ---
-Decided: 2026-08-08 | Session: 019fe1d4
+Decided: 2026-08-08

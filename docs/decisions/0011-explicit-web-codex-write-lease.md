@@ -4,8 +4,6 @@
 status: proposed
 date: 2026-08-09
 verified: 2026-08-12
-extends:
-  - 0009
 governs:
   - crates/piku/src/web.rs
   - crates/piku/src/web/codex.rs

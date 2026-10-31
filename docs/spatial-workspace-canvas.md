@@ -89,4 +89,4 @@ It creates nested canvases and makes ordinary language such as “make it red”
 ambiguous about whether it targets the board or a child page.
 
 ---
-Decided: 2026-08-08 | Session: 019fe1d4
+Decided: 2026-08-08

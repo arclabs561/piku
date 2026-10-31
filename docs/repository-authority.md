@@ -7,8 +7,8 @@ Status: implemented; canonical checks and isolated admission probes verified.
 Piku keeps provider connections, project tool approval and executable replacement
 under separate operator control. Opening a repository supplies task context and
 restrictions; granting one capability does not grant the others. This design
-defines the admission rules used by the [configuration](../design.md) and
-[developer self-update](../self-update.md) paths.
+defines the admission rules used by the [configuration](design.md) and
+[developer self-update](self-update.md) paths.
 
 ## Problem
 
@@ -80,7 +80,7 @@ If scoped shell patterns cannot distinguish their reviewed capability from a
 compound command, decline that automatic grant rather than infer approval.
 No approval store or build-root flag is evidence of sandbox enforcement.
 
-## W03 containment proposal
+## Containment proposal
 
 Status: proposed; implementation and negative-effect probes remain unexecuted.
 The implemented admission contract above stays accepted. This section proposes

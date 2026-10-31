@@ -12,7 +12,7 @@ spend, and an engineering handoff. The runtime still divides the same work
 between chronological session messages, provider streaming events, selective
 traces, terminal callbacks, and final repository state.
 
-That split cannot support the workbench described by the recovered transcript.
+That split cannot support a durable investigation workbench.
 A compact TUI, a Swift investigation app, an editor client, and a browser
 capture tool will drift if each reconstructs context, authority, evidence,
 changes, and completion independently. A polished summary also cannot be the
@@ -385,4 +385,4 @@ the capability, origin, and audit gates above.
   <https://docs.marimo.io/llms.txt>.
 
 ---
-Proposed: 2026-08-05 | Session: current Codex session
+Proposed: 2026-08-05

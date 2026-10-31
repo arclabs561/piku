@@ -36,7 +36,7 @@ conversation.
 - The browser surface is a separate process and subcommand (`piku web`,
   `crates/piku/src/cli.rs:134`).
 - `just check` (`scripts/ci.sh`) is the completion gate. There is no dev,
-  watch, or reload recipe today. `watchexec` is available on this machine.
+  watch, or reload recipe today.
 - The runtime already signals for restart through
   `AgentLoopResult::replace_and_exec` (`crates/piku-runtime/src/agent_loop.rs:126`).
 

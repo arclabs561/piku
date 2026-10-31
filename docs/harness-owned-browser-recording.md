@@ -1,6 +1,6 @@
 # Design: harness-owned browser recording
 
-Status: proposed
+Status: implemented
 
 ## Problem
 
@@ -30,7 +30,7 @@ already retained and bounded. The installed Playwright MCP supports video,
 chapter, and action-overlay operations behind its `devtools` capability, but
 does not expose a reliable automatic-recording configuration in the installed
 version. The harness already defaults human review output to
-`~/Library/Caches/piku/eval-review`, outside a CloudDocs-backed checkout.
+`~/Library/Caches/piku/eval-review`, outside the repository checkout.
 
 ## Non-goals
 
@@ -128,7 +128,7 @@ absence or rendering failure is recorded but cannot change the evaluation
 outcome. The frames remain available for frame-by-frame review. The run-level
 manifest links roles and their finalization state. Small control-plane manifests
 may remain under `.artifacts`; media and human-review copies must be written
-directly to the local review root rather than copied out of CloudDocs later.
+directly to the local review root rather than copied out of the checkout later.
 
 `recorder.jsonl` contains a header with schema, recording strategy, paths
 relative to the role root, and input-redaction policy. Its events are:
@@ -200,4 +200,4 @@ media hash.
   concerns outweigh review utility?
 
 ---
-Decided: 2026-08-14 | Session: Codex
+Decided: 2026-08-14
