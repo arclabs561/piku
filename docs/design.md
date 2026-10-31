@@ -150,6 +150,14 @@ Each tool classifies a call as `Safe`, `Likely`, or `Definite`.
 - Configured deny rules run before classification and per-turn allow-all.
   Remaining `Safe` calls bypass interactive prompting, including new unprotected
   files, Markdown-memory writes, and attempt recording.
+- A scoped bash deny such as `bash(rm *)` denies any command with quoting,
+  escapes, expansion, or control operators. Otherwise it matches the raw
+  command and a normalized form: whitespace collapsed, leading `NAME=value`
+  assignments dropped, the command name reduced to its file name, and the
+  command after a common wrapper (`env`, `sudo`, `nice`, `xargs`, ...).
+  Allow rules match only the raw command. Deny rules are string checks, not a
+  sandbox: a program can still run through `find -delete`, an interpreter, or
+  a script.
 - For other calls, per-turn allow-all or configured allow rules can skip the
   interactive TUI prompt; remaining calls prompt for one-time allow, deny, or
   allow-all for the rest of the turn.
