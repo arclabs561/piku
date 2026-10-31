@@ -265,8 +265,21 @@ pub fn ensure_within_base(target: &str, base: &std::path::Path) -> Result<(), St
         return Ok(());
     }
 
+    // Also check the lexically normalized path so `/tmp/../etc/x` cannot
+    // slip past the prefix check.
+    let mut normalized = std::path::PathBuf::new();
+    for component in target_path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
     for root in SYSTEM_ROOTS {
-        if target_path.starts_with(root) {
+        if target_path.starts_with(root) || normalized.starts_with(root) {
             return Err(format!(
                 "absolute path targets system directory: {target} (under {root})"
             ));
