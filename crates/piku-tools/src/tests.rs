@@ -1616,3 +1616,45 @@ fn resolved_file_policy_classifies_symlink_targets_and_missing_protected_leaves(
         Destructiveness::Definite
     );
 }
+
+#[test]
+fn new_files_at_trust_anchors_need_approval() {
+    use crate::Destructiveness;
+    let base = tempdir().canonicalize().unwrap();
+    let write = |path: std::path::PathBuf| {
+        crate::tool_destructiveness("write_file", &serde_json::json!({ "path": path }))
+    };
+    for anchor in [
+        base.join(".piku/hooks.json"),
+        base.join(".piku/settings.toml"),
+        base.join(".piku/agents/reviewer.md"),
+        base.join("PIKU.md"),
+        base.join("PIKU.local.md"),
+        base.join("other-config/piku/hooks.json"),
+        base.join("other-config/piku/settings.toml"),
+        base.join("other-config/piku/trusted-hooks.json"),
+        crate::global_config_dir().join("_codex/new-attestation.json"),
+    ] {
+        assert!(!anchor.exists(), "{}", anchor.display());
+        assert_eq!(
+            write(anchor.clone()),
+            Destructiveness::Definite,
+            "{}",
+            anchor.display()
+        );
+    }
+    // Same names outside an anchor location stay ordinary new files.
+    for ordinary in [
+        base.join("settings.toml"),
+        base.join("hooks.json"),
+        base.join("piku/src/main.rs"),
+        base.join("docs/piku.md.bak"),
+    ] {
+        assert_eq!(
+            write(ordinary.clone()),
+            Destructiveness::Safe,
+            "{}",
+            ordinary.display()
+        );
+    }
+}
