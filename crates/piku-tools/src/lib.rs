@@ -120,23 +120,69 @@ pub enum Destructiveness {
 /// Path segments classified as `Definite` for permission presentation.
 /// Whether that classification prompts or is allowed depends on the configured
 /// prompter; it is not a bypass-proof authorization boundary.
+/// `.piku` holds project settings, hooks, agents, memory and instructions.
 const PROTECTED_PATH_SEGMENTS: &[&str] = &[
-    ".git", ".claude", ".env", ".ssh", ".gnupg", ".aws", ".npmrc", ".pypirc",
+    ".git", ".claude", ".env", ".ssh", ".gnupg", ".aws", ".npmrc", ".pypirc", ".piku",
 ];
 
-/// Returns true if the path contains a protected segment.
+/// Project instruction files Piku loads into the system prompt.
+const INSTRUCTION_FILE_NAMES: &[&str] = &["PIKU.md", "PIKU.local.md"];
+
+/// Files that grant Piku authority when they sit in a `piku` config directory.
+/// Matched by shape as well as by the current config dir, because a later
+/// launch can select a different `XDG_CONFIG_HOME`.
+const CONFIG_ANCHOR_FILE_NAMES: &[&str] = &["settings.toml", "hooks.json", "trusted-hooks.json"];
+
+/// Returns true if the path is a trust anchor: it contains a protected
+/// segment, names a project instruction file or a `piku/` config anchor, or
+/// lies under the current user-global Piku config dir. Creating or changing
+/// one of these can grant later launches authority without a prompt.
 #[must_use]
 pub fn is_protected_path(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    p.components().any(|c| {
-        if let std::path::Component::Normal(s) = c {
-            PROTECTED_PATH_SEGMENTS
-                .iter()
-                .any(|&seg| s.eq_ignore_ascii_case(seg))
-        } else {
-            false
+    use std::path::{Component, Path};
+    let matches = |s: &std::ffi::OsStr, names: &[&str]| {
+        names.iter().any(|&name| s.eq_ignore_ascii_case(name))
+    };
+    let p = Path::new(path);
+    if p.components().any(|c| match c {
+        Component::Normal(s) => matches(s, PROTECTED_PATH_SEGMENTS),
+        _ => false,
+    }) {
+        return true;
+    }
+    if let Some(name) = p.file_name() {
+        if matches(name, INSTRUCTION_FILE_NAMES) {
+            return true;
         }
-    })
+        let in_piku_dir = p
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir.eq_ignore_ascii_case("piku"));
+        if in_piku_dir && matches(name, CONFIG_ANCHOR_FILE_NAMES) {
+            return true;
+        }
+    }
+    // Compare both spellings: callers pass raw and symlink-resolved paths.
+    let config = global_config_dir();
+    config.is_absolute()
+        && (p.starts_with(&config)
+            || resolve_policy_path(&config.to_string_lossy(), Path::new("/"))
+                .is_ok_and(|resolved| p.starts_with(resolved)))
+}
+
+// SYNC: same resolution as piku-runtime hooks.rs and piku config.rs
+// `global_config_dir` (piku-tools cannot depend on either crate).
+fn global_config_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from(".config"),
+                |h| PathBuf::from(h).join(".config"),
+            )
+        },
+        PathBuf::from,
+    );
+    base.join("piku")
 }
 
 /// Resolve a file-tool target against its actual filesystem base.
