@@ -101,4 +101,4 @@ invent evidence for task requirements that were never checked.
 - `crates/piku-runtime/src/run_record.rs`: effects, verification and run disposition.
 - `crates/piku-runtime/src/task.rs`: task identity and durable child evidence.
 - `crates/piku/src/main.rs`: existing `conclude` writer.
-- [Fork run evidence](fork-run-evidence-design.md): typed links and bounded readers.
+- [Child-run evidence](durable-investigation-core-and-surfaces.md#child-run-browser-evidence): typed links and bounded readers.

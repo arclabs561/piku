@@ -153,7 +153,7 @@ just check
 
 Live-model and browser evaluations are opt-in. Their commands, evidence format,
 and current limitations are documented in
-[the evaluation design](docs/design/shared-cross-surface-evaluation.md) and the
+[the evaluation design](docs/shared-cross-surface-evaluation.md) and the
 [`justfile`](justfile).
 
 More detail:

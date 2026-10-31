@@ -113,4 +113,4 @@ It remains useful only as an offline oracle or deterministic fixture generator.
 
 ---
 
-Decided: 2026-08-10 | Session: 019fe1d4
+Decided: 2026-08-10

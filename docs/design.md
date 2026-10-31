@@ -270,7 +270,7 @@ and embedding configuration; Piku does not import repository dotenv files.
 Project settings cannot change provider/model routing, actor connections or
 provider blocks. Project deny rules apply immediately; project allow rules need
 explicit canonical-root/digest review and approval. A project may lower the
-effective turn limit. See [repository authority](design/repository-authority.md)
+effective turn limit. See [repository authority](repository-authority.md)
 for the approval contract and independent developer self-update boundary.
 
 The CLI supports interactive use, one-shot prompts, `-p` headless output,

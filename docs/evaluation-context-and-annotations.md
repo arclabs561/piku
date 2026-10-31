@@ -19,8 +19,7 @@ not enough to reconstruct an evaluation.
 ## Context
 
 The shared cross-surface design uses immutable run artifacts and a canonical
-evaluation envelope. The review-claim design gives allegations stable IDs and
-typed evidence addresses. The live-failure policy promotes repeated evidence
+evaluation envelope. The live-failure policy promotes repeated evidence
 into deterministic coverage. Operator feedback should compose with those
 systems rather than create another memory store or free-form instruction layer.
 
@@ -209,9 +208,7 @@ remains the sole promotion authority.
 
 - [Shared cross-surface evaluation](shared-cross-surface-evaluation.md) owns run
   envelopes, surface adapters, and synthesis.
-- [Evidence-addressed review claims](review-claim-lifecycle.md) owns claim IDs,
-  evidence references, attestations, and dispositions.
-- [Live failure promotion](../live-failure-promotion-design.md) owns promotion
+- [Live failure promotion](live-failure-promotion-design.md) owns promotion
   from repeated live failures into deterministic engineering work.
 
 This design owns only reproducible evaluation context and the path by which

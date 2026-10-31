@@ -7,7 +7,7 @@
 //! [`RELOAD_EXIT_CODE`]. The supervisor restores the terminal and starts the
 //! new binary on the same session.
 //!
-//! See `docs/design/hot-dev-reload.md` for the process topology, the rejected
+//! See `docs/hot-dev-reload.md` for the process topology, the rejected
 //! alternatives, and the gates.
 
 use std::collections::{BTreeMap, VecDeque};
