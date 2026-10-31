@@ -134,24 +134,25 @@ mod memory_sections {
             );
         }
 
-        // Invalid UTF-8 still has observable prewrite bytes. Preserve the
-        // existing text-read fallback, but report replacement as Modified.
-        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        // A MEMORY.md that is not valid UTF-8 (here a Latin-1 note) must not
+        // be read as empty and replaced: the write is refused and the prior
+        // bytes are left untouched.
+        let prior = b"## Keep\nimportant note caf\xe9\n";
+        std::fs::write(&path, prior).unwrap();
         let result = crate::execute_tool(
             "write_memory",
             serde_json::json!({ "scope": scope, "entry": "plain note" }),
         )
         .await
         .unwrap();
-        assert!(!result.is_error, "{}", result.output);
-        assert_eq!(std::fs::read(&path).unwrap(), b"plain note");
-        assert_eq!(
-            result.effects,
-            vec![ToolEffect::FileWrite {
-                path: path.canonicalize().unwrap(),
-                content_change: ContentChange::Modified,
-            }]
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("not valid UTF-8"),
+            "{}",
+            result.output
         );
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        assert!(result.effects.is_empty());
     }
 
     #[tokio::test]
@@ -1187,6 +1188,17 @@ mod sandbox {
             "expected system-path error, got: {}",
             r.output
         );
+    }
+
+    #[test]
+    fn system_root_check_normalizes_dotdot() {
+        // `/tmp/../etc/...` names a path under /etc; a prefix check on the
+        // unnormalized string would accept it.
+        let base = std::env::temp_dir();
+        let r = crate::ensure_within_base("/tmp/../etc/cron.d/piku-should-not-exist", &base);
+        let err = r.expect_err("dotdot path into /etc should be rejected");
+        assert!(err.contains("system directory"), "unexpected error: {err}");
+        assert!(crate::ensure_within_base("/tmp/piku-ok/../still-ok", &base).is_ok());
     }
 
     #[test]

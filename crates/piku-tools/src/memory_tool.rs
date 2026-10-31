@@ -124,11 +124,18 @@ pub fn execute_write_memory(params: serde_json::Value) -> ToolResult {
     }
     let path = dir.join("MEMORY.md");
     let previous = std::fs::read(&path);
-    let existing = previous
-        .as_deref()
-        .ok()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .unwrap_or_default();
+    // An unreadable-as-text MEMORY.md must not be treated as empty: the
+    // write below would silently replace every prior note.
+    let existing = match previous.as_deref().map(std::str::from_utf8) {
+        Ok(Ok(text)) => text,
+        Ok(Err(_)) => {
+            return ToolResult::error(format!(
+                "{} is not valid UTF-8; refusing to overwrite it",
+                path.display()
+            ));
+        }
+        Err(_) => "",
+    };
 
     // Replace section if heading exists, otherwise append
     let heading = p.entry.lines().find(|l| l.starts_with("## "));
