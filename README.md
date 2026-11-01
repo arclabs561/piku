@@ -3,9 +3,6 @@
 Piku runs a local coding agent in a terminal or browser workspace. It is
 pre-1.0 and built from source.
 
-Piku pairs a provider-agnostic Rust agent with a browser canvas that holds
-chat, terminal, file, and preview cards side by side.
-
 ## Status
 
 The repository gate (`just check`) covers formatting, strict Clippy,
@@ -49,14 +46,14 @@ continues there. `-p` prints one result and exits; `--read-only` runs one turn
 with inspection tools and exits. Provider and model overrides are available as
 `--provider` and `--model`.
 
-For terminal, print, or resume diagnostics, add `--request-log new.jsonl`.
-Piku creates a fresh private JSONL file containing request timing, transport
-outcomes, and available reported token counters. Prompts, responses, tools,
-credentials, and endpoint addresses are excluded. Missing usage stays unknown;
-the cutoff records loss and unfinished work rather than certifying billing or
-background completion. ChatGPT and OpenAI-compatible routes support this option;
-other selected routes fail before inference. Use a new path for each launch.
-This option cannot combine with `--self-update-root` or subcommands.
+For terminal, print, or resume launches, `--request-log new.jsonl` writes
+request timing, transport outcomes, and any token counts the provider reports
+to a fresh private JSONL file. Prompts, responses, tools, credentials, and
+endpoint addresses are left out. The final record counts dropped events and
+unfinished work; it does not certify billing or background completion. Only
+ChatGPT and OpenAI-compatible routes support the log; other routes fail before
+inference. Use a new path for each launch. The option cannot be combined with
+`--self-update-root` or a subcommand.
 
 Piku can use ChatGPT plan access, OpenRouter, Anthropic, Groq, Ollama, or a custom
 OpenAI-compatible server. Provider selection comes from the launch environment,
@@ -85,8 +82,8 @@ revocation. Account credentials remain separate from
 project settings. Session replay is bound to the original account and model.
 
 This preview route requires plan-use permission and has no hard output-token
-cap, including child and memory calls. Allowance and optional credit usage are
-unknown; Piku shows token counts without applying API-dollar estimates. It does
+cap, including child and memory calls. Piku cannot see plan allowance or
+credit usage; it shows token counts without converting them to API prices. It does
 not switch to a paid API or another executor on failure. Embeddings remain a
 separate route. Live account interoperability still needs validation.
 
