@@ -134,9 +134,19 @@ fn search_file(
         }
     }
 
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    }; // skip binary / unreadable files
+    let Ok(bytes) = std::fs::read(path) else {
+        return; // unreadable
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // Text in another encoding (e.g. Latin-1) can still hold matching
+        // lines. Like ripgrep's default, treat a file as binary, and skip it,
+        // only when it contains a NUL byte.
+        Err(error) if !error.as_bytes().contains(&0) => {
+            String::from_utf8_lossy(error.as_bytes()).into_owned()
+        }
+        Err(_) => return,
+    };
 
     for (line_no, line) in content.lines().enumerate() {
         if *total >= limit {

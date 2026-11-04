@@ -712,6 +712,22 @@ mod bash {
     }
 
     #[tokio::test]
+    async fn reports_signal_death_instead_of_an_exit_code() {
+        // A process killed by a signal has no exit code (`ExitStatus::code`
+        // is `None` on Unix), so the report names the signal.
+        let result = bash::execute(serde_json::json!({ "command": "kill -KILL $$" })).await;
+        assert!(result.is_error);
+        assert_eq!(result.output, "terminated by signal 9 (SIGKILL)");
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::ShellCommand {
+                command: "kill -KILL $$".to_string(),
+                exit_code: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn respects_timeout() {
         let result =
             bash::execute(serde_json::json!({ "command": "sleep 10", "timeout_ms": 100 })).await;
@@ -995,6 +1011,31 @@ mod grep_tool {
             "path": dir,
         }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn finds_match_in_text_file_that_is_not_utf8() {
+        // A Latin-1 byte (0xE9) makes the file invalid UTF-8 but not binary.
+        let dir = tempdir();
+        let mut body = b"// caf".to_vec();
+        body.push(0xE9);
+        body.extend_from_slice(b"\nfn needle_here() {}\n");
+        std::fs::write(dir.join("latin1.rs"), &body).unwrap();
+        let result = grep::execute(serde_json::json!({ "pattern": "needle_here", "path": dir }));
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("latin1.rs:2: fn needle_here() {}"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn skips_non_utf8_file_with_nul_bytes() {
+        let dir = tempdir();
+        std::fs::write(dir.join("blob.bin"), b"\xE9\x00needle_here\n").unwrap();
+        let result = grep::execute(serde_json::json!({ "pattern": "needle_here", "path": dir }));
+        assert_eq!(result.output, "(no matches)");
     }
 
     #[test]
