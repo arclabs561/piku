@@ -629,6 +629,25 @@ async fn run_turn_inner(
                 });
                 continue;
             }
+            if replace_and_exec.is_some() {
+                // A self-update was requested after an earlier call in this
+                // message. Answer the rest without running them so the resumed
+                // session sends no `tool_use` without its `tool_result`.
+                let output = "Not run: piku restarted to apply an update".to_string();
+                session.push(ConversationMessage::tool_result(
+                    tool_use_id.clone(),
+                    output.clone(),
+                    true,
+                ));
+                sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                    tool_call_id: tool_use_id.clone(),
+                    result: crate::run_record::ContentRef::Inline { text: output },
+                    is_error: true,
+                    effects: Vec::new(),
+                    verification: None,
+                });
+                continue;
+            }
             if !advertised_tool_names.contains(tool_name) {
                 let msg = format!("{tool_name} is not available in this mode");
                 sink.on_tool_start(tool_name, tool_use_id, params);
@@ -1086,12 +1105,11 @@ async fn run_turn_inner(
                 verification,
             });
 
-            // Self-update: sink detected a new binary — break cleanly after
-            // persisting this tool result, then signal the caller.
+            // Self-update: sink detected a new binary. Later calls in this
+            // message are answered without running, then the caller is signalled.
             if let PostToolAction::ReplaceAndExec(path) = action {
                 if !cancellation_requested(cancel_flag) {
                     replace_and_exec = Some(path);
-                    break;
                 }
             }
         }
