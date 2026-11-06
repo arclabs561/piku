@@ -39,9 +39,29 @@ pub fn destructiveness(params: &serde_json::Value) -> Destructiveness {
     }
     if resolved.exists() {
         Destructiveness::Likely
-    } else {
+    } else if inside_working_dir(&resolved) && !in_piku_config_dir(&resolved) {
         Destructiveness::Safe
+    } else {
+        // A new file elsewhere can be a shell rc, a launch agent, or piku's own
+        // global hooks.json, which runs commands at next start.
+        Destructiveness::Definite
     }
+}
+
+fn inside_working_dir(resolved: &std::path::Path) -> bool {
+    std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .is_ok_and(|cwd| resolved.starts_with(cwd))
+}
+
+fn in_piku_config_dir(resolved: &std::path::Path) -> bool {
+    let parts: Vec<_> = resolved
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    parts
+        .windows(2)
+        .any(|w| w[0] == ".config" && w[1] == "piku")
 }
 
 #[must_use]
