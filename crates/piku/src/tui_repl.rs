@@ -3782,8 +3782,7 @@ fn announce_self_update(new_binary: &std::path::Path) {
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let bin_name = new_binary
         .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
+        .map_or_else(std::borrow::Cow::default, std::ffi::OsStr::to_string_lossy);
 
     // Save cursor position, then spin on a fresh line
     let _ = write!(stdout, "\r\n\x1b[s"); // newline + save position
