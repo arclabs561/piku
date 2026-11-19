@@ -83,6 +83,23 @@ test("help states explicit paths and the provenance authority boundary", () => {
   assert.match(result.stdout, /mode 0600/);
 });
 
+test("promotion after a complete final record preserves readable ledger boundaries", async (t) => {
+  const { ledger } = await fixture(t);
+  for (const ending of ["", "\r", "\r\n", "\n"]) {
+    const original = JSON.stringify(proposal()) + ending;
+    await writeFile(ledger, original);
+    const before = run(["inspect", ledger]);
+    assert.equal(before.status, 0, before.stderr);
+    const promoted = run(["promote", ledger, "--event", JSON.stringify(promotion())]);
+    assert.equal(promoted.status, 0, promoted.stderr);
+    const after = run(["inspect", ledger]);
+    assert.equal(after.status, 0, after.stderr);
+    assert.deepEqual(JSON.parse(after.stdout).events, [proposal(), promotion()]);
+    assert.equal(await readFile(ledger, "utf8"),
+      original + (ending.endsWith("\n") ? "" : "\n") + JSON.stringify(promotion()) + "\n");
+  }
+});
+
 test("proposal-only append round trips through inspect with private creation mode", async (t) => {
   const { directory, ledger } = await fixture(t);
   const source = path.join(directory, "proposals.jsonl");
