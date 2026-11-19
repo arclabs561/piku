@@ -320,6 +320,5 @@ fn anthropic_index_id(raw: &RawStreamEvent) -> String {
     raw.rest
         .get("index")
         .and_then(serde_json::Value::as_u64)
-        .map(|i| format!("__idx_{i}"))
-        .unwrap_or_default()
+        .map_or_else(String::new, |i| format!("__idx_{i}"))
 }

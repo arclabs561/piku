@@ -205,8 +205,7 @@ pub fn build_live_ledger_record(
     );
     let artifact_refs: Vec<String> = trace_path
         .as_ref()
-        .map(|path| vec![path.display().to_string()])
-        .unwrap_or_default();
+        .map_or_else(Vec::new, |path| vec![path.display().to_string()]);
 
     serde_json::json!({
         "schema_version": 1,
