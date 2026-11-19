@@ -71,8 +71,7 @@ impl ResponsesProvider {
             .headers()
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
-            .map(|value| redacted_identifier(value, token.expose_secret()))
-            .unwrap_or_default();
+            .map_or_else(String::new, |value| redacted_identifier(value, token.expose_secret()));
         let response = check_response(response, token.expose_secret(), &request_id).await?;
         let bytes = bounded_body(response, 1024 * 1024).await?;
         let value: Value =
@@ -158,7 +157,7 @@ impl Provider for ResponsesProvider {
                 .map_err(|_| protocol("Responses transport request failed")), ResponsesAttemptFailure::Send)?;
             let request_id = response.headers().get("x-request-id")
                 .and_then(|value| value.to_str().ok())
-                .map(|value| redacted_identifier(value, token.expose_secret())).unwrap_or_default();
+                .map_or_else(String::new, |value| redacted_identifier(value, token.expose_secret()));
             let response = attempt.check(check_response(response, token.expose_secret(), &request_id).await, ResponsesAttemptFailure::Http)?;
             let advertised = tool_names(&request);
             let mut state = ResponseState::default();
@@ -257,8 +256,7 @@ fn diagnostic(value: &Value, request_id: &str, secret: &str) -> String {
         error
             .and_then(|e| e.get(name))
             .and_then(Value::as_str)
-            .map(|value| redacted_identifier(value, secret))
-            .unwrap_or_default()
+            .map_or_else(String::new, |value| redacted_identifier(value, secret))
     };
     json!({"shape":shape,"code":field("code"),"param":field("param"),"request_id":request_id})
         .to_string()
