@@ -71,7 +71,9 @@ impl ResponsesProvider {
             .headers()
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
-            .map_or_else(String::new, |value| redacted_identifier(value, token.expose_secret()));
+            .map_or_else(String::new, |value| {
+                redacted_identifier(value, token.expose_secret())
+            });
         let response = check_response(response, token.expose_secret(), &request_id).await?;
         let bytes = bounded_body(response, 1024 * 1024).await?;
         let value: Value =
