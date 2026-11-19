@@ -1407,20 +1407,8 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
             );
         }
     }
-    assert_eq!(
-        captured[2]["tools"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        0
-    );
-    assert_eq!(
-        captured[5]["tools"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        0
-    );
+    assert_eq!(captured[2]["tools"].as_array().map_or(0, Vec::len), 0);
+    assert_eq!(captured[5]["tools"].as_array().map_or(0, Vec::len), 0);
     let recovered_context = captured[3]["messages"].to_string();
     for expected in [prompt, clarification, correction, "AMBIGUITY:"] {
         assert!(
