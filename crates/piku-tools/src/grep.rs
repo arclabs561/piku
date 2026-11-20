@@ -95,7 +95,11 @@ pub fn execute(params: serde_json::Value) -> ToolResult {
                 entry.path(),
                 &re,
                 p.include.as_deref(),
-                max - total,
+                // `search_file` compares this limit with the running total for
+                // the whole search, so it must be the overall cap. Passing the
+                // remaining budget made every file after the halfway point
+                // contribute nothing, with no truncation marker.
+                max,
                 &mut results,
                 &mut total,
             );

@@ -221,6 +221,21 @@ fn scan_word(characters: &[char], mut index: usize) -> Result<(Word, usize), Str
     let mut tilde = false;
     let mut at_start = true;
 
+    // `2>file`, `2>&1`, `0<file`: a redirection of a numbered file descriptor.
+    // Read as a word followed by `>`, the number would become an argument and
+    // the command's stdout would go to the file meant for stderr.
+    let digits = characters[index..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if digits > 0 && matches!(characters.get(index + digits), Some('>' | '<')) {
+        let descriptor: String = characters[index..index + digits].iter().collect();
+        return Err(format!(
+            "redirection of file descriptor {descriptor} is not supported; \
+             put a space before the operator to pass `{descriptor}` as an argument"
+        ));
+    }
+
     while let Some(&character) = characters.get(index) {
         if is_word_break(character) {
             break;
@@ -559,6 +574,36 @@ fn redirect_kind(op: Op) -> Option<RedirectKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbered_descriptor_redirections_are_rejected() {
+        for line in [
+            "cmd 2>/dev/null",
+            "grep foo src 2>/dev/null",
+            "make 2>err.log",
+            "cmd 2>>err.log",
+            "cmd 2>&1",
+            "cmd 0<input",
+            "cmd 10>out",
+        ] {
+            let error = parse(line).expect_err(line);
+            assert!(error.contains("file descriptor"), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn numbers_that_are_arguments_still_parse() {
+        // A space before the operator makes the number an ordinary argument.
+        for line in [
+            "head -n 2 >out",
+            "echo 2 > out",
+            "seq 1 10",
+            "echo a2>out",
+            "echo 2",
+        ] {
+            parse(line).unwrap_or_else(|error| panic!("{line}: {error}"));
+        }
+    }
 
     fn words(line: &str) -> Vec<Word> {
         let program = parse(line).expect("line parses");
