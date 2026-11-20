@@ -963,6 +963,42 @@ mod grep_tool {
     }
 
     #[test]
+    fn result_budget_spans_files_and_reports_truncation() {
+        let dir = tempdir();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "needle 1\nneedle 2\n").unwrap();
+        }
+        // Six matching lines, cap of five: five results and the marker.
+        let capped = grep::execute(serde_json::json!({
+            "pattern": "needle",
+            "path": dir,
+            "max_results": 5,
+        }));
+        assert!(!capped.is_error, "{}", capped.output);
+        let matches = capped
+            .output
+            .lines()
+            .filter(|l| l.contains("needle"))
+            .count();
+        assert_eq!(matches, 5, "{}", capped.output);
+        assert!(
+            capped.output.contains("(truncated at 5 results)"),
+            "{}",
+            capped.output
+        );
+
+        // A cap above the number of matches returns all of them, unmarked.
+        let all = grep::execute(serde_json::json!({
+            "pattern": "needle",
+            "path": dir,
+            "max_results": 50,
+        }));
+        let matches = all.output.lines().filter(|l| l.contains("needle")).count();
+        assert_eq!(matches, 6, "{}", all.output);
+        assert!(!all.output.contains("truncated"), "{}", all.output);
+    }
+
+    #[test]
     fn finds_pattern_in_file() {
         let dir = tempdir();
         let path = dir.join("src.rs");
