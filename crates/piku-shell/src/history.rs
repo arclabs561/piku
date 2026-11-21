@@ -6,7 +6,7 @@
 //! exist yet, so existing history survives the move and new lines go to piku.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
@@ -123,12 +123,28 @@ fn history_path(suffix: &str) -> Option<PathBuf> {
 }
 
 fn read_entries(path: &std::path::Path) -> Vec<String> {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
+    // The file is append-only, so the newest entries are at the end. Read the
+    // last MAX_BYTES, not the first: once the file outgrew the cap, reading
+    // from the start never saw a new entry again.
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let skipped = len.saturating_sub(MAX_BYTES);
+    if skipped > 0 && file.seek(SeekFrom::Start(skipped)).is_err() {
+        return Vec::new();
+    }
     let mut bytes = Vec::new();
     if file.take(MAX_BYTES).read_to_end(&mut bytes).is_err() {
         return Vec::new();
+    }
+    if skipped > 0 {
+        // The window starts mid-line; drop up to and including the first
+        // newline so the first entry is a whole line.
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(newline) => drop(bytes.drain(..=newline)),
+            None => bytes.clear(),
+        }
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut entries: Vec<String> = Vec::new();
@@ -142,4 +158,43 @@ fn read_entries(path: &std::path::Path) -> Vec<String> {
         entries.drain(..entries.len() - MAX_ENTRIES);
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A history larger than the read cap still yields its newest entries,
+    /// and no entry is a fragment of a line.
+    #[test]
+    fn read_entries_keeps_the_newest_lines_of_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        let mut content = String::new();
+        let mut i = 0usize;
+        while (content.len() as u64) < MAX_BYTES + 1024 * 1024 {
+            content.push_str(&format!("old-command-number-{i:08}\n"));
+            i += 1;
+        }
+        content.push_str("NEWEST-COMMAND\n");
+        fs::write(&path, &content).unwrap();
+
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), MAX_ENTRIES);
+        assert_eq!(entries.last().map(String::as_str), Some("NEWEST-COMMAND"));
+        for entry in &entries[..entries.len() - 1] {
+            assert!(
+                entry.starts_with("old-command-number-") && entry.len() == 27,
+                "partial line in history: {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_entries_reads_a_small_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        fs::write(&path, "one\ntwo\ntwo\n\nthree\n").unwrap();
+        assert_eq!(read_entries(&path), vec!["one", "two", "three"]);
+    }
 }
