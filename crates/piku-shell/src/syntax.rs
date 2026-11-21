@@ -274,6 +274,7 @@ fn scan_word(characters: &[char], mut index: usize) -> Result<(Word, usize), Str
                     }
                 }
             }
+            '`' => return Err(SUBSTITUTION_UNSUPPORTED.into()),
             '~' if at_start => {
                 // Only a leading `~` that ends the word or prefixes a path is
                 // the home directory; `~user` stays as written.
@@ -364,6 +365,7 @@ fn double_quoted(characters: &[char], start: usize) -> Result<(Vec<Part>, usize)
                     }
                 }
             }
+            Some('`') => return Err(SUBSTITUTION_UNSUPPORTED.into()),
             Some(&character) => {
                 literal.push(character);
                 index += 1;
@@ -371,6 +373,9 @@ fn double_quoted(characters: &[char], start: usize) -> Result<(Vec<Part>, usize)
         }
     }
 }
+
+const SUBSTITUTION_UNSUPPORTED: &str = "command substitution (`$(...)` or backticks) is not \
+     supported; quote it with single quotes or escape it to pass the text literally";
 
 #[derive(Clone, Copy)]
 enum Quote {
@@ -390,6 +395,10 @@ fn expansion(
         Quote::Quoted => Part::Quoted(expansion),
     };
     match characters.get(start + 1) {
+        // `$(command)` and `$((arithmetic))`. Kept literal, the line would run
+        // with the text `$(...)` as an argument: `rm $(cat list)` must fail
+        // to parse, not run `rm` on something else.
+        Some('(') => Err(SUBSTITUTION_UNSUPPORTED.into()),
         Some('?') => Ok((Some(wrap(Expansion::Status)), start + 2)),
         Some('{') => {
             let mut end = start + 2;
@@ -574,6 +583,34 @@ fn redirect_kind(op: Op) -> Option<RedirectKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_substitution_is_rejected_not_passed_through() {
+        for line in [
+            "echo $(id)",
+            "rm $(cat list)",
+            "echo \"in quotes $(id)\"",
+            "echo $((1 + 2))",
+            "echo `id`",
+            "echo \"`id`\"",
+            "cd pre`pwd`",
+        ] {
+            let error = parse(line).expect_err(line);
+            assert!(error.contains("command substitution"), "{line}: {error}");
+        }
+        // Quoted or escaped, the same characters are ordinary text.
+        for line in [
+            "echo '$(id)'",
+            "echo '`id`'",
+            "echo \\$(id)",
+            "echo \\`id\\`",
+            "echo \"\\`id\\`\"",
+            "echo \"\\$(id)\"",
+            "echo $HOME ${HOME} $?",
+        ] {
+            assert!(parse(line).is_ok(), "{line}: {:?}", parse(line).err());
+        }
+    }
 
     #[test]
     fn numbered_descriptor_redirections_are_rejected() {
