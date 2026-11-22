@@ -729,13 +729,11 @@ impl AttemptTree {
         let detail = self
             .outcome_detail
             .as_deref()
-            .map(|d| format!(" -- {d}"))
-            .unwrap_or_default();
+            .map_or_else(String::new, |d| format!(" -- {d}"));
         let goal_line = if indent == 0 {
             self.goal
                 .as_deref()
-                .map(|g| format!("{prefix}goal: {g}\n"))
-                .unwrap_or_default()
+                .map_or_else(String::new, |g| format!("{prefix}goal: {g}\n"))
         } else {
             String::new()
         };
@@ -1313,10 +1311,7 @@ impl MemoryStore {
             .last()
             .map_or(entry.id, |r| r.id);
         // Keep unresolved trees (still useful for guiding future attempts)
-        if !self.tree_is_resolved(root_id) {
-            return false;
-        }
-        true
+        self.tree_is_resolved(root_id)
     }
 
     /// Evict (invalidate) memories with strength below `threshold`.

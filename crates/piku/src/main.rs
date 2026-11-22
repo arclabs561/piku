@@ -29,8 +29,41 @@ async fn main() -> anyhow::Result<()> {
     let cwd = env::current_dir().ok();
     let cli = Cli::parse();
     cli.validate_request_log()?;
+    cli.validate_shell_launch()?;
 
     match &cli.command {
+        Some(Commands::Shell) => {
+            // The shell owns the terminal and the exit status; nothing after it
+            // runs. Upgrade paths that would replace this binary are disabled
+            // inside the shell.
+            let code = piku_shell::run_as_subcommand(std::iter::empty())
+                .map_err(|error| anyhow::anyhow!(error))?;
+            std::process::exit(code);
+        }
+        Some(Commands::Init { .. }) => {
+            print!("{}", piku_shell::ledger::ZSH_HOOK);
+            return Ok(());
+        }
+        Some(Commands::LedgerAppend {
+            exit,
+            cwd,
+            started_us,
+            command,
+        }) => {
+            // Called after every zsh command, so it stays silent and cheap:
+            // a ledger problem must never print into the operator's shell.
+            if let (Some(path), Some(mut record)) = (
+                piku_shell::ledger::ledger_path(),
+                piku_shell::ledger::entry(command, cwd, *exit, "zsh"),
+            ) {
+                if let Some(started) = started_us {
+                    record.at_us = Some(*started);
+                    record.at = started / 1_000_000;
+                }
+                let _ = piku_shell::ledger::append(&path, &record);
+            }
+            return Ok(());
+        }
         Some(Commands::Permissions { command }) => {
             piku::project_permissions::run(
                 command,
@@ -148,10 +181,15 @@ async fn run_terminal(
         .await;
     }
 
+    let shell_context = cli.shell_context.or_else(|| {
+        std::env::var("PIKU_SHELL_CONTEXT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    });
     let prompt_str = if cli.prompt.is_empty() {
         None
     } else {
-        Some(cli.prompt.join(" "))
+        Some(with_shell_context(cli.prompt.join(" "), shell_context))
     };
 
     if let Some(session_id) = &cli.resume {
@@ -465,6 +503,36 @@ fn print_route_status(provider: &str, model: &str) {
     }
 }
 
+/// Prepend recent shell ledger records when the operator asked for them, and
+/// say on stderr exactly what was attached (ADR 0012).
+fn with_shell_context(prompt: String, limit: Option<usize>) -> String {
+    let Some(limit) = limit.filter(|&limit| limit > 0) else {
+        return prompt;
+    };
+    let Some(path) = piku_shell::ledger::ledger_path() else {
+        eprintln!("[piku] shell context: no HOME or XDG_STATE_HOME; nothing attached");
+        return prompt;
+    };
+    match piku_shell::ledger::recent(&path, limit) {
+        Ok(entries) if entries.is_empty() => {
+            eprintln!("[piku] shell context: no commands in {}", path.display());
+            prompt
+        }
+        Ok(entries) => {
+            eprintln!(
+                "\x1b[2m[attached {} shell command(s) from {}]\x1b[0m",
+                entries.len(),
+                path.display()
+            );
+            format!("{}\n{prompt}", piku_shell::ledger::render(&entries))
+        }
+        Err(error) => {
+            eprintln!("[piku] shell context not attached: {error}");
+            prompt
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Keep launch persistence and update admission together.
 async fn run_single_shot(
     prompt: &str,
@@ -523,6 +591,15 @@ async fn run_single_shot(
     sink.request_observation = request_log.map(RequestLog::request_observation);
     sink.trace.prompt(prompt);
     let run_path = config.runs_dir().join(format!("{session_id}.jsonl"));
+    system_sections.push(piku::self_system_prompt_section(&piku::SelfContext {
+        provider: resolved.name(),
+        model: &model,
+        actor: "primary",
+        session_id: &session_id,
+        config_dir: &config.config_dir,
+        run_record: Some(&run_path),
+        interactive: false,
+    }));
     let mut turn_nonce = [0; 16];
     getrandom::fill(&mut turn_nonce).map_err(|error| anyhow::anyhow!("turn ID: {error}"))?;
     let turn_id = format!("turn-{:032x}", u128::from_ne_bytes(turn_nonce));

@@ -156,8 +156,7 @@ impl Session {
             .iter()
             .rev()
             .find(|m| m.role == MessageRole::User)
-            .map(extract_keywords)
-            .unwrap_or_default();
+            .map_or_else(std::collections::HashSet::new, extract_keywords);
 
         if query_words.is_empty() {
             return;

@@ -1213,6 +1213,96 @@ async fn e2e_self_update_signal_breaks_loop() {
     );
 }
 
+/// A self-update requested after the first of two tool calls must still answer
+/// the second: providers reject a request whose assistant `tool_use` has no
+/// matching `tool_result`, and the restarted process resumes this session.
+#[tokio::test]
+async fn e2e_self_update_answers_every_remaining_tool_call() {
+    let input = serde_json::json!({ "path": "." }).to_string();
+    let mut two_calls = Vec::new();
+    for id in ["call_a", "call_b"] {
+        two_calls.push(Event::ToolUseStart {
+            id: id.to_string(),
+            name: "list_dir".to_string(),
+        });
+        two_calls.push(Event::ToolUseDelta {
+            id: id.to_string(),
+            partial_json: input.clone(),
+        });
+        two_calls.push(Event::ToolUseEnd { id: id.to_string() });
+    }
+    two_calls.push(Event::MessageStop {
+        stop_reason: StopReason::ToolUse,
+    });
+    let provider = SequenceProvider::new(vec![two_calls, text_stop("ok")]);
+
+    let mut session = Session::new("e2e-10b".to_string());
+    let mut sink = CollectSink {
+        trigger_replace_for_tool: Some("list_dir".to_string()),
+        ..Default::default()
+    };
+    let result = run_turn(
+        "inspect twice",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+    assert!(result.replace_and_exec.is_some());
+    // Only the first call ran; the update was requested when it ended.
+    assert_eq!(sink.tool_ends.len(), 1, "{:?}", sink.tool_ends);
+
+    // The restarted process resumes the session and sends the next turn.
+    let mut sink = CollectSink::default();
+    let _ = run_turn(
+        "continue",
+        &mut session,
+        &provider,
+        "m",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+    let requests = provider.requests.lock().unwrap();
+    let content: Vec<&piku_api::RequestContent> = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .collect();
+    let uses: Vec<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+            piku_api::RequestContent::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let results: Vec<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+            piku_api::RequestContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(uses, ["call_a", "call_b"]);
+    assert_eq!(
+        results,
+        ["call_a", "call_b"],
+        "every tool_use needs a tool_result"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E2E scenario 11: Stream error — session not corrupted
 // ---------------------------------------------------------------------------
@@ -3415,4 +3505,76 @@ mod attempt_graph_regressions {
             });
         }
     }
+}
+
+/// Replays the arguments a gpt-6.1 session sent four times in a row: every
+/// optional integer filled with 0 on an empty attempt store. The call must
+/// create an attempt, not fail with "attempt 0 not found".
+#[test]
+fn record_attempt_with_provider_filled_zero_ids_creates_an_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "record_attempt_zero_ids_in_isolated_process",
+            "--nocapture",
+        ])
+        .current_dir(dir.path())
+        .env("PIKU_RECORD_ATTEMPT_ZERO_IDS_HELPER", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated record_attempt replay failed: {status}"
+    );
+}
+
+#[tokio::test]
+async fn record_attempt_zero_ids_in_isolated_process() {
+    if std::env::var_os("PIKU_RECORD_ATTEMPT_ZERO_IDS_HELPER").is_none() {
+        return;
+    }
+    let (url, server) = memory_embedding_server().await;
+    std::env::set_var("PIKU_EMBED_URL", &url);
+    std::env::set_var("PIKU_EMBED_BACKEND", "ollama");
+    let provider = SequenceProvider::new(vec![
+        tool_call_events(
+            "zero-ids",
+            "record_attempt",
+            r#"{"approach":"Reproduce footer loss in a PTY","attempt_id":0,"goal":"Fix footer after Enter","importance":6,"outcome":"pending","outcome_detail":"","parent_id":0}"#,
+        ),
+        text_stop("done"),
+    ]);
+    let mut session = Session::new("zero-ids".into());
+    let mut sink = CollectSink::default();
+    run_turn(
+        "record the attempt",
+        &mut session,
+        &provider,
+        "scripted",
+        &[],
+        all_tool_definitions(),
+        &AllowAll,
+        &mut sink,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(sink.tool_ends.len(), 1);
+    let (_, _, output, is_error) = &sink.tool_ends[0];
+    assert!(
+        !is_error,
+        "provider-filled zero ids must not fail: {output}"
+    );
+    assert!(output.starts_with("attempt recorded (id="), "{output}");
+    let stored = piku_runtime::MemoryStore::try_load(&piku_runtime::default_store_path(
+        &std::env::current_dir().unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(stored.entries.len(), 1);
+    assert_eq!(
+        stored.entries[0].parent, None,
+        "a parent that does not exist is dropped"
+    );
+    server.abort();
 }

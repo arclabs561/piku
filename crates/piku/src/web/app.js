@@ -241,7 +241,7 @@
     const HTMLTemplateElement = window3.HTMLTemplateElement, Node3 = window3.Node, Element4 = window3.Element, NodeFilter = window3.NodeFilter;
     window3.NamedNodeMap === void 0 && (window3.NamedNodeMap || window3.MozNamedAttrMap);
     window3.HTMLFormElement;
-    const DOMParser2 = window3.DOMParser, trustedTypes = window3.trustedTypes;
+    const DOMParser = window3.DOMParser, trustedTypes = window3.trustedTypes;
     const ElementPrototype = Element4.prototype;
     const cloneNode = lookupGetter(ElementPrototype, "cloneNode");
     const remove3 = lookupGetter(ElementPrototype, "remove");
@@ -757,7 +757,7 @@
       if (PARSER_MEDIA_TYPE === "application/xhtml+xml" && NAMESPACE2 === HTML_NAMESPACE) dirty = '<html xmlns="http://www.w3.org/1999/xhtml"><head></head><body>' + dirty + "</body></html>";
       const dirtyPayload = trustedTypesPolicy ? _createTrustedHTML(dirty) : dirty;
       if (NAMESPACE2 === HTML_NAMESPACE) try {
-        doc = new DOMParser2().parseFromString(dirtyPayload, PARSER_MEDIA_TYPE);
+        doc = new DOMParser().parseFromString(dirtyPayload, PARSER_MEDIA_TYPE);
       } catch (_5) {
       }
       if (!doc || !doc.documentElement) {
@@ -196017,6 +196017,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
 
   // app.js
   var launchStorageKey = "piku.launchToken";
+  var bootstrap = JSON.parse(document.getElementById("piku-bootstrap").textContent);
   var launchFragment = new URLSearchParams(location.hash.slice(1));
   var launchToken = launchFragment.get("token") || "";
   var admissionGeneration = 0;
@@ -196138,13 +196139,13 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
   var delBtn = document.getElementById("del-btn");
   var terminalBtn = document.getElementById("terminal-btn");
   var MAX_WORKSPACE_OBJECT_HEIGHT = 1800;
-  var active = window.PIKU_BOOTSTRAP.active;
+  var active = bootstrap.active;
   var creationMenu = null;
   var zCounter = 20;
   var activitySequence = 0;
   var renderingWorkspace = false;
   var saveTimer = null;
-  var currentPageHtml = window.PIKU_BOOTSTRAP.canvasHtml || "";
+  var currentPageHtml = bootstrap.canvasHtml || "";
   var selectedPageId = null;
   var executorCatalog = {
     default: "codex",
@@ -196165,7 +196166,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     updatePageTargetLabels();
   }
   var executorCatalogReady = Promise.resolve().then(refreshExecutorCatalog);
-  var terminalEnabled = window.PIKU_BOOTSTRAP.terminalEnabled === true;
+  var terminalEnabled = bootstrap.terminalEnabled === true;
   if (!terminalEnabled) terminalBtn.hidden = true;
   function viewportKey(surface) {
     return `piku:viewport:${surface}:${narrowWorkspace() ? "narrow" : "desktop"}`;
@@ -196211,10 +196212,16 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     requestAnimationFrame(() => restoreViewport(name));
     refreshList();
   }
-  function sandboxHtml(html2) {
-    const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; media-src data: blob:; frame-src 'none'; form-action 'none'; base-uri 'none';">`, parsed = new DOMParser().parseFromString(html2, "text/html");
-    parsed.head.insertAdjacentHTML("afterbegin", policy);
-    return "<!doctype html>" + parsed.documentElement.outerHTML;
+  async function previewUrl(html2) {
+    const response = await authenticatedFetch("/api/previews", {
+      method: "POST",
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+      body: html2
+    });
+    if (!response.ok) throw new Error("preview unavailable");
+    const { url } = await response.json();
+    if (!/^\/preview\/[a-f0-9]{64}$/.test(url)) throw new Error("preview unavailable");
+    return url;
   }
   async function showRunRecord(url) {
     const response = await authenticatedFetch(url);
@@ -196227,7 +196234,7 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     const frame2 = document.createElement("iframe");
     frame2.title = "Full session record";
     frame2.sandbox = "allow-scripts";
-    frame2.srcdoc = sandboxHtml(await response.text());
+    frame2.src = await previewUrl(await response.text());
     dialog.append(close2, frame2);
     dialog.addEventListener("close", () => dialog.remove());
     document.body.append(dialog);
@@ -196248,8 +196255,10 @@ Please report this to https://github.com/markedjs/marked.`, e3) {
     frame2.className = "canvas-frame";
     frame2.title = "Sandboxed page preview";
     frame2.sandbox = "allow-scripts";
-    frame2.srcdoc = sandboxHtml(html2);
     body.append(frame2);
+    previewUrl(html2).then((url) => {
+      if (frame2.isConnected) frame2.src = url;
+    }).catch(() => setSaveStatus("preview unavailable", true));
   }
   function renderSurface(name, html2, msgs, objects, running) {
     closeCreationMenu();
@@ -198020,7 +198029,7 @@ ${checks.join("\n")}`;
           if (!response.ok) return;
           const frame2 = evidence.querySelector("iframe");
           frame2.sandbox = "allow-scripts";
-          frame2.srcdoc = sandboxHtml(await response.text());
+          frame2.src = await previewUrl(await response.text());
           frame2.title = `Saved session evidence for ${turn.runId || turn.id}`;
           recordLoaded = true;
         }

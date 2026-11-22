@@ -224,9 +224,29 @@ impl PikuConfig {
 /// with stars only at the edges. Scoped bash denies fail closed when command
 /// structure involves shell controls or expansion; use
 /// `matches_allow_tool_pattern` when considering an auto-grant.
+///
+/// A scoped bash deny also matches the command with whitespace collapsed, the
+/// command name reduced to its file name, and leading `NAME=value`
+/// assignments dropped, and it matches the command run by a common wrapper
+/// such as `env`, `sudo`, `nice` or `xargs`. This keeps `rm x`, `rm\tx` and
+/// `/bin/rm x` under one rule, but string rules cannot see every way to run a
+/// program (`find -delete`, an interpreter, a script); they are not a sandbox.
 #[must_use]
 pub fn matches_tool_pattern(pattern: &str, tool_name: &str, params: &serde_json::Value) -> bool {
-    if tool_name == "bash" && pattern.starts_with("bash(") && shell_command_uncertain(params) {
+    tool_pattern_matches(pattern, tool_name, params, true)
+}
+
+fn tool_pattern_matches(
+    pattern: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+    deny: bool,
+) -> bool {
+    if deny
+        && tool_name == "bash"
+        && pattern.starts_with("bash(")
+        && shell_command_uncertain(params)
+    {
         return true;
     }
     // Parse `ToolName(glob)` syntax
@@ -251,6 +271,8 @@ pub fn matches_tool_pattern(pattern: &str, tool_name: &str, params: &serde_json:
             return primary_arg.is_some_and(|arg| {
                 if matches!(tool_name, "read_file" | "write_file" | "edit_file") {
                     file_rule_matches(glob, arg, false)
+                } else if deny && tool_name == "bash" {
+                    bash_deny_matches(glob, arg)
                 } else {
                     glob_match(glob, arg)
                 }
@@ -319,6 +341,52 @@ fn file_rule_matches_in(pattern: &str, target: &str, allow: bool, base: &Path) -
         || glob_match(&normalized_pattern, &resolved_identity)
         || identity(&requested).is_some_and(|p| glob_match(&normalized_pattern, &p))
         || exact_identity_match
+}
+
+/// Programs that run the rest of their arguments as a command. After one of
+/// these, a deny is checked against every later word as a possible command
+/// start, which also covers option values such as `nice -n 5` or `sudo -u x`.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "builtin", "command", "doas", "env", "exec", "nice", "nohup", "setsid", "stdbuf", "sudo",
+    "time", "timeout", "xargs",
+];
+
+/// Match a scoped bash deny glob against the raw command and its normalized
+/// forms. Callers have already rejected commands with quoting, escapes,
+/// expansion or control operators, so whitespace splitting yields the words
+/// the shell would see.
+fn bash_deny_matches(glob: &str, command: &str) -> bool {
+    if glob_match(glob, command) {
+        return true;
+    }
+    let words: Vec<&str> = command.split_ascii_whitespace().collect();
+    let is_assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let program = |word: &str| word.rsplit('/').next().unwrap_or(word).to_string();
+    let matches_from = |start: usize| {
+        let mut normalized = program(words[start]);
+        for word in &words[start + 1..] {
+            normalized.push(' ');
+            normalized.push_str(word);
+        }
+        glob_match(glob, &normalized)
+    };
+    let Some(head) = words.iter().position(|w| !is_assignment(w)) else {
+        return false;
+    };
+    if matches_from(head) {
+        return true;
+    }
+    if COMMAND_WRAPPERS.contains(&program(words[head]).as_str()) {
+        return (head + 1..words.len()).any(matches_from);
+    }
+    false
 }
 
 /// Simple glob: `*` at start, end, or both. `*` alone matches all.
@@ -413,7 +481,7 @@ pub fn matches_allow_tool_pattern(
                 .is_some_and(|path| file_rule_matches(scope, path, true));
         }
     }
-    matches_tool_pattern(pattern, tool_name, params)
+    tool_pattern_matches(pattern, tool_name, params, false)
 }
 
 fn shell_command_uncertain(params: &serde_json::Value) -> bool {
@@ -761,6 +829,67 @@ model = "llama3.1""#,
             "bash(git *)suffix",
             "bash",
             &serde_json::json!({"command":"git status"})
+        ));
+    }
+
+    #[test]
+    fn scoped_bash_denies_match_the_normalized_command_head() {
+        for command in [
+            "rm x",
+            "  rm x ",
+            "rm\tx",
+            "rm  x",
+            "/bin/rm x",
+            "./rm x",
+            "X=1 rm x",
+            "env rm x",
+            "env -i X=1 /usr/bin/rm x",
+            "command rm x",
+            "exec rm x",
+            "nohup rm x",
+            "time rm x",
+            "nice -n 5 rm x",
+            "sudo -u root rm x",
+            "timeout 5 rm x",
+            "xargs rm x",
+        ] {
+            let params = serde_json::json!({"command": command});
+            assert!(
+                matches_tool_pattern("bash(rm *)", "bash", &params),
+                "{command:?}"
+            );
+        }
+        for command in ["rm", "echo rm x", "grep -r rm src", "rmdir x", "git rm x"] {
+            let params = serde_json::json!({"command": command});
+            assert!(
+                !matches_tool_pattern("bash(rm *)", "bash", &params),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_bash_grants_still_match_the_raw_command() {
+        // Normalization widens denials only; a grant never covers a spelling
+        // it does not name.
+        for command in [
+            "  git status",
+            "git\tstatus",
+            "/usr/bin/git status",
+            "sudo git status",
+            "env git status",
+            "X=1 git status",
+        ] {
+            let params = serde_json::json!({"command": command});
+            assert!(
+                !matches_allow_tool_pattern("bash(git *)", "bash", &params),
+                "{command:?}"
+            );
+        }
+        assert!(matches_allow_tool_pattern(
+            "bash(git *)",
+            "bash",
+            &serde_json::json!({"command": "git status"})
         ));
     }
 

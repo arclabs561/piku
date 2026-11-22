@@ -1892,7 +1892,7 @@ test("execution traces stay visibly transient and outside workspace persistence"
   );
   const frame = restoredEvidence.locator("iframe");
   await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-  await expect(frame).toHaveAttribute("srcdoc", /durable session evidence/);
+  await expect(frame).toHaveAttribute("src", /^\/preview\/[a-f0-9]{64}$/);
   await expect(frame.contentFrame().locator("main")).toHaveText("durable session evidence");
   await restoredEvidence.locator("summary").click();
   await expect(restoredEvidence).not.toHaveAttribute("open", "");

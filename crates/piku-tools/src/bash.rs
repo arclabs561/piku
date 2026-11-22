@@ -239,20 +239,7 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
             )
         }
         Ok(Ok((status, stdout, stderr))) => {
-            let code = status.code().unwrap_or(-1);
-
-            let result = if code != 0 {
-                let mut msg = format!("exit code {code}");
-                if !stdout.is_empty() {
-                    msg.push_str("\nstdout:\n");
-                    msg.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    msg.push_str("\nstderr:\n");
-                    msg.push_str(&stderr);
-                }
-                ToolResult::error(msg)
-            } else {
+            let result = if status.success() {
                 let mut out = stdout;
                 if !stderr.is_empty() {
                     if !out.is_empty() {
@@ -262,6 +249,17 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                     out.push_str(&stderr);
                 }
                 ToolResult::ok(out)
+            } else {
+                let mut msg = failure_summary(status);
+                if !stdout.is_empty() {
+                    msg.push_str("\nstdout:\n");
+                    msg.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    msg.push_str("\nstderr:\n");
+                    msg.push_str(&stderr);
+                }
+                ToolResult::error(msg)
             }
             .with_effect(ToolEffect::ShellCommand {
                 command: p.command.clone(),
@@ -280,6 +278,22 @@ pub async fn execute(params: serde_json::Value) -> ToolResult {
                 },
             )
         }
+    }
+}
+
+/// "exit code N", or, for a process killed by a signal (which has no exit
+/// code on Unix), "terminated by signal N (NAME)".
+fn failure_summary(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return match nix::sys::signal::Signal::try_from(signal) {
+            Ok(name) => format!("terminated by signal {signal} ({})", name.as_str()),
+            Err(_) => format!("terminated by signal {signal}"),
+        };
+    }
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "exited without an exit code".to_string(),
     }
 }
 

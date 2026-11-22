@@ -150,6 +150,14 @@ Each tool classifies a call as `Safe`, `Likely`, or `Definite`.
 - Configured deny rules run before classification and per-turn allow-all.
   Remaining `Safe` calls bypass interactive prompting, including new unprotected
   files, Markdown-memory writes, and attempt recording.
+- A scoped bash deny such as `bash(rm *)` denies any command with quoting,
+  escapes, expansion, or control operators. Otherwise it matches the raw
+  command and a normalized form: whitespace collapsed, leading `NAME=value`
+  assignments dropped, the command name reduced to its file name, and the
+  command after a common wrapper (`env`, `sudo`, `nice`, `xargs`, ...).
+  Allow rules match only the raw command. Deny rules are string checks, not a
+  sandbox: a program can still run through `find -delete`, an interpreter, or
+  a script.
 - For other calls, per-turn allow-all or configured allow rules can skip the
   interactive TUI prompt; remaining calls prompt for one-time allow, deny, or
   allow-all for the rest of the turn.
@@ -262,7 +270,7 @@ and embedding configuration; Piku does not import repository dotenv files.
 Project settings cannot change provider/model routing, actor connections or
 provider blocks. Project deny rules apply immediately; project allow rules need
 explicit canonical-root/digest review and approval. A project may lower the
-effective turn limit. See [repository authority](design/repository-authority.md)
+effective turn limit. See [repository authority](repository-authority.md)
 for the approval contract and independent developer self-update boundary.
 
 The CLI supports interactive use, one-shot prompts, `-p` headless output,
@@ -339,6 +347,10 @@ inconclusive states, an acceptance result is not automatically a product verdict
 - Some state-changing tools are classified `Safe`, including creation of a new
   unprotected path, Markdown-memory writes, and attempt writes. Configured
   denials still apply; otherwise these calls bypass interactive prompting.
+  Protected paths include Piku's own trust anchors (`.piku/`, `PIKU.md`,
+  `PIKU.local.md`, the current user-global Piku config dir, and `settings.toml`, `hooks.json` or
+  `trusted-hooks.json` inside any `piku/` directory), so file-tool writes there
+  are `Definite`. `write_memory` writes are not covered.
 - The full tool schema is sent on normal requests, so `tool_search` improves
   naming discovery but not context size or tool-selection load.
 - Successful tool output is truncated without lossless expansion, while the

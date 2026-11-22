@@ -134,24 +134,25 @@ mod memory_sections {
             );
         }
 
-        // Invalid UTF-8 still has observable prewrite bytes. Preserve the
-        // existing text-read fallback, but report replacement as Modified.
-        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        // A MEMORY.md that is not valid UTF-8 (here a Latin-1 note) must not
+        // be read as empty and replaced: the write is refused and the prior
+        // bytes are left untouched.
+        let prior = b"## Keep\nimportant note caf\xe9\n";
+        std::fs::write(&path, prior).unwrap();
         let result = crate::execute_tool(
             "write_memory",
             serde_json::json!({ "scope": scope, "entry": "plain note" }),
         )
         .await
         .unwrap();
-        assert!(!result.is_error, "{}", result.output);
-        assert_eq!(std::fs::read(&path).unwrap(), b"plain note");
-        assert_eq!(
-            result.effects,
-            vec![ToolEffect::FileWrite {
-                path: path.canonicalize().unwrap(),
-                content_change: ContentChange::Modified,
-            }]
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("not valid UTF-8"),
+            "{}",
+            result.output
         );
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        assert!(result.effects.is_empty());
     }
 
     #[tokio::test]
@@ -703,6 +704,22 @@ mod bash {
     }
 
     #[tokio::test]
+    async fn reports_signal_death_instead_of_an_exit_code() {
+        // A process killed by a signal has no exit code (`ExitStatus::code`
+        // is `None` on Unix), so the report names the signal.
+        let result = bash::execute(serde_json::json!({ "command": "kill -KILL $$" })).await;
+        assert!(result.is_error);
+        assert_eq!(result.output, "terminated by signal 9 (SIGKILL)");
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::ShellCommand {
+                command: "kill -KILL $$".to_string(),
+                exit_code: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn respects_timeout() {
         let result =
             bash::execute(serde_json::json!({ "command": "sleep 10", "timeout_ms": 100 })).await;
@@ -938,6 +955,42 @@ mod grep_tool {
     }
 
     #[test]
+    fn result_budget_spans_files_and_reports_truncation() {
+        let dir = tempdir();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "needle 1\nneedle 2\n").unwrap();
+        }
+        // Six matching lines, cap of five: five results and the marker.
+        let capped = grep::execute(serde_json::json!({
+            "pattern": "needle",
+            "path": dir,
+            "max_results": 5,
+        }));
+        assert!(!capped.is_error, "{}", capped.output);
+        let matches = capped
+            .output
+            .lines()
+            .filter(|l| l.contains("needle"))
+            .count();
+        assert_eq!(matches, 5, "{}", capped.output);
+        assert!(
+            capped.output.contains("(truncated at 5 results)"),
+            "{}",
+            capped.output
+        );
+
+        // A cap above the number of matches returns all of them, unmarked.
+        let all = grep::execute(serde_json::json!({
+            "pattern": "needle",
+            "path": dir,
+            "max_results": 50,
+        }));
+        let matches = all.output.lines().filter(|l| l.contains("needle")).count();
+        assert_eq!(matches, 6, "{}", all.output);
+        assert!(!all.output.contains("truncated"), "{}", all.output);
+    }
+
+    #[test]
     fn finds_pattern_in_file() {
         let dir = tempdir();
         let path = dir.join("src.rs");
@@ -986,6 +1039,31 @@ mod grep_tool {
             "path": dir,
         }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn finds_match_in_text_file_that_is_not_utf8() {
+        // A Latin-1 byte (0xE9) makes the file invalid UTF-8 but not binary.
+        let dir = tempdir();
+        let mut body = b"// caf".to_vec();
+        body.push(0xE9);
+        body.extend_from_slice(b"\nfn needle_here() {}\n");
+        std::fs::write(dir.join("latin1.rs"), &body).unwrap();
+        let result = grep::execute(serde_json::json!({ "pattern": "needle_here", "path": dir }));
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("latin1.rs:2: fn needle_here() {}"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn skips_non_utf8_file_with_nul_bytes() {
+        let dir = tempdir();
+        std::fs::write(dir.join("blob.bin"), b"\xE9\x00needle_here\n").unwrap();
+        let result = grep::execute(serde_json::json!({ "pattern": "needle_here", "path": dir }));
+        assert_eq!(result.output, "(no matches)");
     }
 
     #[test]
@@ -1211,6 +1289,17 @@ mod sandbox {
             "expected system-path error, got: {}",
             r.output
         );
+    }
+
+    #[test]
+    fn system_root_check_normalizes_dotdot() {
+        // `/tmp/../etc/...` names a path under /etc; a prefix check on the
+        // unnormalized string would accept it.
+        let base = std::env::temp_dir();
+        let r = crate::ensure_within_base("/tmp/../etc/cron.d/piku-should-not-exist", &base);
+        let err = r.expect_err("dotdot path into /etc should be rejected");
+        assert!(err.contains("system directory"), "unexpected error: {err}");
+        assert!(crate::ensure_within_base("/tmp/piku-ok/../still-ok", &base).is_ok());
     }
 
     #[test]
@@ -1639,4 +1728,46 @@ fn resolved_file_policy_classifies_symlink_targets_and_missing_protected_leaves(
         ),
         Destructiveness::Definite
     );
+}
+
+#[test]
+fn new_files_at_trust_anchors_need_approval() {
+    use crate::Destructiveness;
+    let base = tempdir().canonicalize().unwrap();
+    let write = |path: std::path::PathBuf| {
+        crate::tool_destructiveness("write_file", &serde_json::json!({ "path": path }))
+    };
+    for anchor in [
+        base.join(".piku/hooks.json"),
+        base.join(".piku/settings.toml"),
+        base.join(".piku/agents/reviewer.md"),
+        base.join("PIKU.md"),
+        base.join("PIKU.local.md"),
+        base.join("other-config/piku/hooks.json"),
+        base.join("other-config/piku/settings.toml"),
+        base.join("other-config/piku/trusted-hooks.json"),
+        crate::global_config_dir().join("_codex/new-attestation.json"),
+    ] {
+        assert!(!anchor.exists(), "{}", anchor.display());
+        assert_eq!(
+            write(anchor.clone()),
+            Destructiveness::Definite,
+            "{}",
+            anchor.display()
+        );
+    }
+    // Same names outside an anchor location stay ordinary new files.
+    for ordinary in [
+        base.join("settings.toml"),
+        base.join("hooks.json"),
+        base.join("piku/src/main.rs"),
+        base.join("docs/piku.md.bak"),
+    ] {
+        assert_eq!(
+            write(ordinary.clone()),
+            Destructiveness::Safe,
+            "{}",
+            ordinary.display()
+        );
+    }
 }

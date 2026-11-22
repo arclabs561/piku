@@ -38,8 +38,7 @@ use serial_test::serial;
 mod test_helpers;
 
 // The shared "seeing" model — a vt100 parser that renders the PTY byte stream
-// into the grid a human would see. Same observer the agentic judge loop uses,
-// so these smoke tests and the judge assert on one definition of "the screen".
+// into the grid a human would see.
 use surfacekit::term::screen::{self, ScreenObserver, ScreenSnapshot};
 
 /// The fixed grid these PTY tests render into. The observer and the PTY winsize
@@ -411,24 +410,25 @@ impl Drop for Pty {
         use nix::sys::signal::Signal;
         use nix::sys::wait::WaitStatus;
 
+        //
+        // Keep reading the PTY while waiting: a child whose terminal output
+        // buffer is full cannot finish exiting (the kernel drains tty output
+        // on close), not even after SIGKILL, so an unread master turned one
+        // failed assertion into a suite that never ended.
         let _ = self._proc.signal(Signal::SIGTERM);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            match self._proc.status() {
-                Some(WaitStatus::StillAlive) => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Some(_) | None => return,
+        for (signal, bound) in [(None, 1), (Some(Signal::SIGKILL), 5)] {
+            if let Some(signal) = signal {
+                let _ = self._proc.signal(signal);
             }
-        }
-        let _ = self._proc.signal(Signal::SIGKILL);
-        let kill_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < kill_deadline {
-            match self._proc.status() {
-                Some(WaitStatus::StillAlive) => {
-                    std::thread::sleep(Duration::from_millis(20));
+            let deadline = Instant::now() + Duration::from_secs(bound);
+            while Instant::now() < deadline {
+                self.drain();
+                match self._proc.status() {
+                    Some(WaitStatus::StillAlive) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Some(_) | None => return,
                 }
-                Some(_) | None => return,
             }
         }
     }
@@ -1407,20 +1407,8 @@ fn ambiguity_correction_after_interruption_preserves_terminal_evidence() {
             );
         }
     }
-    assert_eq!(
-        captured[2]["tools"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        0
-    );
-    assert_eq!(
-        captured[5]["tools"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        0
-    );
+    assert_eq!(captured[2]["tools"].as_array().map_or(0, Vec::len), 0);
+    assert_eq!(captured[5]["tools"].as_array().map_or(0, Vec::len), 0);
     let recovered_context = captured[3]["messages"].to_string();
     for expected in [prompt, clarification, correction, "AMBIGUITY:"] {
         assert!(
@@ -1549,16 +1537,14 @@ fn set_winsize(file: &std::fs::File, rows: u16, cols: u16) {
 // Rendered-screen TUI QA — assert on what a human SEES
 // ---------------------------------------------------------------------------
 // These tests drive the real piku binary over a PTY and assert on the rendered
-// grid (`pty.screen()`), not the raw byte log. The renderer is the same vt100
-// observer the agentic judge loop uses (`agentic/screen.rs`), so "the screen"
-// has one definition across the suite.
+// grid (`pty.screen()`), not the raw byte log. The renderer is surfacekit's
+// vt100 `ScreenObserver`.
 //
 // Why the rendered screen and not raw bytes: a user experiences the grid a
 // terminal paints, not the escape sequence. vt100 is faithful enough that it
 // *caught* the blank-screen bug these tests now guard against — DECSTBM homes
 // the cursor (`ESC [ r` -> xterm `CursorSet(screen, 0, 0, ...)`), so piku's
-// reset-region-then-erase wiped the whole frame on a real terminal too. See
-// `agentic/screen.rs` for the full rationale.
+// reset-region-then-erase wiped the whole frame on a real terminal too.
 //
 // A fake API key means no network call succeeds; we assert only on the
 // presentation that happens before / instead of the LLM response.
@@ -1600,7 +1586,7 @@ fn header_is_pinned_and_shows_version_on_launch() {
     );
     assert!(
         snap.shows("custom"),
-        "provider should be visible in the header; screen:\n{}",
+        "provider should be visible (footer); screen:\n{}",
         snap.summary(24)
     );
     pty.exit_cleanly();
@@ -1740,6 +1726,216 @@ fn submit_does_not_blank_the_screen() {
         "header should survive a submit; screen:\n{}",
         snap.summary(24)
     );
+    pty.exit_cleanly();
+}
+
+/// The footer must be restored as soon as the editor returns, not only once
+/// a provider finishes. Multiline editing can scroll it off its reserved row.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn submit_restores_footer_while_provider_is_pending() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let config_home = config.path().to_str().unwrap();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config_home),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "footer-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    // First use a single-line control, then exercise a multiline editor redraw.
+    for input in ["hello", "first line\nsecond line"] {
+        pty.send(b"\x1b[200~");
+        pty.send(input.as_bytes());
+        pty.send(b"\x1b[201~");
+        pty.wait(Duration::from_millis(150));
+        pty.send(b"\r");
+        let (pending, snap) = pty.wait_until(
+            |s| s.input_row().contains("thinking"),
+            Duration::from_secs(5),
+        );
+        assert!(pending, "turn never started:\n{}", snap.summary(24));
+        let footer = &snap.rows[usize::from(TEST_ROWS - 2)];
+        assert!(
+            footer.contains("footer-model") && footer.contains("/help"),
+            "footer missing while provider is pending after {input:?}:\n{}",
+            snap.summary(24)
+        );
+        pty.send(b"\x03");
+        wait_ready(&mut pty);
+    }
+    pty.exit_cleanly();
+}
+
+/// OpenAI-style completions server that answers every request after `delay`
+/// and records each request body.
+fn slow_completions_server(
+    delay: Duration,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    completions_server(delay, "ok")
+}
+
+/// Like [`slow_completions_server`], answering every request with `reply`.
+fn completions_server(
+    delay: Duration,
+    reply: &'static str,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = bodies.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request[end + 4..]).into_owned());
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
+            let content = serde_json::to_string(reply).unwrap();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}},\"finish_reason\":null}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (base_url, bodies)
+}
+
+/// A line typed and submitted while a turn runs is queued, shown on the input
+/// row, and sent as the next turn once the current one finishes.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn type_ahead_line_is_sent_after_the_running_turn() {
+    let (base_url, bodies) = slow_completions_server(Duration::from_secs(2));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "queue-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"first turn\r");
+    let (pending, snap) = pty.wait_until(
+        |s| s.input_row().contains("thinking"),
+        Duration::from_secs(5),
+    );
+    assert!(pending, "turn never started:\n{}", snap.summary(24));
+    pty.send(b"queued follow-up\r");
+    let (shown, snap) = pty.wait_until(
+        |s| s.input_row().contains("1 queued"),
+        Duration::from_secs(2),
+    );
+    assert!(shown, "queue not shown on input row:\n{}", snap.summary(24));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while bodies.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        pty.wait(Duration::from_millis(100));
+    }
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "expected two requests: {bodies:?}");
+    assert!(
+        bodies[1].contains("queued follow-up") && !bodies[0].contains("queued follow-up"),
+        "queued line must be the second turn: {bodies:?}"
+    );
+    pty.send(b"\x03");
+    wait_ready(&mut pty);
+    pty.exit_cleanly();
+}
+
+/// Ctrl-L rebuilds the frame from the session: the conversation tail, the
+/// footer, and the prompt with the unsent draft kept.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn ctrl_l_repaints_transcript_footer_and_keeps_the_draft() {
+    let (base_url, _bodies) = slow_completions_server(Duration::from_millis(10));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "repaint-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"remember this question\r");
+    let (answered, snap) = pty.wait_until(
+        |s| s.is_ready() && s.rows.iter().any(|row| row.trim() == "ok"),
+        Duration::from_secs(10),
+    );
+    assert!(answered, "turn did not finish:\n{}", snap.summary(24));
+    assert!(
+        !snap
+            .rows
+            .iter()
+            .any(|row| row.contains("prior conversation")),
+        "replay marker already on screen before Ctrl-L:\n{}",
+        snap.summary(24)
+    );
+    pty.send(b"draft");
+    pty.send(b"\x0c");
+    let (repainted, snap) = pty.wait_until(
+        |s| {
+            let footer = &s.rows[usize::from(TEST_ROWS - 2)];
+            s.rows[0].contains("piku")
+                && s.rows.iter().any(|row| row.contains("prior conversation"))
+                && s.rows
+                    .iter()
+                    .any(|row| row.contains("❯ remember this question"))
+                && footer.contains("repaint-model")
+                && s.input_row().contains("draft")
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        repainted,
+        "Ctrl-L did not rebuild the frame:\n{}",
+        snap.summary(24)
+    );
+    pty.send(b"\x03");
+    pty.send(b"\x03");
     pty.exit_cleanly();
 }
 
@@ -1895,4 +2091,303 @@ fn actor_drives_the_tui_and_promotes_a_replayable_case() {
     assert!(replay.passed(), "{replay:?}");
     pty2.exit_cleanly();
     server2.join().unwrap();
+}
+
+#[test]
+#[ignore = "isolated PTY smoke test"]
+#[serial]
+fn piku_shell_runs_a_line_and_exits() {
+    // `piku shell` owns the terminal instead of the TUI: no provider, config,
+    // or API key participates. The only proof that matters is that a typed
+    // line executed and the process left a clean exit status.
+    // Keep the shell ledger (ADR 0012) out of the operator's real state dir.
+    let state = smoke_tempdir();
+    let mut shell = Command::new(piku_binary());
+    shell.arg("shell");
+    let mut pty = Pty::spawn_command_with_env(
+        shell,
+        &smoke_temp_root(),
+        &[("XDG_STATE_HOME", state.path().to_str().unwrap())],
+    );
+    assert!(
+        pty.wait_for("% ", Duration::from_secs(10)),
+        "piku shell did not draw a prompt: {:?}",
+        pty.captured()
+    );
+
+    pty.send(b"echo shell-smoke\r");
+    // The echoed prompt repaints the typed text per keystroke, so only the
+    // executed output ends a line with the bare marker.
+    assert!(
+        pty.wait_for("shell-smoke\r\n", Duration::from_secs(10)),
+        "piku shell did not run the line: {:?}",
+        pty.captured()
+    );
+
+    // A nonzero status with nothing to say stays silent, the way every other
+    // shell behaves; `test` with no arguments is a plain false.
+    pty.send(b"test\r");
+    pty.send(b"echo status=$?\r");
+    assert!(
+        pty.wait_for("status=1\r\n", Duration::from_secs(10)),
+        "a failed builtin did not set $?: {:?}",
+        pty.captured()
+    );
+    assert!(
+        !pty.captured().contains("piku shell: exit"),
+        "a bare nonzero status must not print a line: {:?}",
+        pty.captured()
+    );
+
+    // The self-exec upgrade belongs to the wish prototype; under piku it must
+    // refuse rather than replace the installed binary.
+    pty.send(b":upgrade\r");
+    assert!(
+        pty.wait_for("upgrade is managed by piku", Duration::from_secs(10)),
+        "piku shell did not refuse :upgrade: {:?}",
+        pty.captured()
+    );
+
+    pty.exit_cleanly();
+    assert!(pty.eof, "piku shell did not exit: {:?}", pty.captured());
+
+    // Each command left one ledger record with its exit status. Meta commands
+    // (`:upgrade`) and `exit` are not shell commands and leave none.
+    let ledger =
+        std::fs::read_to_string(state.path().join("piku/shell-ledger.jsonl")).unwrap_or_default();
+    let records: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary: Vec<(String, i64)> = records
+        .iter()
+        .map(|r| {
+            (
+                r["command"].as_str().unwrap().to_string(),
+                r["exit"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("echo shell-smoke".to_string(), 0),
+            ("test".to_string(), 1),
+            ("echo status=$?".to_string(), 0),
+        ],
+        "ledger: {ledger}"
+    );
+}
+
+/// The frame every interactive state must keep: pinned header, a footer that
+/// names the model, and an input row. The header does not repeat the model
+/// (it used to); transcript rows such as /status output may name it.
+fn assert_frame(snap: &ScreenSnapshot, model: &str, step: &str) {
+    let footer = &snap.rows[usize::from(TEST_ROWS - 2)];
+    let problems: Vec<&str> = [
+        (!snap.rows[0].starts_with("piku v"), "header row lost"),
+        (!footer.contains(model), "footer lost its model"),
+        (!footer.contains("/help"), "footer lost its /help hint"),
+        (
+            snap.rows[..2].iter().any(|row| row.contains(model)),
+            "header repeats the model the footer shows",
+        ),
+        (
+            !snap.input_row().trim_start().starts_with('❯'),
+            "input row has no prompt",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(bad, what)| bad.then_some(what))
+    .collect();
+    assert!(
+        problems.is_empty(),
+        "after {step}: {problems:?}\n{}",
+        snap.summary(24)
+    );
+}
+
+/// While the input block is taller than one row the footer sits directly
+/// above it, not on the second-to-last row.
+fn assert_frame_above_input(snap: &ScreenSnapshot, model: &str, step: &str) {
+    let footer = snap
+        .rows
+        .iter()
+        .rposition(|row| row.contains("/help") && row.contains(model));
+    // Earlier rows starting with the prompt glyph are transcript echoes; the
+    // input block starts on the row right after the footer and runs to the end.
+    let block_starts_after_footer = footer.is_some_and(|row| {
+        snap.rows
+            .get(row + 1)
+            .is_some_and(|text| text.trim_start().starts_with('❯'))
+            && row + 2 < snap.rows.len()
+    });
+    assert!(
+        snap.rows[0].starts_with("piku v") && block_starts_after_footer,
+        "after {step}: header kept, footer directly above the input block\n{}",
+        snap.summary(24)
+    );
+}
+
+/// One operator session through the states that each broke once: a multiline
+/// submit, typing while a slow turn runs, the queued turn, Ctrl-L, a slash
+/// command, and exit. The whole frame is checked after every step, so a
+/// regression in any one of them names the step that caused it.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn operator_journey_keeps_the_frame_through_every_step() {
+    const MODEL: &str = "journey-model";
+    let (base_url, bodies) = slow_completions_server(Duration::from_millis(1500));
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let state = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("XDG_STATE_HOME", state.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", MODEL),
+        ],
+    );
+    let snap = wait_ready(&mut pty);
+    assert_frame(&snap, MODEL, "launch");
+
+    // Multiline submit: the editor scrolls the whole screen while typing.
+    pty.send(b"\x1b[200~first line\nsecond line\x1b[201~");
+    pty.wait(Duration::from_millis(150));
+    pty.send(b"\r");
+    let (pending, snap) = pty.wait_until(
+        |s| s.input_row().contains("thinking"),
+        Duration::from_secs(5),
+    );
+    assert!(pending, "turn never started:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "multiline submit");
+
+    // Type and queue a follow-up while the first turn is still running.
+    pty.send(b"follow up\r");
+    let (queued, snap) = pty.wait_until(
+        |s| s.input_row().contains("1 queued"),
+        Duration::from_secs(2),
+    );
+    assert!(queued, "queue not shown:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "typing during a turn");
+
+    // Both turns finish and the queued one was its own request.
+    let (done, snap) = pty.wait_until(
+        |s| s.is_ready() && bodies.lock().unwrap().len() >= 2,
+        Duration::from_secs(15),
+    );
+    assert!(done, "queued turn did not run:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "queued turn");
+    assert!(bodies.lock().unwrap()[1].contains("follow up"));
+
+    pty.send(b"\x0c");
+    let (repainted, snap) = pty.wait_until(
+        |s| s.is_ready() && s.rows.iter().any(|row| row.contains("prior conversation")),
+        Duration::from_secs(5),
+    );
+    assert!(repainted, "Ctrl-L did nothing:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "Ctrl-L");
+
+    // A long line wraps inside the input block; the frame moves up for it
+    // and comes back once the line is cleared.
+    pty.send(&[b'z'; 200]);
+    let (wrapped, snap) = pty.wait_until(
+        |s| s.rows.iter().filter(|row| row.contains("zzzz")).count() >= 3,
+        Duration::from_secs(5),
+    );
+    assert!(wrapped, "long input did not wrap:\n{}", snap.summary(24));
+    assert_frame_above_input(&snap, MODEL, "long wrapped input");
+    pty.send(b"\x15");
+    let (cleared, snap) = pty.wait_until(ScreenSnapshot::is_ready, Duration::from_secs(5));
+    assert!(cleared, "Ctrl-U did not clear:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "clearing long input");
+
+    pty.send(b"/status\r");
+    pty.wait(Duration::from_millis(400));
+    let (ready, snap) = pty.wait_until(ScreenSnapshot::is_ready, Duration::from_secs(5));
+    assert!(ready, "not ready after /status:\n{}", snap.summary(24));
+    assert_frame(&snap, MODEL, "/status");
+
+    // Exit announces its waits and their outcome instead of hanging silently.
+    let started = Instant::now();
+    pty.send(b"\x04");
+    while !pty.eof && started.elapsed() < Duration::from_secs(25) {
+        pty.wait(Duration::from_millis(100));
+    }
+    assert!(pty.eof, "piku did not exit:\n{}", pty.captured());
+    let log = pty.captured();
+    assert!(
+        log.contains("[extracting memories"),
+        "exit wait not announced:\n{log}"
+    );
+    assert!(
+        [
+            "[no new memories",
+            "memories saved to",
+            "memory extraction failed",
+            "timed out after"
+        ]
+        .iter()
+        .any(|outcome| log.contains(outcome)),
+        "exit wait outcome not reported:\n{log}"
+    );
+}
+
+/// After a typing pause the prompt shows the continuation the suggestion
+/// samples agree on; Right accepts it and it is sent as typed text.
+#[test]
+#[serial]
+#[ignore = "PTY smoke: run isolated via scripts/ci.sh pty"]
+fn model_ghost_text_appears_after_a_pause_and_right_accepts_it() {
+    let (base_url, bodies) = completions_server(Duration::from_millis(10), " the parser tests");
+    let tmp = smoke_tempdir();
+    let config = smoke_tempdir();
+    let mut pty = Pty::spawn_command_with_env(
+        Command::new(piku_binary()),
+        tmp.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("PIKU_BASE_URL", &base_url),
+            ("PIKU_MODEL", "chat-model"),
+            ("PIKU_GHOST_MODEL", "ghost-model"),
+        ],
+    );
+    wait_ready(&mut pty);
+    pty.send(b"please run");
+    let (shown, snap) = pty.wait_until(
+        |s| s.input_row().contains("please run the parser tests"),
+        Duration::from_secs(5),
+    );
+    assert!(shown, "ghost text never appeared:\n{}", snap.summary(24));
+    {
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "three suggestion samples: {bodies:?}");
+        assert!(
+            bodies.iter().all(|body| body.contains("\"ghost-model\"")),
+            "{bodies:?}"
+        );
+        assert!(bodies.iter().all(|body| body.contains("please run")));
+    }
+    pty.send(b"\x1b[C");
+    pty.wait(Duration::from_millis(200));
+    pty.send(b"\r");
+    let (sent, snap) = pty.wait_until(
+        |s| s.is_ready() && bodies.lock().unwrap().len() >= 4,
+        Duration::from_secs(10),
+    );
+    assert!(
+        sent,
+        "accepted text was not submitted:\n{}",
+        snap.summary(24)
+    );
+    let turn = bodies.lock().unwrap()[3].clone();
+    assert!(
+        turn.contains("\"chat-model\"") && turn.contains("please run the parser tests"),
+        "{turn}"
+    );
+    pty.exit_cleanly();
 }

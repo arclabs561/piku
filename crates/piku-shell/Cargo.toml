@@ -1,0 +1,33 @@
+[package]
+name = "piku-shell"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+# The absorbed shell core uses let-chains, which need edition 2024.
+edition = "2024"
+
+[lib]
+name = "piku_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "piku-shell"
+path = "src/bin/piku-shell.rs"
+
+[dependencies]
+libc = "0.2.191"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# The terminal, signal, and job-control layers are thin syscall wrappers, so
+# this crate relaxes the workspace-wide unsafe_code deny.
+unsafe_code = "allow"
+
+[lints.clippy]
+# The absorbed shell core carries only `all`, so its source stays diffable
+# against the prototype that produced it. The pedantic backlog is separate work.
+all = { level = "warn", priority = -1 }

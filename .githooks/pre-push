@@ -1,0 +1,8 @@
+#!/bin/sh
+# Opt in with: git config --local dotfiles.repoPrePush true
+# Runs the same fmt and clippy steps CI runs, so a lint failure stops here
+# instead of turning main red. Tests stay in CI and `scripts/ci.sh test`.
+set -eu
+root=$(git rev-parse --show-toplevel)
+"$root/scripts/ci.sh" fmt
+"$root/scripts/ci.sh" clippy

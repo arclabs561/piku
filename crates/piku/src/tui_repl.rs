@@ -531,15 +531,7 @@ fn record_operator_receipt(
 }
 
 fn term_size() -> (u16, u16) {
-    // Fall back to a sane default when the terminal reports no size. Some PTY
-    // setups (e.g. freshly spawned pty slaves, CI runners) report (0, 0) via a
-    // successful ioctl rather than failing; an unwrap_or on Err would miss that
-    // and leave piku drawing into a zero-sized grid (no header, no scroll
-    // region). A degenerate size must still resolve to a usable layout.
-    match terminal::size() {
-        Ok((r, c)) if r > 0 && c > 0 => (r, c),
-        _ => (80, 24),
-    }
+    crate::input_helper::term_size()
 }
 
 /// Escape terminal controls and bound a permission description without splitting UTF-8.
@@ -618,6 +610,179 @@ fn install_terminal_restoring_signal_handlers() {}
 
 // ── Divider ───────────────────────────────────────────────────────────────────
 
+// ── Type-ahead queue ──────────────────────────────────────────────────────────
+
+/// Input typed while a turn runs. Enter moves the draft into `queued`; the
+/// main loop submits queued lines in order once the turn ends. An interrupt
+/// keeps everything but stops auto-submission: the lines return to the editor.
+#[derive(Default)]
+pub(crate) struct TypeAhead {
+    pub(crate) draft: String,
+    pub(crate) queued: std::collections::VecDeque<String>,
+    pub(crate) interrupted: bool,
+}
+
+impl TypeAhead {
+    /// Apply one keypress. Returns false for keys type-ahead does not use.
+    pub(crate) fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        match code {
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => self.draft.push(c),
+            KeyCode::Backspace => {
+                self.draft.pop();
+            }
+            KeyCode::Enter => {
+                let line = std::mem::take(&mut self.draft);
+                if !line.trim().is_empty() {
+                    self.queued.push_back(line);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// After an interrupt, nothing runs unattended: queued lines and the draft
+    /// become one editable input.
+    pub(crate) fn take_for_editor(&mut self) -> Option<String> {
+        let mut parts: Vec<String> = self.queued.drain(..).collect();
+        if !self.draft.is_empty() {
+            parts.push(std::mem::take(&mut self.draft));
+        }
+        self.interrupted = false;
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    /// The input row while a turn runs: the draft drawn like a prompt with a
+    /// block cursor, then the queue count. The cursor shows even with nothing
+    /// typed, so Enter never leaves the operator without one.
+    pub(crate) fn line(&self, max_chars: usize) -> String {
+        let queued = if self.queued.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} queued", self.queued.len())
+        };
+        let budget = max_chars.saturating_sub(queued.chars().count() + 3);
+        let skip = self.draft.chars().count().saturating_sub(budget);
+        let tail: String = self.draft.chars().skip(skip).collect();
+        format!("\x1b[2m❯\x1b[0m {tail}\x1b[7m \x1b[0m\x1b[2m{queued}\x1b[0m")
+    }
+}
+
+fn lock_type_ahead(ahead: &Mutex<TypeAhead>) -> MutexGuard<'_, TypeAhead> {
+    ahead
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Draw the type-ahead line on `row` without moving the output cursor. The
+/// terminal cursor stays hidden during a turn (output streams at it); this
+/// line carries the visible one.
+fn draw_type_ahead_row(row: u16, ahead: &TypeAhead, suffix: &str) {
+    let line = ahead.line(usize::from(term_size().0).saturating_sub(24));
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[s");
+    goto(row, 1);
+    let _ = out.write_all(format!("\x1b[2K{line}{suffix}").as_bytes());
+    let _ = out.write_all(b"\x1b[u");
+    let _ = out.flush();
+}
+
+// ── Input block layout ────────────────────────────────────────────────────────
+
+/// Footer values owned by the editor's relayout callback, which outlives the
+/// borrows a [`FooterState`] holds.
+struct OwnedFooter {
+    provider: String,
+    model: String,
+    actor: String,
+    session_id: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    running_agents: usize,
+    context_pct: Option<u8>,
+}
+
+/// Most rows the input block may take: leave the header and a few rows of
+/// conversation visible.
+fn input_block_max_rows(rows: u16) -> u16 {
+    rows.saturating_sub(HEADER_ROWS + 4).clamp(1, 10)
+}
+
+/// The frame below the conversation is the footer row plus `block` input rows.
+/// When the block grows, scroll the conversation up by the difference first so
+/// nothing is drawn over; then shrink the region and redraw the footer above
+/// the block.
+fn input_block_relayout(footer: OwnedFooter) -> impl FnMut(u16, u16) {
+    move |old: u16, new: u16| {
+        let (cols, rows) = term_size();
+        if new > old {
+            let old_bottom = rows.saturating_sub(1 + old);
+            set_scroll_region(scroll_top(), old_bottom);
+            goto(old_bottom, 1);
+            for _ in 0..(new - old) {
+                println!();
+            }
+        }
+        set_scroll_region(scroll_top(), rows.saturating_sub(1 + new));
+        for row in rows.saturating_sub(old.max(new))..=rows {
+            goto(row, 1);
+            print!("\x1b[2K");
+        }
+        draw_footer(
+            rows.saturating_sub(new),
+            cols,
+            &FooterState {
+                provider: &footer.provider,
+                model: &footer.model,
+                actor: &footer.actor,
+                session_id: &footer.session_id,
+                input_tokens: footer.input_tokens,
+                output_tokens: footer.output_tokens,
+                turns: 0,
+                running_agents: footer.running_agents,
+                context_pct: footer.context_pct,
+            },
+        );
+        let _ = io::stdout().flush();
+    }
+}
+
+// ── Repaint ───────────────────────────────────────────────────────────────────
+
+/// Draw the pinned two-row header. Provider and model live in the footer,
+/// which stays current; repeating them here only goes stale.
+fn draw_header(read_only: bool) {
+    let mode = if read_only {
+        "  \x1b[2mread-only\x1b[0m"
+    } else {
+        ""
+    };
+    goto(1, 1);
+    print!("\x1b[2K");
+    println!(
+        "\x1b[1mpiku\x1b[0m \x1b[2mv{}\x1b[0m{mode}\r",
+        crate::VERSION
+    );
+    goto(2, 1);
+    print!("\x1b[2K\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit · type / for commands\x1b[0m\r");
+}
+
+/// Rebuild the frame from scratch for Ctrl-L. The terminal holds the only copy
+/// of what was drawn, so push it into scrollback (as `setup_layout` does, so
+/// nothing is erased), then redraw the header and replay the session tail.
+/// The caller redraws the footer.
+fn repaint_screen(rows: u16, session: &Session, read_only: bool) {
+    leave_scroll_region(rows);
+    for _ in 0..rows {
+        println!();
+    }
+    enter_scroll_region(rows, scroll_top());
+    draw_header(read_only);
+    goto(scroll_top(), 1);
+    print_session_tail(session, rows.saturating_sub(2));
+    let _ = io::stdout().flush();
+}
+
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 /// All the state needed to render the footer bar.
@@ -643,7 +808,9 @@ pub(crate) struct FooterState<'a> {
 fn draw_footer(row: u16, cols: u16, s: &FooterState) {
     let line = render_footer(cols, s);
     goto(row, 1);
-    print!("\x1b[2K\x1b[7m{line}\x1b[0m");
+    // No reverse video: the first segment reset cancelled it, so only the
+    // model segment was highlighted, as a bright block. Plain text, rest dim.
+    print!("\x1b[2K{line}\x1b[0m");
 }
 
 /// Render the footer bar content as a String (no cursor movement).
@@ -1072,6 +1239,8 @@ pub struct TuiSink {
     /// users run and the one the agentic harness drives, left nothing to read
     /// afterwards. A run that cannot be reconstructed cannot be debugged.
     trace: crate::trace::TraceWriter,
+    /// Input typed during the turn; redrawn when the indicator row is cleared.
+    type_ahead: Option<std::sync::Arc<Mutex<TypeAhead>>>,
 }
 
 fn lock_indicator_label(label: &Mutex<String>) -> MutexGuard<'_, String> {
@@ -1098,6 +1267,7 @@ impl TuiSink {
             turn_start_tokens: 0,
             md: StreamingMarkdown::new(),
             trace,
+            type_ahead: None,
         }
     }
 
@@ -1114,6 +1284,9 @@ impl TuiSink {
             // Clear the thinking text from the input row
             goto(rows, 1);
             let _ = self.stdout.write_all(b"\x1b[2K");
+            if let Some(ahead) = &self.type_ahead {
+                draw_type_ahead_row(rows, &lock_type_ahead(ahead), "");
+            }
             // Move cursor into scroll zone for output
             goto(scroll_bot, 1);
             let _ = self.stdout.flush();
@@ -1555,18 +1728,7 @@ async fn run_tui_repl_core(
             goto(2, 1);
             print!("\x1b[2K\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit\x1b[0m\r");
         } else {
-            let mode = if read_only { " · read-only" } else { "" };
-            goto(1, 1);
-            print!("\x1b[2K");
-            println!(
-                "\x1b[1mpiku\x1b[0m \x1b[2mv{}\x1b[0m  \x1b[2m{} · {}{}\x1b[0m\r",
-                crate::VERSION,
-                resolved.name(),
-                model,
-                mode,
-            );
-            goto(2, 1);
-            print!("\x1b[2K\x1b[2m/help for commands · Shift+Enter for newline · Ctrl-D to exit · type / for commands\x1b[0m\r");
+            draw_header(read_only);
         }
 
         // Replay tail of session history into the scroll region (below header).
@@ -1583,6 +1745,12 @@ async fn run_tui_repl_core(
     // ── Line editor ──────────────────────────────────────────────────────────
     let history_path = repl_history_path(&sessions_dir, &session_id);
     let mut editor = LineEditor::new("\x1b[34m❯\x1b[0m ");
+    if let Some(ghost_model) = crate::ghost::configured_model(resolved.name()) {
+        editor.set_ghost_source(Some(Box::new(crate::ghost::ModelGhost::new(
+            resolved.as_provider().boxed_clone(),
+            ghost_model,
+        ))));
+    }
     editor.load_history_file(&history_path);
     // Dev reload: the supervisor signals a completed build, and the prompt
     // exits at the next idle tick or turn boundary. The draft and the session
@@ -1594,6 +1762,8 @@ async fn run_tui_repl_core(
             editor.set_initial_input(draft);
         }
     }
+
+    let type_ahead = std::sync::Arc::new(Mutex::new(TypeAhead::default()));
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -1636,20 +1806,72 @@ async fn run_tui_repl_core(
         // the caret reports only whether input is accepted right now.
         editor.set_prompt(READY_PROMPT);
 
-        // Use read_line_raw so the editor doesn't emit post-submit
-        // cursor movement that conflicts with the DECSTBM layout.
-        // We temporarily reset the scroll region so MoveUp/MoveDown
-        // in the editor's redraw work without scroll-region clipping.
-        // Park on the input row: leaving the region homes the cursor, and the
-        // editor's first redraw erases from wherever the cursor is down to the
-        // bottom. Homed, that erase eats the header, transcript, and footer.
-        leave_scroll_region(input_row);
-        let readline = editor.read_line_raw();
-        // Restore the region and park in the scroll zone so turn output lands
+        // The editor draws a bottom-anchored input block at absolute rows and
+        // asks for a relayout when the block changes height, so multiline or
+        // wrapped input pushes the footer up instead of scrolling the header
+        // and footer off screen.
+        let _ = input_row;
+        editor.set_frame(Some(crate::input_helper::EditorFrame {
+            relayout: Box::new(input_block_relayout(OwnedFooter {
+                provider: resolved.name().to_string(),
+                model: model.clone(),
+                actor: active_actor.clone(),
+                session_id: session_id.clone(),
+                input_tokens: total_usage.input_tokens,
+                output_tokens: total_usage.output_tokens,
+                running_agents: task_registry.running().len(),
+                context_pct: request_context_pct(request_context.as_ref(), &model),
+            })),
+            max_rows: input_block_max_rows(term_size().1),
+        }));
+        let queued = {
+            let mut ahead = lock_type_ahead(&type_ahead);
+            if ahead.interrupted {
+                if let Some(text) = ahead.take_for_editor() {
+                    editor.set_initial_input(text);
+                }
+                None
+            } else if let Some(line) = ahead.queued.pop_front() {
+                Some(line)
+            } else {
+                if !ahead.draft.is_empty() {
+                    editor.set_initial_input(std::mem::take(&mut ahead.draft));
+                }
+                None
+            }
+        };
+        let readline = match queued {
+            Some(line) => Ok(ReadOutcome::Submit(line)),
+            None => editor.read_line_raw(),
+        };
+        // Back to a one-row input: clear the block and the footer above it,
+        // restore the region, and park in the scroll zone so turn output lands
         // below the transcript rather than on top of the header.
-        let (_cols, rows) = term_size();
+        let block_rows = editor.frame_rows();
+        editor.set_frame(None);
+        let (cols, rows) = term_size();
+        for row in rows.saturating_sub(block_rows)..=rows {
+            goto(row, 1);
+            print!("\x1b[2K");
+        }
         let scroll_bot = rows.saturating_sub(2);
         enter_scroll_region(rows, scroll_bot);
+        draw_footer(
+            rows.saturating_sub(1),
+            cols,
+            &FooterState {
+                provider: resolved.name(),
+                model: &model,
+                actor: &active_actor,
+                session_id: &session_id,
+                input_tokens: total_usage.input_tokens,
+                output_tokens: total_usage.output_tokens,
+                turns: 0,
+                running_agents: task_registry.running().len(),
+                context_pct: request_context_pct(request_context.as_ref(), &model),
+            },
+        );
+        goto(scroll_bot, 1);
         print!("\x1b[?25h");
         let _ = io::stdout().flush();
 
@@ -2381,6 +2603,15 @@ async fn run_tui_repl_core(
                 let _ = io::stdout().flush();
 
                 let mut system_sections = build_system_prompt(&cwd, &date, &model, &custom_agents);
+                system_sections.push(crate::self_system_prompt_section(&crate::SelfContext {
+                    provider: resolved.name(),
+                    model: &model,
+                    actor: &active_actor,
+                    session_id: &session_id,
+                    config_dir: &config.config_dir,
+                    run_record: Some(run.record_path()),
+                    interactive: true,
+                }));
                 if let Some(instructions) = config
                     .actor(&active_actor)
                     .and_then(|profile| profile.instructions.as_deref())
@@ -2435,10 +2666,14 @@ async fn run_tui_repl_core(
                 *lock_indicator_label(&label_ref) = "thinking".to_string();
                 // Show dimmed prompt with animated indicator on the input row.
                 goto(rows, 1);
-                print!("\x1b[2K\x1b[2m❯ · thinking\x1b[0m\x1b[?25h");
+                // The real cursor stays hidden for the turn: output streams at it while
+                // type-ahead draws its own block cursor on this row.
+                print!("\x1b[2K\x1b[2m❯\x1b[0m \x1b[7m \x1b[0m  \x1b[2m· thinking\x1b[0m\x1b[?25l");
                 goto(rows, 3);
                 let _ = io::stdout().flush();
                 let indicator_row = rows;
+                let indicator_ahead = type_ahead.clone();
+                sink.type_ahead = Some(type_ahead.clone());
                 tokio::task::spawn_local(async move {
                     const FRAMES: &[&str] = &["·", "✦", "✶", "✻", "✽", "✻", "✶", "✦"];
                     const STALL_SECS: u64 = 30;
@@ -2464,15 +2699,12 @@ async fn run_tui_repl_core(
                         } else {
                             "\x1b[2m".to_string()
                         };
-                        let mut out = io::stdout();
-                        let _ = out.write_all(b"\x1b[s");
-                        goto(indicator_row, 1);
-                        let _ = out.write_all(
-                            format!("\x1b[2K{color}❯ {frame} {label} ({time_str})\x1b[0m")
-                                .as_bytes(),
+                        let indicator = format!("{color}{frame} {label} ({time_str})\x1b[0m");
+                        draw_type_ahead_row(
+                            indicator_row,
+                            &lock_type_ahead(&indicator_ahead),
+                            &format!("  {indicator}"),
                         );
-                        let _ = out.write_all(b"\x1b[u");
-                        let _ = out.flush();
                     }
                 });
 
@@ -2480,6 +2712,8 @@ async fn run_tui_repl_core(
                 let cancel_flag: piku_runtime::CancelFlag =
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let cancel_clone = cancel_flag.clone();
+                let reader_ahead = type_ahead.clone();
+                let ahead_row = rows;
                 let keypress_handle = tokio::task::spawn_local(async move {
                     // Enable raw mode to read individual keypresses.
                     let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
@@ -2504,9 +2738,16 @@ async fn run_tui_repl_core(
                                         && matches!(code, KeyCode::Char('c')))
                                         || code == KeyCode::Esc
                                     {
+                                        lock_type_ahead(&reader_ahead).interrupted = true;
                                         cancel_clone
                                             .store(true, std::sync::atomic::Ordering::Relaxed);
                                         break;
+                                    }
+                                    // Type-ahead: echo on the input row at once;
+                                    // the thinking indicator repeats it per tick.
+                                    let mut ahead = lock_type_ahead(&reader_ahead);
+                                    if ahead.key(code, modifiers) {
+                                        draw_type_ahead_row(ahead_row, &ahead, "");
                                     }
                                 }
                                 tokio::task::yield_now().await;
@@ -2673,6 +2914,27 @@ async fn run_tui_repl_core(
                 );
             }
 
+            Ok(ReadOutcome::Repaint(draft)) => {
+                let (cols, rows) = term_size();
+                repaint_screen(rows, run.session(), read_only);
+                draw_footer(
+                    rows.saturating_sub(1),
+                    cols,
+                    &FooterState {
+                        provider: resolved.name(),
+                        model: &model,
+                        actor: &active_actor,
+                        session_id: &session_id,
+                        input_tokens: total_usage.input_tokens,
+                        output_tokens: total_usage.output_tokens,
+                        turns: 0,
+                        running_agents: task_registry.running().len(),
+                        context_pct: request_context_pct(request_context.as_ref(), &model),
+                    },
+                );
+                editor.set_initial_input(draft);
+            }
+
             Ok(ReadOutcome::Reload(draft)) => {
                 // The prompt was idle when the build finished. Keep the typed
                 // draft and the session, then let the supervisor restart us.
@@ -2736,9 +2998,20 @@ async fn run_tui_repl_core(
         eprintln!("\x1b[2m[session saved → {}]\x1b[0m", session_path.display());
     }
 
+    // Save prompt history before anything that can wait: Ctrl-C during the
+    // waits below exits through the signal handler and would skip this.
+    editor.save_history_file(&history_path);
+
     // Wait for async hooks to finish writing (logs, etc) before the
     // process exits and truncates their output mid-write. Bounded so a
     // hung hook can't block shutdown — the user's exit should feel snappy.
+    // Every wait is announced first, so exit never looks like a hang.
+    let pending_hooks = hook_registry.pending_count();
+    if pending_hooks > 0 {
+        eprintln!(
+            "\x1b[2m[waiting up to 2s for {pending_hooks} async hook(s) · Ctrl-C to skip]\x1b[0m"
+        );
+    }
     let still_running = hook_registry.shutdown(std::time::Duration::from_secs(2));
     if still_running > 0 {
         eprintln!("\x1b[2m[{still_running} async hook(s) still running at exit — detached]\x1b[0m");
@@ -2759,6 +3032,11 @@ async fn run_tui_repl_core(
             let store_path = piku_runtime::default_store_path(&cwd);
             let embed_config = piku_runtime::embed_memory::EmbedConfig::from_env();
             // Use a short timeout — don't make the user wait forever on exit
+            const EXTRACTION_TIMEOUT_SECS: u64 = 15;
+            eprintln!(
+                "\x1b[2m[extracting memories from this session with {model} · up to {EXTRACTION_TIMEOUT_SECS}s · Ctrl-C to skip]\x1b[0m"
+            );
+            let started = std::time::Instant::now();
             let extraction_future = piku_runtime::embed_memory::extract_and_persist(
                 &transcript,
                 exit_provider
@@ -2768,18 +3046,25 @@ async fn run_tui_repl_core(
                 &store_path,
                 &embed_config,
             );
-            match tokio::time::timeout(std::time::Duration::from_secs(15), extraction_future).await
-            {
-                Ok(Ok(n)) if n > 0 => {
-                    eprintln!("\x1b[2m[{n} memories extracted from session]\x1b[0m");
-                }
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(EXTRACTION_TIMEOUT_SECS),
+                extraction_future,
+            )
+            .await;
+            let took = crate::fmt_duration(started.elapsed().as_secs());
+            match outcome {
+                Ok(Ok(0)) => eprintln!("\x1b[2m[no new memories · {took}]\x1b[0m"),
+                Ok(Ok(n)) => eprintln!(
+                    "\x1b[2m[{n} memories saved to {} · {took}]\x1b[0m",
+                    store_path.display()
+                ),
                 Ok(Err(error)) => eprintln!("[piku] memory extraction failed: {error}"),
-                _ => {} // timeout or no memories — exit silently
+                Err(_) => eprintln!(
+                    "\x1b[2m[memory extraction timed out after {EXTRACTION_TIMEOUT_SECS}s · skipped]\x1b[0m"
+                ),
             }
         }
     }
-
-    editor.save_history_file(&history_path);
 
     Ok(())
 }
@@ -3126,6 +3411,7 @@ fn handle_slash_cmd(
   Ctrl+K / U     Kill to end / start of line\r
   Ctrl+W         Kill previous word\r
   Ctrl+Y         Yank (paste killed text)\r
+  Ctrl+L         Repaint the screen\r
   Right          Accept history suggestion\r
   Esc            Clear input\r{read_only_note}"
             );
@@ -3496,8 +3782,7 @@ fn announce_self_update(new_binary: &std::path::Path) {
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let bin_name = new_binary
         .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
+        .map_or_else(std::borrow::Cow::default, std::ffi::OsStr::to_string_lossy);
 
     // Save cursor position, then spin on a fresh line
     let _ = write!(stdout, "\r\n\x1b[s"); // newline + save position
@@ -4440,5 +4725,59 @@ mod tests {
         assert!(format_age_secs(now - 120).ends_with('m'));
         assert!(format_age_secs(now - 7_200).ends_with('h'));
         assert!(format_age_secs(now - 3 * 86_400).ends_with('d'));
+    }
+
+    fn type_keys(ahead: &mut TypeAhead, text: &str) {
+        for c in text.chars() {
+            let code = if c == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            ahead.key(code, KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn type_ahead_queues_submitted_lines_in_order_and_drops_blank_ones() {
+        let mut ahead = TypeAhead::default();
+        type_keys(&mut ahead, "first\n\n  \nsecond\nthird");
+        assert_eq!(ahead.queued, ["first", "second"]);
+        assert_eq!(ahead.draft, "third");
+    }
+
+    #[test]
+    fn type_ahead_backspace_edits_and_control_keys_pass_through() {
+        let mut ahead = TypeAhead::default();
+        type_keys(&mut ahead, "abc");
+        assert!(ahead.key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!ahead.key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(!ahead.key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(ahead.draft, "ab");
+    }
+
+    #[test]
+    fn type_ahead_interrupt_returns_everything_to_the_editor_unsent() {
+        let mut ahead = TypeAhead::default();
+        type_keys(&mut ahead, "one\ntwo\nunfinished");
+        ahead.interrupted = true;
+        assert_eq!(
+            ahead.take_for_editor().as_deref(),
+            Some("one\ntwo\nunfinished")
+        );
+        assert!(ahead.queued.is_empty() && ahead.draft.is_empty() && !ahead.interrupted);
+        assert_eq!(ahead.take_for_editor(), None);
+    }
+
+    #[test]
+    fn type_ahead_line_shows_draft_tail_with_cursor_and_queue_count() {
+        let mut ahead = TypeAhead::default();
+        assert_eq!(crate::markdown::strip_ansi(&ahead.line(80)), "❯  ");
+        type_keys(&mut ahead, "a\nb\n");
+        type_keys(&mut ahead, &"x".repeat(100));
+        let plain = crate::markdown::strip_ansi(&ahead.line(30));
+        // The block cursor is a reverse-video space, so it strips to " ".
+        assert_eq!(plain, format!("❯ {}  · 2 queued", "x".repeat(16)));
+        assert_eq!(plain.chars().count(), 30);
     }
 }

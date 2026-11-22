@@ -119,6 +119,14 @@ pub struct HookRegistry {
 }
 
 impl HookRegistry {
+    /// Async hooks that have not finished yet.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .map_or(0, |guard| guard.iter().filter(|h| !h.is_finished()).count())
+    }
+
     /// Wait for all async hooks to finish, up to `timeout`. After that,
     /// move on — blocking shutdown on a stuck hook is worse than losing
     /// a hook's tail-end work. Returns the number of hooks that were

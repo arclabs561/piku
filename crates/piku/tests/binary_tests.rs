@@ -1596,3 +1596,178 @@ fn inspect_html_resolves_cross_directory_record_alias_artifacts() {
         .file_type()
         .is_symlink());
 }
+
+/// ADR 0012: shell ledger records reach the model only when asked for, and
+/// the operator is told what was attached.
+#[test]
+fn shell_context_attaches_only_requested_ledger_tail_and_says_so() {
+    let config = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let ledger = state.path().join("piku/shell-ledger.jsonl");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let mut records = String::new();
+    for (n, command) in ["make build", "cargo test -p alpha", "git status"]
+        .iter()
+        .enumerate()
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            records,
+            "{{\"at\":{n},\"cwd\":\"/work\",\"command\":\"{command}\",\"exit\":{n},\"source\":\"piku-shell\"}}"
+        );
+    }
+    std::fs::write(&ledger, records).unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let run = |extra: &[&str]| {
+        let out = piku_clean_env()
+            .args(extra)
+            .args(["-p", "what failed?"])
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env_remove("PIKU_SHELL_CONTEXT")
+            .env("PIKU_BASE_URL", &base_url)
+            .env("PIKU_API_KEY", "test-key")
+            .env("PIKU_MODEL", "canned-model")
+            .current_dir(config.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+        stderr(&out)
+    };
+
+    let quiet = run(&[]);
+    assert!(!quiet.contains("attached"), "no flag, no notice: {quiet}");
+    let with_tail = run(&["--shell-context", "2"]);
+    assert!(
+        with_tail.contains("[attached 2 shell command(s) from"),
+        "notice missing: {with_tail}"
+    );
+
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(!bodies[0].contains("cargo test -p alpha"), "{}", bodies[0]);
+    assert!(
+        bodies[1].contains("[/work] $ cargo test -p alpha  (exit 1)"),
+        "{}",
+        bodies[1]
+    );
+    assert!(
+        bodies[1].contains("$ git status  (exit 2)"),
+        "{}",
+        bodies[1]
+    );
+    assert!(
+        !bodies[1].contains("make build"),
+        "only the last 2: {}",
+        bodies[1]
+    );
+}
+
+/// `eval "$(piku init zsh)"` makes zsh append each command and its exit
+/// status to the same ledger `piku shell` writes, skipping space-prefixed
+/// lines. Skipped where zsh is not installed.
+#[test]
+fn zsh_init_hook_records_commands_and_exit_status() {
+    let Ok(zsh) = which_zsh() else {
+        eprintln!("zsh not installed; skipping");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(piku_binary(), bin.join("piku")).unwrap();
+    let mut child = Command::new(zsh)
+        .args(["-f", "-i"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("XDG_STATE_HOME", state.path())
+        .current_dir(home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(
+                b"eval \"$(piku init zsh)\"\necho one\n export SECRET_TOKEN=x\nfalse\nexit\n",
+            )
+            .unwrap();
+    }
+    child.wait().unwrap();
+    // The hook appends in the background; give it a moment to land.
+    let ledger = state.path().join("piku/shell-ledger.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&ledger).unwrap_or_default();
+        if text.lines().count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Appends run in the background and may land out of order; readers
+    // order by the start time the hook records, and so does this check.
+    let mut values: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    values.sort_by_key(|value| value["at_us"].as_u64().expect("hook records a start time"));
+    let records: Vec<(String, i64, String)> = values
+        .iter()
+        .map(|value| {
+            (
+                value["command"].as_str().unwrap().to_string(),
+                value["exit"].as_i64().unwrap(),
+                value["source"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        records,
+        [
+            ("echo one".to_string(), 0, "zsh".to_string()),
+            ("false".to_string(), 1, "zsh".to_string()),
+        ],
+        "ledger: {text}"
+    );
+}
+
+fn which_zsh() -> Result<std::path::PathBuf, ()> {
+    ["/bin/zsh", "/usr/bin/zsh"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.exists())
+        .ok_or(())
+}
+
+/// The agent is told where its own settings and records live, so a question
+/// like "where is piku's default model configured?" does not need a search.
+#[test]
+fn system_prompt_tells_the_agent_about_itself() {
+    let config = tempfile::tempdir().unwrap();
+    let (base_url, bodies) = fake_completions_server(CANNED_ANSWER);
+    let (_out, session_id) = run_headless_turn(config.path(), &base_url);
+    let bodies = bodies.lock().unwrap().clone();
+    let body = bodies.first().expect("one request");
+    let settings = config.path().join("piku/settings.toml");
+    let transcript = config
+        .path()
+        .join(format!("piku/sessions/{session_id}.json"));
+    for needle in [
+        "# About you (piku)".to_string(),
+        format!("piku {}", env!("CARGO_PKG_VERSION")),
+        "model canned-model".to_string(),
+        settings.display().to_string(),
+        transcript.display().to_string(),
+    ] {
+        assert!(
+            body.contains(&needle),
+            "missing {needle:?} in request: {body}"
+        );
+    }
+}

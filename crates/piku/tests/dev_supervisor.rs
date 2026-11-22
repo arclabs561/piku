@@ -115,10 +115,11 @@ impl Fixture {
 #[test]
 fn reload_restarts_the_child_on_the_same_session() {
     let fixture = Fixture::new();
+    // Like the real TUI: on reload, save the draft naming the session, exit 75.
     script(
         &fixture.target.join("debug"),
         "piku",
-        "#!/bin/sh\necho start >> \"$STARTS\"\ntrap 'exit 75' USR1\nwhile :; do sleep 0.05; done\n",
+        "#!/bin/sh\necho \"start ${PIKU_SESSION_ID:-none} ${PIKU_RESTARTED:-0}\" >> \"$STARTS\"\ntrap 'printf %s \"{\\\"session_id\\\":\\\"sess-1\\\",\\\"text\\\":\\\"\\\"}\" > \"$PIKU_DEV_STATE_DIR/draft.json\"; exit 75' USR1\nwhile :; do sleep 0.05; done\n",
     );
     let build = script(fixture.dir.path(), "build.sh", "#!/bin/sh\nexit 0\n");
 
@@ -131,6 +132,13 @@ fn reload_restarts_the_child_on_the_same_session() {
     );
     stop(&mut supervisor);
 
+    let starts = fs::read_to_string(&fixture.starts).unwrap_or_default();
+    let starts: Vec<&str> = starts.lines().collect();
+    assert_eq!(
+        starts[..2],
+        ["start none 0", "start sess-1 1"],
+        "the restarted child must resume the saved session"
+    );
     let receipts = fixture.receipts();
     assert!(receipts.contains("\"kind\":\"reload\""), "{receipts}");
     assert!(!receipts.contains("build-failed"), "{receipts}");

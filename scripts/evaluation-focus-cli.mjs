@@ -56,13 +56,12 @@ function parseJson(text, source) {
   }
 }
 
-async function readEvents(file) {
-  let contents;
+async function readLedger(file) {
+  let contents = "";
   try {
     contents = await readFile(file, "utf8");
   } catch (error) {
-    if (error.code === "ENOENT") return [];
-    throw error;
+    if (error.code !== "ENOENT") throw error;
   }
   const events = [];
   for (const [index, line] of contents.split("\n").entries()) {
@@ -77,7 +76,7 @@ async function readEvents(file) {
     events.push(event);
   }
   validateHistory(events, file);
-  return events;
+  return { events, needsLineFeed: contents.length > 0 && !contents.endsWith("\n") };
 }
 
 function validateHistory(events, file) {
@@ -148,15 +147,17 @@ async function withLock(ledger, operation) {
 
 async function appendEvents(ledger, incoming) {
   return withLock(ledger, async () => {
-    const existing = await readEvents(ledger);
+    const { events: existing, needsLineFeed } = await readLedger(ledger);
     for (const [index, event] of incoming.entries()) {
       assertEvaluationFocusEvent(event, `import:${index + 1}`);
     }
     validateHistory([...existing, ...incoming], ledger);
     const handle = await open(ledger, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY, 0o600);
     try {
+      let separator = needsLineFeed ? "\n" : "";
       for (const event of incoming) {
-        const line = Buffer.from(`${JSON.stringify(event)}\n`, "utf8");
+        const line = Buffer.from(`${separator}${JSON.stringify(event)}\n`, "utf8");
+        separator = "";
         const { bytesWritten } = await handle.write(line, 0, line.length, null);
         if (bytesWritten !== line.length) fail(`short append to focus ledger: ${ledger}`);
         await handle.sync();
@@ -228,7 +229,7 @@ async function main(args) {
   if (!ledger || ledger.startsWith("--")) fail(`${command} requires an explicit events.jsonl path`);
   if (command === "inspect") {
     if (rest.length) fail(`inspect does not accept options`);
-    const events = await readEvents(ledger);
+    const { events } = await readLedger(ledger);
     process.stdout.write(`${JSON.stringify({ path: ledger, event_count: events.length, events }, null, 2)}\n`);
     return;
   }
@@ -256,7 +257,8 @@ async function main(args) {
     const file = option(rest, "--options-file");
     if (Boolean(inline) === Boolean(file)) fail("provide exactly one of --options or --options-file");
     const options = parseJson(inline ?? await readFile(file, "utf8"), file ?? "--options");
-    const output = canonicalEvaluationFocus(projectEvaluationFocus(await readEvents(ledger), options));
+    const { events } = await readLedger(ledger);
+    const output = canonicalEvaluationFocus(projectEvaluationFocus(events, options));
     const destination = option(rest, "--output");
     if (destination) await atomicWrite(destination, output);
     else process.stdout.write(output);

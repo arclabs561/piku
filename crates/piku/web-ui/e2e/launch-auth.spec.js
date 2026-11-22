@@ -117,8 +117,41 @@ test("protected full records render the real timeline in opaque credential-free 
   const full = page.getByRole("dialog");
   await expect(full.locator("iframe").contentFrame().locator("#timeline article")).toContainText("complete protected timeline evidence");
   await expect(full.locator("iframe")).toHaveAttribute("sandbox", "allow-scripts");
-  await expect(full.locator("iframe")).not.toHaveAttribute("src", /./);
+  // Previews navigate to a single-use ticket route, never a credential URL.
+  await expect(full.locator("iframe")).toHaveAttribute("src", /^\/preview\/[a-f0-9]{64}$/);
   await full.getByRole("button", { name: "close record" }).click();
+});
+
+test("page previews execute their own inline scripts in an isolated frame under a strict shell CSP", async ({ page, surfaceName }) => {
+  const violations = [];
+  page.on("console", (message) => {
+    if (/Content Security Policy/i.test(message.text())) violations.push(message.text());
+  });
+  const previewHtml = '<main id="out">static</main><script>'
+    + 'let parentAccess; try { parentAccess = parent.document.title; } catch { parentAccess = "isolated"; }'
+    + 'document.getElementById("out").textContent = "script ran · " + parentAccess;</script>';
+  await page.route(`**/api/surfaces/${surfaceName}`, async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const response = await route.fetch();
+    const data = await response.json();
+    data.html = previewHtml;
+    data.objects = [{ id: "inline-preview", kind: "page_preview", title: "page preview",
+      x: 24, y: 24, width: 480, height: 320, z: 1, content: "" }];
+    await route.fulfill({ response, json: data });
+  });
+  const shell = await page.goto(`/?surface=${encodeURIComponent(surfaceName)}`);
+  const policy = shell.headers()["content-security-policy"];
+  const scriptSrc = policy.split(";").map((part) => part.trim()).find((part) => part.startsWith("script-src "));
+  expect(scriptSrc).toBe("script-src 'self'");
+  await expect(page.locator(".surface-btn.active")).toHaveText(surfaceName);
+  const frame = page.locator('[data-kind="page_preview"] iframe');
+  await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+  await expect(frame).toHaveAttribute("src", /^\/preview\/[a-f0-9]{64}$/);
+  await expect(frame.contentFrame().locator("#out")).toHaveText("script ran · isolated");
+  // The ticket was redeemed by the frame navigation; replaying it fails.
+  const replay = await page.request.get(await frame.getAttribute("src"));
+  expect(replay.status()).toBe(404);
+  expect(violations).toEqual([]);
 });
 
 test("terminal authenticates before resize or input without credential URLs", async ({ page, surfaceName }) => {

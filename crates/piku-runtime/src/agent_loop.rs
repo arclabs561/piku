@@ -176,6 +176,27 @@ impl TurnExit {
 /// If `task_registry` is Some, `spawn_agent` / `agent_status` / `agent_join`
 /// calls are handled natively — subagents run as background tokio tasks and
 /// report back through the registry.
+/// Count a failing call and, from its second identical occurrence, append a
+/// note telling the model that repeating it will not help.
+fn note_repeated_failure(
+    failed_calls: &mut std::collections::HashMap<String, u32>,
+    tool_name: &str,
+    params: &serde_json::Value,
+    output: String,
+) -> String {
+    let count = failed_calls
+        .entry(format!("{tool_name}\u{1f}{params}"))
+        .or_insert(0);
+    *count += 1;
+    if *count < 2 {
+        return output;
+    }
+    format!(
+        "{output}\n\n[piku] This exact {tool_name} call has now failed {count} times with these \
+arguments. Repeating it will fail the same way: change the arguments or take a different approach."
+    )
+}
+
 pub async fn run_turn(
     input: &str,
     session: &mut Session,
@@ -283,6 +304,8 @@ async fn run_turn_inner(
     let turn_start = std::time::Instant::now();
     let mut tracker = UsageTracker::default();
     let mut iterations = 0u32;
+    // Failing calls seen this turn, keyed by tool name and exact arguments.
+    let mut failed_calls: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut request_pressure = 0.0;
     let mut stream_error: Option<String> = None;
     let mut replace_and_exec: Option<std::path::PathBuf> = None;
@@ -606,6 +629,25 @@ async fn run_turn_inner(
                 });
                 continue;
             }
+            if replace_and_exec.is_some() {
+                // A self-update was requested after an earlier call in this
+                // message. Answer the rest without running them so the resumed
+                // session sends no `tool_use` without its `tool_result`.
+                let output = "Not run: piku restarted to apply an update".to_string();
+                session.push(ConversationMessage::tool_result(
+                    tool_use_id.clone(),
+                    output.clone(),
+                    true,
+                ));
+                sink.on_run_event(&crate::run_record::RunEvent::ToolCompleted {
+                    tool_call_id: tool_use_id.clone(),
+                    result: crate::run_record::ContentRef::Inline { text: output },
+                    is_error: true,
+                    effects: Vec::new(),
+                    verification: None,
+                });
+                continue;
+            }
             if !advertised_tool_names.contains(tool_name) {
                 let msg = format!("{tool_name} is not available in this mode");
                 sink.on_tool_start(tool_name, tool_use_id, params);
@@ -798,7 +840,19 @@ async fn run_turn_inner(
                     .get("approach")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let attempt_id = params.get("attempt_id").and_then(serde_json::Value::as_u64);
+                // Some providers fill every optional integer with 0. An id that
+                // names no attempt, sent alongside goal and approach, is a
+                // create, not an update to retry forever.
+                let known = |id: u64| store.entries.iter().any(|e| e.id == id && e.is_valid);
+                let creating = !goal.trim().is_empty() && !approach.trim().is_empty();
+                let attempt_id = params
+                    .get("attempt_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&id| !creating || known(id));
+                let parent_id = params
+                    .get("parent_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&id| known(id));
 
                 if let Some(error) = load_error {
                     (
@@ -857,8 +911,6 @@ async fn run_turn_inner(
                     .await;
                     match embed_result {
                         Ok(Ok(embedding)) => {
-                            let parent_id =
-                                params.get("parent_id").and_then(serde_json::Value::as_u64);
                             #[allow(clippy::cast_possible_truncation)]
                             let importance = params
                                 .get("importance")
@@ -1011,6 +1063,15 @@ async fn run_turn_inner(
                 }
             };
 
+            // A model that repeats an identical failing call will keep getting
+            // the same error; say so instead of letting it loop (a session sent
+            // record_attempt with attempt_id 0 four times in a row).
+            let output = if is_error {
+                note_repeated_failure(&mut failed_calls, tool_name, params, output)
+            } else {
+                output
+            };
+
             // Append hook-injected context to the tool output so the model sees it.
             let output = if let Some(ctx) = hook_context {
                 format!("{output}\n\n<hook-context>\n{ctx}\n</hook-context>")
@@ -1044,12 +1105,11 @@ async fn run_turn_inner(
                 verification,
             });
 
-            // Self-update: sink detected a new binary — break cleanly after
-            // persisting this tool result, then signal the caller.
+            // Self-update: sink detected a new binary. Later calls in this
+            // message are answered without running, then the caller is signalled.
             if let PostToolAction::ReplaceAndExec(path) = action {
                 if !cancellation_requested(cancel_flag) {
                     replace_and_exec = Some(path);
-                    break;
                 }
             }
         }
@@ -2957,5 +3017,28 @@ mod curation_tests {
             has_use, has_result,
             "tool_use and tool_result must be included or dropped together (use={has_use} result={has_result})"
         );
+    }
+}
+
+#[cfg(test)]
+mod repeated_failure_tests {
+    use super::note_repeated_failure;
+
+    #[test]
+    fn second_identical_failure_gets_a_note_and_different_arguments_do_not() {
+        let mut seen = std::collections::HashMap::new();
+        let args = serde_json::json!({"attempt_id": 0});
+        let first = note_repeated_failure(&mut seen, "record_attempt", &args, "not found".into());
+        assert_eq!(first, "not found");
+        let second = note_repeated_failure(&mut seen, "record_attempt", &args, "not found".into());
+        assert!(
+            second.starts_with(
+                "not found\n\n[piku] This exact record_attempt call has now failed 2 times"
+            ),
+            "{second}"
+        );
+        let other = serde_json::json!({"attempt_id": 1});
+        let fresh = note_repeated_failure(&mut seen, "record_attempt", &other, "not found".into());
+        assert_eq!(fresh, "not found");
     }
 }

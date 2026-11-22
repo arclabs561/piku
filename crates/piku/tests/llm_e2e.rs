@@ -493,3 +493,142 @@ fn piku_explores_own_codebase_with_glob_and_read() {
         "response should mention modules from lib.rs. stdout: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Self-knowledge and working-directory behavior (failures seen 2026-10-26)
+// ---------------------------------------------------------------------------
+
+/// Tool results recorded in this run's event records, for asserting on what
+/// the agent actually ran rather than on what it said.
+fn recorded_tool_results(config_dir: &std::path::Path) -> Vec<String> {
+    let runs = config_dir.join("piku/runs");
+    let mut results = Vec::new();
+    for entry in std::fs::read_dir(runs).into_iter().flatten().flatten() {
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for line in text.lines() {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if event["event"] == "tool_completed" {
+                results.push(
+                    event["result"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    results
+}
+
+/// Asked where its default model is configured, a session searched the disk
+/// with six shell calls. The system prompt now says; the answer must name the
+/// real settings file.
+#[test]
+#[ignore = "live LLM e2e; run with `cargo test --test llm_e2e -- --ignored` and a provider key"]
+fn piku_knows_where_its_default_model_is_configured() {
+    let Some((provider, key_var, model)) = detect_provider() else {
+        panic!("llm_e2e is opt-in (`--ignored`) and needs a provider key");
+    };
+    let dir = tempdir();
+    let config = dir.join("config");
+    let (stdout, stderr, success) = run_piku(
+        "Where is your own default model configured? Reply with the file path only.",
+        &provider,
+        &model,
+        &key_var,
+        &dir,
+        &config,
+    );
+    assert!(success, "piku should exit 0. stderr: {stderr}");
+    let settings = config.join("piku/settings.toml");
+    assert!(
+        stdout.contains(&settings.display().to_string()),
+        "answer should name {}: {stdout}",
+        settings.display()
+    );
+    let calls = recorded_tool_results(&config).len();
+    assert!(calls <= 1, "answering about itself took {calls} tool calls");
+}
+
+/// Launched from a parent directory, a session ran `cargo test` without a
+/// `cd` after earlier calls that had one, and every bash call starts in the
+/// launch directory. No recorded result may show that mistake.
+#[test]
+#[ignore = "live LLM e2e; run with `cargo test --test llm_e2e -- --ignored` and a provider key"]
+fn piku_runs_a_subproject_command_from_the_parent_directory() {
+    let Some((provider, key_var, model)) = detect_provider() else {
+        panic!("llm_e2e is opt-in (`--ignored`) and needs a provider key");
+    };
+    let dir = tempdir();
+    let config = dir.join("config");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
+    )
+    .unwrap();
+    let (stdout, stderr, success) = run_piku(
+        "Run the tests of the Rust project in ./proj, then run `cargo metadata --no-deps --format-version 1` for it, and tell me the package name.",
+        &provider,
+        &model,
+        &key_var,
+        &dir,
+        &config,
+    );
+    assert!(success, "piku should exit 0. stderr: {stderr}");
+    let results = recorded_tool_results(&config);
+    let lost = results
+        .iter()
+        .filter(|text| text.contains("could not find `Cargo.toml`"))
+        .count();
+    assert_eq!(lost, 0, "a bash call ran outside ./proj: {results:#?}");
+    assert!(
+        stdout.contains("proj"),
+        "answer should name the package: {stdout}"
+    );
+}
+
+/// Ghost text against the real default suggestion model: it answers inside
+/// the editor's budget, and whatever it shows continues the draft rather than
+/// repeating it. Disagreement (no suggestion) is an allowed outcome.
+#[test]
+#[ignore = "live LLM e2e; run with `cargo test --test llm_e2e -- --ignored` and OPENROUTER_API_KEY"]
+fn ghost_suggestions_from_the_default_model_continue_the_draft() {
+    use piku::input_helper::GhostSource as _;
+    assert!(has_key("OPENROUTER_API_KEY"), "needs OPENROUTER_API_KEY");
+    let resolved = piku_runtime::ResolvedProvider::resolve_named("openrouter").unwrap();
+    let mut ghost = piku::ghost::ModelGhost::new(
+        resolved.as_provider().boxed_clone(),
+        piku::ghost::DEFAULT_OPENROUTER_MODEL.to_string(),
+    );
+    let mut shown = 0;
+    for draft in [
+        "run cargo test and fix the ",
+        "explain what this function ",
+        "add a unit test for ",
+    ] {
+        let started = std::time::Instant::now();
+        let answer = ghost
+            .request(draft)
+            .recv_timeout(std::time::Duration::from_secs(6))
+            .expect("suggestion thread answers");
+        eprintln!("{draft:?} -> {answer:?} in {:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        if let Some(text) = answer {
+            shown += 1;
+            assert!(
+                !text.trim().is_empty() && !text.contains(draft.trim()),
+                "{text:?}"
+            );
+        }
+    }
+    eprintln!("{shown}/3 drafts got a suggestion");
+}
