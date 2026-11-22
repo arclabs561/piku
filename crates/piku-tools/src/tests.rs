@@ -1731,9 +1731,11 @@ fn resolved_file_policy_classifies_symlink_targets_and_missing_protected_leaves(
 }
 
 #[test]
+#[serial_test::serial(cwd)]
 fn new_files_at_trust_anchors_need_approval() {
     use crate::Destructiveness;
-    let base = tempdir().canonicalize().unwrap();
+    let workspace = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let base = workspace.path();
     let write = |path: std::path::PathBuf| {
         crate::tool_destructiveness("write_file", &serde_json::json!({ "path": path }))
     };
