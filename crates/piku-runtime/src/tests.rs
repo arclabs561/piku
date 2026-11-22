@@ -216,10 +216,9 @@ mod permissions {
     }
 
     #[test]
-    fn new_file_write_is_safe_even_with_deny_all() {
-        // write_file to a non-existent path → Safe → auto-approved regardless of prompter
-        let dir = tempdir();
-        let path = dir.join("brand_new_file.txt");
+    fn new_file_in_workspace_is_safe_even_with_deny_all() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("brand_new_file.txt");
         let outcome = check_permission(
             "write_file",
             &serde_json::json!({ "path": path, "content": "y" }),
