@@ -369,14 +369,6 @@ mod write_file {
     }
 
     #[test]
-    fn new_file_is_safe_destructiveness() {
-        let dir = tempdir();
-        let path = dir.join("brand_new.txt");
-        let d = write_file::destructiveness(&serde_json::json!({ "path": path }));
-        assert_eq!(d, crate::Destructiveness::Safe);
-    }
-
-    #[test]
     fn overwrite_is_likely_destructiveness() {
         let dir = tempdir();
         let path = dir.join("exists.txt");
@@ -1178,6 +1170,38 @@ mod sandbox {
 
     #[test]
     #[serial(cwd)]
+    fn new_file_inside_working_dir_is_safe() {
+        let td = tempdir();
+        cd(&td);
+        let d = crate::write_file::destructiveness(&serde_json::json!({ "path": "brand_new.txt" }));
+        assert_eq!(d, crate::Destructiveness::Safe);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn new_file_outside_working_dir_needs_approval() {
+        let work = tempdir();
+        let elsewhere = tempdir();
+        cd(&work);
+        let path = elsewhere.join("brand_new.txt");
+        let d = crate::write_file::destructiveness(&serde_json::json!({ "path": path }));
+        assert_eq!(d, crate::Destructiveness::Definite);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn new_piku_global_hooks_file_needs_approval_even_from_home() {
+        // Running from $HOME puts ~/.config/piku inside the working directory.
+        let home = tempdir();
+        cd(&home);
+        let d = crate::write_file::destructiveness(
+            &serde_json::json!({ "path": ".config/piku/hooks.json" }),
+        );
+        assert_eq!(d, crate::Destructiveness::Definite);
+    }
+
+    #[test]
+    #[serial(cwd)]
     fn write_file_refuses_parent_traversal() {
         let td = tempdir();
         cd(&td);
@@ -1707,9 +1731,11 @@ fn resolved_file_policy_classifies_symlink_targets_and_missing_protected_leaves(
 }
 
 #[test]
+#[serial_test::serial(cwd)]
 fn new_files_at_trust_anchors_need_approval() {
     use crate::Destructiveness;
-    let base = tempdir().canonicalize().unwrap();
+    let workspace = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let base = workspace.path();
     let write = |path: std::path::PathBuf| {
         crate::tool_destructiveness("write_file", &serde_json::json!({ "path": path }))
     };
